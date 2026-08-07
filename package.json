@@ -3,18 +3,26 @@
   "version": "0.2.0",
   "description": "Extensible chat and markdown orchestrator for coding agents",
   "license": "MIT",
+  "keywords": [
+    "coding-agent",
+    "terminal-ui",
+    "telegram",
+    "whatsapp",
+    "automation"
+  ],
   "bin": {
     "spynel": "npm/bin/spynel.js"
   },
   "scripts": {
     "postinstall": "node npm/install.js",
+    "test": "node npm/test.js",
     "test:npm": "node npm/test.js"
   },
   "files": [
     "npm/bin/",
     "npm/install.js",
     "npm/platform.js",
-    "npm/test.js",
+    "npm/update.js",
     "THIRD_PARTY_NOTICES.md"
   ],
   "engines": {
@@ -22,6 +30,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/frdel/spynel.git"
+    "url": "git+https://github.com/agent0ai/spynel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/agent0ai/spynel/issues"
+  },
+  "homepage": "https://github.com/agent0ai/spynel#readme",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
   }
 }

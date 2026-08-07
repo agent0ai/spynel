@@ -1,4 +1,4 @@
-module github.com/frdel/spynel
+module github.com/agent0ai/spynel
 
 go 1.25.0
 
@@ -8,9 +8,12 @@ require (
 	github.com/charmbracelet/glamour v1.0.0
 	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
 	github.com/charmbracelet/x/ansi v0.10.2
+	github.com/k2-fsa/sherpa-onnx-go v1.13.4
 	github.com/mdp/qrterminal/v3 v3.2.1
+	github.com/muesli/termenv v0.16.0
 	github.com/ncruces/go-sqlite3 v0.35.2
-	github.com/yuin/goldmark v1.7.13
+	github.com/pion/opus v0.1.0
+	github.com/yuin/goldmark v1.7.17
 	go.mau.fi/whatsmeow v0.0.0-20260721154117-8b4a8ba0d318
 	golang.org/x/sys v0.47.0
 	google.golang.org/protobuf v1.36.11
@@ -37,6 +40,9 @@ require (
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-linux v1.13.4 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-macos v1.13.4 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-windows v1.13.4 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -46,7 +52,6 @@ require (
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/muesli/reflow v0.3.0 // indirect
-	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/ncruces/go-sqlite3-wasm/v3 v3.2.35303 // indirect
 	github.com/ncruces/julianday v1.0.0 // indirect
 	github.com/petermattis/goid v0.0.0-20260713124913-97594f28f5ca // indirect

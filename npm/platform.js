@@ -5,8 +5,7 @@ const mapping = {
   "linux-arm64": ["linux", "arm64", "tar.gz"],
   "darwin-x64": ["darwin", "amd64", "tar.gz"],
   "darwin-arm64": ["darwin", "arm64", "tar.gz"],
-  "win32-x64": ["windows", "amd64", "zip"],
-  "win32-arm64": ["windows", "arm64", "zip"]
+  "win32-x64": ["windows", "amd64", "zip"]
 };
 
 function resolve(platform, arch) {

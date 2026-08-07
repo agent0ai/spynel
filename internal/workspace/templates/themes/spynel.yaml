@@ -1,0 +1,20 @@
+name: spynel
+description: Spynel's vivid midnight palette
+appearance: dark
+color_blind_friendly: false
+colors:
+  background: "#111927"
+  surface: "#171F2D"
+  surface_elevated: "#1D2939"
+  surface_selected: "#2A3B50"
+  text: "#D4DCEB"
+  text_muted: "#8292AE"
+  primary: "#F472B6"
+  secondary: "#A7F3D0"
+  border: "#3D5276"
+  user: "#60A5FA"
+  success: "#5EE6A8"
+  warning: "#F7C76B"
+  error: "#FB7185"
+  info: "#7DD3FC"
+  code: "#C4B5FD"

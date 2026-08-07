@@ -11,12 +11,25 @@ import (
 	"strings"
 	"time"
 
-	"github.com/frdel/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/config"
 )
 
 var nonSlug = regexp.MustCompile(`[^a-z0-9]+`)
 
 func Create(cfg config.Config, routeName, title, body string) (string, error) {
+	return CreateWithOptions(cfg, routeName, title, body, CreateOptions{})
+}
+
+type CreateOptions struct {
+	Notify       bool
+	Origin       string
+	Outcomes     []string
+	ParentTaskID string
+	GoalID       string
+	GoalRound    int
+}
+
+func CreateWithOptions(cfg config.Config, routeName, title, body string, options CreateOptions) (string, error) {
 	var route *config.Route
 	for i := range cfg.Orchestrator.Routes {
 		if cfg.Orchestrator.Routes[i].Name == routeName {
@@ -46,10 +59,50 @@ func Create(cfg config.Config, routeName, title, body string) (string, error) {
 		"created_at": now.Format(time.RFC3339), "updated_at": now.Format(time.RFC3339), "attempt": 0,
 	}
 	if routeName == "goals" {
-		front["next_review_at"] = now.Format(time.RFC3339)
+		front["round"] = 0
+		front["review_trigger"] = "all_round_tasks_settled"
+		front["success_criteria"] = []map[string]any{{
+			"id": "criterion-1", "condition": title,
+			"evidence_required": "Direct, reviewable evidence that the stated outcome has been achieved.",
+		}}
+	}
+	if routeName == "tasks" {
+		enabled := options.Notify
+		notify := map[string]any{"enabled": enabled}
+		if enabled {
+			if _, err := ParseOrigin(options.Origin); err != nil {
+				return "", fmt.Errorf("notification origin: %w", err)
+			}
+			outcomes := options.Outcomes
+			if len(outcomes) == 0 {
+				outcomes = []string{"done", "failed", "waiting", "cancelled"}
+			}
+			notify["origin"] = options.Origin
+			notify["on"] = outcomes
+			for _, outcome := range outcomes {
+				if outcome != "done" && outcome != "failed" && outcome != "waiting" && outcome != "cancelled" {
+					return "", fmt.Errorf("notification outcome %q is not supported", outcome)
+				}
+			}
+		}
+		front["notify"] = notify
+		if options.ParentTaskID != "" {
+			front["parent_task_id"] = options.ParentTaskID
+		}
+		if strings.TrimSpace(options.GoalID) != "" {
+			if options.GoalRound <= 0 {
+				return "", errors.New("goal-linked tasks require a positive goal round")
+			}
+			front["goal_id"] = strings.TrimSpace(options.GoalID)
+			front["goal_round"] = options.GoalRound
+		}
 	}
 	if strings.TrimSpace(body) == "" {
-		body = "# " + title + "\n\n" + title + "\n\n## Progress\n\n- Created by Spynel.\n"
+		if routeName == "goals" {
+			body = "# " + title + "\n\n## Objective\n\n" + title + "\n\n## Boundaries\n\n- To be refined during planning.\n\n## Target conditions\n\n- `criterion-1`: " + title + "\n\n## Current evidence\n\n- No evidence recorded yet.\n\n## Planning history\n\n- Awaiting the initial planning pass.\n\n## Review history\n\n- No reviews yet.\n\n## Progress\n\n- Created by Spynel.\n"
+		} else {
+			body = "# " + title + "\n\n## Objective\n\n" + title + "\n\n## Acceptance criteria\n\n- The requested finite outcome is implemented and independently verified.\n\n## Context\n\n- Created by Spynel.\n\n## Progress\n\n- Not started.\n"
+		}
 	}
 	document := Document{FrontMatter: front, Body: body}
 	directory := cfg.Resolve(route.Source)

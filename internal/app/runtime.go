@@ -7,12 +7,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
-	"github.com/frdel/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/core"
 )
 
 const (
 	logPageEntries      = 20
+	maxLogPageRange     = 5
 	maxLogSearchEntries = 20
 	maxLogEntries       = 4096
 	maxLogEntryRunes    = 4096
@@ -209,22 +211,37 @@ func formatLogs(entries []LogEntry) string {
 }
 
 func formatLogPage(entries []LogEntry, page int) string {
+	return formatLogPages(entries, page, page)
+}
+
+func formatLogPages(entries []LogEntry, firstPage, lastPage int) string {
 	if len(entries) == 0 {
 		return "# Log\n\nNo runtime log entries."
 	}
 	totalPages := (len(entries) + logPageEntries - 1) / logPageEntries
-	if page > totalPages {
-		return fmt.Sprintf("# Log\n\nPage %d does not exist. The log has %d entries across %d pages.", page, len(entries), totalPages)
+	if firstPage > totalPages {
+		return fmt.Sprintf("# Log\n\nPage %d does not exist. The log has %d entries across %d pages.", firstPage, len(entries), totalPages)
 	}
-	end := len(entries) - (page-1)*logPageEntries
-	start := max(0, end-logPageEntries)
-	lines := []string{"# Log", "", fmt.Sprintf("%d entries. Page %d of %d, showing %d.", len(entries), page, totalPages, end-start), ""}
-	for _, entry := range entries[start:end] {
-		text := strings.ReplaceAll(entry.Text, "\n", " ")
-		lines = append(lines, fmt.Sprintf("- `%s` %s", entry.At.Local().Format("15:04:05"), text))
+	lastPage = min(lastPage, totalPages)
+	shown := 0
+	for page := firstPage; page <= lastPage; page++ {
+		end := len(entries) - (page-1)*logPageEntries
+		shown += end - max(0, end-logPageEntries)
+	}
+	coverage := fmt.Sprintf("Page %d", firstPage)
+	if firstPage != lastPage {
+		coverage = fmt.Sprintf("Pages %d-%d", firstPage, lastPage)
+	}
+	lines := []string{"# Log", "", fmt.Sprintf("%d entries. %s of %d, showing %d.", len(entries), coverage, totalPages, shown), ""}
+	for page := firstPage; page <= lastPage; page++ {
+		end := len(entries) - (page-1)*logPageEntries
+		start := max(0, end-logPageEntries)
+		for _, entry := range entries[start:end] {
+			lines = append(lines, formatLogEntry(entry)...)
+		}
 	}
 	if totalPages > 1 {
-		lines = append(lines, "", "Use `/log page <number>` to move through the log; page 1 is newest.")
+		lines = append(lines, "", fmt.Sprintf("Use `/log page <number>` or `/log page <start>-<end>` (up to %d pages); page 1 is newest.", maxLogPageRange))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -233,7 +250,7 @@ func formatLogSearch(entries []LogEntry, query string) string {
 	queryLower := strings.ToLower(query)
 	matches := make([]LogEntry, 0)
 	for _, entry := range entries {
-		if strings.Contains(strings.ToLower(entry.Text), queryLower) {
+		if strings.Contains(strings.ToLower(sanitizeLogText(entry.Text)), queryLower) {
 			matches = append(matches, entry)
 		}
 	}
@@ -243,10 +260,137 @@ func formatLogSearch(entries []LogEntry, query string) string {
 	start := max(0, len(matches)-maxLogSearchEntries)
 	lines := []string{"# Log search", "", fmt.Sprintf("%d matches for %q. Showing %d most recent.", len(matches), query, len(matches)-start), ""}
 	for _, entry := range matches[start:] {
-		text := strings.ReplaceAll(entry.Text, "\n", " ")
-		lines = append(lines, fmt.Sprintf("- `%s` %s", entry.At.Local().Format("15:04:05"), text))
+		lines = append(lines, formatLogEntry(entry)...)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// formatLogEntry is the shared user-facing boundary for captured output. The
+// source entry stays untouched while every channel receives safe plain text.
+func formatLogEntry(entry LogEntry) []string {
+	textLines := strings.Split(sanitizeLogText(entry.Text), "\n")
+	lines := []string{fmt.Sprintf("- `%s` %s", entry.At.Local().Format("15:04:05"), textLines[0])}
+	for _, line := range textLines[1:] {
+		lines = append(lines, "  "+line)
+	}
+	return lines
+}
+
+// sanitizeLogText strips ECMA-48 terminal commands and unsafe residual
+// controls while retaining Unicode and meaningful line boundaries.
+func sanitizeLogText(text string) string {
+	runes := decodeLogRunes(text)
+	var clean strings.Builder
+	for index := 0; index < len(runes); {
+		current := runes[index]
+		switch current {
+		case '\x1b':
+			index = consumeEscape(runes, index)
+		case '\u009b': // CSI
+			index = consumeCSI(runes, index+1)
+		case '\u009d': // OSC
+			index = consumeControlString(runes, index+1, true)
+		case '\u0090', '\u0098', '\u009e', '\u009f': // DCS, SOS, PM, APC
+			index = consumeControlString(runes, index+1, false)
+		case '\n':
+			clean.WriteRune('\n')
+			index++
+		case '\r':
+			clean.WriteRune('\n')
+			index++
+			if index < len(runes) && runes[index] == '\n' {
+				index++
+			}
+		case '\t':
+			clean.WriteString("    ")
+			index++
+		default:
+			if current >= 0x20 && current != 0x7f && !(current >= 0x80 && current <= 0x9f) {
+				clean.WriteRune(current)
+			}
+			index++
+		}
+	}
+	return clean.String()
+}
+
+// decodeLogRunes preserves valid UTF-8 while recovering legacy single-byte
+// C1 controls so the terminal parser can remove them instead of rendering a
+// replacement rune followed by the command parameters.
+func decodeLogRunes(text string) []rune {
+	runes := make([]rune, 0, utf8.RuneCountInString(text))
+	for len(text) > 0 {
+		decoded, size := utf8.DecodeRuneInString(text)
+		if decoded == utf8.RuneError && size == 1 {
+			raw := text[0]
+			if raw >= 0x80 && raw <= 0x9f {
+				decoded = rune(raw)
+			}
+		}
+		runes = append(runes, decoded)
+		text = text[size:]
+	}
+	return runes
+}
+
+func consumeEscape(runes []rune, index int) int {
+	index++
+	if index >= len(runes) {
+		return index
+	}
+	switch runes[index] {
+	case '[':
+		return consumeCSI(runes, index+1)
+	case ']':
+		return consumeControlString(runes, index+1, true)
+	case 'P', 'X', '^', '_':
+		return consumeControlString(runes, index+1, false)
+	}
+	for index < len(runes) && runes[index] >= 0x20 && runes[index] <= 0x2f {
+		index++
+	}
+	if index < len(runes) && runes[index] >= 0x30 && runes[index] <= 0x7e {
+		index++
+	}
+	return index
+}
+
+func consumeCSI(runes []rune, index int) int {
+	for index < len(runes) {
+		current := runes[index]
+		if current == '\r' || current == '\n' {
+			return index
+		}
+		index++
+		if current == '\x18' || current == '\x1a' { // CAN or SUB cancels the sequence.
+			break
+		}
+		if current >= 0x40 && current <= 0x7e {
+			break
+		}
+	}
+	return index
+}
+
+func consumeControlString(runes []rune, index int, bellTerminated bool) int {
+	for index < len(runes) {
+		switch runes[index] {
+		case '\u009c':
+			return index + 1
+		case '\a':
+			if bellTerminated {
+				return index + 1
+			}
+		case '\x18', '\x1a': // CAN or SUB cancels the string.
+			return index + 1
+		case '\x1b':
+			if index+1 < len(runes) && runes[index+1] == '\\' {
+				return index + 2
+			}
+		}
+		index++
+	}
+	return index
 }
 
 func formatJobs(jobs []Job) string {

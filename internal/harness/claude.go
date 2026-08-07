@@ -9,18 +9,22 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/frdel/spynel/internal/core"
-	"github.com/frdel/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/fsx"
 )
 
-// Claude is a lightweight adapter around Claude Code print mode. Claude Code
-// owns the agent loop and durable transcript; Spynel stores only the mapping
-// from its conversation keys to Claude's opaque session IDs.
+// Claude is a lightweight adapter around Claude Code print mode. It uses
+// streaming JSON input when the selected permission mode supports it, and
+// bounded text input when Claude requires its ordinary permission pipeline for
+// autonomous tools. Claude Code owns the agent loop and durable transcript;
+// Spynel stores only conversation-to-session mappings.
 type Claude struct {
 	config HarnessConfig
 	ctx    context.Context
@@ -29,25 +33,40 @@ type Claude struct {
 	keyMu    sync.Mutex
 	keyLocks map[string]*sync.Mutex
 	mu       sync.Mutex
-	sessions map[string]string
+	sessions map[string]claudeSession
 	active   map[string]*claudeTurn
 	closed   bool
+}
+
+type claudeSession struct {
+	ID     string `json:"id"`
+	Policy string `json:"policy"`
 }
 
 type claudeTurn struct {
 	key       string
 	cmd       *exec.Cmd
 	cancel    context.CancelFunc
-	emit      core.Emit
 	ready     chan error
+	done      chan struct{}
 	readyOnce sync.Once
 	doneOnce  sync.Once
 	sessionID string
 	text      strings.Builder
+	finalText strings.Builder
 	sawText   bool
 	separator bool
 	stderr    *tailBuffer
+
+	emitMu sync.RWMutex
+	emit   core.Emit
+
+	inputMu   sync.Mutex
+	stdin     io.WriteCloser
+	accepting bool
 }
+
+var errClaudeTurnClosing = errors.New("Claude Code turn is finishing")
 
 type claudeEvent struct {
 	Type      string          `json:"type"`
@@ -66,17 +85,24 @@ type claudeEvent struct {
 }
 
 func NewClaude(cfg HarnessConfig) (*Claude, error) {
-	if cfg.Command == "" || cfg.Command == "codex" {
+	if cfg.Command == "" {
 		cfg.Command = "claude"
 	}
 	if cfg.Cwd == "" {
 		cfg.Cwd = "."
 	}
-	c := &Claude{config: cfg, keyLocks: map[string]*sync.Mutex{}, sessions: map[string]string{}, active: map[string]*claudeTurn{}}
+	c := &Claude{config: cfg, keyLocks: map[string]*sync.Mutex{}, sessions: map[string]claudeSession{}, active: map[string]*claudeTurn{}}
 	if err := c.loadSessions(); err != nil {
 		return nil, err
 	}
 	return c, nil
+}
+
+func (c *Claude) FollowUpMode() FollowUpMode {
+	if claudeUsesStreamingInput(c.config) {
+		return FollowUpSteer
+	}
+	return FollowUpQueue
 }
 
 func (c *Claude) Start(parent context.Context) error {
@@ -96,6 +122,9 @@ func (c *Claude) Start(parent context.Context) error {
 		return fmt.Errorf("Claude Code working directory %q is unavailable", c.config.Cwd)
 	}
 	c.ctx, c.cancel = context.WithCancel(parent)
+	if claudeUsesPrivilegedFallback(c.config) && c.config.Stderr != nil {
+		_, _ = fmt.Fprintln(c.config.Stderr, "Claude Code refuses --dangerously-skip-permissions for a privileged account; using acceptEdits with all tools allowed")
+	}
 	return nil
 }
 
@@ -139,22 +168,61 @@ func (c *Claude) Send(ctx context.Context, key, prompt string, emit core.Emit) (
 	lock.Lock()
 	defer lock.Unlock()
 
-	c.mu.Lock()
-	if c.closed || c.ctx == nil {
+	for {
+		c.mu.Lock()
+		if c.closed || c.ctx == nil {
+			c.mu.Unlock()
+			return "", false, errors.New("Claude Code harness is not running")
+		}
+		active := c.active[key]
+		session := c.sessions[key]
+		threadID := session.ID
+		if active != nil {
+			c.mu.Unlock()
+			previous, err := active.writePrompt(prompt, emit, true)
+			if errors.Is(err, errClaudeTurnClosing) {
+				select {
+				case <-active.done:
+					continue
+				case <-ctx.Done():
+					return threadID, true, ctx.Err()
+				}
+			}
+			if err != nil {
+				return threadID, true, fmt.Errorf("steer active Claude Code turn: %w", err)
+			}
+			if previous != nil {
+				previous(core.Event{Kind: core.EventStatus, Text: "Response continued on a newer message", ThreadID: threadID, Done: true})
+			}
+			if emit != nil {
+				emit(core.Event{Kind: core.EventStatus, Text: "Steering active Claude Code turn", ThreadID: threadID})
+			}
+			return threadID, true, nil
+		}
+		baseContext := c.ctx
+		cfg := c.config
+		previousSession := c.resumeSessionLocked(key, cfg)
 		c.mu.Unlock()
-		return "", false, errors.New("Claude Code harness is not running")
+		return c.startTurn(ctx, baseContext, key, prompt, previousSession, cfg, emit)
 	}
-	if c.active[key] != nil {
-		c.mu.Unlock()
-		return c.sessions[key], true, errors.New("Claude Code print mode cannot steer an active turn; use /stop or wait for it to finish")
-	}
-	baseContext := c.ctx
-	previousSession := c.sessions[key]
-	cfg := c.config
-	c.mu.Unlock()
+}
 
+func (c *Claude) resumeSessionLocked(key string, cfg HarnessConfig) string {
+	session := c.sessions[key]
+	if session.Policy != claudeSessionPolicy(cfg) {
+		return ""
+	}
+	return session.ID
+}
+
+func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previousSession string, cfg HarnessConfig, emit core.Emit) (string, bool, error) {
 	turnContext, cancel := context.WithCancel(baseContext)
-	args := []string{"-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages"}
+	streamingInput := claudeUsesStreamingInput(cfg)
+	args := []string{"-p"}
+	if streamingInput {
+		args = append(args, "--input-format", "stream-json")
+	}
+	args = append(args, "--output-format", "stream-json", "--verbose", "--include-partial-messages")
 	if previousSession != "" {
 		args = append(args, "--resume", previousSession)
 	}
@@ -167,7 +235,17 @@ func (c *Claude) Send(ctx context.Context, key, prompt string, emit core.Emit) (
 	args = append(args, claudePermissionArgs(cfg)...)
 	cmd := exec.CommandContext(turnContext, cfg.Command, args...)
 	cmd.Dir = cfg.Cwd
-	cmd.Stdin = strings.NewReader(prompt)
+	var stdin io.WriteCloser
+	if streamingInput {
+		var err error
+		stdin, err = cmd.StdinPipe()
+		if err != nil {
+			cancel()
+			return "", false, err
+		}
+	} else {
+		cmd.Stdin = strings.NewReader(prompt)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -179,7 +257,10 @@ func (c *Claude) Send(ctx context.Context, key, prompt string, emit core.Emit) (
 	} else {
 		cmd.Stderr = stderr
 	}
-	turn := &claudeTurn{key: key, cmd: cmd, cancel: cancel, emit: emit, ready: make(chan error, 1), stderr: stderr}
+	turn := &claudeTurn{
+		key: key, cmd: cmd, cancel: cancel, emit: emit, stdin: stdin, accepting: streamingInput,
+		ready: make(chan error, 1), done: make(chan struct{}), stderr: stderr,
+	}
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return "", false, fmt.Errorf("start Claude Code: %w", err)
@@ -188,6 +269,12 @@ func (c *Claude) Send(ctx context.Context, key, prompt string, emit core.Emit) (
 	c.active[key] = turn
 	c.mu.Unlock()
 	go c.runTurn(turn, stdout)
+	if streamingInput {
+		if _, err := turn.writePrompt(prompt, nil, false); err != nil {
+			cancel()
+			return "", false, fmt.Errorf("send initial Claude Code prompt: %w", err)
+		}
+	}
 
 	select {
 	case err := <-turn.ready:
@@ -204,25 +291,143 @@ func (c *Claude) Send(ctx context.Context, key, prompt string, emit core.Emit) (
 }
 
 func claudePermissionArgs(cfg HarnessConfig) []string {
-	if cfg.Sandbox == "dangerFullAccess" || cfg.Sandbox == "danger-full-access" {
-		if cfg.ApprovalPolicy == "never" {
-			return []string{"--dangerously-skip-permissions"}
-		}
-	}
+	return claudePermissionArgsFor(cfg, claudeRunningPrivileged())
+}
+
+func claudePermissionArgsFor(cfg HarnessConfig, privileged bool) []string {
 	switch cfg.ApprovalPolicy {
-	case "never":
-		return []string{"--permission-mode", "dontAsk"}
 	case "untrusted", "plan":
 		return []string{"--permission-mode", "plan"}
-	default:
-		return nil
 	}
+	switch cfg.Sandbox {
+	case "readOnly", "read-only":
+		return []string{"--permission-mode", "plan"}
+	case "workspaceWrite", "workspace-write":
+		return []string{"--permission-mode", "acceptEdits", "--allowedTools", "Bash(*)"}
+	case "dangerFullAccess", "danger-full-access":
+		if cfg.ApprovalPolicy == "never" && !privileged {
+			return []string{"--dangerously-skip-permissions"}
+		}
+		if cfg.ApprovalPolicy == "never" && privileged {
+			return []string{"--permission-mode", "acceptEdits", "--allowedTools", "*", "Bash(*)"}
+		}
+	}
+	if cfg.ApprovalPolicy == "never" {
+		return []string{"--permission-mode", "dontAsk"}
+	}
+	return nil
+}
+
+func claudeRunningPrivileged() bool {
+	current, err := user.Current()
+	return err == nil && current.Uid == "0"
+}
+
+func claudeUsesPrivilegedFallback(cfg HarnessConfig) bool {
+	return cfg.ApprovalPolicy == "never" &&
+		(cfg.Sandbox == "dangerFullAccess" || cfg.Sandbox == "danger-full-access") &&
+		claudeRunningPrivileged()
+}
+
+func claudeUsesStreamingInput(cfg HarnessConfig) bool {
+	return claudeUsesStreamingInputFor(cfg, claudeRunningPrivileged())
+}
+
+func claudeUsesStreamingInputFor(cfg HarnessConfig, privileged bool) bool {
+	if cfg.ApprovalPolicy == "untrusted" || cfg.ApprovalPolicy == "plan" {
+		return true
+	}
+	switch cfg.Sandbox {
+	case "workspaceWrite", "workspace-write":
+		// Claude Code 2.1.x does not honor allowedTools for approval-gated
+		// commands under stream-json input. Ordinary text input does.
+		return false
+	case "dangerFullAccess", "danger-full-access":
+		// Non-privileged bypass needs no approval callback. Claude refuses
+		// bypass under root/sudo, whose all-tools fallback needs text input.
+		return !privileged
+	default:
+		return true
+	}
+}
+
+func claudeSessionPolicy(cfg HarnessConfig) string {
+	return strings.Join([]string{
+		cfg.Model,
+		cfg.Effort,
+		cfg.ApprovalPolicy,
+		cfg.Sandbox,
+		strconv.FormatBool(cfg.Network),
+		strings.Join(claudePermissionArgs(cfg), "\x1f"),
+		strconv.FormatBool(claudeUsesStreamingInput(cfg)),
+	}, "\x1e")
+}
+
+func (turn *claudeTurn) writePrompt(prompt string, emit core.Emit, replace bool) (core.Emit, error) {
+	message := map[string]any{
+		"type": "user",
+		"message": map[string]any{
+			"role":    "user",
+			"content": []map[string]string{{"type": "text", "text": prompt}},
+		},
+	}
+	data, err := json.Marshal(message)
+	if err != nil {
+		return nil, err
+	}
+	turn.inputMu.Lock()
+	defer turn.inputMu.Unlock()
+	if !turn.accepting || turn.stdin == nil {
+		return nil, errClaudeTurnClosing
+	}
+	var previous core.Emit
+	if replace {
+		previous = turn.replaceEmit(emit)
+	}
+	if _, err := turn.stdin.Write(append(data, '\n')); err != nil {
+		if replace {
+			turn.replaceEmit(previous)
+		}
+		return nil, err
+	}
+	return previous, nil
+}
+
+func (turn *claudeTurn) closeInput() {
+	turn.inputMu.Lock()
+	defer turn.inputMu.Unlock()
+	if !turn.accepting {
+		return
+	}
+	turn.accepting = false
+	if turn.stdin != nil {
+		_ = turn.stdin.Close()
+		turn.stdin = nil
+	}
+}
+
+func (turn *claudeTurn) emitEvent(event core.Event) {
+	turn.emitMu.RLock()
+	emit := turn.emit
+	turn.emitMu.RUnlock()
+	if emit != nil {
+		emit(event)
+	}
+}
+
+func (turn *claudeTurn) replaceEmit(emit core.Emit) core.Emit {
+	turn.emitMu.Lock()
+	previous := turn.emit
+	turn.emit = emit
+	turn.emitMu.Unlock()
+	return previous
 }
 
 func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	completed := false
+	var terminal core.Event
 	for scanner.Scan() {
 		var event claudeEvent
 		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
@@ -238,11 +443,13 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 			case "message_start":
 				if turn.sawText {
 					turn.separator = true
+					turn.finalText.Reset()
 				}
 			case "content_block_delta":
 				if event.Event.Delta.Type == "text_delta" && event.Event.Delta.Text != "" {
 					if turn.separator {
 						c.emitClaudeDelta(turn, "\n")
+						turn.finalText.Reset()
 						turn.separator = false
 					}
 					c.emitClaudeDelta(turn, event.Event.Delta.Text)
@@ -253,20 +460,34 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 		}
 		if event.Type == "result" {
 			text := turn.text.String()
-			if text == "" {
+			if text == "" || event.IsError {
 				text = event.Result
+			}
+			finalText := turn.finalText.String()
+			if finalText == "" || event.IsError {
+				finalText = event.Result
+			}
+			if finalText == "" {
+				finalText = text
 			}
 			kind := core.EventFinal
 			if event.IsError {
 				kind = core.EventError
 			}
-			c.finishClaudeTurn(turn, core.Event{Kind: kind, Text: text, ThreadID: turn.sessionID, Done: true})
+			terminal = core.Event{Kind: kind, Text: text, FinalText: &finalText, ThreadID: turn.sessionID, Done: true}
 			completed = true
+			// Streaming input keeps print mode alive for more user messages.
+			// Close it after the provider result so this finite Spynel turn can
+			// exit; a follow-up written before this lock is included first.
+			turn.closeInput()
 		}
 	}
 	waitErr := turn.cmd.Wait()
 	turn.cancel()
 	if completed {
+		// Wait for print mode to exit before releasing the session. Closing its
+		// streaming input after the result keeps each Spynel execution bounded.
+		c.finishClaudeTurn(turn, terminal)
 		return
 	}
 	err := scanner.Err()
@@ -284,9 +505,8 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 
 func (c *Claude) emitClaudeDelta(turn *claudeTurn, text string) {
 	turn.text.WriteString(text)
-	if turn.emit != nil {
-		turn.emit(core.Event{Kind: core.EventDelta, Text: text, ThreadID: turn.sessionID})
-	}
+	turn.finalText.WriteString(text)
+	turn.emitEvent(core.Event{Kind: core.EventDelta, Text: text, ThreadID: turn.sessionID})
 }
 
 func (c *Claude) finishClaudeTurn(turn *claudeTurn, event core.Event) {
@@ -303,15 +523,14 @@ func (c *Claude) finishClaudeTurn(turn *claudeTurn, event core.Event) {
 			delete(c.active, turn.key)
 		}
 		c.mu.Unlock()
-		if turn.emit != nil {
-			turn.emit(event)
-		}
+		turn.emitEvent(event)
+		close(turn.done)
 	})
 }
 
 func (c *Claude) rememberSession(key, sessionID string) {
 	c.mu.Lock()
-	c.sessions[key] = sessionID
+	c.sessions[key] = claudeSession{ID: sessionID, Policy: claudeSessionPolicy(c.config)}
 	err := c.saveSessionsLocked()
 	c.mu.Unlock()
 	if err != nil && c.config.Stderr != nil {
@@ -352,7 +571,7 @@ func (c *Claude) ResetSession(key string) error {
 func (c *Claude) ThreadID(key string) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.sessions[key]
+	return c.sessions[key].ID
 }
 
 func (c *Claude) IsActive(key string) bool {
@@ -405,7 +624,24 @@ func (c *Claude) loadSessions() error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, &c.sessions)
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(data, &values); err != nil {
+		return err
+	}
+	for key, value := range values {
+		var session claudeSession
+		if err := json.Unmarshal(value, &session); err != nil {
+			var legacy string
+			if legacyErr := json.Unmarshal(value, &legacy); legacyErr != nil {
+				return err
+			}
+			session.ID = legacy
+		}
+		if strings.TrimSpace(session.ID) != "" {
+			c.sessions[key] = session
+		}
+	}
+	return nil
 }
 
 func (c *Claude) saveSessionsLocked() error {

@@ -1,0 +1,20 @@
+name: okabe-ito-light
+description: "Color-blind friendly: Okabe-Ito blue, orange, yellow, and purple on soft white"
+appearance: light
+color_blind_friendly: true
+colors:
+  background: "#FCFCFA"
+  surface: "#F4F4F0"
+  surface_elevated: "#EAEAE4"
+  surface_selected: "#DCEBF2"
+  text: "#171717"
+  text_muted: "#595959"
+  primary: "#00689F"
+  secondary: "#743F68"
+  border: "#767676"
+  user: "#005C8E"
+  success: "#00689F"
+  warning: "#6A5500"
+  error: "#743F68"
+  info: "#005C8E"
+  code: "#743F68"

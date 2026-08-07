@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/frdel/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/core"
 )
 
 // Supervisor keeps the rest of Spynel provider-neutral while allowing the
@@ -22,12 +22,21 @@ type Supervisor struct {
 	current     Harness
 	startErr    error
 	active      map[string]int
+	pending     map[string][]pendingSend
 	ready       chan struct{}
 	closed      bool
 }
 
+type pendingSend struct {
+	prompt string
+	emit   core.Emit
+}
+
 func NewSupervisor(registry *Registry, cfg HarnessConfig) *Supervisor {
-	return &Supervisor{registry: registry, config: cfg, active: map[string]int{}, ready: make(chan struct{}, 1)}
+	return &Supervisor{
+		registry: registry, config: cfg, active: map[string]int{}, pending: map[string][]pendingSend{},
+		ready: make(chan struct{}, 1),
+	}
 }
 
 func (s *Supervisor) HarnessConfig() HarnessConfig {
@@ -207,33 +216,94 @@ func (s *Supervisor) Send(ctx context.Context, key, prompt string, emit core.Emi
 		s.mu.Unlock()
 		return "", false, err
 	}
-	if target.IsActive(key) {
+	wasActive := target.IsActive(key)
+	if wasActive && followUpMode(target) == FollowUpQueue {
+		threadID := target.ThreadID(key)
+		s.pending[key] = append(s.pending[key], pendingSend{prompt: prompt, emit: emit})
 		s.mu.Unlock()
-		return target.Send(ctx, key, prompt, emit)
+		if emit != nil {
+			emit(core.Event{Kind: core.EventStatus, Text: "Follow-up queued behind the active harness turn", ThreadID: threadID})
+		}
+		return threadID, true, nil
 	}
-	s.active[key] = 1
+	if !wasActive {
+		s.active[key] = 1
+	}
 	s.mu.Unlock()
-	var once sync.Once
-	finish := func() {
-		once.Do(func() {
+	threadID, steered, err := target.Send(ctx, key, prompt, s.executionEmit(key, target, emit))
+	if err != nil {
+		if wasActive && steered {
+			// The active turn finished during the failed steering attempt. Retry
+			// as the next ordinary turn instead of losing the follow-up.
+			if !target.IsActive(key) {
+				return s.Send(ctx, key, prompt, emit)
+			}
+			return threadID, steered, err
+		}
+		if !wasActive {
 			s.mu.Lock()
 			delete(s.active, key)
 			s.mu.Unlock()
-		})
+		}
 	}
-	wrapper := func(event core.Event) {
+	return threadID, steered, err
+}
+
+func followUpMode(target Harness) FollowUpMode {
+	provider, ok := target.(FollowUpProvider)
+	if !ok || provider.FollowUpMode() != FollowUpSteer {
+		return FollowUpQueue
+	}
+	return FollowUpSteer
+}
+
+func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) core.Emit {
+	return func(event core.Event) {
+		var next *pendingSend
+		if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+			s.mu.Lock()
+			queue := s.pending[key]
+			if len(queue) > 0 {
+				value := queue[0]
+				next = &value
+				if len(queue) == 1 {
+					delete(s.pending, key)
+				} else {
+					s.pending[key] = queue[1:]
+				}
+				event.Continues = true
+			} else {
+				delete(s.active, key)
+			}
+			s.mu.Unlock()
+		}
 		if emit != nil {
 			emit(event)
 		}
-		if event.Done {
-			finish()
+		if next != nil {
+			s.startQueued(key, target, *next)
 		}
 	}
-	threadID, steered, err := target.Send(ctx, key, prompt, wrapper)
-	if err != nil {
-		finish()
+}
+
+func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
+	wrapper := s.executionEmit(key, target, next.emit)
+	s.mu.RLock()
+	ctx := s.ctx
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed || ctx == nil {
+		wrapper(core.Event{Kind: core.EventError, Text: "queued follow-up failed: harness supervisor is closed", Done: true})
+		return
 	}
-	return threadID, steered, err
+	threadID, _, err := target.Send(ctx, key, next.prompt, wrapper)
+	if err != nil {
+		wrapper(core.Event{Kind: core.EventError, Text: "queued follow-up failed: " + err.Error(), ThreadID: threadID, Done: true})
+		return
+	}
+	if next.emit != nil && target.IsActive(key) {
+		next.emit(core.Event{Kind: core.EventStatus, Text: "Queued follow-up started", ThreadID: threadID})
+	}
 }
 
 func (s *Supervisor) Interrupt(ctx context.Context, key string) (bool, error) {

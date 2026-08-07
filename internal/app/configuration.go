@@ -6,29 +6,32 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 
-	"github.com/frdel/spynel/internal/channel"
-	"github.com/frdel/spynel/internal/config"
-	"github.com/frdel/spynel/internal/core"
-	"github.com/frdel/spynel/internal/fsx"
-	"github.com/frdel/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/theme"
 )
 
 func (s *Service) Screen(id string) (core.Screen, error) {
 	switch strings.ToLower(strings.TrimSpace(id)) {
-	case "config", "telegram", "whatsapp":
+	case "config":
+		return settingsScreen(s.Settings.Snapshot(), "config"), nil
+	case "telegram", "whatsapp":
 		section := strings.ToLower(strings.TrimSpace(id))
-		screen := settingsScreen(s.Settings.Snapshot(), section)
+		if s.channelNeedsSetup(section) {
+			return s.initialChannelWizard(section), nil
+		}
 		if section == "whatsapp" {
-			if pairing, ok := s.Pairing("whatsapp"); ok {
-				if pairing.Rendered != "" {
-					screen.Banner = pairing.Rendered
-				}
-				screen.Status = pairing.Detail
+			if pairing, ok := s.Pairing(section); ok && pairing.State != "" && pairing.State != "connected" {
+				return s.whatsappWizardScreen("pair", nil), nil
 			}
 		}
-		return screen, nil
+		return s.channelSettingsScreen(section), nil
 	case "welcome":
 		return s.WelcomeScreen(), nil
 	default:
@@ -36,34 +39,73 @@ func (s *Service) Screen(id string) (core.Screen, error) {
 	}
 }
 
-func (s *Service) WelcomeScreen() core.Screen {
-	lines := []string{
-		"Spynel is both an interface to coding harnesses and a durable task manager.",
-		"Ask the harness directly in chat, or use /task and /goal for reliable Markdown workflows.",
-		"",
-		"Type /help to show available commands and help topics.",
-		"Type /config to configure Spynel, the coding harness, models, speech, and startup.",
-		"Type /telegram to configure the Telegram connection.",
-		"Type /whatsapp to configure the WhatsApp connection.",
+func (s *Service) initialChannelWizard(section string) core.Screen {
+	if section == "telegram" {
+		return s.telegramWizardScreen("intro", nil)
 	}
-	if availability, ok := s.Harness.(harness.Availability); ok {
-		if ready, detail := availability.Available(); !ready {
-			lines = append(lines, "", "The configured coding harness is unavailable: "+detail, "Type /harness to select or repair it before sending a task.")
-		}
-	}
-	return core.Screen{ID: "welcome", Title: "Welcome to Spynel", Banner: core.SpynelASCII, Subtitle: strings.Join(lines, "\n")}
+	return s.whatsappWizardScreen("mode", nil)
 }
 
-func (s *Service) welcomeText() string {
+func (s *Service) channelSettingsScreen(section string) core.Screen {
+	screen := settingsScreen(s.Settings.Snapshot(), section)
+	if section == "whatsapp" {
+		// Pairing QR data belongs only to the dedicated pairing flow, never the
+		// general channel configuration surface. The shared connection section
+		// already reports health, so pairing success text would be redundant.
+		screen.Banner = ""
+		screen.Status = ""
+	}
+	return screen
+}
+
+func (s *Service) channelNeedsSetup(section string) bool {
+	cfg := s.Settings.Snapshot()
+	switch section {
+	case "telegram":
+		return strings.TrimSpace(cfg.TelegramToken()) == "" || !hasCommaSeparatedValue(strings.Join(cfg.Channels.Telegram.AllowedUsers, ","))
+	case "whatsapp":
+		return !config.HasAllowedWhatsAppNumber(cfg.Channels.WhatsApp.AllowedNumbers)
+	default:
+		return false
+	}
+}
+
+func (s *Service) WelcomeScreen() core.Screen {
+	return core.Screen{
+		ID: "welcome", Title: "Welcome to Spynel", Banner: core.SpynelASCII,
+		Subtitle: s.welcomeText("tui"), Markdown: true,
+	}
+}
+
+func (s *Service) welcomeText(channelName string) string {
 	lines := []string{
-		"# Welcome to Spynel", "",
-		"Spynel connects coding harnesses to chat and manages durable Markdown task and goal workflows.", "",
-		"- Type `/help` to show available commands and help topics.",
-		"- Type `/config` to configure Spynel, the coding harness, models, speech, and startup.",
-		"- Type `/telegram` to configure Telegram.",
-		"- Type `/whatsapp` to configure WhatsApp.",
+		"👋 Hey, I'm **Spynel** — you can call me **Spy**.", "",
+		"I handle tasks and orchestrate agents. Just tell me your objectives and leave the rest to me.",
+		"Feel free to ask me for updates anytime or have me get things done. 👍",
+		"", "- type `/help` if you ever feel lost",
+	}
+	if channelName == "tui" {
+		if s.connectionStatus("telegram").State != channel.ConnectionConnected {
+			lines = append(lines, "- type `/telegram` to connect Telegram")
+		}
+		if s.connectionStatus("whatsapp").State != channel.ConnectionConnected {
+			lines = append(lines, "- type `/whatsapp` to connect WhatsApp")
+		}
+		if availability, ok := s.Harness.(harness.Availability); ok {
+			if ready, detail := availability.Available(); !ready {
+				lines = append(lines, "", "**Heads up:** The configured coding harness is unavailable: "+detail, "Use `/harness` to select or repair it before sending an objective.")
+			}
+		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (s *Service) welcomeMessage(channelName string) string {
+	text := s.welcomeText(channelName)
+	if channelName != "tui" {
+		return text
+	}
+	return core.SpynelLogoMarkdown + "\n\n" + text
 }
 
 // InitialWelcome returns the welcome screen once per workspace. The marker
@@ -157,6 +199,7 @@ const (
 	whatsappModeKey    = "channels.whatsapp.mode"
 	whatsappAllowedKey = "channels.whatsapp.allowed_numbers"
 	whatsappEnabledKey = "channels.whatsapp.enabled"
+	whatsappPhoneKey   = "whatsapp_pairing_phone"
 )
 
 func (s *Service) configurationScreenAction(ctx context.Context, screenID, action string, values map[string]string) (*core.Screen, bool, error) { //nolint:gocyclo
@@ -173,11 +216,8 @@ func (s *Service) configurationScreenAction(ctx context.Context, screenID, actio
 		return screen, true, err
 	}
 	if (screenID == "telegram" || screenID == "whatsapp") && action == "wizard" {
-		if screenID == "telegram" {
-			screen := s.telegramWizardScreen("intro", nil)
-			return &screen, true, nil
-		}
-		screen := s.whatsappWizardScreen("mode", nil)
+		screen := s.initialChannelWizard(screenID)
+		screen.ParentID = screenID
 		return &screen, true, nil
 	}
 	if !strings.HasPrefix(screenID, "wizard:") {
@@ -188,9 +228,12 @@ func (s *Service) configurationScreenAction(ctx context.Context, screenID, actio
 		return nil, true, fmt.Errorf("invalid setup wizard screen %q", screenID)
 	}
 	channelName, step := parts[1], parts[2]
-	if action == "cancel" || action == "done" {
-		screen, err := s.Screen(channelName)
-		return &screen, true, err
+	if action == "cancel" {
+		return nil, true, nil
+	}
+	if action == "done" {
+		screen := s.channelSettingsScreen(channelName)
+		return &screen, true, nil
 	}
 	switch channelName {
 	case "telegram":
@@ -236,9 +279,9 @@ func (s *Service) configurationScreenAction(ctx context.Context, screenID, actio
 			if _, err := s.ApplySettings(changes); err != nil {
 				return nil, true, err
 			}
-			screen, err := s.Screen("telegram")
+			screen := s.channelSettingsScreen("telegram")
 			screen.Status = "Telegram setup saved. Connection status will update in the header."
-			return &screen, true, err
+			return &screen, true, nil
 		}
 	case "whatsapp":
 		switch step + ":" + action {
@@ -249,26 +292,63 @@ func (s *Service) configurationScreenAction(ctx context.Context, screenID, actio
 			screen := s.whatsappWizardScreen("mode", values)
 			return &screen, true, nil
 		case "access:next":
-			screen := s.whatsappWizardScreen("enable", values)
-			return &screen, true, nil
-		case "enable:back":
-			screen := s.whatsappWizardScreen("access", values)
-			return &screen, true, nil
-		case "enable:finish":
-			enabled := wizardValue(values, whatsappEnabledKey, "on")
+			if !hasPhoneNumberValue(values[whatsappAllowedKey]) {
+				return nil, true, errors.New("add at least one allowed WhatsApp number before continuing")
+			}
 			if _, err := s.ApplySettings(map[string]string{
 				whatsappModeKey:    wizardValue(values, whatsappModeKey, "self-chat"),
 				whatsappAllowedKey: values[whatsappAllowedKey],
-				whatsappEnabledKey: enabled,
+				whatsappEnabledKey: "on",
 			}); err != nil {
 				return nil, true, err
 			}
-			if enabled == "off" {
-				screen, err := s.Screen("whatsapp")
-				screen.Status = "WhatsApp setup saved but left disabled. Run the wizard again or turn it on to pair."
-				return &screen, true, err
+			if pairing, ok := s.Pairing("whatsapp"); ok && pairingNeedsRetry(pairing.State) && s.PairingControl != nil {
+				if err := s.PairingControl.RetryPairing("whatsapp"); err != nil {
+					return nil, true, err
+				}
+				s.SetPairing(channel.PairingEvent{Name: "whatsapp", State: "starting", Detail: "Starting a fresh WhatsApp pairing session…"})
 			}
 			screen := s.whatsappWizardScreen("pair", values)
+			return &screen, true, nil
+		case "pair:back":
+			screen := s.whatsappWizardScreen("access", values)
+			return &screen, true, nil
+		case "pair:show_qr":
+			pairing, ok := s.Pairing("whatsapp")
+			if !ok || (pairing.State != "code" && pairing.State != "phone-code") || strings.TrimSpace(pairing.Rendered) == "" {
+				return nil, true, errors.New("the WhatsApp QR is not ready; wait a moment or select Retry pairing")
+			}
+			screen := core.Screen{
+				ID: core.ScreenWhatsAppQR, ParentID: "wizard:whatsapp:pair", Banner: pairing.Rendered,
+				SaveDisabled: true, StartAtTop: true,
+			}
+			return &screen, true, nil
+		case "pair:phone":
+			screen := s.whatsappPhonePairingScreen(values, "")
+			return &screen, true, nil
+		case "pair:retry":
+			if s.PairingControl == nil {
+				return nil, true, errors.New("WhatsApp pairing is not running yet")
+			}
+			if err := s.PairingControl.RetryPairing("whatsapp"); err != nil {
+				return nil, true, err
+			}
+			s.SetPairing(channel.PairingEvent{Name: "whatsapp", State: "starting", Detail: "Starting a fresh WhatsApp pairing session…"})
+			screen := s.whatsappWizardScreen("pair", values)
+			return &screen, true, nil
+		case "phone:generate":
+			phone := strings.TrimSpace(values[whatsappPhoneKey])
+			if !validWhatsAppPairingPhone(phone) {
+				return nil, true, errors.New("enter the WhatsApp account's phone number in international format")
+			}
+			if s.PairingControl == nil {
+				return nil, true, errors.New("WhatsApp pairing is not running yet")
+			}
+			code, err := s.PairingControl.PairPhone(ctx, "whatsapp", phone)
+			if err != nil {
+				return nil, true, err
+			}
+			screen := s.whatsappPhonePairingScreen(values, code)
 			return &screen, true, nil
 		}
 	}
@@ -281,20 +361,21 @@ func (s *Service) telegramWizardScreen(step string, values map[string]string) co
 	allowed := wizardValue(values, telegramAllowedKey, strings.Join(cfg.Channels.Telegram.AllowedUsers, ","))
 	enabled := wizardValue(values, telegramEnabledKey, "on")
 	var state []core.ScreenControl
-	screen := core.Screen{ID: "wizard:telegram:" + step, Markdown: true, SaveDisabled: true, StartAtTop: true}
+	screen := core.Screen{
+		ID: "wizard:telegram:" + step, Title: "Telegram setup", Markdown: true, SaveDisabled: true, StartAtTop: true,
+		Hints: wizardScreenHints(),
+		Tabs:  []string{"Start", "Create bot", "Token", "Access", "Enable"}, ActiveTab: wizardStepIndex(step, []string{"intro", "create", "token", "access", "enable"}),
+	}
 	switch step {
 	case "intro":
-		screen.Title = "Telegram setup · 1/5"
 		screen.Subtitle = "Open Telegram on your phone, tablet, or desktop.\n\nUse Telegram's verified bot-management account: [@BotFather](https://t.me/BotFather).\n\nTreat the token it gives you like a password. [Read Telegram's official bot tutorial](https://core.telegram.org/bots/tutorial#obtain-your-bot-token)."
 		screen.Controls = wizardActions("Open BotFather, then continue", false)
 		state = telegramWizardState(token, allowed, enabled)
 	case "create":
-		screen.Title = "Telegram setup · 2/5"
 		screen.Subtitle = "In the BotFather chat:\n\n1. Send `/newbot`.\n2. Choose the display name people will see.\n3. Choose a unique username ending in `bot`, such as `my_spynel_bot`.\n\nBotFather will reply with an HTTP API token. Copy that complete token."
 		screen.Controls = wizardActions("I have the token", true)
 		state = telegramWizardState(token, allowed, enabled)
 	case "token":
-		screen.Title = "Telegram setup · 3/5"
 		screen.Subtitle = "Paste the complete token from BotFather below. It is stored in the private `spynel.yaml` file and never shown in configuration replies or history. Leave it blank only if a token is already configured through the file or environment."
 		screen.Controls = []core.ScreenControl{
 			{Key: telegramTokenKey, Label: "bot token", Kind: "password", Value: token, Secret: true, Configured: cfg.TelegramToken() != "", Description: "Paste the token exactly as BotFather supplied it"},
@@ -307,7 +388,6 @@ func (s *Service) telegramWizardScreen(step string, values map[string]string) co
 			{Key: telegramEnabledKey, Kind: "hidden", Value: enabled},
 		}
 	case "access":
-		screen.Title = "Telegram setup · 4/5"
 		screen.Subtitle = "Enter at least one Telegram numeric user ID or username, separated by commas. The whitelist is required before Telegram can be enabled.\n\nIf you do not know your numeric ID, message [@userinfobot](https://t.me/userinfobot). It is a third-party bot and will see the message you send it."
 		screen.Controls = []core.ScreenControl{
 			{Key: telegramAllowedKey, Label: "allowed users", Kind: "text", Value: allowed, Description: "Required; find your ID with [@userinfobot](https://t.me/userinfobot) (third-party)", DescriptionMarkdown: true},
@@ -320,7 +400,6 @@ func (s *Service) telegramWizardScreen(step string, values map[string]string) co
 			{Key: telegramEnabledKey, Kind: "hidden", Value: enabled},
 		}
 	case "enable":
-		screen.Title = "Telegram setup · 5/5"
 		screen.Subtitle = "Turn Telegram on to start the bot now. Finishing validates and saves the token, access list, and enabled state together. You can change optional polling, webhook, and group behavior later under Advanced settings."
 		screen.Controls = []core.ScreenControl{
 			{Key: telegramEnabledKey, Label: "enabled", Kind: "toggle", Value: enabled, Options: []string{"on", "off"}, Description: "Start Telegram after saving"},
@@ -341,12 +420,14 @@ func (s *Service) whatsappWizardScreen(step string, values map[string]string) co
 	cfg := s.Settings.Snapshot()
 	mode := wizardValue(values, whatsappModeKey, cfg.Channels.WhatsApp.Mode)
 	allowed := wizardValue(values, whatsappAllowedKey, strings.Join(cfg.Channels.WhatsApp.AllowedNumbers, ","))
-	enabled := wizardValue(values, whatsappEnabledKey, "on")
 	var state []core.ScreenControl
-	screen := core.Screen{ID: "wizard:whatsapp:" + step, Markdown: true, SaveDisabled: true, StartAtTop: true}
+	screen := core.Screen{
+		ID: "wizard:whatsapp:" + step, Title: "WhatsApp setup", Markdown: true, SaveDisabled: true, StartAtTop: true,
+		Hints: wizardScreenHints(),
+		Tabs:  []string{"Mode", "Access", "Pair"}, ActiveTab: wizardStepIndex(step, []string{"mode", "access", "pair"}),
+	}
 	switch step {
 	case "mode":
-		screen.Title = "WhatsApp setup · 1/4"
 		screen.Subtitle = "Choose how the linked WhatsApp account will be used.\n\n- **Self-chat:** send requests from the account to its own chat; Spynel suppresses reply loops.\n- **Dedicated:** use a separate account as the bot number; messages sent by that linked account are ignored."
 		screen.Controls = []core.ScreenControl{
 			{Key: whatsappModeKey, Label: "mode", Kind: "select", Value: mode, Options: []string{"self-chat", "dedicated"}, Description: "Choose the account behavior"},
@@ -355,50 +436,68 @@ func (s *Service) whatsappWizardScreen(step string, values map[string]string) co
 		}
 		state = []core.ScreenControl{
 			{Key: whatsappAllowedKey, Kind: "hidden", Value: allowed},
-			{Key: whatsappEnabledKey, Kind: "hidden", Value: enabled},
 		}
 	case "access":
-		screen.Title = "WhatsApp setup · 2/4"
-		screen.Subtitle = "Enter allowed phone numbers in international format, separated by commas. Punctuation is normalized.\n\n**Security:** leaving this empty permits every direct sender allowed by the selected mode."
+		screen.Subtitle = "Enter at least one allowed phone number in international format, separated by commas. A leading + or 00, spaces, and punctuation are normalized. Continuing saves these settings and opens secure device pairing."
 		screen.Controls = []core.ScreenControl{
-			{Key: whatsappAllowedKey, Label: "allowed numbers", Kind: "text", Value: allowed, Description: "Example: 15551234567,442071234567"},
-			{Key: "next", Kind: "action", Value: "Continue", Description: "Choose whether to start and pair WhatsApp"},
+			{Key: whatsappAllowedKey, Label: "allowed numbers", Kind: "text", Value: allowed, Description: "Required; for example: 15551234567,442071234567"},
+			{Key: "next", Kind: "action", Value: "Continue", Description: "Save settings and open pairing"},
 			{Key: "back", Kind: "action", Value: "Back", Description: "Return to account mode"},
-			{Key: "cancel", Kind: "action", Value: "Cancel setup", Description: "Return to WhatsApp settings without saving"},
+			{Key: "cancel", Kind: "action", Value: "Cancel setup", Description: "Return without saving"},
 		}
 		state = []core.ScreenControl{
 			{Key: whatsappModeKey, Kind: "hidden", Value: mode},
-			{Key: whatsappEnabledKey, Kind: "hidden", Value: enabled},
-		}
-	case "enable":
-		screen.Title = "WhatsApp setup · 3/4"
-		screen.Subtitle = "Turn WhatsApp on to save these essentials and start secure device pairing. When enabled, the next screen waits for Spynel's QR code. Leave it off to save without linking a device.\n\nOn your primary phone, prepare **Linked devices → Link a device** (under ⋮ on Android or Settings on iPhone). [Watch WhatsApp's official linking guide](https://www.youtube.com/watch?v=2PzIAa3M8rM) or [open the official help page](https://faq.whatsapp.com/1317564962315842)."
-		screen.Controls = []core.ScreenControl{
-			{Key: whatsappEnabledKey, Label: "enabled", Kind: "toggle", Value: enabled, Options: []string{"on", "off"}, Description: "Start WhatsApp and request a pairing code"},
-			{Key: "finish", Kind: "action", Value: "Save and continue", Description: "Apply mode, access, and enabled state atomically"},
-			{Key: "back", Kind: "action", Value: "Back", Description: "Return to allowed numbers"},
-			{Key: "cancel", Kind: "action", Value: "Cancel setup", Description: "Return to WhatsApp settings without saving"},
-		}
-		state = []core.ScreenControl{
-			{Key: whatsappModeKey, Kind: "hidden", Value: mode},
-			{Key: whatsappAllowedKey, Kind: "hidden", Value: allowed},
 		}
 	case "pair":
-		screen.Title = "WhatsApp setup · 4/4"
 		screen.StartAtTop = true
 		screen.Status = "Starting WhatsApp and waiting for its pairing QR code…"
-		screen.Subtitle = "Scan only the QR shown above. Pairing status updates here; select Done after it reports connected."
+		screen.Subtitle = "On your primary phone, open **Linked devices → Link a device** (under ⋮ on Android or Settings on iPhone). Open the QR by itself so the terminal can use every available row, or link with a phone-number code instead. Pairing continues in the background when you leave this screen.\n\n[Open WhatsApp's official linking help](https://faq.whatsapp.com/1317564962315842)."
 		screen.Controls = []core.ScreenControl{
+			{Key: "show_qr", Kind: "action", Value: "Show QR", Description: "Use the full terminal for the QR; press any key to return"},
+			{Key: "phone", Kind: "action", Value: "Use pairing code", Description: "Link with the account phone number when QR scanning is unavailable"},
+			{Key: "retry", Kind: "action", Value: "Retry pairing", Description: "Refresh immediately instead of waiting for the automatic retry"},
+			{Key: "back", Kind: "action", Value: "Back", Description: "Return to allowed numbers"},
 			{Key: "done", Kind: "action", Value: "Done", Description: "Return to WhatsApp settings; pairing continues in the background"},
 		}
 		state = nil
 		if pairing, ok := s.Pairing("whatsapp"); ok {
-			screen.Banner = pairing.Rendered
 			screen.Status = pairing.Detail
 		}
 	}
 	screen.Controls = append(screen.Controls, state...)
 	return screen
+}
+
+func (s *Service) whatsappPhonePairingScreen(values map[string]string, code string) core.Screen {
+	screen := core.Screen{
+		ID: "wizard:whatsapp:phone", ParentID: "wizard:whatsapp:pair", Title: "WhatsApp setup",
+		Markdown: true, SaveDisabled: true, StartAtTop: true, Tabs: []string{"Mode", "Access", "Pair"}, ActiveTab: 2,
+		Hints:    wizardScreenHints(),
+		Subtitle: "Enter the international phone number of the WhatsApp account being linked. Then, on that phone, open **Linked devices → Link a device → Link with phone number instead** and enter the generated code.\n\n[Open WhatsApp's official phone-linking help](https://faq.whatsapp.com/1324084875126592).",
+		Controls: []core.ScreenControl{
+			{Key: whatsappPhoneKey, Label: "account phone number", Kind: "text", Value: wizardValue(values, whatsappPhoneKey, ""), Description: "Required; international format, for example 15551234567"},
+			{Key: "generate", Kind: "action", Value: "Generate pairing code", Description: "Request a short-lived code from WhatsApp"},
+			{Key: "cancel", Kind: "action", Value: "Back to pairing", Description: "Return to QR and retry options"},
+		},
+	}
+	if code != "" {
+		screen.Banner = "Pairing code: " + code
+		screen.Status = "Enter this code on your phone before the pairing session expires."
+	}
+	return screen
+}
+
+func pairingNeedsRetry(state string) bool {
+	return state == "timeout" || state == "error" || strings.HasPrefix(state, "err-")
+}
+
+func wizardStepIndex(step string, steps []string) int {
+	for index, candidate := range steps {
+		if candidate == step {
+			return index
+		}
+	}
+	return 0
 }
 
 func wizardActions(nextLabel string, back bool) []core.ScreenControl {
@@ -407,6 +506,31 @@ func wizardActions(nextLabel string, back bool) []core.ScreenControl {
 		controls = append(controls, core.ScreenControl{Key: "back", Kind: "action", Value: "Back", Description: "Return to the previous step"})
 	}
 	return append(controls, core.ScreenControl{Key: "cancel", Kind: "action", Value: "Cancel setup", Description: "Return without saving"})
+}
+
+func formScreenHints() []core.ScreenHint {
+	return []core.ScreenHint{
+		{Key: "↑↓/⇥", Action: "nav"},
+		{Key: "␠/↵", Action: "choose"},
+		{Key: "⌃S", Action: "save"},
+		{Key: "␛", Action: "exit"},
+	}
+}
+
+func wizardScreenHints() []core.ScreenHint {
+	return []core.ScreenHint{
+		{Key: "↑↓/⇥", Action: "nav"},
+		{Key: "␠/↵", Action: "choose"},
+		{Key: "␛", Action: "cancel"},
+	}
+}
+
+func selectionScreenHints() []core.ScreenHint {
+	return []core.ScreenHint{
+		{Key: "↑↓/⇥", Action: "nav"},
+		{Key: "␠/↵", Action: "select"},
+		{Key: "␛", Action: "cancel"},
+	}
 }
 
 func telegramWizardState(token, allowed, enabled string) []core.ScreenControl {
@@ -433,8 +557,27 @@ func hasCommaSeparatedValue(value string) bool {
 	return false
 }
 
+func hasPhoneNumberValue(value string) bool {
+	return config.HasAllowedWhatsAppNumber(strings.Split(value, ","))
+}
+
+func validWhatsAppPairingPhone(value string) bool {
+	var digits strings.Builder
+	for _, character := range value {
+		if character >= '0' && character <= '9' {
+			digits.WriteRune(character)
+		}
+	}
+	normalized := digits.String()
+	return len(normalized) > 6 && normalized[0] != '0'
+}
+
 func (s *Service) SetNotice(notice channel.Notice) {
 	s.Runtime.Log(notice.Channel + " message from " + notice.Sender + ": " + notice.Text)
+	s.noticeMu.Lock()
+	s.noticeSequence++
+	s.lastNotice = notice
+	s.noticeMu.Unlock()
 	select {
 	case s.noticeEvents <- notice:
 	default:
@@ -442,6 +585,45 @@ func (s *Service) SetNotice(notice channel.Notice) {
 }
 
 func (s *Service) NoticeEvents() <-chan channel.Notice { return s.noticeEvents }
+
+// SharedState is the bounded process state needed by every attached TUI. It
+// intentionally excludes configuration secrets, log bodies, and conversation
+// contents.
+type SharedState struct {
+	Title          string                     `json:"title"`
+	Theme          string                     `json:"theme"`
+	Connections    []channel.ConnectionStatus `json:"connections"`
+	Pairings       []channel.PairingEvent     `json:"pairings"`
+	Runtime        core.RuntimeStatus         `json:"runtime"`
+	NoticeSequence uint64                     `json:"notice_sequence"`
+	Notice         channel.Notice             `json:"notice"`
+}
+
+func (s *Service) SharedState() SharedState {
+	state := SharedState{
+		Title: s.currentTitle(), Theme: s.Settings.Snapshot().Channels.TUI.Theme,
+		Runtime: s.Runtime.Status(),
+	}
+	s.connectionMu.RLock()
+	for _, name := range []string{"telegram", "whatsapp"} {
+		if status, ok := s.connections[name]; ok {
+			state.Connections = append(state.Connections, status)
+		}
+	}
+	s.connectionMu.RUnlock()
+	s.pairingMu.RLock()
+	for _, name := range []string{"telegram", "whatsapp"} {
+		if pairing, ok := s.pairing[name]; ok {
+			state.Pairings = append(state.Pairings, pairing)
+		}
+	}
+	s.pairingMu.RUnlock()
+	s.noticeMu.RLock()
+	state.NoticeSequence = s.noticeSequence
+	state.Notice = s.lastNotice
+	s.noticeMu.RUnlock()
+	return state
+}
 
 func (s *Service) harnessCommand(message core.Message, remainder string, emit core.Emit) error {
 	if strings.TrimSpace(remainder) != "" {
@@ -483,7 +665,11 @@ func (s *Service) HarnessScreen(required bool) core.Screen {
 	detectedAny := false
 	screen := core.Screen{
 		ID: "harness", Title: "Coding harness", SaveDisabled: true, Required: required,
+		Hints:    selectionScreenHints(),
 		Subtitle: "Choose the coding CLI Spynel should use. Executables and working directories are detected automatically.",
+	}
+	if required {
+		screen.Hints[len(screen.Hints)-1].Action = "exit"
 	}
 	for _, definition := range harness.Catalog() {
 		description := definition.Description
@@ -568,6 +754,7 @@ func (s *Service) modelScreen(ctx context.Context) (*core.Screen, error) {
 	current := s.Settings.Snapshot().Harness.Model
 	screen := &core.Screen{
 		ID: "model", Title: "Harness model", SaveDisabled: true,
+		Hints:          selectionScreenHints(),
 		Subtitle:       "Choose a model supplied by " + s.Settings.Snapshot().Harness.Name + ". Enter applies the highlighted model immediately.",
 		InitialControl: "select:" + current,
 		Controls: []core.ScreenControl{{
@@ -706,6 +893,25 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	if err != nil {
 		return nil, err
 	}
+	var selectedTheme theme.Theme
+	themeChanged := previous.Channels.TUI.Theme != next.Channels.TUI.Theme
+	if themeChanged {
+		themes, loadErr := theme.LoadDir(next.StatePath("themes"))
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		var found bool
+		selectedTheme, found = theme.Find(themes, next.Channels.TUI.Theme)
+		if !found {
+			return nil, fmt.Errorf("unknown theme %q; use /theme to list available themes", next.Channels.TUI.Theme)
+		}
+		next.Channels.TUI.Theme = selectedTheme.Name
+		for index := range changed {
+			if changed[index].Key == "channels.tui.theme" {
+				changed[index], _ = config.SettingByKey(next, changed[index].Key)
+			}
+		}
+	}
 	unchanged := reflect.DeepEqual(previous, next)
 	harnessChanged := previous.Harness != next.Harness
 	startupChanged := previous.Startup.Enabled != next.Startup.Enabled
@@ -715,6 +921,9 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		}
 	}
 	if unchanged {
+		if themeChanged {
+			s.publishTheme(selectedTheme)
+		}
 		return changed, nil
 	}
 	if _, err := s.Settings.Update(func(current *config.Config) error {
@@ -747,7 +956,56 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 			s.publishTitle(values[setting.Key])
 		}
 	}
+	if themeChanged {
+		s.publishTheme(selectedTheme)
+	}
 	return changed, nil
+}
+
+func (s *Service) themeCommand(message core.Message, name string, emit core.Emit) error {
+	values, err := theme.LoadDir(s.Settings.Snapshot().StatePath("themes"))
+	if err != nil {
+		return s.localReply(message, "Cannot load themes: "+err.Error(), emit)
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		if message.Channel == "tui" && emit != nil {
+			emit(core.Event{Kind: core.EventThemePicker, Local: true})
+			return nil
+		}
+		current := s.Settings.Snapshot().Channels.TUI.Theme
+		lines := []string{"# Themes", "", "Active: `" + current + "`", ""}
+		for _, value := range values {
+			lines = append(lines, "- `"+value.Name+"` — "+value.Description)
+		}
+		lines = append(lines, "", "Use `/theme <name>` to apply one to the TUI.")
+		return s.localReply(message, strings.Join(lines, "\n"), emit)
+	}
+	selected, ok := theme.Find(values, name)
+	if !ok {
+		return s.localReply(message, "Unknown theme `"+name+"`. Use `/theme` to list available themes.", emit)
+	}
+	unchanged := strings.EqualFold(s.Settings.Snapshot().Channels.TUI.Theme, selected.Name)
+	if _, err := s.ApplySettings(map[string]string{"channels.tui.theme": selected.Name}); err != nil {
+		return s.localReply(message, "Cannot apply theme: "+err.Error(), emit)
+	}
+	// Re-publish even when the configured name is unchanged so editing the
+	// corresponding YAML file can be applied without restarting Spynel.
+	if unchanged {
+		s.publishTheme(selected)
+	}
+	return s.localReply(message, "Theme changed to `"+selected.Name+"` — "+selected.Description, emit)
+}
+
+// ThemeChanges publishes persisted theme selections from every channel.
+func (s *Service) ThemeChanges() <-chan theme.Theme { return s.themeChanges }
+
+func (s *Service) publishTheme(value theme.Theme) {
+	select {
+	case <-s.themeChanges:
+	default:
+	}
+	s.themeChanges <- value
 }
 
 func wrapRollback(component string, err error) error {
@@ -839,33 +1097,53 @@ func scopedSettingKey(section, key string) string {
 }
 
 func settingsScreen(cfg config.Config, section string) core.Screen {
-	title := "Spynel configuration"
-	subtitle := "Harness, context, task management, extensions, speech, and startup settings"
-	if section == "telegram" {
-		title = "Telegram"
-		subtitle = "Bot connection, access, groups, and attachment behavior"
-	} else if section == "whatsapp" {
-		title = "WhatsApp"
-		subtitle = "Account mode, access, groups, and conversation behavior"
-	}
-	screen := core.Screen{ID: section, Title: title, Subtitle: subtitle}
+	screen := core.Screen{ID: section, Hints: formScreenHints()}
 	if section == "config" {
 		harnessName := emptyAs(cfg.Harness.Name, "Choose a harness")
 		modelName := emptyAs(cfg.Harness.Model, "Harness default")
 		screen.StartAtTop = true
 		screen.Controls = append(screen.Controls,
-			core.ScreenControl{Key: "harness", Kind: "action", Value: "Coding harness · " + harnessName, Description: "Select Codex or Claude Code; Spynel finds the executable automatically"},
+			core.ScreenControl{Key: "harness", Section: "Core settings", Kind: "action", Value: "Coding harness · " + harnessName, Description: "Select Codex or Claude Code; Spynel finds the executable automatically"},
 			core.ScreenControl{Key: "model", Kind: "action", Value: "Model · " + modelName, Description: "Choose from the active harness model catalog"},
 		)
 	} else if section == "telegram" || section == "whatsapp" {
 		screen.StartAtTop = true
-		screen.Controls = append(screen.Controls, core.ScreenControl{
-			Key: "wizard", Kind: "action", Value: "Setup wizard",
-			Description: "Configure the essential connection step by step",
-		})
 	}
 	advanced := false
-	for _, setting := range config.Settings(cfg) {
+	basic := section == "telegram" || section == "whatsapp"
+	settings := config.Settings(cfg)
+	order := map[string]int{}
+	enabledKey := ""
+	switch section {
+	case "telegram":
+		enabledKey = telegramEnabledKey
+		order = map[string]int{
+			telegramEnabledKey: 0,
+			telegramTokenKey:   1,
+			telegramAllowedKey: 2,
+		}
+	case "whatsapp":
+		enabledKey = whatsappEnabledKey
+		order = map[string]int{
+			whatsappEnabledKey: 0,
+			whatsappModeKey:    1,
+			whatsappAllowedKey: 2,
+		}
+	}
+	if len(order) > 0 {
+		sort.SliceStable(settings, func(left, right int) bool {
+			leftOrder, leftBasic := order[settings[left].Key]
+			rightOrder, rightBasic := order[settings[right].Key]
+			if !leftBasic {
+				leftOrder = len(order)
+			}
+			if !rightBasic {
+				rightOrder = len(order)
+			}
+			return leftOrder < rightOrder
+		})
+	}
+	for _, setting := range settings {
 		if setting.Section != section {
 			continue
 		}
@@ -875,7 +1153,7 @@ func settingsScreen(cfg config.Config, section string) core.Screen {
 				description = "Show task-management, channel, speech, extension, and storage controls"
 			}
 			screen.Controls = append(screen.Controls, core.ScreenControl{
-				Key: "advanced", Kind: "disclosure", Value: "Advanced settings",
+				Key: "advanced", Section: "Advanced settings", Kind: "disclosure", Value: "Advanced settings",
 				Description: description,
 			})
 			advanced = true
@@ -909,11 +1187,23 @@ func settingsScreen(cfg config.Config, section string) core.Screen {
 			configured = setting.Value == "set"
 			value = ""
 		}
-		screen.Controls = append(screen.Controls, core.ScreenControl{
+		control := core.ScreenControl{
 			Key: setting.Key, Label: label, Description: setting.Description, Kind: kind,
 			Value: value, Options: append([]string(nil), setting.Choices...), Secret: setting.Secret, Configured: configured,
 			DescriptionMarkdown: setting.DescriptionMarkdown, Advanced: setting.Advanced,
-		})
+		}
+		if setting.Key == enabledKey {
+			screen.Controls = append(screen.Controls, control, core.ScreenControl{
+				Key: "wizard", Section: "Setup", Kind: "action", Value: "Setup wizard",
+				Description: "Configure the essential connection step by step",
+			})
+			continue
+		}
+		if basic && !setting.Advanced {
+			control.Section = "Basic settings"
+			basic = false
+		}
+		screen.Controls = append(screen.Controls, control)
 	}
 	return screen
 }

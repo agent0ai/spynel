@@ -4,7 +4,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/glamour/styles"
 	"github.com/charmbracelet/x/ansi"
+
+	"github.com/agent0ai/spynel/internal/theme"
 )
 
 const sample = `# Release
@@ -48,6 +51,65 @@ func TestTerminalRendersMarkdownInsteadOfShowingMarkers(t *testing.T) {
 	result := Terminal("**bold** and `code`", 80)
 	if strings.Contains(result, "**bold**") || result == "" {
 		t.Fatalf("unexpected terminal output %q", result)
+	}
+}
+
+func TestTerminalKeepsExactWidthTextAndShortHeadingTogether(t *testing.T) {
+	for _, test := range []struct {
+		input string
+		width int
+		want  string
+	}{
+		{input: "second response", width: 15, want: "second response"},
+		{input: "# About Spynel", width: 16, want: "About Spynel"},
+	} {
+		result := ansi.Strip(Terminal(test.input, test.width))
+		if strings.Contains(result, "\n") || !strings.Contains(result, test.want) {
+			t.Fatalf("exact-width Markdown wrapped unexpectedly at %d: %q", test.width, result)
+		}
+		if width := ansi.StringWidth(result); width > test.width {
+			t.Fatalf("Markdown row width = %d, exceeds %d: %q", width, test.width, result)
+		}
+	}
+}
+
+func TestTerminalStyleUsesSemanticThemeColors(t *testing.T) {
+	originalChromaText := *styles.DarkStyleConfig.CodeBlock.Chroma.Text.Color
+	active := theme.Default()
+	active.Colors.Text = "#010203"
+	active.Colors.Primary = "#040506"
+	active.Colors.Surface = "#070809"
+	active.Colors.Code = "#0A0B0C"
+	style := terminalStyle(active)
+	if style.Document.Color == nil || *style.Document.Color != active.Colors.Text {
+		t.Fatalf("document color = %#v", style.Document.Color)
+	}
+	if style.Heading.Color == nil || *style.Heading.Color != active.Colors.Primary {
+		t.Fatalf("heading color = %#v", style.Heading.Color)
+	}
+	if style.Strong.Color == nil || *style.Strong.Color != active.Colors.Primary {
+		t.Fatalf("strong emphasis color = %#v", style.Strong.Color)
+	}
+	if style.Code.Color == nil || *style.Code.Color != active.Colors.Code || style.Code.BackgroundColor == nil || *style.Code.BackgroundColor != active.Colors.SurfaceElevated {
+		t.Fatalf("inline code style = %#v", style.Code)
+	}
+	if style.CodeBlock.Chroma != nil || style.CodeBlock.Theme != "" || style.CodeBlock.Color == nil || *style.CodeBlock.Color != active.Colors.Code {
+		t.Fatalf("code block style = %#v", style.CodeBlock)
+	}
+	if got := *styles.DarkStyleConfig.CodeBlock.Chroma.Text.Color; got != originalChromaText {
+		t.Fatalf("themed renderer mutated Glamour's global style: %q, want %q", got, originalChromaText)
+	}
+}
+
+func TestRenderedFencedCodeUsesActiveTrueColorRole(t *testing.T) {
+	active := theme.Default()
+	active.Colors.Code = "#0A0B0C"
+	result := TerminalWithTheme("```go\nstatus := runtime.Snapshot()\n```", 80, active)
+	if !strings.Contains(result, "38;2;10;11;12") {
+		t.Fatalf("rendered code does not use active semantic truecolor: %q", result)
+	}
+	if strings.Contains(result, "38;5;") {
+		t.Fatalf("rendered code leaked a fixed ANSI-256 Chroma color: %q", result)
 	}
 }
 

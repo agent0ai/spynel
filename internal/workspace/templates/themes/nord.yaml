@@ -1,0 +1,20 @@
+name: nord
+description: Arctic blue Polar Night and muted Frost accents from Nord
+appearance: dark
+color_blind_friendly: false
+colors:
+  background: "#2E3440"
+  surface: "#3B4252"
+  surface_elevated: "#434C5E"
+  surface_selected: "#4C566A"
+  text: "#ECEFF4"
+  text_muted: "#D8DEE9"
+  primary: "#A7D9E3"
+  secondary: "#D9BED3"
+  border: "#71809A"
+  user: "#A6BED8"
+  success: "#B7CF9E"
+  warning: "#F0D39A"
+  error: "#E28A91"
+  info: "#A6BED8"
+  code: "#D9BED3"

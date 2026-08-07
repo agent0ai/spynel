@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frdel/spynel/internal/channel"
-	"github.com/frdel/spynel/internal/config"
-	"github.com/frdel/spynel/internal/core"
-	"github.com/frdel/spynel/internal/media"
+	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/media"
 )
 
 type fixedTranscriber struct{ text string }
@@ -46,6 +46,43 @@ func TestSplitHonorsTelegramCharacterLimit(t *testing.T) {
 	chunks := split(text, 4096)
 	if len(chunks) != 2 || len([]rune(chunks[0])) > 4096 || len([]rune(chunks[1])) > 4096 {
 		t.Fatalf("unexpected chunks: %d (%d, %d)", len(chunks), len([]rune(chunks[0])), len([]rune(chunks[1])))
+	}
+}
+
+func TestSendAttachmentUsesNativeTelegramMediaMethods(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "report.txt")
+	if err := os.WriteFile(path, []byte("report body"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := make(chan *http.Request, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, got *http.Request) {
+		if err := got.ParseMultipartForm(1024); err != nil {
+			t.Errorf("parse multipart: %v", err)
+		}
+		request <- got
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"ok":true,"result":{}}`))
+	}))
+	defer server.Close()
+	bot := New(config.Telegram{}, "test")
+	bot.baseURL = server.URL
+	if err := bot.sendAttachment(context.Background(), "42", core.OutboundAttachment{
+		Kind: "attachment", Name: "report.txt", Path: path, MediaType: "text/plain", MaxBytes: 1024,
+	}, 8); err != nil {
+		t.Fatal(err)
+	}
+	got := <-request
+	if got.URL.Path != "/bottest/sendDocument" || got.FormValue("chat_id") != "42" || got.FormValue("reply_parameters") != `{"message_id":8}` {
+		t.Fatalf("request path = %q, form = %#v", got.URL.Path, got.MultipartForm.Value)
+	}
+	file, header, err := got.FormFile("document")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if header.Filename != "report.txt" {
+		t.Fatalf("filename = %q", header.Filename)
 	}
 }
 
@@ -114,6 +151,50 @@ func TestLongPollingRoutesMessageAndSendsReply(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("Telegram poller did not stop")
+	}
+}
+
+func TestTelegramSendsOnlyLastTerminalResponse(t *testing.T) {
+	sent := make(chan string, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/bottest/sendChatAction":
+			_, _ = writer.Write([]byte(`{"ok":true}`))
+		case "/bottest/sendMessage":
+			var payload map[string]any
+			_ = json.NewDecoder(request.Body).Decode(&payload)
+			sent <- payload["text"].(string)
+			_, _ = writer.Write([]byte(`{"ok":true}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	bot := New(config.Telegram{}, "test")
+	bot.baseURL = server.URL
+	bot.handle(context.Background(), func(_ context.Context, _ core.Message, emit core.Emit) error {
+		lastResponse := "last response"
+		emit(core.Event{Kind: core.EventDelta, Text: "streamed progress"})
+		emit(core.Event{Kind: core.EventStatus, Text: "transport handoff", Done: true})
+		emit(core.Event{Kind: core.EventFinal, Text: "intermediate response", Done: true, Continues: true})
+		emit(core.Event{Kind: core.EventFinal, Text: "progress update\nlast response", FinalText: &lastResponse, Done: true})
+		return nil
+	}, &telegramMessage{MessageID: 8, From: telegramUser{ID: 7}, Chat: telegramChat{ID: 42, Type: "private"}, Date: 1, Text: "hello"})
+
+	select {
+	case got := <-sent:
+		if got != "last response" {
+			t.Fatalf("Telegram sent %q, want only the last response", got)
+		}
+	default:
+		t.Fatal("Telegram did not send the last response")
+	}
+	select {
+	case extra := <-sent:
+		t.Fatalf("Telegram sent an intermediate response: %q", extra)
+	default:
 	}
 }
 
@@ -294,6 +375,51 @@ func TestTelegramTypingRefreshesThroughVoiceTranscriptionAndAgentTurn(t *testing
 	}
 }
 
+func TestTelegramTypingContinuesUntilFinalDeliveryCompletes(t *testing.T) {
+	var actions atomic.Int32
+	deliveryEntered := make(chan struct{})
+	deliveryRelease := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/bottest/sendChatAction":
+			actions.Add(1)
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		case "/bottest/sendMessage":
+			close(deliveryEntered)
+			<-deliveryRelease
+			_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	bot := New(config.Telegram{}, "test")
+	bot.baseURL = server.URL
+	bot.activity = newTelegramActivity(bot, 10*time.Millisecond)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bot.handle(context.Background(), func(_ context.Context, _ core.Message, emit core.Emit) error {
+			emit(core.Event{Kind: core.EventStatus, Done: true})
+			emit(core.Event{Kind: core.EventFinal, Text: "intermediate", Done: true, Continues: true})
+			emit(core.Event{Kind: core.EventFinal, Text: "complete", Done: true})
+			return nil
+		}, &telegramMessage{MessageID: 8, From: telegramUser{ID: 7}, Chat: telegramChat{ID: 42, Type: "private"}, Date: 1, Text: "hello"})
+	}()
+	waitClosed(t, deliveryEntered, "Telegram final delivery")
+	beforeDeliveryRefresh := actions.Load()
+	waitAtomicCount(t, &actions, beforeDeliveryRefresh+1, "Telegram typing during final delivery")
+	close(deliveryRelease)
+	waitClosed(t, done, "Telegram final delivery completion")
+	stoppedAt := actions.Load()
+	time.Sleep(30 * time.Millisecond)
+	if got := actions.Load(); got != stoppedAt {
+		t.Fatalf("Telegram typing continued after delivery: %d -> %d", stoppedAt, got)
+	}
+}
+
 func waitAtomicCount(t *testing.T, value *atomic.Int32, minimum int32, description string) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -366,6 +492,9 @@ func TestWebhookModeVerifiesSecretAndRoutesUpdate(t *testing.T) {
 	index := strings.LastIndex(detail, marker)
 	if index < 0 {
 		t.Fatalf("webhook status detail = %q", detail)
+	}
+	if strings.Contains(detail, parsed.Path) || strings.Contains(detail, webhookURL) {
+		t.Fatalf("webhook status exposed its private public URL: %q", detail)
 	}
 	localURL := "http://" + detail[index+len(marker):] + parsed.Path
 	post := func(secret string) int {

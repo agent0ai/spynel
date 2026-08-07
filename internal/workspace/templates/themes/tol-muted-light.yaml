@@ -1,0 +1,20 @@
+name: tol-muted-light
+description: "Color-blind friendly: Paul Tol muted categorical accents on a cool paper canvas"
+appearance: light
+color_blind_friendly: true
+colors:
+  background: "#EAF3F7"
+  surface: "#DCEBF1"
+  surface_elevated: "#CFDFE7"
+  surface_selected: "#BED2DC"
+  text: "#24343D"
+  text_muted: "#4D626C"
+  primary: "#5F2450"
+  secondary: "#332288"
+  border: "#607984"
+  user: "#332288"
+  success: "#117733"
+  warning: "#665500"
+  error: "#882255"
+  info: "#315F78"
+  code: "#5F2450"

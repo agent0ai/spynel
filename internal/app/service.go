@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,41 +11,59 @@ import (
 	"sync"
 	"time"
 
-	"github.com/frdel/spynel/internal/channel"
-	"github.com/frdel/spynel/internal/config"
-	"github.com/frdel/spynel/internal/core"
-	"github.com/frdel/spynel/internal/extensions"
-	"github.com/frdel/spynel/internal/fsx"
-	"github.com/frdel/spynel/internal/harness"
-	"github.com/frdel/spynel/internal/history"
-	"github.com/frdel/spynel/internal/orchestrator"
-	"github.com/frdel/spynel/internal/shortid"
+	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/history"
+	"github.com/agent0ai/spynel/internal/media"
+	"github.com/agent0ai/spynel/internal/orchestrator"
+	"github.com/agent0ai/spynel/internal/shortid"
+	"github.com/agent0ai/spynel/internal/theme"
+	"github.com/agent0ai/spynel/internal/updater"
 )
 
 type Service struct {
 	// Config is the immutable structural configuration used to construct
 	// histories, hooks, routes, and workspace paths. Live scalar values are
 	// always read through Settings, avoiding races with remote form commands.
-	Config       config.Config
-	Harness      harness.Harness
-	History      *history.Store
-	Hooks        extensions.Runner
-	Orchestrator *orchestrator.Manager
-	Runtime      *Runtime
-	Settings     *config.Store
-	Startup      interface {
+	Config          config.Config
+	Harness         harness.Harness
+	History         *history.Store
+	Hooks           extensions.Runner
+	Orchestrator    *orchestrator.Manager
+	Runtime         *Runtime
+	Settings        *config.Store
+	PairingControl  channel.PairingManager
+	DeliveryControl channel.DeliveryRouter
+	Startup         interface {
 		Sync(config.Config, bool) error
 	}
-	configurationMu sync.Mutex
-	titleMu         sync.Mutex
-	titleChanges    chan string
-	connectionMu    sync.RWMutex
-	connections     map[string]channel.ConnectionStatus
-	pairingMu       sync.RWMutex
-	pairing         map[string]channel.PairingEvent
-	pairingEvents   chan channel.PairingEvent
-	noticeEvents    chan channel.Notice
-	restartRequests chan struct{}
+	Updates          *updater.Manager
+	configurationMu  sync.Mutex
+	instanceMu       sync.RWMutex
+	primaryInstance  string
+	titleMu          sync.Mutex
+	titleChanges     chan string
+	themeChanges     chan theme.Theme
+	connectionMu     sync.RWMutex
+	connections      map[string]channel.ConnectionStatus
+	pairingMu        sync.RWMutex
+	pairing          map[string]channel.PairingEvent
+	pairingEvents    chan channel.PairingEvent
+	noticeMu         sync.RWMutex
+	noticeSequence   uint64
+	lastNotice       channel.Notice
+	noticeEvents     chan channel.Notice
+	restartRequests  chan struct{}
+	updateRequests   chan struct{}
+	primaryRequests  chan string
+	primaryRequestMu sync.Mutex
+	primaryRequested bool
+	streamMu         sync.Mutex
+	streamText       map[string]string
 }
 
 func New(cfg config.Config, target harness.Harness) *Service {
@@ -74,22 +93,159 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 		Runtime:         runtime,
 		Settings:        config.NewStore(cfg),
 		titleChanges:    make(chan string, 1),
+		themeChanges:    make(chan theme.Theme, 1),
 		connections:     connections,
 		pairing:         map[string]channel.PairingEvent{},
 		pairingEvents:   make(chan channel.PairingEvent, 1),
 		noticeEvents:    make(chan channel.Notice, 8),
 		restartRequests: make(chan struct{}, 1),
+		updateRequests:  make(chan struct{}, 1),
+		primaryRequests: make(chan string, 1),
+		streamText:      map[string]string{},
 	}
 	manager.Log = runtime.Log
 	manager.JobStarted = func(sessionKey, description string) int {
 		return runtime.BeginJob(sessionKey, "orchestrator", "markdown", description)
 	}
 	manager.JobFinished = runtime.EndJob
+	manager.SetNotificationDelivery(service.deliverNotification)
 	return service
+}
+
+func (s *Service) validateOrigin(origin orchestrator.Origin) error {
+	if _, err := os.Stat(s.History.Path(origin.Channel, origin.Conversation)); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("origin %s/%s is not a known conversation", origin.Channel, origin.Conversation)
+		}
+		return err
+	}
+	cfg := s.Settings.Snapshot()
+	switch origin.Channel {
+	case "telegram":
+		if strings.HasPrefix(origin.Conversation, "TG-group-") {
+			if cfg.Channels.Telegram.GroupMode == "off" {
+				return errors.New("Telegram group origin is disabled")
+			}
+			return nil
+		}
+		if !strings.HasPrefix(origin.Conversation, "TG-") {
+			return errors.New("invalid Telegram origin")
+		}
+		id := strings.TrimPrefix(origin.Conversation, "TG-")
+		for _, allowed := range cfg.Channels.Telegram.AllowedUsers {
+			if strings.TrimSpace(strings.TrimPrefix(allowed, "@")) == id {
+				return nil
+			}
+		}
+		return errors.New("Telegram origin is not authorized by allowed_users")
+	case "whatsapp":
+		if strings.HasPrefix(origin.Conversation, "WA-group-") {
+			if !cfg.Channels.WhatsApp.AllowGroups {
+				return errors.New("WhatsApp group origin is disabled")
+			}
+			return nil
+		}
+		if !strings.HasPrefix(origin.Conversation, "WA-") {
+			return errors.New("invalid WhatsApp origin")
+		}
+		number := config.NormalizeWhatsAppNumber(strings.TrimPrefix(origin.Conversation, "WA-"))
+		for _, allowed := range cfg.Channels.WhatsApp.AllowedNumbers {
+			if config.NormalizeWhatsAppNumber(allowed) == number {
+				return nil
+			}
+		}
+		return errors.New("WhatsApp origin is not authorized by allowed_numbers")
+	case "tui", "cli":
+		return nil
+	}
+	return errors.New("unsupported origin channel")
+}
+
+func (s *Service) deliverNotification(ctx context.Context, origin orchestrator.Origin, eventID, text string) error {
+	if err := s.validateOrigin(origin); err != nil {
+		return err
+	}
+	if origin.Channel == "telegram" || origin.Channel == "whatsapp" {
+		state, stateErr := s.History.DeliveryState(origin.Channel, origin.Conversation, eventID)
+		if stateErr != nil {
+			return stateErr
+		}
+		if state == "sent" {
+			return nil
+		}
+		if s.DeliveryControl == nil {
+			return fmt.Errorf("%s is disconnected", origin.Channel)
+		}
+		if _, err := s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: "notification_sending", EventID: eventID}); err != nil {
+			return err
+		}
+		if err := s.DeliveryControl.Deliver(ctx, origin.Channel, origin.Conversation, eventID, text); err != nil {
+			_, _ = s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: "notification_failed", EventID: eventID, Content: err.Error()})
+			return err
+		}
+	}
+	role := "assistant"
+	if origin.Channel == "tui" && s.Harness.IsActive(sessionKey(core.Message{Channel: origin.Channel, Conversation: origin.Conversation})) {
+		role = "notification_pending"
+	}
+	_, err := s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: role, Sender: "Spy", Content: text, EventID: eventID})
+	return err
+}
+
+func (s *Service) AckNotification(originText, eventID string, afterChars int) error {
+	origin, err := orchestrator.ParseOrigin(originText)
+	if err != nil {
+		return err
+	}
+	if origin.Channel != "tui" {
+		return errors.New("notification interleave acknowledgements are TUI-only")
+	}
+	if eventID == "" || afterChars < 0 {
+		return errors.New("invalid notification acknowledgement")
+	}
+	_, err = s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: "notification_ack", EventID: eventID, AfterChars: afterChars})
+	return err
+}
+
+func (s *Service) Notify(ctx context.Context, originText, text string) (string, error) {
+	origin, err := orchestrator.ParseOrigin(originText)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(text) == "" {
+		return "", errors.New("notification message is required")
+	}
+	if err := s.validateOrigin(origin); err != nil {
+		return "", err
+	}
+	id := fmt.Sprintf("manual-%d", time.Now().UTC().UnixNano())
+	entry, err := s.Orchestrator.Outbox.Enqueue(id, "manual", originText, strings.TrimSpace(text))
+	if err != nil {
+		return "", err
+	}
+	if processErr := s.Orchestrator.Outbox.Process(ctx); processErr != nil {
+		s.Runtime.Log("notification retained for retry: " + processErr.Error())
+	}
+	return entry.ID, nil
 }
 
 func (s *Service) Start(ctx context.Context) error {
 	return s.Harness.Start(ctx)
+}
+
+// SetPrimaryInstanceID records the workspace server owner for shared status
+// output. Loopback clients separately identify the process making a request.
+func (s *Service) SetPrimaryInstanceID(id string) {
+	s.instanceMu.Lock()
+	s.primaryInstance = id
+	s.instanceMu.Unlock()
+}
+
+func (s *Service) primaryInstanceID() string {
+	s.instanceMu.RLock()
+	id := s.primaryInstance
+	s.instanceMu.RUnlock()
+	return id
 }
 
 func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Emit) error {
@@ -99,6 +255,9 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 	message.Text = strings.TrimSpace(message.Text)
 	if message.Text == "" {
 		return nil
+	}
+	if message.FollowupOnly && !s.Harness.IsActive(sessionKey(message)) {
+		return errors.New("there is no active execution for this conversation")
 	}
 	if s.Config.Extensions.Enabled {
 		output, err := s.Hooks.Run(ctx, "message.received", map[string]any{
@@ -130,6 +289,10 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 	if err != nil {
 		return err
 	}
+	return s.dispatchHarnessPrompt(ctx, message, prompt, emit)
+}
+
+func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Message, prompt string, emit core.Emit) error {
 	if s.Config.Extensions.Enabled {
 		output, err := s.Hooks.Run(ctx, "harness.before", map[string]any{
 			"session_key": sessionKey(message), "prompt": prompt, "channel": message.Channel,
@@ -149,7 +312,9 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 	wrapped := s.wrapEmit(message, jobID, emit)
 	threadID, steered, err := s.Harness.Send(ctx, key, prompt, wrapped)
 	if err != nil {
-		s.Runtime.EndJob(jobID)
+		if !s.Harness.IsActive(key) {
+			s.Runtime.EndJob(jobID)
+		}
 		return err
 	}
 	if emit != nil {
@@ -160,6 +325,35 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 		emit(core.Event{Kind: core.EventStatus, Text: verb, ThreadID: threadID})
 	}
 	return nil
+}
+
+func (s *Service) creationCommandPrompt(message core.Message, kind, userMessage string) (string, error) {
+	base, err := s.chatPrompt(message)
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(s.Config.StatePath("prompts", "create-"+kind+".md"))
+	if err != nil {
+		return "", err
+	}
+	directive := string(data)
+	directive = strings.ReplaceAll(directive, "{{CHANNEL}}", message.Channel)
+	directive = strings.ReplaceAll(directive, "{{CONVERSATION}}", message.Conversation)
+	directive = strings.ReplaceAll(directive, "{{TASK_SOURCE}}", s.routeSource("tasks"))
+	directive = strings.ReplaceAll(directive, "{{GOAL_SOURCE}}", s.routeSource("goals"))
+	// Replace user data last so template-looking text inside the request is
+	// never interpreted as another framework placeholder.
+	directive = strings.ReplaceAll(directive, "{{USER_MESSAGE}}", userMessage)
+	return base + "\n\n---\n\n" + directive, nil
+}
+
+func (s *Service) routeSource(name string) string {
+	for _, route := range s.Config.Orchestrator.Routes {
+		if route.Name == name {
+			return s.Config.Resolve(route.Source)
+		}
+	}
+	return "(route not configured)"
 }
 
 func (s *Service) chatPrompt(message core.Message) (string, error) {
@@ -186,49 +380,116 @@ func (s *Service) chatPrompt(message core.Message) (string, error) {
 	}
 	prompt = strings.ReplaceAll(prompt, "{{PROJECT}}", "")
 	prompt = strings.ReplaceAll(prompt, "{{INSTRUCTIONS}}", "")
-	replacements := map[string]string{
-		"{{HISTORY_FILE}}":   fullPath,
-		"{{CHANNEL}}":        message.Channel,
-		"{{CONVERSATION}}":   message.Conversation,
-		"{{RECENT_HISTORY}}": recent,
-	}
-	for from, to := range replacements {
-		prompt = strings.ReplaceAll(prompt, from, to)
+	prompt = strings.ReplaceAll(prompt, "{{HISTORY_FILE}}", fullPath)
+	prompt = strings.ReplaceAll(prompt, "{{CHANNEL}}", message.Channel)
+	prompt = strings.ReplaceAll(prompt, "{{CONVERSATION}}", message.Conversation)
+	prompt = strings.ReplaceAll(prompt, "{{TASK_SOURCE}}", s.routeSource("tasks"))
+	prompt = strings.ReplaceAll(prompt, "{{GOAL_SOURCE}}", s.routeSource("goals"))
+	// History is untrusted conversation data. Insert it last so placeholder-like
+	// text in prior messages remains literal.
+	prompt = strings.ReplaceAll(prompt, "{{RECENT_HISTORY}}", recent)
+	if message.Channel == "telegram" || message.Channel == "whatsapp" {
+		prompt += "\n\nTo send a readable local file back through this channel, put one directive on its own line in the final response: `[Send attachment](</absolute/path/to/file>)`. For an image displayed as a native photo, use `[Send photo](</absolute/path/to/image.png>)`. Keep any user-facing caption as ordinary text. The path may be outside the active workspace, but it must be absolute and resolve to a regular file within the attachment size limit."
 	}
 	return prompt, nil
 }
 
 func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit) core.Emit {
 	return func(event core.Event) {
+		key := sessionKey(message)
+		if event.Kind == core.EventDelta {
+			s.streamMu.Lock()
+			s.streamText[key] += event.Text
+			s.streamMu.Unlock()
+		}
 		if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+			s.streamMu.Lock()
+			streamed := s.streamText[key]
+			delete(s.streamText, key)
+			s.streamMu.Unlock()
 			text := event.Text
+			remoteChannel := message.Channel == "telegram" || message.Channel == "whatsapp"
+			hookText := text
+			if remoteChannel && event.FinalText != nil {
+				hookText = *event.FinalText
+			}
 			if s.Config.Extensions.Enabled {
 				output, err := s.Hooks.Run(context.Background(), "harness.after", map[string]any{
-					"session_key": sessionKey(message), "text": text, "kind": event.Kind,
+					"session_key": sessionKey(message), "text": hookText, "kind": event.Kind,
 				})
 				if err != nil {
 					event.Kind = core.EventError
 					text = "harness.after extension hook failed: " + err.Error()
+					event.FinalText = &text
 				} else if output.Cancel {
 					text = output.Message
+					event.FinalText = &text
 				} else {
 					if value, ok := output.Payload["text"].(string); ok {
-						text = value
+						if remoteChannel && event.FinalText != nil {
+							if value != hookText {
+								text = replaceFinalAssistantItem(text, hookText, value)
+								event.FinalText = &value
+							}
+						} else {
+							text = value
+						}
+					}
+				}
+			}
+			if event.Kind == core.EventFinal && remoteChannel {
+				cfg := s.Settings.Snapshot()
+				maxBytes := int64(cfg.Workspace.AttachmentMaxMB) * 1024 * 1024
+				cleaned, attachments, err := media.ParseOutbound(text, maxBytes)
+				if err != nil {
+					event.Kind = core.EventError
+					text = "Spynel outbound attachment error: " + err.Error()
+					event.FinalText = &text
+					event.Attachments = nil
+				} else {
+					text = cleaned
+					event.Attachments = attachments
+					if event.FinalText != nil {
+						finalText, finalAttachments, finalErr := media.ParseOutbound(*event.FinalText, maxBytes)
+						if finalErr != nil {
+							event.Kind = core.EventError
+							text = "Spynel outbound attachment error: " + finalErr.Error()
+							event.FinalText = &text
+							event.Attachments = nil
+						} else {
+							event.FinalText = &finalText
+							event.Attachments = finalAttachments
+						}
 					}
 				}
 			}
 			event.Text = text
-			_, _ = s.History.Append(message.Channel, message.Conversation, history.Entry{
-				At: time.Now().UTC(), Role: "assistant", Content: text,
-			})
+			historyText := text
+			for _, attachment := range event.Attachments {
+				historyText = strings.TrimSpace(historyText + "\n\n[Sent " + attachment.Kind + " " + attachment.Name + "]")
+			}
+			if event.Kind == core.EventError && streamed != "" {
+				_, _ = s.History.Append(message.Channel, message.Conversation, history.Entry{At: time.Now().UTC(), Role: "assistant", Content: streamed})
+			}
+			_, _ = s.History.Append(message.Channel, message.Conversation, history.Entry{At: time.Now().UTC(), Role: map[bool]string{true: "error", false: "assistant"}[event.Kind == core.EventError], Content: historyText, Terminal: true})
 		}
 		if downstream != nil {
 			downstream(event)
 		}
-		if event.Done {
+		if event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
 			s.Runtime.EndJob(jobID)
 		}
 	}
+}
+
+func replaceFinalAssistantItem(aggregate, previous, replacement string) string {
+	if aggregate == previous {
+		return replacement
+	}
+	if previous != "" && strings.HasSuffix(aggregate, previous) {
+		return strings.TrimSuffix(aggregate, previous) + replacement
+	}
+	return aggregate
 }
 
 func (s *Service) handleCommand(ctx context.Context, message core.Message, emit core.Emit) error {
@@ -248,12 +509,7 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 	case "commands":
 		return s.localReply(message, commandHelp, emit)
 	case "welcome":
-		if message.Channel == "tui" && emit != nil {
-			screen := s.WelcomeScreen()
-			emit(core.Event{Kind: core.EventScreen, Screen: &screen, Local: true})
-			return nil
-		}
-		return s.localReply(message, s.welcomeText(), emit)
+		return s.localReply(message, s.welcomeMessage(message.Channel), emit)
 	case "new":
 		if err := s.Harness.ResetSession(sessionKey(message)); err != nil {
 			return s.localReply(message, "Cannot start a new thread: "+err.Error(), emit)
@@ -265,6 +521,8 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 			return err
 		}
 		return s.localReply(message, status, emit)
+	case "primary":
+		return s.primaryCommand(message, emit)
 	case "config":
 		return s.configurationCommand(message, "config", remainder, emit)
 	case "telegram":
@@ -281,6 +539,8 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		return s.harnessCommand(message, remainder, emit)
 	case "model":
 		return s.modelCommand(ctx, message, remainder, emit)
+	case "theme":
+		return s.themeCommand(message, remainder, emit)
 	case "title":
 		if remainder == "" {
 			return s.localReply(message, "Usage: /title <name>", emit)
@@ -357,24 +617,26 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		}
 		s.requestRestart()
 		return nil
+	case "update":
+		return s.updateCommand(ctx, message, remainder, emit)
 	case "task", "todo":
 		if remainder == "" {
 			return s.localReply(message, "Usage: /task <title and request>", emit)
 		}
-		path, err := orchestrator.Create(s.Config, "tasks", remainder, "")
+		prompt, err := s.creationCommandPrompt(message, "task", remainder)
 		if err != nil {
 			return err
 		}
-		return s.localReply(message, "Created task: "+path, emit)
+		return s.dispatchHarnessPrompt(ctx, message, prompt, emit)
 	case "goal":
 		if remainder == "" {
 			return s.localReply(message, "Usage: /goal <objective>", emit)
 		}
-		path, err := orchestrator.Create(s.Config, "goals", remainder, "")
+		prompt, err := s.creationCommandPrompt(message, "goal", remainder)
 		if err != nil {
 			return err
 		}
-		return s.localReply(message, "Created goal: "+path, emit)
+		return s.dispatchHarnessPrompt(ctx, message, prompt, emit)
 	case "run":
 		if err := s.Orchestrator.ScanOnce(ctx); err != nil {
 			return err
@@ -390,7 +652,7 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 }
 
 func (s *Service) logCommand(message core.Message, remainder string, emit core.Emit) error {
-	usage := "Usage: /log [page <number>|search <text>|clear]"
+	usage := "Usage: /log [page <number>|page <start>-<end>|search <text>|clear]"
 	parts := strings.Fields(remainder)
 	if len(parts) == 0 {
 		return s.localReply(message, formatLogs(s.Runtime.Logs()), emit)
@@ -400,11 +662,11 @@ func (s *Service) logCommand(message core.Message, remainder string, emit core.E
 		if len(parts) != 2 {
 			return s.localReply(message, usage, emit)
 		}
-		page, err := strconv.Atoi(parts[1])
-		if err != nil || page < 1 {
-			return s.localReply(message, "Log page must be a positive number.\n\n"+usage, emit)
+		firstPage, lastPage, err := parseLogPageSpec(parts[1])
+		if err != nil {
+			return s.localReply(message, err.Error()+"\n\n"+usage, emit)
 		}
-		return s.localReply(message, formatLogPage(s.Runtime.Logs(), page), emit)
+		return s.localReply(message, formatLogPages(s.Runtime.Logs(), firstPage, lastPage), emit)
 	case "search":
 		query := strings.TrimSpace(strings.TrimPrefix(remainder, parts[0]))
 		if query == "" {
@@ -420,6 +682,32 @@ func (s *Service) logCommand(message core.Message, remainder string, emit core.E
 	default:
 		return s.localReply(message, usage, emit)
 	}
+}
+
+func parseLogPageSpec(spec string) (int, int, error) {
+	if !strings.Contains(spec, "-") {
+		page, err := strconv.Atoi(spec)
+		if err != nil || page < 1 {
+			return 0, 0, fmt.Errorf("log page must be a positive number or inclusive range such as 1-5")
+		}
+		return page, page, nil
+	}
+	if strings.Count(spec, "-") != 1 {
+		return 0, 0, fmt.Errorf("log page must be a positive number or inclusive range such as 1-5")
+	}
+	bounds := strings.SplitN(spec, "-", 2)
+	firstPage, firstErr := strconv.Atoi(bounds[0])
+	lastPage, lastErr := strconv.Atoi(bounds[1])
+	if firstErr != nil || lastErr != nil || firstPage < 1 || lastPage < 1 {
+		return 0, 0, fmt.Errorf("log page range bounds must be positive numbers")
+	}
+	if firstPage > lastPage {
+		return 0, 0, fmt.Errorf("log page range must run from a lower page to a higher page")
+	}
+	if lastPage-firstPage+1 > maxLogPageRange {
+		return 0, 0, fmt.Errorf("log page range may cover at most %d pages", maxLogPageRange)
+	}
+	return firstPage, lastPage, nil
 }
 
 func (s *Service) jobCommand(ctx context.Context, message core.Message, remainder string, emit core.Emit) error {
@@ -476,6 +764,99 @@ func (s *Service) requestRestart() {
 	}
 }
 
+// UpdateRequests publishes npm update-and-restart requests after the command
+// acknowledgement has been persisted. The npm launcher performs the package
+// replacement only after the Go process has exited, which is safe on Windows.
+func (s *Service) UpdateRequests() <-chan struct{} {
+	return s.updateRequests
+}
+
+func (s *Service) requestUpdate() {
+	select {
+	case s.updateRequests <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Service) updateCommand(ctx context.Context, message core.Message, remainder string, emit core.Emit) error {
+	if s.Updates == nil {
+		return s.localReply(message, "npm updates are unavailable in this build. Install Spynel through npm to use `/update`.", emit)
+	}
+	action := strings.ToLower(strings.TrimSpace(remainder))
+	if action != "" && action != "install" {
+		return s.localReply(message, "Usage: /update [install]", emit)
+	}
+	result, err := s.Updates.Check(ctx)
+	if err != nil {
+		return s.localReply(message, "Update check skipped: "+err.Error()+". Try `/update` again later.", emit)
+	}
+	if !result.InstalledViaNPM {
+		return s.localReply(message, "This Spynel binary is not managed by npm. Download a newer release using the same installation method.", emit)
+	}
+	if !result.Available {
+		latest := result.Latest
+		if latest == "" {
+			latest = result.Current
+		}
+		return s.localReply(message, fmt.Sprintf("Spynel %s is current; npm also reports %s.", result.Current, latest), emit)
+	}
+	if action == "" {
+		if result.CanAutoInstall {
+			return s.localReply(message, fmt.Sprintf("Spynel %s is installed through npm; %s is available. Run `/update install` to run npm update and restart Spynel safely.", result.Current, result.Latest), emit)
+		}
+		return s.localReply(message, fmt.Sprintf("Spynel %s is installed through npm; %s is available. Run `%s`, then `/restart`. This process was not launched by the npm wrapper, so it cannot replace itself safely.", result.Current, result.Latest, result.Command), emit)
+	}
+	if !result.CanAutoInstall {
+		return s.localReply(message, fmt.Sprintf("Run `%s`, then `/restart`. Updating in place is unavailable because this process was not launched by the npm wrapper.", result.Command), emit)
+	}
+	if err := s.localReply(message, fmt.Sprintf("Updating Spynel from %s to %s with npm, then restarting. Saved workspace state will be migrated on startup.", result.Current, result.Latest), emit); err != nil {
+		return err
+	}
+	s.requestUpdate()
+	return nil
+}
+
+// PrimaryRequests publishes a target-specific request after /primary has
+// acknowledged the requesting local TUI and verified that no jobs are active.
+func (s *Service) PrimaryRequests() <-chan string {
+	return s.primaryRequests
+}
+
+func (s *Service) primaryCommand(message core.Message, emit core.Emit) error {
+	if message.Channel != "tui" {
+		return s.localReply(message, "/primary is available only from a local TUI instance.", emit)
+	}
+	primaryID := s.primaryInstanceID()
+	if message.InstanceID == "" || primaryID == "" {
+		return s.localReply(message, "Cannot identify both this instance and the current primary instance.", emit)
+	}
+	if message.InstanceID == primaryID {
+		return s.localReply(message, "This instance is already the primary instance.", emit)
+	}
+	if jobs := s.Runtime.Status().Jobs; jobs != 0 {
+		activity := fmt.Sprintf("%d agent jobs are", jobs)
+		if jobs == 1 {
+			activity = "1 agent job is"
+		}
+		return s.localReply(message, "Cannot transfer primary ownership while "+activity+" running. Use `/jobs` to inspect active work and retry when the workspace is idle.", emit)
+	}
+	s.primaryRequestMu.Lock()
+	if s.primaryRequested {
+		s.primaryRequestMu.Unlock()
+		return s.localReply(message, "A primary handoff is already in progress.", emit)
+	}
+	s.primaryRequested = true
+	s.primaryRequestMu.Unlock()
+	if err := s.localReply(message, "Primary handoff requested. This instance will take ownership after the current primary safely stops its owner-only services.", emit); err != nil {
+		s.primaryRequestMu.Lock()
+		s.primaryRequested = false
+		s.primaryRequestMu.Unlock()
+		return err
+	}
+	s.primaryRequests <- message.InstanceID
+	return nil
+}
+
 // SetConnectionStatus keeps shared channel health available to commands on
 // every transport, not only to the TUI that renders the live badges.
 func (s *Service) SetConnectionStatus(status channel.ConnectionStatus) {
@@ -497,46 +878,121 @@ func (s *Service) connectionStatus(name string) channel.ConnectionStatus {
 	return status
 }
 
-func (s *Service) statusText(message core.Message) (string, error) {
+// StatusSnapshot is the bounded, non-secret operational state exposed to
+// plain CLI clients and rendered by /status on every channel.
+type StatusSnapshot struct {
+	Title             string                     `json:"title"`
+	Theme             string                     `json:"theme"`
+	Instance          string                     `json:"instance,omitempty"`
+	PrimaryInstance   string                     `json:"primary_instance,omitempty"`
+	Connections       []channel.ConnectionStatus `json:"connections"`
+	Runtime           core.RuntimeStatus         `json:"runtime"`
+	Harness           string                     `json:"harness,omitempty"`
+	HarnessState      string                     `json:"harness_state"`
+	HarnessDetail     string                     `json:"harness_detail,omitempty"`
+	Model             string                     `json:"model,omitempty"`
+	Sandbox           string                     `json:"sandbox"`
+	StartupEnabled    bool                       `json:"startup_enabled"`
+	Thread            string                     `json:"thread,omitempty"`
+	TurnActive        bool                       `json:"turn_active"`
+	OrchestratorLease int                        `json:"orchestrator_leases"`
+	OrchestratorRuns  int                        `json:"orchestrator_dispatches"`
+}
+
+// Status returns the same status contract used by /status without requiring a
+// caller to parse presentation Markdown. Opaque identifiers stay shortened.
+func (s *Service) Status(message core.Message) (StatusSnapshot, error) {
 	leases, dispatches, err := s.Orchestrator.Status()
+	if err != nil {
+		return StatusSnapshot{}, err
+	}
+	cfg := s.Settings.Snapshot()
+	primaryInstanceID := s.primaryInstanceID()
+	instanceID := message.InstanceID
+	if instanceID == "" {
+		// Telegram and WhatsApp execute inside the primary process rather than
+		// crossing the loopback API, so their caller is the owner itself.
+		instanceID = primaryInstanceID
+	}
+	harnessState := "connected"
+	harnessDetail := ""
+	if availability, ok := s.Harness.(harness.Availability); ok {
+		if ready, detail := availability.Available(); !ready {
+			harnessState = "unavailable"
+			harnessDetail = detail
+		}
+	}
+	thread := shortid.Display(s.Harness.ThreadID(sessionKey(message)))
+	return StatusSnapshot{
+		Title: s.currentTitle(), Theme: cfg.Channels.TUI.Theme,
+		Instance: shortid.Display(instanceID), PrimaryInstance: shortid.Display(primaryInstanceID),
+		Connections: []channel.ConnectionStatus{s.connectionStatus("telegram"), s.connectionStatus("whatsapp")},
+		Runtime:     s.Runtime.Status(), Harness: cfg.Harness.Name, HarnessState: harnessState,
+		HarnessDetail: harnessDetail, Model: cfg.Harness.Model, Sandbox: cfg.Harness.Sandbox,
+		StartupEnabled: cfg.Startup.Enabled, Thread: thread, TurnActive: s.Harness.IsActive(sessionKey(message)),
+		OrchestratorLease: leases, OrchestratorRuns: dispatches,
+	}, nil
+}
+
+func (s *Service) statusText(message core.Message) (string, error) {
+	status, err := s.Status(message)
 	if err != nil {
 		return "", err
 	}
-	runtimeStatus := s.Runtime.Status()
+	return FormatStatus(status), nil
+}
+
+// FormatStatus renders a StatusSnapshot for text terminals and chat channels.
+func FormatStatus(status StatusSnapshot) string {
+	harnessStatus := status.HarnessState
+	if status.HarnessDetail != "" {
+		harnessStatus += " — " + status.HarnessDetail
+	}
 	thread := "not started"
-	if threadID := s.Harness.ThreadID(sessionKey(message)); threadID != "" {
-		thread = "`" + emptyAs(shortid.Display(threadID), "unknown") + "`"
+	if status.Thread != "" {
+		thread = "`" + status.Thread + "`"
 	}
 	turn := "idle"
-	if s.Harness.IsActive(sessionKey(message)) {
+	if status.TurnActive {
 		turn = "active"
 	}
-	cfg := s.Settings.Snapshot()
-	harnessStatus := "connected"
-	if availability, ok := s.Harness.(harness.Availability); ok {
-		if ready, detail := availability.Available(); !ready {
-			harnessStatus = "unavailable"
-			if detail != "" {
-				harnessStatus += " — " + detail
-			}
+	telegram := channel.ConnectionStatus{Name: "telegram", State: channel.ConnectionUnconfigured}
+	whatsapp := channel.ConnectionStatus{Name: "whatsapp", State: channel.ConnectionUnconfigured}
+	for _, connection := range status.Connections {
+		switch connection.Name {
+		case "telegram":
+			telegram = connection
+		case "whatsapp":
+			whatsapp = connection
 		}
 	}
 	return strings.Join([]string{
 		"# Status",
 		"",
-		"- Title: " + s.currentTitle(),
-		"- Telegram: " + connectionIndicator(s.connectionStatus("telegram")),
-		"- WhatsApp: " + connectionIndicator(s.connectionStatus("whatsapp")),
-		fmt.Sprintf("- Jobs: %d — `/jobs`", runtimeStatus.Jobs),
-		fmt.Sprintf("- Logs: %d — `/log`", runtimeStatus.Logs),
-		"- Coding harness: " + emptyAs(cfg.Harness.Name, "not selected") + " (" + harnessStatus + ")",
-		"- Model: " + emptyAs(cfg.Harness.Model, "harness default"),
-		"- Agent filesystem access: " + cfg.Harness.Sandbox,
-		"- Run at startup: " + enabledText(cfg.Startup.Enabled),
+		"- Title: " + status.Title,
+		"- Theme: " + status.Theme,
+		"- Instance ID: " + statusID(status.Instance),
+		"- Primary instance ID: " + statusID(status.PrimaryInstance),
+		"- Telegram: " + connectionIndicator(telegram),
+		"- WhatsApp: " + connectionIndicator(whatsapp),
+		fmt.Sprintf("- Jobs: %d — `/jobs`", status.Runtime.Jobs),
+		fmt.Sprintf("- Logs: %d — `/log`", status.Runtime.Logs),
+		"- Coding harness: " + emptyAs(status.Harness, "not selected") + " (" + harnessStatus + ")",
+		"- Model: " + emptyAs(status.Model, "harness default"),
+		"- Agent filesystem access: " + status.Sandbox,
+		"- Run at startup: " + enabledText(status.StartupEnabled),
 		"- Thread: " + thread,
 		"- Turn: " + turn,
-		fmt.Sprintf("- Orchestrator: %d leases, %d dispatch goroutines", leases, dispatches),
-	}, "\n"), nil
+		fmt.Sprintf("- Orchestrator: %d leases, %d dispatch goroutines", status.OrchestratorLease, status.OrchestratorRuns),
+	}, "\n")
+}
+
+func statusID(value string) string {
+	display := shortid.Display(value)
+	if display == "" {
+		return "not available"
+	}
+	return "`" + display + "`"
 }
 
 func enabledText(enabled bool) string {
@@ -647,12 +1103,14 @@ var slashCommands = []core.SlashCommand{
 	{Value: "/help channels", Usage: "/help channels", Description: "Learn about the TUI, Telegram, and WhatsApp"},
 	{Value: "/help workflows", Usage: "/help workflows", Description: "Learn how tasks, goals, and scans work"},
 	{Value: "/status", Usage: "/status", Description: "Show channel, runtime, thread, and orchestrator state"},
-	{Value: "/welcome", Usage: "/welcome", Description: "Open or show the Spynel welcome guide"},
+	{Value: "/primary", Usage: "/primary", Description: "Safely make this TUI instance the workspace primary"},
+	{Value: "/welcome", Usage: "/welcome", Description: "Print the Spynel welcome guide in this conversation"},
 	{Value: "/config", Usage: "/config", Description: "Open or show Spynel configuration"},
 	{Value: "/config get ", Usage: "/config get <key>", Description: "Read one configuration value"},
 	{Value: "/config set ", Usage: "/config set <key> <value>", Description: "Persist one configuration value"},
 	{Value: "/harness ", Usage: "/harness [name]", Description: "Show or select the coding harness"},
 	{Value: "/model ", Usage: "/model [name]", Description: "Show or select the harness model"},
+	{Value: "/theme", Usage: "/theme [name]", Description: "Preview or select a color theme"},
 	{Value: "/telegram", Usage: "/telegram", Description: "Open or show Telegram configuration"},
 	{Value: "/telegram on", Usage: "/telegram on", Description: "Enable Telegram"},
 	{Value: "/telegram off", Usage: "/telegram off", Description: "Disable Telegram"},
@@ -666,17 +1124,19 @@ var slashCommands = []core.SlashCommand{
 	{Value: "/steer ", Usage: "/steer <message>", Description: "Explicitly steer the active harness turn"},
 	{Value: "/stop", Usage: "/stop", Description: "Stop the active execution for this conversation"},
 	{Value: "/restart", Usage: "/restart", Description: "Restart Spynel and restore saved state"},
+	{Value: "/update", Usage: "/update", Description: "Check npm for a newer Spynel release"},
+	{Value: "/update install", Usage: "/update install", Description: "Install an npm update and restart safely"},
 	{Value: "/history", Usage: "/history", Description: "Show the complete history file"},
 	{Value: "/resume", Usage: "/resume", Description: "Browse saved conversations and branch one into the TUI"},
 	{Value: "/log", Usage: "/log", Description: "Show the newest page of captured runtime logs"},
-	{Value: "/log page ", Usage: "/log page <number>", Description: "Show an older runtime log page"},
+	{Value: "/log page ", Usage: "/log page <number|start-end>", Description: "Show one or up to five runtime log pages"},
 	{Value: "/log search ", Usage: "/log search <text>", Description: "Search captured runtime logs"},
 	{Value: "/log clear", Usage: "/log clear", Description: "Clear captured runtime logs"},
 	{Value: "/jobs", Usage: "/jobs", Description: "List running agent jobs"},
 	{Value: "/job kill ", Usage: "/job kill <number>", Description: "Stop a running agent job by number"},
 	{Value: "/clear", Usage: "/clear", Description: "Clear this conversation's history and harness thread"},
-	{Value: "/task ", Usage: "/task <request>", Description: "Create a markdown task"},
-	{Value: "/goal ", Usage: "/goal <objective>", Description: "Create a markdown goal"},
+	{Value: "/task ", Usage: "/task <request>", Description: "Ask the communication agent to create or refine a finite task"},
+	{Value: "/goal ", Usage: "/goal <objective>", Description: "Ask the communication agent to create or refine a measurable goal"},
 	{Value: "/run", Usage: "/run", Description: "Trigger an orchestrator scan"},
 	{Value: "/extension list", Usage: "/extension list", Description: "List installed project extensions"},
 	{Value: "/extension install ", Usage: "/extension install URL", Description: "Install a trusted Git extension"},
@@ -706,22 +1166,22 @@ var helpTopics = []struct {
 	{
 		name:        "extensions",
 		description: "Trusted project extensions and their hooks",
-		body:        "# Extensions\n\nExtensions are explicitly installed Git repositories that can run hooks around messages, harness calls, and orchestration. Their directory and whether hooks are enabled are configured under `extensions` in `spynel.yaml`.\n\n- `/extension list` lists installed extensions.\n- `/extension install <git-url> [name]` installs a repository you trust.\n- `/extension remove <name>` removes an installed extension.",
+		body:        "# Extensions\n\nExtensions are explicitly installed Git repositories that can run hooks around messages, harness calls, orchestration, and application-version transitions. Update hooks receive exact `from_version` and `to_version` values and must be retry-safe. Their directory and whether hooks are enabled are configured under `extensions` in `spynel.yaml`.\n\n- `/extension list` lists installed extensions.\n- `/extension install <git-url> [name]` installs a repository you trust.\n- `/extension remove <name>` removes an installed extension.",
 	},
 	{
 		name:        "config",
 		description: "spynel.yaml settings and path resolution",
-		body:        "# Configuration\n\n`spynel.yaml` controls the workspace, harness, channels, speech processing, orchestration routes, and extensions. `/config` shows the shared settings, `/config get <key>` reads one value, and `/config set <key> <value>` atomically validates and persists a change from any channel. `/harness [name]` and `/model [name]` are concise selectors. `harness.sandbox` accepts `danger-full-access`, `workspace-write`, or `read-only`; unrestricted access is the default. Relative paths are resolved from the directory containing `spynel.yaml`, so a project can be moved without rewriting local paths.",
+		body:        "# Configuration\n\n`spynel.yaml` controls the workspace, harness, channels, speech processing, orchestration routes, and extensions. `/config` shows the shared settings, `/config get <key>` reads one value, and `/config set <key> <value>` atomically validates and persists a change from any channel. `/harness [name]` and `/model [name]` are concise selectors. `/theme [name]` previews/lists or selects a semantic palette from `.spynel/themes`. `harness.sandbox` accepts `danger-full-access`, `workspace-write`, or `read-only`; unrestricted access is the default. Relative paths are resolved from the directory containing `spynel.yaml`, so a project can be moved without rewriting local paths.",
 	},
 	{
 		name:        "channels",
 		description: "The TUI, Telegram, and WhatsApp",
-		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, and orchestrator indicators, `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to start a fresh harness thread without erasing channel history. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/log` shows the newest captured runtime output, `/log page <number>` moves backward through it, `/log search <text>` searches it, and `/log clear` erases it. `/jobs` and `/job kill <number>` manage active agent executions across channels.",
+		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, instance, and orchestrator indicators. From an idle local TUI, `/primary` safely hands workspace ownership to that TUI instance. Use `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to start a fresh harness thread without erasing channel history. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/update` checks npm with a ten-second deadline, and `/update install` lets a supervising npm launcher update after shutdown and then restart. `/log` shows the newest captured runtime output, `/log page <number>` moves backward through it, `/log page <start>-<end>` shows up to five consecutive pages, `/log search <text>` searches it, and `/log clear` erases it. `/jobs` and `/job kill <number>` manage active agent executions across channels.",
 	},
 	{
 		name:        "workflows",
 		description: "Durable tasks, goals, and orchestrator scans",
-		body:        "# Workflows\n\n`/task <request>` and `/goal <objective>` create durable Markdown files in the configured route directories. Their front matter is machine-readable; their bodies and agent logs remain readable and editable by people.\n\nUse `/run` to trigger an orchestrator scan immediately. The orchestrator claims eligible files, dispatches them to the configured harness, records progress, and applies the route's completion behavior.",
+		body:        "# Workflows\n\nA task is one finite, independently verifiable objective. `/task <request>` sends a dedicated creation directive and your request to the communication agent, which creates or refines a complete task in `todo`. Spynel claims it through `working`, then separately claims completed implementation through `review` into `reviewing`; only that fresh review may accept `done`.\n\nA goal is a long-term or multi-round outcome with measurable success criteria. `/goal <objective>` asks the communication agent to create or refine it in `proposed`. A leased planner creates linked finite task rounds, the goal remains unleased in `active` while they run, and a fresh goal review decides against the bar whether to finish, wait, abandon, or plan another round. Finished tasks never complete a goal automatically.\n\nUse `/run` to trigger an orchestrator scan immediately. Claimed `working`, `planning`, and `reviewing` documents have persisted leases and are recovered after crashes.",
 	},
 }
 

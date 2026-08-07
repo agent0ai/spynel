@@ -7,13 +7,17 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/glamour/ansi"
 	"github.com/charmbracelet/glamour/styles"
-	"github.com/charmbracelet/x/ansi"
+	charmansi "github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
 	extast "github.com/yuin/goldmark/extension/ast"
 	"github.com/yuin/goldmark/text"
+
+	"github.com/agent0ai/spynel/internal/theme"
 )
 
 const (
@@ -26,12 +30,33 @@ const (
 
 // Terminal renders GitHub-flavored Markdown for an ANSI terminal.
 func Terminal(input string, width int) string {
-	width = max(20, width)
-	style := styles.DarkStyleConfig
+	return TerminalWithTheme(input, width, theme.Default())
+}
+
+// TerminalWithTheme renders Markdown with colors drawn exclusively from the
+// active semantic theme.
+func TerminalWithTheme(input string, width int, active theme.Theme) string {
+	width = max(1, width)
+	style := terminalStyle(active)
 	zero := uint(0)
 	style.Document.Margin = &zero
 	style.Document.BlockPrefix = ""
 	style.Document.BlockSuffix = ""
+	style.H1.Prefix = "◆ "
+	// DarkStyleConfig gives H1 a trailing badge cell. Once its background is
+	// removed that invisible suffix still participates in ANSI word wrapping,
+	// which can split short headings at narrow chat widths.
+	style.H1.Suffix = ""
+	style.H2.Prefix = "▸ "
+	style.H3.Prefix = "› "
+	style.H4.Prefix = ""
+	style.H5.Prefix = ""
+	style.H6.Prefix = ""
+	indent := uint(1)
+	indentToken := "│ "
+	style.CodeBlock.Margin = &zero
+	style.CodeBlock.Indent = &indent
+	style.CodeBlock.IndentToken = &indentToken
 	style.CodeBlock.BlockPrefix = codeBlockStart
 	style.CodeBlock.BlockSuffix = codeBlockEnd
 	// Mark the rendered href boundaries before Glamour wraps the document.
@@ -41,7 +66,11 @@ func Terminal(input string, width int) string {
 	style.Link.BlockSuffix = terminalLinkEnd
 	renderer, err := glamour.NewTermRenderer(
 		glamour.WithStyles(style),
-		glamour.WithWordWrap(width),
+		glamour.WithColorProfile(termenv.TrueColor),
+		// Glamour's reflow writer wraps when a word reaches the boundary rather
+		// than only when it exceeds it. Give it the exclusive upper bound so the
+		// public width remains the maximum visible row width.
+		glamour.WithWordWrap(width+1),
 		glamour.WithTableWrap(true),
 		glamour.WithPreservedNewLines(),
 	)
@@ -53,8 +82,86 @@ func Terminal(input string, width int) string {
 		return input
 	}
 	result = applyTerminalLinks(result, terminalLinkTargets(input))
-	return strings.TrimSpace(compactCodeBlockSpacing(result))
+	result = trimTerminalLinePadding(strings.TrimSpace(compactCodeBlockSpacing(result)))
+	return trimTerminalOuterBlankRows(result)
 }
+
+func trimTerminalLinePadding(value string) string {
+	lines := strings.Split(value, "\n")
+	for index, line := range lines {
+		trimmed := strings.TrimRight(charmansi.Strip(line), " \t")
+		lines[index] = charmansi.Truncate(line, charmansi.StringWidth(trimmed), "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func trimTerminalOuterBlankRows(value string) string {
+	lines := strings.Split(value, "\n")
+	for len(lines) > 0 && visuallyBlank(lines[0]) {
+		lines = lines[1:]
+	}
+	for len(lines) > 0 && visuallyBlank(lines[len(lines)-1]) {
+		lines = lines[:len(lines)-1]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func terminalStyle(active theme.Theme) ansi.StyleConfig { //nolint:gocyclo
+	style := styles.DarkStyleConfig
+	if style.CodeBlock.Chroma != nil {
+		chroma := *style.CodeBlock.Chroma
+		style.CodeBlock.Chroma = &chroma
+	}
+	c := active.Colors
+	set := func(primitive *ansi.StylePrimitive, foreground string, background ...string) {
+		primitive.Color = stringPointer(foreground)
+		if len(background) > 0 {
+			primitive.BackgroundColor = stringPointer(background[0])
+		} else {
+			primitive.BackgroundColor = nil
+		}
+	}
+	set(&style.Document.StylePrimitive, c.Text)
+	set(&style.BlockQuote.StylePrimitive, c.TextMuted)
+	set(&style.Paragraph.StylePrimitive, c.Text)
+	set(&style.List.StylePrimitive, c.Text)
+	set(&style.Heading.StylePrimitive, c.Primary)
+	set(&style.H1.StylePrimitive, c.Primary)
+	set(&style.H2.StylePrimitive, c.Primary)
+	set(&style.H3.StylePrimitive, c.Secondary)
+	set(&style.H4.StylePrimitive, c.Secondary)
+	set(&style.H5.StylePrimitive, c.Info)
+	set(&style.H6.StylePrimitive, c.Info)
+	set(&style.Text, c.Text)
+	set(&style.Strikethrough, c.TextMuted)
+	set(&style.Emph, c.Text)
+	set(&style.Strong, c.Primary)
+	set(&style.HorizontalRule, c.Border)
+	set(&style.Item, c.Primary)
+	set(&style.Enumeration, c.Primary)
+	set(&style.Task.StylePrimitive, c.Secondary)
+	set(&style.Link, c.Info)
+	set(&style.LinkText, c.Info)
+	set(&style.Image, c.Secondary)
+	set(&style.ImageText, c.TextMuted)
+	set(&style.Code.StylePrimitive, c.Code, c.SurfaceElevated)
+	set(&style.CodeBlock.StylePrimitive, c.Code)
+	set(&style.Table.StylePrimitive, c.Text)
+	set(&style.DefinitionList.StylePrimitive, c.Text)
+	set(&style.DefinitionTerm, c.Primary)
+	set(&style.DefinitionDescription, c.Text)
+	set(&style.HTMLBlock.StylePrimitive, c.TextMuted)
+	set(&style.HTMLSpan.StylePrimitive, c.TextMuted)
+
+	// Glamour registers custom Chroma styles under one process-global name, so
+	// the first rendered theme otherwise leaks into every later code block.
+	// Render fenced code uniformly with the semantic code role instead.
+	style.CodeBlock.Theme = ""
+	style.CodeBlock.Chroma = nil
+	return style
+}
+
+func stringPointer(value string) *string { return &value }
 
 // compactCodeBlockSpacing removes only blank rendered rows immediately next
 // to code blocks. Boundary markers let this remain independent of ANSI styles
@@ -87,7 +194,7 @@ func compactCodeBlockSpacing(value string) string {
 }
 
 func visuallyBlank(value string) bool {
-	return strings.TrimSpace(ansi.Strip(value)) == ""
+	return strings.TrimSpace(charmansi.Strip(value)) == ""
 }
 
 func terminalLinkTargets(input string) []string {

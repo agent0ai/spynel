@@ -14,8 +14,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/frdel/spynel/internal/core"
-	"github.com/frdel/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/fsx"
 )
 
 type CodexConfig struct {
@@ -51,14 +51,34 @@ type Codex struct {
 	closed   bool
 }
 
+func (*Codex) FollowUpMode() FollowUpMode { return FollowUpSteer }
+
 type turnState struct {
 	key              string
 	threadID         string
 	turnID           string
+	emitMu           sync.RWMutex
 	emit             core.Emit
 	messages         []string
 	currentMessage   strings.Builder
 	separatorPending bool
+}
+
+func (s *turnState) emitEvent(event core.Event) {
+	s.emitMu.RLock()
+	emit := s.emit
+	s.emitMu.RUnlock()
+	if emit != nil {
+		emit(event)
+	}
+}
+
+func (s *turnState) replaceEmit(emit core.Emit) core.Emit {
+	s.emitMu.Lock()
+	previous := s.emit
+	s.emit = emit
+	s.emitMu.Unlock()
+	return previous
 }
 
 type rpcResponse struct {
@@ -220,13 +240,26 @@ func (c *Codex) Send(ctx context.Context, key, prompt string, emit core.Emit) (s
 	active := c.active[threadID]
 	c.mu.Unlock()
 	if active != nil {
+		previousEmit := active.replaceEmit(emit)
 		params := map[string]any{
 			"threadId":       threadID,
 			"expectedTurnId": active.turnID,
 			"input":          []map[string]any{{"type": "text", "text": prompt}},
 		}
 		if _, err := c.call(ctx, "turn/steer", params); err != nil {
+			c.mu.Lock()
+			stillActive := c.active[threadID] == active
+			c.mu.Unlock()
+			if stillActive {
+				active.replaceEmit(previousEmit)
+			}
 			return threadID, true, err
+		}
+		// The newest message owns the rest of the streamed response. Release
+		// transport-local activity associated with the older message without
+		// declaring the underlying harness turn complete.
+		if previousEmit != nil {
+			previousEmit(core.Event{Kind: core.EventStatus, Done: true, ThreadID: threadID, TurnID: active.turnID})
 		}
 		if emit != nil {
 			emit(core.Event{Kind: core.EventStatus, Text: "Steering active Codex turn", ThreadID: threadID, TurnID: active.turnID})
@@ -448,12 +481,10 @@ func (c *Codex) handleNotification(message wireMessage) {
 	case "item/agentMessage/delta":
 		delta, _ := params["delta"].(string)
 		if delta != "" {
-			if state.emit != nil {
-				if state.separatorPending {
-					state.emit(core.Event{Kind: core.EventDelta, Text: "\n", ThreadID: state.threadID, TurnID: state.turnID})
-				}
-				state.emit(core.Event{Kind: core.EventDelta, Text: delta, ThreadID: state.threadID, TurnID: state.turnID})
+			if state.separatorPending {
+				state.emitEvent(core.Event{Kind: core.EventDelta, Text: "\n", ThreadID: state.threadID, TurnID: state.turnID})
 			}
+			state.emitEvent(core.Event{Kind: core.EventDelta, Text: delta, ThreadID: state.threadID, TurnID: state.turnID})
 			state.separatorPending = false
 			state.currentMessage.WriteString(delta)
 		}
@@ -473,9 +504,7 @@ func (c *Codex) handleNotification(message wireMessage) {
 	case "error":
 		errorObject, _ := params["error"].(map[string]any)
 		text, _ := errorObject["message"].(string)
-		if state.emit != nil {
-			state.emit(core.Event{Kind: core.EventError, Text: text, ThreadID: state.threadID, TurnID: state.turnID})
-		}
+		state.emitEvent(core.Event{Kind: core.EventError, Text: text, ThreadID: state.threadID, TurnID: state.turnID})
 	case "turn/completed":
 		turn, _ := params["turn"].(map[string]any)
 		status, _ := turn["status"].(string)
@@ -484,6 +513,10 @@ func (c *Codex) handleNotification(message wireMessage) {
 			messages = append(messages, text)
 		}
 		text := strings.Join(messages, "\n")
+		finalText := ""
+		if len(messages) > 0 {
+			finalText = messages[len(messages)-1]
+		}
 		kind := core.EventFinal
 		if status == "failed" {
 			kind = core.EventError
@@ -492,10 +525,9 @@ func (c *Codex) handleNotification(message wireMessage) {
 					text = message
 				}
 			}
+			finalText = text
 		}
-		if state.emit != nil {
-			state.emit(core.Event{Kind: kind, Text: text, ThreadID: state.threadID, TurnID: state.turnID, Done: true})
-		}
+		state.emitEvent(core.Event{Kind: kind, Text: text, FinalText: &finalText, ThreadID: state.threadID, TurnID: state.turnID, Done: true})
 		c.mu.Lock()
 		delete(c.active, state.threadID)
 		c.mu.Unlock()
@@ -620,9 +652,7 @@ func (c *Codex) failAll(err error) {
 		waiter <- rpcResponse{Error: &rpcError{Code: -1, Message: err.Error()}}
 	}
 	for _, state := range active {
-		if state.emit != nil {
-			state.emit(core.Event{Kind: core.EventError, Text: err.Error(), ThreadID: state.threadID, TurnID: state.turnID, Done: true})
-		}
+		state.emitEvent(core.Event{Kind: core.EventError, Text: err.Error(), ThreadID: state.threadID, TurnID: state.turnID, Done: true})
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,25 +16,31 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/frdel/spynel/internal/app"
-	"github.com/frdel/spynel/internal/channel"
-	"github.com/frdel/spynel/internal/channel/telegram"
-	"github.com/frdel/spynel/internal/channel/tui"
-	"github.com/frdel/spynel/internal/channel/whatsapp"
-	"github.com/frdel/spynel/internal/config"
-	"github.com/frdel/spynel/internal/core"
-	"github.com/frdel/spynel/internal/extensions"
-	"github.com/frdel/spynel/internal/harness"
-	"github.com/frdel/spynel/internal/media"
-	"github.com/frdel/spynel/internal/orchestrator"
-	startupmanager "github.com/frdel/spynel/internal/startup"
-	"github.com/frdel/spynel/internal/workspace"
+	"github.com/agent0ai/spynel/internal/app"
+	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/channel/telegram"
+	"github.com/agent0ai/spynel/internal/channel/tui"
+	"github.com/agent0ai/spynel/internal/channel/whatsapp"
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/history"
+	"github.com/agent0ai/spynel/internal/instance"
+	"github.com/agent0ai/spynel/internal/localapi"
+	"github.com/agent0ai/spynel/internal/media"
+	"github.com/agent0ai/spynel/internal/orchestrator"
+	startupmanager "github.com/agent0ai/spynel/internal/startup"
+	"github.com/agent0ai/spynel/internal/theme"
+	"github.com/agent0ai/spynel/internal/updater"
+	"github.com/agent0ai/spynel/internal/workspace"
 )
 
 const (
 	initialTUIHistoryMessages = 500
 	initialTUIHistoryChars    = 500000
 	restartNoticeDelay        = 200 * time.Millisecond
+	npmUpdateExitCode         = 75
 )
 
 func Run(args []string, version string) error {
@@ -73,6 +80,7 @@ func run(args []string, version string) error {
 		flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 		configPath := flags.String("config", "", "path to spynel.yaml")
 		withTUI := flags.Bool("tui", false, "also launch the terminal UI")
+		flags.Bool("automatic-startup", false, "identify a non-interactive operating-system startup")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -88,6 +96,20 @@ func run(args []string, version string) error {
 			return errors.New("run currently requires --once; use 'spynel serve' for the continuous loop")
 		}
 		return runOnce(*configPath, version)
+	case "message", "send":
+		return runSendCommand(args[0], args[1:], version, false)
+	case "followup", "follow-up":
+		return runSendCommand("followup", args[1:], version, true)
+	case "notify":
+		return runNotifyCommand(args[1:], version)
+	case "command":
+		return runFrameworkCLICommand("", args[1:], version)
+	case "status":
+		return runStatusCLICommand(args[1:], version, os.Stdout)
+	case "jobs", "job", "log", "logs", "stop", "new", "clear", "history", "harness", "model", "telegram", "restart", "update":
+		return runFrameworkCLICommand(args[0], args[1:], version)
+	case "conversation", "conversations":
+		return runConversationCommand(args[1:], os.Stdout)
 	case "task", "todo", "goal":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: spynel %s <request>", args[0])
@@ -100,13 +122,24 @@ func run(args []string, version string) error {
 		if args[0] == "goal" {
 			route = "goals"
 		}
-		path, err := orchestrator.Create(cfg, route, strings.Join(args[1:], " "), "")
+		request := strings.Join(args[1:], " ")
+		if route == "tasks" {
+			_, _ = history.New(cfg.StatePath("history")).Append("cli", "local", history.Entry{Role: "user", Sender: "cli", Content: "/task " + request})
+		}
+		options := orchestrator.CreateOptions{}
+		if route == "tasks" {
+			options = orchestrator.CreateOptions{Notify: true, Origin: "cli/local", Outcomes: []string{"done", "failed", "waiting", "cancelled"}}
+		}
+		path, err := orchestrator.CreateWithOptions(cfg, route, request, "", options)
 		if err != nil {
 			return err
 		}
 		fmt.Println(path)
 		return nil
 	case "config":
+		if len(args) > 1 {
+			return runFrameworkCLICommand("config", args[1:], version)
+		}
 		cfg, err := config.Load("")
 		if err != nil {
 			return err
@@ -118,10 +151,10 @@ func run(args []string, version string) error {
 	case "extension", "extensions":
 		return extensionCommand(args[1:])
 	case "whatsapp":
-		if len(args) != 2 || args[1] != "pair" {
-			return errors.New("usage: spynel whatsapp pair")
+		if len(args) == 2 && args[1] == "pair" {
+			return pairWhatsApp()
 		}
-		return pairWhatsApp()
+		return runFrameworkCLICommand("whatsapp", args[1:], version)
 	default:
 		return fmt.Errorf("unknown command %q; run 'spynel help'", args[0])
 	}
@@ -133,6 +166,35 @@ type restartRequest struct {
 
 func (r *restartRequest) Error() string {
 	return "restart Spynel"
+}
+
+type updateRequest struct {
+	args []string
+}
+
+func (*updateRequest) Error() string { return "update Spynel through npm" }
+func (r *updateRequest) ExitCode() int {
+	r.writeRestartArgs()
+	return npmUpdateExitCode
+}
+
+func (r *updateRequest) writeRestartArgs() {
+	requestPath := strings.TrimSpace(os.Getenv("SPYNEL_NPM_UPDATE_STATE"))
+	if requestPath == "" || filepath.Clean(filepath.Dir(requestPath)) != filepath.Clean(os.TempDir()) || !strings.HasPrefix(filepath.Base(requestPath), "spynel-update-") {
+		return
+	}
+	data, err := json.Marshal(struct {
+		Args []string `json:"args"`
+	}{Args: append([]string(nil), r.args...)})
+	if err != nil {
+		return
+	}
+	file, err := os.OpenFile(requestPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = file.Write(append(data, '\n'))
+	_ = file.Close()
 }
 
 func completeRun(err error, restart func([]string) error) error {
@@ -163,126 +225,192 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	service, err := buildService(cfg, version)
+	election, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
 	if err != nil {
 		return err
 	}
-	launchTUI := withTUI || (cfg.Channels.TUI.Enabled && len(os.Args) == 1)
-	if err := service.Start(ctx); err != nil {
-		service.Runtime.Log("Harness unavailable: " + err.Error())
+	hadHealthyPrimary := false
+	if lease, leaseErr := election.Current(); leaseErr == nil {
+		hadHealthyPrimary = !election.IsStale(lease)
 	}
-	service.Runtime.Log("Spynel started")
-	defer service.Harness.Close()
+	launchTUI := withTUI || (cfg.Channels.TUI.Enabled && len(os.Args) == 1)
+	var restartScheduled atomic.Bool
 	var restarting atomic.Bool
-	go func() {
-		select {
-		case <-ctx.Done():
+	var updateScheduled atomic.Bool
+	var updating atomic.Bool
+	requestRestart := func() {
+		if !restartScheduled.CompareAndSwap(false, true) {
 			return
-		case <-service.RestartRequests():
 		}
-		timer := time.NewTimer(restartNoticeDelay)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
+		go func() {
+			timer := time.NewTimer(restartNoticeDelay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+			case <-timer.C:
+				restarting.Store(true)
+				cancel()
+			}
+		}()
+	}
+	requestUpdate := func() {
+		if !updateScheduled.CompareAndSwap(false, true) {
 			return
-		case <-timer.C:
-			restarting.Store(true)
+		}
+		go func() {
+			timer := time.NewTimer(restartNoticeDelay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+			case <-timer.C:
+				updating.Store(true)
+				cancel()
+			}
+		}()
+	}
+	ownerResult := make(chan error, 1)
+	go func() {
+		ownerErr := runOwnerElection(ctx, cfg, version, election, requestRestart, requestUpdate)
+		ownerResult <- ownerErr
+		if ownerErr != nil {
 			cancel()
 		}
 	}()
+	ownerFinished := false
 	serverResult := func(err error) error {
 		cancel()
+		if !ownerFinished {
+			ownerErr := <-ownerResult
+			ownerFinished = true
+			if err == nil && ownerErr != nil {
+				err = ownerErr
+			}
+		}
+		if updating.Load() {
+			return &updateRequest{args: append([]string(nil), restartArgs...)}
+		}
 		if restarting.Load() {
 			return &restartRequest{args: append([]string(nil), restartArgs...)}
 		}
 		return err
 	}
-	errorsChannel := make(chan error, 4)
-	connectionEvents := make(chan channel.ConnectionStatus, 32)
-	reportConnection := func(status channel.ConnectionStatus) {
-		service.SetConnectionStatus(status)
-		select {
-		case connectionEvents <- status:
-		default:
+	client := localapi.NewClient(election)
+	ready := make(chan struct {
+		state app.SharedState
+		err   error
+	}, 1)
+	go func() {
+		state, waitErr := client.WaitReady(ctx)
+		ready <- struct {
+			state app.SharedState
+			err   error
+		}{state: state, err: waitErr}
+	}()
+	var shared app.SharedState
+	select {
+	case result := <-ready:
+		if result.err != nil {
+			return serverResult(result.err)
 		}
+		shared = result.state
+	case err := <-ownerResult:
+		ownerFinished = true
+		return serverResult(err)
+	case <-ctx.Done():
+		return serverResult(nil)
 	}
-	go runOrchestratorWhenReady(ctx, service, errorsChannel)
-	startChannels(ctx, service, reportConnection)
 	if launchTUI {
-		initialHistory, _, err := service.History.RecentEntries("tui", "local", initialTUIHistoryMessages, initialTUIHistoryChars)
+		themes, themeErr := theme.LoadDir(cfg.StatePath("themes"))
+		if themeErr != nil {
+			return serverResult(fmt.Errorf("load TUI themes: %w", themeErr))
+		}
+		activeTheme := theme.Selected(themes, shared.Theme)
+		if _, found := theme.Find(themes, shared.Theme); !found {
+			if saveErr := client.ApplySettings(ctx, map[string]string{"channels.tui.theme": activeTheme.Name}); saveErr != nil {
+				return serverResult(fmt.Errorf("restore missing TUI theme: %w", saveErr))
+			}
+		}
+		histories := history.New(cfg.StatePath("history"))
+		lease, leaseErr := election.Current()
+		becameInitialPrimary := leaseErr == nil && shouldResumeTUIHistory(hadHealthyPrimary, lease, election.ID())
+		conversation, err := selectTUIConversation(histories, election.ID(), becameInitialPrimary)
 		if err != nil {
-			cancel()
-			return fmt.Errorf("load TUI history: %w", err)
+			return serverResult(fmt.Errorf("select startup TUI history: %w", err))
 		}
-		var initialScreen *core.Screen
-		hasHistory, historyErr := service.History.HasEntries("tui", "local")
+		initialHistory, _, err := histories.RecentEntries("tui", conversation, initialTUIHistoryMessages, initialTUIHistoryChars)
+		if err != nil {
+			return serverResult(fmt.Errorf("load TUI history: %w", err))
+		}
+		hasHistory, historyErr := histories.HasEntries("tui", conversation)
 		if historyErr != nil {
-			cancel()
-			return fmt.Errorf("inspect TUI history: %w", historyErr)
+			return serverResult(fmt.Errorf("inspect TUI history: %w", historyErr))
 		}
-		if !hasHistory {
-			if availability, ok := service.Harness.(harness.Availability); ok {
-				if ready, _ := availability.Available(); !ready {
-					screen := service.HarnessScreen(true)
-					initialScreen = &screen
-				}
-			}
-			if initialScreen == nil {
-				initialScreen, err = service.InitialWelcome()
-				if err != nil {
-					cancel()
-					return fmt.Errorf("load welcome screen: %w", err)
-				}
-			}
+		initialScreen, err := client.InitialScreen(ctx, hasHistory, !becameInitialPrimary)
+		if err != nil {
+			return serverResult(fmt.Errorf("load initial TUI screen: %w", err))
 		}
-		err = tui.Run(ctx, cfg.Channels.TUI.Title, service.Handle, app.SlashCommands(), initialHistory, tui.Options{
-			Attachments:        cfg.StatePath("attachments"),
-			TitlePath:          cfg.StatePath("tui-title"),
-			TitleEvents:        service.TitleChanges(),
-			ConnectionEvents:   connectionEvents,
-			PairingEvents:      service.PairingEvents(),
-			NoticeEvents:       service.NoticeEvents(),
-			InitialConnections: initialConnectionStatuses(cfg),
-			RuntimeEvents:      service.Runtime.Updates(),
-			InitialRuntime:     service.Runtime.Status(),
+		stateEvents := startTUIStatePolling(ctx, client, shared, cfg.StatePath("themes"))
+		notificationEvents := watchTaskNotifications(ctx, histories.Path("tui", conversation))
+		err = tui.Run(ctx, shared.Title, client.Handle, app.SlashCommands(), initialHistory, tui.Options{
+			Conversation: conversation,
+			Attachments:  cfg.StatePath("attachments"),
+			TitlePath:    cfg.StatePath("tui-title"),
+			TitleEvents:  stateEvents.titles,
+			Themes:       themes,
+			InitialTheme: activeTheme,
+			ThemeEvents:  stateEvents.themes,
+			SaveTheme: func(name string) error {
+				return client.ApplySettings(ctx, map[string]string{"channels.tui.theme": name})
+			},
+			LoadThemes: func() ([]theme.Theme, error) {
+				return theme.LoadDir(cfg.StatePath("themes"))
+			},
+			ConnectionEvents:   stateEvents.connections,
+			PairingEvents:      stateEvents.pairings,
+			NoticeEvents:       stateEvents.notices,
+			NotificationEvents: notificationEvents,
+			AckNotification:    func(id string, after int) error { return client.AckNotification(ctx, "tui/"+conversation, id, after) },
+			InitialConnections: shared.Connections,
+			RuntimeEvents:      stateEvents.runtime,
+			InitialRuntime:     shared.Runtime,
 			SaveSettings: func(values map[string]string) error {
-				_, saveErr := service.ApplySettings(values)
-				return saveErr
+				return client.ApplySettings(ctx, values)
 			},
 			InitialScreen: initialScreen,
-			ScreenAction:  service.ScreenAction,
+			ScreenAction:  client.ScreenAction,
 		})
 		return serverResult(err)
 	}
 	select {
 	case <-ctx.Done():
 		return serverResult(nil)
-	case err := <-errorsChannel:
-		if errors.Is(err, context.Canceled) {
-			return serverResult(nil)
-		}
+	case err := <-ownerResult:
+		ownerFinished = true
 		return serverResult(err)
 	}
+}
+
+func shouldResumeTUIHistory(hadHealthyPrimary bool, lease instance.Lease, instanceID string) bool {
+	return !hadHealthyPrimary && lease.InstanceID == instanceID && lease.HandoffTo == ""
+}
+
+func selectTUIConversation(histories *history.Store, instanceID string, resumeLatest bool) (string, error) {
+	if resumeLatest {
+		latest, found, err := histories.Latest("tui")
+		if err != nil {
+			return "", err
+		}
+		if found {
+			return latest.Conversation, nil
+		}
+	}
+	return "local-" + instanceID, nil
 }
 
 func interactiveTerminal() bool {
 	input, inputErr := os.Stdin.Stat()
 	output, outputErr := os.Stdout.Stat()
 	return inputErr == nil && outputErr == nil && input.Mode()&os.ModeCharDevice != 0 && output.Mode()&os.ModeCharDevice != 0
-}
-
-func runOrchestratorWhenReady(ctx context.Context, service *app.Service, errorsChannel chan<- error) {
-	if availability, ok := service.Harness.(harness.Availability); ok {
-		if ready, _ := availability.Available(); !ready {
-			select {
-			case <-ctx.Done():
-				errorsChannel <- ctx.Err()
-				return
-			case <-availability.ReadyEvents():
-			}
-		}
-	}
-	errorsChannel <- service.Orchestrator.Run(ctx)
 }
 
 func runOnce(configPath, version string) error {
@@ -292,6 +420,11 @@ func runOnce(configPath, version string) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if client, active, clientErr := activeWorkspaceClient(ctx, cfg); clientErr != nil {
+		return clientErr
+	} else if active {
+		return client.RunOnce(ctx)
+	}
 	service, err := buildService(cfg, version)
 	if err != nil {
 		return err
@@ -306,20 +439,206 @@ func runOnce(configPath, version string) error {
 	return service.Orchestrator.WaitForIdle(ctx)
 }
 
-func buildService(cfg config.Config, version string) (*app.Service, error) {
-	runtimeState := app.NewRuntime()
-	registry := harness.NewRegistry()
-	registry.Register("codex", func(runtimeConfig harness.HarnessConfig) (harness.Harness, error) {
-		return harness.NewCodex(harness.CodexConfig{
-			Command: runtimeConfig.Command, Cwd: runtimeConfig.Cwd, Model: runtimeConfig.Model,
-			Effort: runtimeConfig.Effort, ApprovalPolicy: runtimeConfig.ApprovalPolicy,
-			Sandbox: runtimeConfig.Sandbox, Network: runtimeConfig.Network,
-			SessionsFile: runtimeConfig.SessionsFile, Version: runtimeConfig.Version, Stderr: runtimeConfig.Stderr,
+func runMessage(configPath, conversation, text, version string) error {
+	return runMessageMode(configPath, conversation, text, version, messageRunOptions{Output: os.Stdout})
+}
+
+func runMessageMode(configPath, conversation, text, version string, options messageRunOptions) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	text, err = addCLIAttachments(ctx, cfg, text, options.Attachments)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(text) == "" {
+		return errors.New("message text or at least one attachment is required")
+	}
+	if client, active, clientErr := activeWorkspaceClient(ctx, cfg); clientErr != nil {
+		return clientErr
+	} else if active {
+		return runMessageWithOutput(ctx, client.Handle, conversation, text, options)
+	} else if options.FollowupOnly {
+		return errors.New("followup requires a running Spynel server with an active execution; start `spynel serve` first")
+	}
+	service, err := buildService(cfg, version)
+	if err != nil {
+		return err
+	}
+	// Match server mode: the supervisor retains a harness startup error, but
+	// message.received extensions still get the opportunity to answer, reject,
+	// or rewrite the input. If no extension completes the operation, Handle
+	// reaches the supervisor and returns the original availability failure.
+	_ = service.Start(ctx)
+	defer service.Harness.Close()
+
+	return runMessageWithOutput(ctx, service.Handle, conversation, text, options)
+}
+
+func addCLIAttachments(ctx context.Context, cfg config.Config, text string, sources []string) (string, error) {
+	for _, source := range sources {
+		file, openErr := os.Open(source)
+		if openErr != nil {
+			return "", fmt.Errorf("open attachment %s: %w", filepath.Base(source), openErr)
+		}
+		attachment, saveErr := (media.Store{
+			Directory: cfg.StatePath("attachments", "cli"),
+			MaxBytes:  int64(cfg.Workspace.AttachmentMaxMB) * 1024 * 1024,
+		}).Save(ctx, filepath.Base(source), file)
+		closeErr := file.Close()
+		if saveErr != nil {
+			return "", fmt.Errorf("save attachment %s: %w", filepath.Base(source), saveErr)
+		}
+		if closeErr != nil {
+			return "", closeErr
+		}
+		text = strings.TrimSpace(text + "\n\n" + attachment.Token())
+	}
+	return text, nil
+}
+
+func activeWorkspaceClient(ctx context.Context, cfg config.Config) (*localapi.Client, bool, error) {
+	election, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	if err != nil {
+		return nil, false, err
+	}
+	lease, err := election.Current()
+	if os.IsNotExist(err) || (err == nil && election.IsStale(lease)) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	client := localapi.NewClient(election)
+	if _, err := client.WaitReady(ctx); err != nil {
+		return nil, false, err
+	}
+	return client, true, nil
+}
+
+func runMessageWithHandler(ctx context.Context, handler channel.Handler, conversation, messageText string) error {
+	return runMessageWithOutput(ctx, handler, conversation, messageText, messageRunOptions{Output: os.Stdout})
+}
+
+func runMessageWithOutput(ctx context.Context, handler channel.Handler, conversation, messageText string, options messageRunOptions) error {
+	output := options.Output
+	if output == nil {
+		output = os.Stdout
+	}
+	events := make(chan core.Event, 64)
+	dispatched := make(chan error, 1)
+	go func() {
+		dispatched <- handler(ctx, core.Message{
+			Channel: "cli", Conversation: conversation, Sender: "cli", Text: messageText, FollowupOnly: options.FollowupOnly,
+		}, func(event core.Event) {
+			select {
+			case events <- event:
+			case <-ctx.Done():
+			}
 		})
-	})
-	registry.Register("claude-code", func(runtimeConfig harness.HarnessConfig) (harness.Harness, error) {
-		return harness.NewClaude(runtimeConfig)
-	})
+	}()
+
+	var streamed strings.Builder
+	handlerDone := false
+	awaitTerminal := false
+	for {
+		if handlerDone && !awaitTerminal {
+			// Framework hooks may intentionally cancel a message without a
+			// visible reply. Drain an event already emitted before Handle
+			// returned, but do not leave a script waiting forever for one.
+			select {
+			case event := <-events:
+				if !event.Done {
+					awaitTerminal = true
+				}
+				if done, err := writeCLIEvent(output, &streamed, event, options); done || err != nil {
+					return err
+				}
+				continue
+			default:
+				return nil
+			}
+		}
+		select {
+		case err := <-dispatched:
+			dispatched = nil
+			if err != nil {
+				return err
+			}
+			handlerDone = true
+		case event := <-events:
+			if !event.Done {
+				awaitTerminal = true
+			}
+			if done, err := writeCLIEvent(output, &streamed, event, options); done || err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func writeCLIEvent(output io.Writer, streamed *strings.Builder, event core.Event, options messageRunOptions) (bool, error) {
+	if options.JSON {
+		if err := json.NewEncoder(output).Encode(event); err != nil {
+			return false, err
+		}
+	} else if options.Stream && event.Kind == core.EventDelta {
+		if _, err := fmt.Fprint(output, event.Text); err != nil {
+			return false, err
+		}
+		streamed.WriteString(event.Text)
+	}
+	if !event.Done {
+		return false, nil
+	}
+	switch event.Kind {
+	case core.EventError:
+		if options.Stream && streamed.Len() > 0 {
+			_, _ = fmt.Fprintln(output)
+		}
+		if strings.TrimSpace(event.Text) == "" {
+			return true, errors.New("harness turn failed")
+		}
+		return true, errors.New(event.Text)
+	case core.EventFinal, core.EventStatus:
+		if !options.JSON && event.Text != "" {
+			if options.Stream && streamed.Len() > 0 {
+				if suffix := strings.TrimPrefix(event.Text, streamed.String()); suffix != event.Text {
+					_, _ = fmt.Fprint(output, suffix)
+				} else if event.Text != streamed.String() {
+					_, _ = fmt.Fprint(output, "\n"+event.Text)
+				}
+				_, _ = fmt.Fprintln(output)
+			} else {
+				text := event.Text
+				if event.Kind == core.EventFinal && event.FinalText != nil {
+					text = *event.FinalText
+				}
+				if _, err := fmt.Fprintln(output, text); err != nil {
+					return false, err
+				}
+			}
+		} else if !options.JSON && options.Stream && streamed.Len() > 0 {
+			if _, err := fmt.Fprintln(output); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func buildService(cfg config.Config, version string) (*app.Service, error) {
+	if err := workspace.Upgrade(cfg.Root); err != nil {
+		return nil, fmt.Errorf("upgrade Spynel workspace: %w", err)
+	}
+	runtimeState := app.NewRuntime()
+	registry := harness.NewBuiltinRegistry()
 	command, commandErr := harness.ResolveCommand(cfg.Harness.Name, nil)
 	if commandErr != nil {
 		if definition, ok := harness.Lookup(cfg.Harness.Name); ok {
@@ -334,6 +653,10 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 		Version: version, Stderr: runtimeState,
 	})
 	service := app.NewWithRuntime(cfg, target, runtimeState)
+	service.Updates = updater.Detect(version, cfg.StatePath("runtime", "application-version.json"))
+	if err := service.Updates.Migrate(context.Background(), cfg, cfg.Extensions.Enabled, service.Hooks); err != nil {
+		return nil, fmt.Errorf("migrate Spynel workspace from application update: %w", err)
+	}
 	startup, err := startupmanager.New("")
 	if err != nil {
 		return nil, fmt.Errorf("initialize startup manager: %w", err)
@@ -342,9 +665,9 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 	return service, nil
 }
 
-func startChannels(ctx context.Context, service *app.Service, report channel.StatusReporter) {
+func startChannels(ctx context.Context, service *app.Service, report channel.StatusReporter) <-chan error {
 	initial := service.Settings.Snapshot()
-	speech := media.NewWhisper(service.Settings, initial.StatePath("models", "whisper"), initial.StatePath("runtime", "speech"), service.Runtime)
+	speech := media.NewParakeet(service.Settings, initial.StatePath("models", "parakeet"), service.Runtime)
 	managed := []channel.Managed{
 		{
 			Name:    "telegram",
@@ -393,11 +716,17 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 		},
 	}
 	supervisor := channel.NewSupervisor(service.Settings, service.Handle, managed, report, service.Runtime)
+	service.PairingControl = supervisor
+	service.DeliveryControl = supervisor
+	done := make(chan error, 1)
 	go func() {
-		if err := supervisor.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		err := supervisor.Run(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
 			service.Runtime.Log("channel supervisor: " + err.Error())
 		}
+		done <- err
 	}()
+	return done
 }
 
 func configFingerprint(value any) string {
@@ -527,12 +856,29 @@ Usage:
   spynel serve [--tui]           Run Telegram, WhatsApp, and the loop as a server
   spynel init [--dir DIR]        Initialize and continue into the TUI
     --no-start                   Initialize only (for scripts and automation)
+  spynel send [flags] TEXT       Send or stream a message (message is an alias)
+  spynel message [flags] TEXT    Backward-compatible alias for send
+    --config PATH                Load an explicit workspace configuration
+    --conversation NAME          Reuse a durable CLI conversation (default local)
+    --stream                     Print response deltas as they arrive
+    --json                       Emit every response event as NDJSON
+    --stdin                      Read the message body from standard input
+    --attach PATH                Copy and attach a file (repeatable)
+  spynel followup [flags] TEXT   Steer an active server-side CLI conversation
+  spynel notify --origin O TEXT Queue a proactive assistant notification
+  spynel conversations list     List disk-backed conversations
+  spynel conversations show     Read a bounded conversation tail
+  spynel conversations resume   Branch any saved conversation into CLI
+  spynel status [flags]          Show workspace and current conversation status
+  spynel command [flags] NAME    Run any non-visual framework slash command
+  spynel jobs|log|stop|clear...  Concise aliases for common framework commands
+	spynel update                  Check npm for an update (/update install applies it)
   spynel run --once              Dispatch one orchestration scan and wait
   spynel task REQUEST            Create a task markdown file
   spynel goal OBJECTIVE          Create a goal markdown file
   spynel extension ...           List, install, or remove Git extensions
   spynel whatsapp pair           Pair a WhatsApp account by QR code
-  spynel config                  Validate and locate spynel.yaml
+  spynel config [get|set ...]    Validate config or run the shared config command
   spynel doctor                  Check local configuration and prerequisites
   spynel version                 Print the binary version
 `

@@ -8,18 +8,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/frdel/spynel/internal/channel"
-	"github.com/frdel/spynel/internal/config"
-	"github.com/frdel/spynel/internal/core"
-	markdownfmt "github.com/frdel/spynel/internal/markdown"
-	"github.com/frdel/spynel/internal/media"
+	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
+	markdownfmt "github.com/agent0ai/spynel/internal/markdown"
+	"github.com/agent0ai/spynel/internal/media"
 )
 
 type Bot struct {
@@ -65,6 +68,31 @@ func (b *Bot) SetMedia(store *media.Store, speech media.Transcriber) {
 	b.speech = speech
 }
 
+func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string) error {
+	var chatID string
+	if strings.HasPrefix(conversation, "TG-group-") {
+		if b.config.GroupMode == "off" {
+			return errors.New("Telegram group delivery is disabled")
+		}
+		chatID = strings.TrimPrefix(conversation, "TG-group-")
+	} else if strings.HasPrefix(conversation, "TG-") {
+		chatID = strings.TrimPrefix(conversation, "TG-")
+		authorized := false
+		for _, allowed := range b.config.AllowedUsers {
+			authorized = authorized || strings.TrimSpace(strings.TrimPrefix(allowed, "@")) == chatID
+		}
+		if !authorized {
+			return errors.New("Telegram origin is not in allowed_users")
+		}
+	} else {
+		return errors.New("invalid Telegram conversation origin")
+	}
+	if _, err := strconv.ParseInt(chatID, 10, 64); err != nil {
+		return errors.New("invalid Telegram chat identifier")
+	}
+	return b.send(ctx, chatID, text, 0)
+}
+
 func (b *Bot) Run(ctx context.Context, handler channel.Handler) error {
 	if b.token == "" {
 		err := errors.New("Telegram is enabled but no token is configured")
@@ -73,6 +101,11 @@ func (b *Bot) Run(ctx context.Context, handler channel.Handler) error {
 	}
 	if !hasAllowedUser(b.config.AllowedUsers) {
 		err := errors.New("Telegram is enabled but its allowed-users whitelist is empty")
+		b.reportStatus(channel.ConnectionError, err.Error())
+		return err
+	}
+	if b.config.Mode == "webhook" && strings.TrimSpace(b.config.WebhookSecret) == "" {
+		err := errors.New("Telegram webhook mode requires a verification secret")
 		b.reportStatus(channel.ConnectionError, err.Error())
 		return err
 	}
@@ -170,7 +203,7 @@ func (b *Bot) runWebhook(ctx context.Context, handler channel.Handler) error {
 			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if secret := b.config.WebhookSecret; secret != "" && subtle.ConstantTimeCompare([]byte(request.Header.Get("X-Telegram-Bot-Api-Secret-Token")), []byte(secret)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(request.Header.Get("X-Telegram-Bot-Api-Secret-Token")), []byte(b.config.WebhookSecret)) != 1 {
 			http.Error(writer, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -193,15 +226,12 @@ func (b *Bot) runWebhook(ctx context.Context, handler channel.Handler) error {
 	serveError := make(chan error, 1)
 	go func() { serveError <- server.Serve(listener) }()
 	publicURL := strings.TrimRight(b.config.WebhookURL, "/") + path
-	payload := map[string]any{"url": publicURL, "allowed_updates": []string{"message"}}
-	if b.config.WebhookSecret != "" {
-		payload["secret_token"] = b.config.WebhookSecret
-	}
+	payload := map[string]any{"url": publicURL, "allowed_updates": []string{"message"}, "secret_token": b.config.WebhookSecret}
 	if err := b.post(ctx, "setWebhook", payload); err != nil {
 		_ = server.Close()
 		return err
 	}
-	b.reportStatus(channel.ConnectionConnected, "webhook "+publicURL+" via "+listener.Addr().String())
+	b.reportStatus(channel.ConnectionConnected, "webhook connected via "+listener.Addr().String())
 	select {
 	case <-ctx.Done():
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -268,17 +298,27 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 		b.notice(channel.Notice{Channel: b.Name(), Sender: b.sender(message.From), Text: preview})
 	}
 	emit := func(event core.Event) {
-		if !event.Done {
+		if !event.Done || event.Continues || (event.Kind != core.EventFinal && event.Kind != core.EventError) {
 			return
 		}
+		defer finishActivity()
 		text := event.Text
+		if event.FinalText != nil {
+			text = *event.FinalText
+		}
 		if text == "" && event.Kind == core.EventError {
 			text = "The harness turn failed."
 		}
 		if text != "" {
 			_ = b.send(context.Background(), chatID, text, message.MessageID)
+			message.MessageID = 0
 		}
-		finishActivity()
+		for _, attachment := range event.Attachments {
+			if err := b.sendAttachment(context.Background(), chatID, attachment, message.MessageID); err != nil {
+				_ = b.send(context.Background(), chatID, "Spynel attachment delivery error: "+err.Error(), message.MessageID)
+			}
+			message.MessageID = 0
+		}
 	}
 	err = handler(ctx, core.Message{
 		Channel: b.Name(), Conversation: b.conversationID(message), Sender: b.sender(message.From),
@@ -443,6 +483,59 @@ func (b *Bot) send(ctx context.Context, chatID, text string, replyTo int64) erro
 			return err
 		}
 		replyTo = 0
+	}
+	return nil
+}
+
+func (b *Bot) sendAttachment(ctx context.Context, chatID string, attachment core.OutboundAttachment, replyTo int64) error {
+	file, err := media.OpenOutbound(attachment)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	method, field := "sendDocument", "document"
+	if attachment.Kind == "photo" {
+		method, field = "sendPhoto", "photo"
+	}
+	reader, pipe := io.Pipe()
+	writer := multipart.NewWriter(pipe)
+	contentType := writer.FormDataContentType()
+	go func() {
+		writeErr := writer.WriteField("chat_id", chatID)
+		if writeErr == nil && replyTo > 0 {
+			writeErr = writer.WriteField("reply_parameters", fmt.Sprintf(`{"message_id":%d}`, replyTo))
+		}
+		if writeErr == nil {
+			var part io.Writer
+			part, writeErr = writer.CreateFormFile(field, filepath.Base(attachment.Name))
+			if writeErr == nil {
+				_, writeErr = io.Copy(part, file)
+			}
+		}
+		if closeErr := writer.Close(); writeErr == nil {
+			writeErr = closeErr
+		}
+		_ = pipe.CloseWithError(writeErr)
+	}()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, b.endpoint(method), reader)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", contentType)
+	response, err := b.client.Do(request)
+	if err != nil {
+		return b.redact(err)
+	}
+	defer response.Body.Close()
+	var envelope struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK || !envelope.OK {
+		return fmt.Errorf("Telegram %s: %s", method, envelope.Description)
 	}
 	return nil
 }

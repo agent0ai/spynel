@@ -14,9 +14,10 @@ func TestSetSettingParsesSharedCommandValues(t *testing.T) {
 		{"workspace.history_max_messages", "24"},
 		{"harness.name", "claude"},
 		{"harness.sandbox", "unrestricted"},
+		{"channels.tui.theme", "catppuccin-latte"},
 		{"channels.telegram.allowed_users", "@one, 42"},
 		{"channels.whatsapp.mode", "dedicated"},
-		{"speech.model", "small"},
+		{"speech.language", "fr"},
 		{"orchestrator.interval_seconds", "15"},
 		{"extensions.hook_timeout", "45s"},
 	} {
@@ -24,8 +25,24 @@ func TestSetSettingParsesSharedCommandValues(t *testing.T) {
 			t.Fatalf("set %s: %v", test.key, err)
 		}
 	}
-	if cfg.Workspace.HistoryMaxMessages != 24 || cfg.Harness.Name != "claude-code" || cfg.Harness.Sandbox != "danger-full-access" || len(cfg.Channels.Telegram.AllowedUsers) != 2 || cfg.Channels.WhatsApp.Mode != "dedicated" || cfg.Speech.Model != "small" || cfg.Orchestrator.IntervalSec != 15 || cfg.Extensions.HookTimeout != "45s" {
+	if cfg.Workspace.HistoryMaxMessages != 24 || cfg.Harness.Name != "claude-code" || cfg.Harness.Sandbox != "danger-full-access" || cfg.Channels.TUI.Theme != "catppuccin-latte" || len(cfg.Channels.Telegram.AllowedUsers) != 2 || cfg.Channels.WhatsApp.Mode != "dedicated" || cfg.Speech.Language != "fr" || cfg.Orchestrator.IntervalSec != 15 || cfg.Extensions.HookTimeout != "45s" {
 		t.Fatalf("unexpected config after settings: %#v", cfg)
+	}
+}
+
+func TestSpeechSettingsExposeParakeetLanguagesWithoutModelSize(t *testing.T) {
+	cfg := Default()
+	language, ok := SettingByKey(cfg, "speech.language")
+	if !ok {
+		t.Fatal("speech.language setting is missing")
+	}
+	if strings.Join(language.Choices, ",") != strings.Join(SpeechLanguages(), ",") {
+		t.Fatalf("speech language choices = %#v", language.Choices)
+	}
+	for _, removed := range []string{"speech.model", "speech.command", "speech.ffmpeg_command", "speech.model_path"} {
+		if _, ok := SettingByKey(cfg, removed); ok {
+			t.Fatalf("obsolete Whisper setting %q is still exposed", removed)
+		}
 	}
 }
 
@@ -73,6 +90,16 @@ func TestChannelSettingsPutEssentialsFirstAndRemovePromptOverrides(t *testing.T)
 		if _, err := SetSetting(&cfg, removed, "stale"); err == nil {
 			t.Fatalf("removed channel setting %q can still be changed", removed)
 		}
+	}
+}
+
+func TestWhatsAppAllowedNumbersAreDescribedAsRequired(t *testing.T) {
+	setting, ok := SettingByKey(Default(), "channels.whatsapp.allowed_numbers")
+	if !ok {
+		t.Fatal("WhatsApp allowed-number setting is missing")
+	}
+	if !strings.Contains(strings.ToLower(setting.Description), "required") || strings.Contains(strings.ToLower(setting.Description), "empty allows") {
+		t.Fatalf("WhatsApp allowed-number description = %q", setting.Description)
 	}
 }
 
@@ -147,13 +174,14 @@ func TestSetSettingsValidatesRelatedFormFieldsTogether(t *testing.T) {
 	cfg.Channels.Telegram.Enabled = true
 	cfg.Channels.Telegram.AllowedUsers = []string{"123456789"}
 	changed, err := SetSettings(&cfg, map[string]string{
-		"channels.telegram.mode":        "webhook",
-		"channels.telegram.webhook_url": "https://spynel.example",
+		"channels.telegram.mode":           "webhook",
+		"channels.telegram.webhook_url":    "https://spynel.example",
+		"channels.telegram.webhook_secret": "verification-secret",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(changed) != 2 || cfg.Channels.Telegram.Mode != "webhook" || cfg.Channels.Telegram.WebhookURL == "" {
+	if len(changed) != 3 || cfg.Channels.Telegram.Mode != "webhook" || cfg.Channels.Telegram.WebhookURL == "" || cfg.Channels.Telegram.WebhookSecret == "" {
 		t.Fatalf("related settings were not applied: %#v, %#v", changed, cfg.Channels.Telegram)
 	}
 }
@@ -177,5 +205,27 @@ func TestTelegramWhitelistAndEnabledStateValidateAtomically(t *testing.T) {
 	}
 	if len(cfg.Channels.Telegram.AllowedUsers) != 1 {
 		t.Fatal("failed whitelist clear changed the configuration")
+	}
+}
+
+func TestWhatsAppWhitelistAndEnabledStateValidateAtomically(t *testing.T) {
+	cfg := Default()
+	if _, err := SetSetting(&cfg, "channels.whatsapp.enabled", "on"); err == nil || !strings.Contains(err.Error(), "allowed_numbers requires at least one number") {
+		t.Fatalf("WhatsApp enabled without an allow-list: %v", err)
+	}
+	if cfg.Channels.WhatsApp.Enabled {
+		t.Fatal("failed WhatsApp enable changed the configuration")
+	}
+	if _, err := SetSettings(&cfg, map[string]string{
+		"channels.whatsapp.allowed_numbers": "+1 (555) 123-4567",
+		"channels.whatsapp.enabled":         "on",
+	}); err != nil {
+		t.Fatalf("WhatsApp allow-list and enable transaction failed: %v", err)
+	}
+	if _, err := SetSetting(&cfg, "channels.whatsapp.allowed_numbers", ""); err == nil || !strings.Contains(err.Error(), "allowed_numbers requires at least one number") {
+		t.Fatalf("enabled WhatsApp allow-list was cleared: %v", err)
+	}
+	if len(cfg.Channels.WhatsApp.AllowedNumbers) != 1 || cfg.Channels.WhatsApp.AllowedNumbers[0] != "+1 (555) 123-4567" {
+		t.Fatalf("failed allow-list clear changed the configuration: %#v", cfg.Channels.WhatsApp.AllowedNumbers)
 	}
 }

@@ -29,11 +29,11 @@ if [ "$#" -gt 0 ]; then shift; fi
 case "$action" in
   build)
     mkdir -p "$project_dir/bin"
-    (cd "$project_dir" && CGO_ENABLED=0 "$go_bin" build -o bin/spynel ./cmd/spynel)
+    (cd "$project_dir" && CGO_ENABLED=1 "$go_bin" build -o bin/spynel ./cmd/spynel)
     echo "$project_dir/bin/spynel"
     ;;
   test)
-    (cd "$project_dir" && CGO_ENABLED=0 "$go_bin" test ./... && "$go_bin" vet ./...)
+    (cd "$project_dir" && CGO_ENABLED=1 "$go_bin" test ./... && CGO_ENABLED=1 "$go_bin" vet ./...)
     ;;
   run)
     "$script_dir/dev.sh" build >/dev/null

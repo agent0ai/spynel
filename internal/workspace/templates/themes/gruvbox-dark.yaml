@@ -1,0 +1,20 @@
+name: gruvbox-dark
+description: Warm yellow and sandy contrast from the original Gruvbox dark palette
+appearance: dark
+color_blind_friendly: false
+colors:
+  background: "#282828"
+  surface: "#32302F"
+  surface_elevated: "#3C3836"
+  surface_selected: "#504945"
+  text: "#EBDBB2"
+  text_muted: "#BDAE93"
+  primary: "#FFA85F"
+  secondary: "#D8DA66"
+  border: "#7C6F64"
+  user: "#A9C6BA"
+  success: "#D8DA66"
+  warning: "#FABD2F"
+  error: "#FF7664"
+  info: "#A9C6BA"
+  code: "#E2A7B8"

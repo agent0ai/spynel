@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/frdel/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/fsx"
 	"gopkg.in/yaml.v3"
 )
 

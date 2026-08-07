@@ -2,13 +2,14 @@ package whatsapp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -16,37 +17,50 @@ import (
 	"github.com/mdp/qrterminal/v3"
 	_ "github.com/ncruces/go-sqlite3/driver"
 	"go.mau.fi/whatsmeow"
+	waCompanionReg "go.mau.fi/whatsmeow/proto/waCompanionReg"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/frdel/spynel/internal/channel"
-	"github.com/frdel/spynel/internal/config"
-	"github.com/frdel/spynel/internal/core"
-	markdownfmt "github.com/frdel/spynel/internal/markdown"
-	"github.com/frdel/spynel/internal/media"
+	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
+	markdownfmt "github.com/agent0ai/spynel/internal/markdown"
+	"github.com/agent0ai/spynel/internal/media"
 )
 
 type Client struct {
-	config   config.WhatsApp
-	dbPath   string
-	handler  channel.Handler
-	client   *whatsmeow.Client
-	ctx      context.Context
-	report   channel.StatusReporter
-	pairing  channel.PairingReporter
-	log      io.Writer
-	store    *media.Store
-	speech   media.Transcriber
-	incoming chan incomingMessage
-	download func(context.Context, whatsmeow.DownloadableMessage, *os.File) error
-	presence func(context.Context, types.JID, types.ChatPresence, types.ChatPresenceMedia) error
-	activity *channel.ActivityIndicator[types.JID]
+	config    config.WhatsApp
+	dbPath    string
+	handler   channel.Handler
+	client    *whatsmeow.Client
+	ctx       context.Context
+	report    channel.StatusReporter
+	pairing   channel.PairingReporter
+	log       io.Writer
+	store     *media.Store
+	speech    media.Transcriber
+	incoming  chan incomingMessage
+	download  func(context.Context, whatsmeow.DownloadableMessage, *os.File) error
+	upload    func(context.Context, io.Reader, io.ReadWriteSeeker, whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
+	deliver   func(context.Context, types.JID, *waE2E.Message) (whatsmeow.SendResponse, error)
+	deliverID func(context.Context, types.JID, *waE2E.Message, types.MessageID) (whatsmeow.SendResponse, error)
+	presence  func(context.Context, types.JID, types.ChatPresence, types.ChatPresenceMedia) error
+	activity  *channel.ActivityIndicator[types.JID]
 
 	mu      sync.Mutex
 	sentIDs map[types.MessageID]time.Time
+
+	pairingMu     sync.RWMutex
+	pairingActive bool
+	pairingReady  bool
+	pairingQR     string
+	pairingRetry  chan struct{}
+	pairingDelay  time.Duration
+	pairPhone     func(context.Context, string) (string, error)
 }
 
 type incomingMessage struct {
@@ -57,10 +71,13 @@ type incomingMessage struct {
 	id       types.MessageID
 }
 
-var nonNumber = regexp.MustCompile(`\D+`)
+const whatsAppDeviceName = "Spynel"
 
 func New(cfg config.WhatsApp, database string) *Client {
-	client := &Client{config: cfg, dbPath: database, sentIDs: map[types.MessageID]time.Time{}, log: os.Stderr, incoming: make(chan incomingMessage, 64)}
+	client := &Client{
+		config: cfg, dbPath: database, sentIDs: map[types.MessageID]time.Time{}, log: os.Stderr,
+		incoming: make(chan incomingMessage, 64), pairingRetry: make(chan struct{}, 1), pairingDelay: 2 * time.Second,
+	}
 	client.activity = newWhatsAppActivity(client, 4*time.Second)
 	return client
 }
@@ -92,7 +109,63 @@ func (c *Client) SetMedia(store *media.Store, speech media.Transcriber) {
 	c.speech = speech
 }
 
+func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string) error {
+	var chat types.JID
+	if strings.HasPrefix(conversation, "WA-group-") {
+		if !c.config.AllowGroups {
+			return errors.New("WhatsApp group delivery is disabled")
+		}
+		chat = types.NewJID(strings.TrimPrefix(conversation, "WA-group-"), types.GroupServer)
+	} else if strings.HasPrefix(conversation, "WA-") {
+		number := config.NormalizeWhatsAppNumber(strings.TrimPrefix(conversation, "WA-"))
+		authorized := false
+		for _, allowed := range c.config.AllowedNumbers {
+			authorized = authorized || config.NormalizeWhatsAppNumber(allowed) == number
+		}
+		if number == "" || !authorized {
+			return errors.New("WhatsApp origin is not in allowed_numbers")
+		}
+		chat = types.NewJID(number, types.DefaultUserServer)
+	} else {
+		return errors.New("invalid WhatsApp conversation origin")
+	}
+	return c.sendEvent(ctx, chat, eventID, text)
+}
+
+func stableWhatsAppMessageID(eventID string, index int) types.MessageID {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", eventID, index)))
+	return types.MessageID("3EB0" + strings.ToUpper(hex.EncodeToString(sum[:9])))
+}
+
+func (c *Client) sendEvent(ctx context.Context, chat types.JID, eventID, text string) error {
+	if c.client == nil && c.deliver == nil && c.deliverID == nil {
+		return errors.New("WhatsApp is not connected")
+	}
+	for index, chunk := range split(markdownfmt.WhatsApp(text), 60000) {
+		id := stableWhatsAppMessageID(eventID, index)
+		var response whatsmeow.SendResponse
+		var err error
+		if c.deliverID != nil {
+			response, err = c.deliverID(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)}, id)
+		} else if c.deliver != nil {
+			response, err = c.deliver(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)})
+		} else {
+			response, err = c.client.SendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)}, whatsmeow.SendRequestExtra{ID: id})
+		}
+		if err != nil {
+			return err
+		}
+		c.recordSent(response.ID)
+	}
+	return nil
+}
+
 func (c *Client) Run(ctx context.Context, handler channel.Handler) error {
+	if !config.HasAllowedWhatsAppNumber(c.config.AllowedNumbers) {
+		err := errors.New("WhatsApp is enabled but its allowed-numbers whitelist is empty")
+		c.reportStatus(channel.ConnectionError, err.Error())
+		return err
+	}
 	c.handler = handler
 	c.ctx = ctx
 	go c.messageWorker(ctx)
@@ -109,28 +182,23 @@ func (c *Client) Run(ctx context.Context, handler channel.Handler) error {
 		return err
 	}
 	c.client = whatsmeow.NewClient(device, nil)
+	configurePairingIdentity(c.client)
+	c.pairingMu.Lock()
+	c.pairPhone = func(ctx context.Context, phone string) (string, error) {
+		return c.client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	}
+	c.pairingMu.Unlock()
+	c.upload = func(ctx context.Context, source io.Reader, temporary io.ReadWriteSeeker, mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+		return c.client.UploadReader(ctx, source, temporary, mediaType)
+	}
+	c.deliver = func(ctx context.Context, chat types.JID, message *waE2E.Message) (whatsmeow.SendResponse, error) {
+		return c.client.SendMessage(ctx, chat, message)
+	}
 	c.client.AddEventHandler(c.onEvent)
 	if c.client.Store.ID == nil {
-		qrChannel, err := c.client.GetQRChannel(ctx)
-		if err != nil {
+		if err := c.runPairing(ctx); err != nil {
 			return err
 		}
-		if err := c.client.Connect(); err != nil {
-			return err
-		}
-		go func() {
-			for event := range qrChannel {
-				if event.Event == "code" {
-					var rendered strings.Builder
-					qrterminal.GenerateHalfBlock(event.Code, qrterminal.L, &rendered)
-					c.reportPairing(channel.PairingEvent{Name: c.Name(), State: "code", Code: event.Code, Rendered: strings.TrimSpace(rendered.String()), Detail: "Scan in WhatsApp → Linked devices"})
-					fmt.Fprintln(c.log, "WhatsApp is waiting for QR pairing; open /whatsapp in the TUI")
-				} else {
-					fmt.Fprintln(c.log, "WhatsApp pairing:", event.Event)
-					c.reportPairing(channel.PairingEvent{Name: c.Name(), State: event.Event, Detail: "WhatsApp pairing: " + event.Event})
-				}
-			}
-		}()
 	} else {
 		if err := c.client.Connect(); err != nil {
 			return err
@@ -149,7 +217,7 @@ func (c *Client) Run(ctx context.Context, handler channel.Handler) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if c.client.IsConnected() {
+			if c.client.IsConnected() && c.isPaired() {
 				c.reportStatus(channel.ConnectionConnected, "")
 			} else {
 				c.reportStatus(channel.ConnectionError, "disconnected")
@@ -158,9 +226,180 @@ func (c *Client) Run(ctx context.Context, handler channel.Handler) error {
 	}
 }
 
+// configurePairingIdentity sets the companion metadata that WhatsApp records
+// when a new device is linked. The phone-code endpoint has separate server-
+// validated display-name restrictions and is intentionally configured below.
+func configurePairingIdentity(client *whatsmeow.Client) {
+	store.DeviceProps.Os = proto.String(whatsAppDeviceName)
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
+	client.QRClientType = whatsmeow.PairClientElectron
+}
+
+// RetryPairing replaces the current unpaired websocket and its expired QR
+// codes. The signal is buffered so a retry pressed while the session is
+// winding down is still observed by the terminal-state wait.
+func (c *Client) RetryPairing() error {
+	c.pairingMu.RLock()
+	active := c.pairingActive
+	c.pairingMu.RUnlock()
+	if !active {
+		return errors.New("WhatsApp is not waiting for pairing")
+	}
+	select {
+	case c.pairingRetry <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// PairPhone generates WhatsApp's official eight-character alternative to QR
+// scanning for the active pairing websocket.
+func (c *Client) PairPhone(ctx context.Context, phone string) (string, error) {
+	c.pairingMu.RLock()
+	active, ready, rendered, pair := c.pairingActive, c.pairingReady, c.pairingQR, c.pairPhone
+	c.pairingMu.RUnlock()
+	if !active {
+		return "", errors.New("WhatsApp is not waiting for pairing")
+	}
+	if !ready || pair == nil {
+		return "", errors.New("WhatsApp pairing is not ready yet; wait for Show QR, then try again")
+	}
+	code, err := pair(ctx, phone)
+	if err != nil {
+		return "", err
+	}
+	c.reportPairing(channel.PairingEvent{Name: c.Name(), State: "phone-code", Code: code, Rendered: rendered, Detail: "Enter this code in WhatsApp: " + code})
+	return code, nil
+}
+
+func (c *Client) runPairing(ctx context.Context) error {
+	c.setPairingState(true, false)
+	defer c.setPairingState(false, false)
+	for c.client.Store.ID == nil {
+		c.reportStatus(channel.ConnectionConnecting, "waiting for pairing")
+		c.reportPairing(channel.PairingEvent{Name: c.Name(), State: "starting", Detail: "Starting a fresh WhatsApp pairing session…"})
+		qrChannel, err := c.client.GetQRChannel(ctx)
+		if err != nil {
+			if waitErr := c.waitForPairingRestart(ctx, "error", "WhatsApp pairing could not start: "+err.Error()); waitErr != nil {
+				return waitErr
+			}
+			continue
+		}
+		if err := c.client.Connect(); err != nil {
+			if waitErr := c.waitForPairingRestart(ctx, "error", "WhatsApp pairing could not connect: "+err.Error()); waitErr != nil {
+				return waitErr
+			}
+			continue
+		}
+
+		restart := false
+		for !restart {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-c.pairingRetry:
+				c.setPairingState(true, false)
+				c.client.Disconnect()
+				restart = true
+			case event, ok := <-qrChannel:
+				if !ok {
+					if err := c.waitForPairingRestart(ctx, "error", "WhatsApp pairing ended before the device was linked"); err != nil {
+						return err
+					}
+					restart = true
+					continue
+				}
+				switch event.Event {
+				case whatsmeow.QRChannelEventCode:
+					var rendered strings.Builder
+					qrterminal.GenerateHalfBlock(event.Code, qrterminal.L, &rendered)
+					qr := strings.TrimSpace(rendered.String())
+					c.setPairingQR(qr)
+					c.reportPairing(channel.PairingEvent{Name: c.Name(), State: "code", Code: event.Code, Rendered: qr, Detail: "WhatsApp is ready to pair"})
+					fmt.Fprintln(c.log, "WhatsApp is waiting for pairing; open /whatsapp in the TUI")
+				case whatsmeow.QRChannelEventPasskeyRequest, whatsmeow.QRChannelEventPasskeyResponse:
+					c.setPairingState(true, false)
+					c.reportPairing(channel.PairingEvent{Name: c.Name(), State: event.Event, Detail: "Confirm WhatsApp pairing on your phone"})
+				case whatsmeow.QRChannelEventError:
+					detail := "WhatsApp pairing failed"
+					if event.Error != nil {
+						detail += ": " + event.Error.Error()
+					}
+					if err := c.waitForPairingRestart(ctx, "error", detail); err != nil {
+						return err
+					}
+					restart = true
+				case "success":
+					c.setPairingState(true, false)
+					c.reportStatus(channel.ConnectionConnected, "")
+					c.reportPairing(channel.PairingEvent{Name: c.Name(), State: "connected", Detail: "WhatsApp connected"})
+					return nil
+				default:
+					if err := c.waitForPairingRestart(ctx, event.Event, "WhatsApp pairing: "+event.Event); err != nil {
+						return err
+					}
+					restart = true
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Client) waitForPairingRestart(ctx context.Context, state, detail string) error {
+	c.setPairingState(true, false)
+	retryingDetail := detail + " — retrying automatically…"
+	c.reportPairing(channel.PairingEvent{Name: c.Name(), State: state, Detail: retryingDetail})
+	fmt.Fprintln(c.log, retryingDetail)
+	delay := c.pairingDelay
+	if delay <= 0 {
+		delay = 2 * time.Second
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.pairingRetry:
+	case <-timer.C:
+		// Do not carry a simultaneous manual signal into the newly created
+		// session and immediately restart it a second time.
+		select {
+		case <-c.pairingRetry:
+		default:
+		}
+	}
+	if c.client != nil {
+		c.client.Disconnect()
+	}
+	return nil
+}
+
+func (c *Client) setPairingState(active, ready bool) {
+	c.pairingMu.Lock()
+	c.pairingActive = active
+	c.pairingReady = ready
+	if !ready {
+		c.pairingQR = ""
+	}
+	c.pairingMu.Unlock()
+}
+
+func (c *Client) setPairingQR(rendered string) {
+	c.pairingMu.Lock()
+	c.pairingActive = true
+	c.pairingReady = true
+	c.pairingQR = rendered
+	c.pairingMu.Unlock()
+}
+
 func (c *Client) onEvent(raw any) {
 	switch event := raw.(type) {
 	case *events.Connected:
+		if !c.isPaired() {
+			c.reportStatus(channel.ConnectionConnecting, "waiting for pairing")
+			return
+		}
 		c.reportStatus(channel.ConnectionConnected, "")
 		c.reportPairing(channel.PairingEvent{Name: c.Name(), State: "connected", Detail: "WhatsApp connected"})
 		return
@@ -196,11 +435,16 @@ func (c *Client) onEvent(raw any) {
 	} else if event.Info.IsFromMe {
 		return
 	}
-	sender := event.Info.Sender.User
-	if !event.Info.SenderAlt.IsEmpty() {
-		sender = event.Info.SenderAlt.User
+	sender := preferredPhoneUser(event.Info.Sender, event.Info.SenderAlt)
+	allowedSenders := []string{event.Info.Sender.User, event.Info.SenderAlt.User}
+	if c.config.Mode == "self-chat" && c.client != nil && c.client.Store != nil && c.client.Store.ID != nil {
+		// Messages sent from the primary phone may arrive under the account's
+		// opaque LID without SenderAlt. Authorize and key them by the paired
+		// phone-number identity rather than requiring users to whitelist a LID.
+		sender = c.client.Store.ID.User
+		allowedSenders = append(allowedSenders, sender, event.Info.RecipientAlt.User)
 	}
-	if !c.allowed(event.Info.Sender.User, event.Info.SenderAlt.User) {
+	if !c.allowed(allowedSenders...) {
 		return
 	}
 	if strings.TrimSpace(messageText(event)) == "" && !hasMedia(event.Message) {
@@ -212,6 +456,27 @@ func (c *Client) onEvent(raw any) {
 	default:
 		fmt.Fprintln(c.log, "WhatsApp incoming queue is full; dropping message", event.Info.ID)
 	}
+}
+
+func preferredPhoneUser(addresses ...types.JID) string {
+	fallback := ""
+	for _, address := range addresses {
+		if address.IsEmpty() {
+			continue
+		}
+		if fallback == "" {
+			fallback = address.User
+		}
+		switch address.Server {
+		case types.DefaultUserServer, types.LegacyUserServer, types.HostedServer:
+			return address.User
+		}
+	}
+	return fallback
+}
+
+func (c *Client) isPaired() bool {
+	return c.client != nil && c.client.Store != nil && c.client.Store.ID != nil
 }
 
 func (c *Client) groupAddressed(message *waE2E.Message) bool {
@@ -316,8 +581,29 @@ func (c *Client) prepareMessage(ctx context.Context, incoming incomingMessage) (
 
 func (c *Client) reportStatus(state channel.ConnectionState, detail string) {
 	if c.report != nil {
-		c.report(channel.ConnectionStatus{Name: c.Name(), State: state, Detail: detail})
+		status := channel.ConnectionStatus{Name: c.Name(), State: state, Detail: detail}
+		if state == channel.ConnectionConnected {
+			status.Identity, status.Link = c.pairedAccountIdentity()
+		}
+		c.report(status)
 	}
+}
+
+func (c *Client) pairedAccountIdentity() (string, string) {
+	if !c.isPaired() {
+		return "", ""
+	}
+	address := c.client.Store.ID.ToNonAD()
+	switch address.Server {
+	case types.DefaultUserServer, types.LegacyUserServer, types.HostedServer:
+	default:
+		return "", ""
+	}
+	number := config.NormalizeWhatsAppNumber(address.User)
+	if number == "" {
+		return "", ""
+	}
+	return "+" + number, "https://wa.me/" + number
 }
 
 func (c *Client) handle(received time.Time, chat types.JID, sender, text string) {
@@ -334,13 +620,22 @@ func (c *Client) handleWithActivity(received time.Time, chat types.JID, sender, 
 		ctx = context.Background()
 	}
 	emit := func(event core.Event) {
-		if !event.Done {
+		if !event.Done || event.Continues || (event.Kind != core.EventFinal && event.Kind != core.EventError) {
 			return
 		}
-		if event.Text != "" {
-			_ = c.send(ctx, chat, event.Text)
+		defer finishActivity()
+		text := event.Text
+		if event.FinalText != nil {
+			text = *event.FinalText
 		}
-		finishActivity()
+		if text != "" {
+			_ = c.send(ctx, chat, text)
+		}
+		for _, attachment := range event.Attachments {
+			if err := c.sendAttachment(ctx, chat, attachment); err != nil {
+				_ = c.send(ctx, chat, "Spynel attachment delivery error: "+err.Error())
+			}
+		}
 	}
 	err := c.handler(ctx, core.Message{
 		Channel: c.Name(), Conversation: whatsappConversation(chat, sender), Sender: sender,
@@ -368,28 +663,83 @@ func whatsappConversation(chat types.JID, sender string) string {
 	if chat.Server == types.GroupServer {
 		return "WA-group-" + chat.User
 	}
-	number := nonNumber.ReplaceAllString(sender, "")
+	number := config.NormalizeWhatsAppNumber(sender)
 	if number == "" {
-		number = nonNumber.ReplaceAllString(chat.User, "")
+		number = config.NormalizeWhatsAppNumber(chat.User)
 	}
 	return "WA-" + number
 }
 
 func (c *Client) send(ctx context.Context, chat types.JID, text string) error {
-	if c.client == nil {
+	if c.client == nil && c.deliver == nil {
 		return errors.New("WhatsApp is not connected")
 	}
 	for _, chunk := range split(markdownfmt.WhatsApp(text), 60000) {
-		response, err := c.client.SendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)})
+		response, err := c.sendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)})
 		if err != nil {
 			return err
 		}
-		c.mu.Lock()
-		c.sentIDs[response.ID] = time.Now()
-		c.cleanupSentLocked()
-		c.mu.Unlock()
+		c.recordSent(response.ID)
 	}
 	return nil
+}
+
+func (c *Client) sendAttachment(ctx context.Context, chat types.JID, attachment core.OutboundAttachment) error {
+	if (c.client == nil && c.upload == nil) || (c.client == nil && c.deliver == nil) {
+		return errors.New("WhatsApp is not connected")
+	}
+	file, err := media.OpenOutbound(attachment)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	mediaType := whatsmeow.MediaDocument
+	if attachment.Kind == "photo" {
+		mediaType = whatsmeow.MediaImage
+	}
+	var uploaded whatsmeow.UploadResponse
+	if c.upload != nil {
+		uploaded, err = c.upload(ctx, file, nil, mediaType)
+	} else {
+		uploaded, err = c.client.UploadReader(ctx, file, nil, mediaType)
+	}
+	if err != nil {
+		return err
+	}
+	var message *waE2E.Message
+	if attachment.Kind == "photo" {
+		message = &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+			URL: &uploaded.URL, DirectPath: &uploaded.DirectPath, MediaKey: uploaded.MediaKey,
+			FileEncSHA256: uploaded.FileEncSHA256, FileSHA256: uploaded.FileSHA256, FileLength: &uploaded.FileLength,
+			Mimetype: proto.String(attachment.MediaType),
+		}}
+	} else {
+		message = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+			URL: &uploaded.URL, DirectPath: &uploaded.DirectPath, MediaKey: uploaded.MediaKey,
+			FileEncSHA256: uploaded.FileEncSHA256, FileSHA256: uploaded.FileSHA256, FileLength: &uploaded.FileLength,
+			Mimetype: proto.String(attachment.MediaType), FileName: proto.String(attachment.Name), Title: proto.String(attachment.Name),
+		}}
+	}
+	response, err := c.sendMessage(ctx, chat, message)
+	if err != nil {
+		return err
+	}
+	c.recordSent(response.ID)
+	return nil
+}
+
+func (c *Client) sendMessage(ctx context.Context, chat types.JID, message *waE2E.Message) (whatsmeow.SendResponse, error) {
+	if c.deliver != nil {
+		return c.deliver(ctx, chat, message)
+	}
+	return c.client.SendMessage(ctx, chat, message)
+}
+
+func (c *Client) recordSent(id types.MessageID) {
+	c.mu.Lock()
+	c.sentIDs[id] = time.Now()
+	c.cleanupSentLocked()
+	c.mu.Unlock()
 }
 
 func (c *Client) wasSent(id types.MessageID) bool {
@@ -413,13 +763,13 @@ func (c *Client) cleanupSentLocked() {
 }
 
 func (c *Client) allowed(senders ...string) bool {
-	if len(c.config.AllowedNumbers) == 0 {
-		return true
+	if !config.HasAllowedWhatsAppNumber(c.config.AllowedNumbers) {
+		return false
 	}
 	for _, sender := range senders {
-		number := nonNumber.ReplaceAllString(sender, "")
+		number := config.NormalizeWhatsAppNumber(sender)
 		for _, allowed := range c.config.AllowedNumbers {
-			if number != "" && number == nonNumber.ReplaceAllString(allowed, "") {
+			if number != "" && number == config.NormalizeWhatsAppNumber(allowed) {
 				return true
 			}
 		}

@@ -6,7 +6,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/frdel/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/core"
 )
 
 // HarnessConfig is the provider-neutral runtime contract used to construct a
@@ -48,6 +48,23 @@ type ModelProvider interface {
 type Availability interface {
 	Available() (bool, string)
 	ReadyEvents() <-chan struct{}
+}
+
+// FollowUpMode describes how a harness accepts another user message while a
+// turn is active. Harnesses that do not implement FollowUpProvider are queued
+// conservatively by Supervisor, which makes a basic adapter safe by default.
+type FollowUpMode string
+
+const (
+	FollowUpQueue FollowUpMode = "queue"
+	FollowUpSteer FollowUpMode = "steer"
+)
+
+// FollowUpProvider is an optional harness capability. Native steering keeps a
+// follow-up in the current provider turn; queue mode starts it after the active
+// provider turn completes, using the same durable conversation session.
+type FollowUpProvider interface {
+	FollowUpMode() FollowUpMode
 }
 
 type Harness interface {

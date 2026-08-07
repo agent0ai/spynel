@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/frdel/spynel/internal/config"
-	"github.com/frdel/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/fsx"
 )
 
 type CommandRunner func(context.Context, string, ...string) error
@@ -24,6 +24,8 @@ type Manager struct {
 	GOOS                  string
 	Home                  string
 	Executable            string
+	NodeExecutable        string
+	NPMLauncher           string
 	SystemWide            bool
 	SystemUnitDirectory   string
 	SystemLaunchDirectory string
@@ -49,11 +51,24 @@ func New(executable string) (*Manager, error) {
 	if runtime.GOOS != "windows" {
 		systemWide = os.Geteuid() == 0
 	}
-	return &Manager{
+	manager := &Manager{
 		GOOS: runtime.GOOS, Home: home, Executable: executable, SystemWide: systemWide,
 		SystemUnitDirectory: "/etc/systemd/system", SystemLaunchDirectory: "/Library/LaunchDaemons",
 		RunCommand: runCommand,
-	}, nil
+	}
+	nodeExecutable := strings.TrimSpace(os.Getenv("SPYNEL_NPM_NODE"))
+	npmLauncher := strings.TrimSpace(os.Getenv("SPYNEL_NPM_LAUNCHER"))
+	if nodeExecutable != "" && npmLauncher != "" {
+		if nodeExecutable, err = filepath.Abs(nodeExecutable); err != nil {
+			return nil, err
+		}
+		if npmLauncher, err = filepath.Abs(npmLauncher); err != nil {
+			return nil, err
+		}
+		manager.NodeExecutable = nodeExecutable
+		manager.NPMLauncher = npmLauncher
+	}
+	return manager, nil
 }
 
 func (m *Manager) Sync(cfg config.Config, enabled bool) error {
@@ -83,6 +98,16 @@ func workspaceID(cfg config.Config) string {
 	return hex.EncodeToString(hash[:4])
 }
 
+func (m *Manager) startupCommand(cfg config.Config) (string, []string) {
+	executable := m.Executable
+	arguments := []string{"serve", "--automatic-startup", "--config", cfg.Path}
+	if m.NodeExecutable != "" && m.NPMLauncher != "" {
+		executable = m.NodeExecutable
+		arguments = append([]string{m.NPMLauncher}, arguments...)
+	}
+	return executable, arguments
+}
+
 func (m *Manager) enableLinux(cfg config.Config) error {
 	unitName := "spynel-" + workspaceID(cfg) + ".service"
 	unitDirectory := filepath.Join(m.Home, ".config", "systemd", "user")
@@ -95,16 +120,21 @@ func (m *Manager) enableLinux(cfg config.Config) error {
 	if err := os.MkdirAll(wantsDirectory, 0o700); err != nil {
 		return err
 	}
+	executable, arguments := m.startupCommand(cfg)
+	execStart := systemdQuote(executable)
+	for _, argument := range arguments {
+		execStart += " " + systemdQuote(argument)
+	}
 	unit := strings.Join([]string{
 		"[Unit]",
-		"Description=Spynel workspace " + systemdEscape(cfg.Root),
+		"Description=" + systemdQuote("Spynel workspace "+cfg.Root),
 		"Wants=network-online.target",
 		"After=network-online.target",
 		"",
 		"[Service]",
 		"Type=simple",
 		"WorkingDirectory=" + systemdQuote(cfg.Root),
-		"ExecStart=" + systemdQuote(m.Executable) + " serve --config " + systemdQuote(cfg.Path),
+		"ExecStart=" + execStart,
 		"Restart=on-failure",
 		"RestartSec=5",
 		"",
@@ -146,12 +176,13 @@ func (m *Manager) disableLinux(cfg config.Config) error {
 
 func (m *Manager) enableDarwin(cfg config.Config) error {
 	label := "dev.spynel.workspace." + workspaceID(cfg)
+	executable, arguments := m.startupCommand(cfg)
 	plist := struct {
 		XMLName xml.Name  `xml:"plist"`
 		Version string    `xml:"version,attr"`
 		Dict    plistDict `xml:"dict"`
 	}{Version: "1.0", Dict: plistDict{
-		Label: label, ProgramArguments: []string{m.Executable, "serve", "--config", cfg.Path},
+		Label: label, ProgramArguments: append([]string{executable}, arguments...),
 		WorkingDirectory: cfg.Root, RunAtLoad: true, KeepAlive: true,
 	}}
 	data, err := xml.MarshalIndent(plist, "", "  ")
@@ -189,8 +220,16 @@ func (m *Manager) syncWindows(cfg config.Config, enabled bool) error {
 	if !enabled {
 		return m.RunCommand(ctx, "schtasks.exe", "/Delete", "/TN", name, "/F")
 	}
-	action := fmt.Sprintf(`"%s" serve --config "%s"`, strings.ReplaceAll(m.Executable, `"`, `\"`), strings.ReplaceAll(cfg.Path, `"`, `\"`))
+	executable, arguments := m.startupCommand(cfg)
+	action := windowsQuote(executable)
+	for _, argument := range arguments {
+		action += " " + windowsQuote(argument)
+	}
 	return m.RunCommand(ctx, "schtasks.exe", "/Create", "/SC", "ONLOGON", "/TN", name, "/TR", action, "/F")
+}
+
+func windowsQuote(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
 }
 
 func runCommand(ctx context.Context, name string, arguments ...string) error {
@@ -203,14 +242,33 @@ func runCommand(ctx context.Context, name string, arguments ...string) error {
 }
 
 func systemdQuote(value string) string {
-	value = strings.ReplaceAll(value, `\`, `\\`)
-	value = strings.ReplaceAll(value, `"`, `\"`)
-	value = strings.ReplaceAll(value, `%`, `%%`)
-	return `"` + value + `"`
-}
-
-func systemdEscape(value string) string {
-	return strings.NewReplacer("\n", " ", "\r", " ", "%", "%%").Replace(value)
+	var escaped strings.Builder
+	escaped.WriteByte('"')
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		switch character {
+		case '\\':
+			escaped.WriteString(`\\`)
+		case '"':
+			escaped.WriteString(`\"`)
+		case '%':
+			escaped.WriteString(`%%`)
+		case '\n':
+			escaped.WriteString(`\n`)
+		case '\r':
+			escaped.WriteString(`\r`)
+		case '\t':
+			escaped.WriteString(`\t`)
+		default:
+			if character < 0x20 || character == 0x7f {
+				_, _ = fmt.Fprintf(&escaped, `\x%02x`, character)
+			} else {
+				escaped.WriteByte(character)
+			}
+		}
+	}
+	escaped.WriteByte('"')
+	return escaped.String()
 }
 
 type plistDict struct {

@@ -2,6 +2,8 @@ package harness
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -32,5 +34,41 @@ func TestResolveCommandRejectsManualOrUnknownHarnesses(t *testing.T) {
 	command, err := ResolveCommand("claude", func(name string) (string, error) { return "/bin/" + name, nil })
 	if err != nil || command != "/bin/claude" {
 		t.Fatalf("Claude alias resolution = %q, %v", command, err)
+	}
+}
+
+func TestResolveDefinitionCommandUsesStandardUserLocalBin(t *testing.T) {
+	definition, ok := Lookup("claude-code")
+	if !ok {
+		t.Fatal("Claude Code definition is missing")
+	}
+	home := t.TempDir()
+	command := filepath.Join(home, ".local", "bin", definition.Command)
+	if err := os.MkdirAll(filepath.Dir(command), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(command, []byte("fixture"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveDefinitionCommand(
+		definition,
+		func(string) (string, error) { return "", errors.New("not on PATH") },
+		func() (string, error) { return home, nil },
+	)
+	if err != nil || resolved != command {
+		t.Fatalf("user-local resolution = %q, %v", resolved, err)
+	}
+}
+
+func TestBuiltinRegistryCoversCatalog(t *testing.T) {
+	registry := NewBuiltinRegistry()
+	for _, definition := range Catalog() {
+		target, err := registry.Create(HarnessConfig{Name: definition.Name, Command: "fixture", Cwd: t.TempDir()})
+		if err != nil {
+			t.Fatalf("create %s: %v", definition.Name, err)
+		}
+		if target == nil {
+			t.Fatalf("factory for %s returned nil", definition.Name)
+		}
 	}
 }

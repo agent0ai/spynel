@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/frdel/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/harness"
 )
 
 // Setting is the shared metadata used by command-based configuration and TUI
@@ -35,6 +35,7 @@ func Settings(cfg Config) []Setting {
 		{Key: "workspace.attachment_max_mb", Section: "config", Description: "Maximum downloaded attachment size", Value: strconv.Itoa(cfg.Workspace.AttachmentMaxMB), Advanced: true},
 		{Key: "channels.tui.enabled", Section: "config", Description: "Launch the TUI by default on the next start", Value: formatBool(cfg.Channels.TUI.Enabled), Choices: []string{"on", "off"}, Restart: true, Advanced: true},
 		{Key: "channels.tui.title", Section: "config", Description: "Default TUI title", Value: cfg.Channels.TUI.Title, Advanced: true},
+		{Key: "channels.tui.theme", Section: "config", Description: "Active color theme from .spynel/themes", Value: cfg.Channels.TUI.Theme, Advanced: true},
 		{Key: "orchestrator.enabled", Section: "config", Description: "Run Markdown task and goal routes after restart", Value: formatBool(cfg.Orchestrator.Enabled), Choices: []string{"on", "off"}, Restart: true, Advanced: true},
 		{Key: "orchestrator.interval_seconds", Section: "config", Description: "Route scan interval after restart", Value: strconv.Itoa(cfg.Orchestrator.IntervalSec), Restart: true, Advanced: true},
 		{Key: "orchestrator.max_parallel", Section: "config", Description: "Maximum concurrent Markdown jobs after restart", Value: strconv.Itoa(cfg.Orchestrator.MaxParallel), Restart: true, Advanced: true},
@@ -49,7 +50,7 @@ func Settings(cfg Config) []Setting {
 		{Key: "channels.telegram.mode", Section: "telegram", Description: "Telegram delivery mode", Value: cfg.Channels.Telegram.Mode, Choices: []string{"polling", "webhook"}, Advanced: true},
 		{Key: "channels.telegram.webhook_url", Section: "telegram", Description: "Public HTTPS base URL for webhook mode", Value: cfg.Channels.Telegram.WebhookURL, Advanced: true},
 		{Key: "channels.telegram.webhook_listen", Section: "telegram", Description: "Local HTTP address behind the webhook reverse proxy", Value: cfg.Channels.Telegram.WebhookListen, Advanced: true},
-		{Key: "channels.telegram.webhook_secret", Section: "telegram", Description: "Webhook verification secret", Value: secretState(cfg.Channels.Telegram.WebhookSecret), Secret: true, Advanced: true},
+		{Key: "channels.telegram.webhook_secret", Section: "telegram", Description: "Webhook verification secret (required in webhook mode)", Value: secretState(cfg.Channels.Telegram.WebhookSecret), Secret: true, Advanced: true},
 		{Key: "channels.telegram.poll_timeout_seconds", Section: "telegram", Description: "Long-poll timeout", Value: strconv.Itoa(cfg.Channels.Telegram.PollTimeoutSec), Advanced: true},
 		{Key: "channels.telegram.group_mode", Section: "telegram", Description: "Group response policy", Value: cfg.Channels.Telegram.GroupMode, Choices: []string{"mention", "all", "off"}, Advanced: true},
 		{Key: "channels.telegram.welcome_enabled", Section: "telegram", Description: "Welcome new group members", Value: formatBool(cfg.Channels.Telegram.WelcomeEnabled), Choices: []string{"on", "off"}, Advanced: true},
@@ -57,17 +58,15 @@ func Settings(cfg Config) []Setting {
 		{Key: "channels.telegram.notify_messages", Section: "telegram", Description: "Show a TUI notification for incoming messages", Value: formatBool(cfg.Channels.Telegram.NotifyMessages), Choices: []string{"on", "off"}, Advanced: true},
 		{Key: "channels.telegram.attachment_max_age_hours", Section: "telegram", Description: "Downloaded attachment retention; 0 keeps files", Value: strconv.Itoa(cfg.Channels.Telegram.AttachmentMaxAgeHours), Advanced: true},
 		{Key: "channels.whatsapp.mode", Section: "whatsapp", Description: "Personal self-chat or dedicated number", Value: cfg.Channels.WhatsApp.Mode, Choices: []string{"self-chat", "dedicated"}},
-		{Key: "channels.whatsapp.allowed_numbers", Section: "whatsapp", Description: "Comma-separated phone numbers; empty allows all", Value: strings.Join(cfg.Channels.WhatsApp.AllowedNumbers, ",")},
+		{Key: "channels.whatsapp.allowed_numbers", Section: "whatsapp", Description: "Required when enabled; comma-separated phone numbers allowed to message Spynel", Value: strings.Join(cfg.Channels.WhatsApp.AllowedNumbers, ",")},
 		{Key: "channels.whatsapp.enabled", Section: "whatsapp", Description: "Run the WhatsApp integration", Value: formatBool(cfg.Channels.WhatsApp.Enabled), Choices: []string{"on", "off"}},
 		{Key: "channels.whatsapp.database", Section: "whatsapp", Description: "Persistent WhatsApp session database", Value: cfg.Channels.WhatsApp.Database, Advanced: true},
 		{Key: "channels.whatsapp.allow_groups", Section: "whatsapp", Description: "Respond in groups when supported", Value: formatBool(cfg.Channels.WhatsApp.AllowGroups), Choices: []string{"on", "off"}, Advanced: true},
 		{Key: "channels.whatsapp.poll_interval_seconds", Section: "whatsapp", Description: "Connection health-check interval", Value: strconv.Itoa(cfg.Channels.WhatsApp.PollIntervalSec), Advanced: true},
 		{Key: "speech.enabled", Section: "config", Description: "Transcribe incoming voice messages", Value: formatBool(cfg.Speech.Enabled), Choices: []string{"on", "off"}, Advanced: true},
-		{Key: "speech.command", Section: "config", Description: "Whisper-compatible executable; the default is provisioned automatically when supported", Value: cfg.Speech.Command, Advanced: true},
-		{Key: "speech.ffmpeg_command", Section: "config", Description: "FFmpeg executable used to split and normalize voice messages", Value: cfg.Speech.FFmpegCommand, Advanced: true},
-		{Key: "speech.model", Section: "config", Description: "Whisper model size", Value: cfg.Speech.Model, Choices: []string{"tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"}, Advanced: true},
-		{Key: "speech.model_path", Section: "config", Description: "Optional local Whisper model path", Value: cfg.Speech.ModelPath, Advanced: true},
-		{Key: "speech.language", Section: "config", Description: "Transcription language or auto", Value: cfg.Speech.Language, Advanced: true},
+		{Key: "speech.language", Section: "config", Description: "Parakeet transcription language; English uses the English model and other values use multilingual auto-detection", Value: cfg.Speech.Language, Choices: SpeechLanguages(), Advanced: true},
+		{Key: "speech.model_dir", Section: "config", Description: "Optional local directory containing Parakeet encoder, decoder, joiner, and tokens files", Value: cfg.Speech.ModelDir, Advanced: true},
+		{Key: "speech.num_threads", Section: "config", Description: "CPU threads used for local transcription", Value: strconv.Itoa(cfg.Speech.NumThreads), Advanced: true},
 		{Key: "speech.max_file_mb", Section: "config", Description: "Maximum accepted voice file size", Value: strconv.Itoa(cfg.Speech.MaxFileMB), Advanced: true},
 		{Key: "speech.max_duration_seconds", Section: "config", Description: "Maximum voice duration processed", Value: strconv.Itoa(cfg.Speech.MaxDurationSec), Advanced: true},
 		{Key: "speech.chunk_seconds", Section: "config", Description: "Maximum transcription chunk duration", Value: strconv.Itoa(cfg.Speech.ChunkSeconds), Advanced: true},
@@ -154,6 +153,8 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Harness.Sandbox = normalizeSandbox(value)
 	case "channels.tui.title":
 		cfg.Channels.TUI.Title = value
+	case "channels.tui.theme":
+		cfg.Channels.TUI.Theme = value
 	case "channels.tui.enabled":
 		cfg.Channels.TUI.Enabled, err = parseBoolean()
 	case "orchestrator.enabled":
@@ -212,16 +213,12 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Channels.WhatsApp.PollIntervalSec, err = parseInteger(2)
 	case "speech.enabled":
 		cfg.Speech.Enabled, err = parseBoolean()
-	case "speech.command":
-		cfg.Speech.Command = value
-	case "speech.ffmpeg_command":
-		cfg.Speech.FFmpegCommand = value
-	case "speech.model":
-		cfg.Speech.Model = strings.ToLower(value)
-	case "speech.model_path":
-		cfg.Speech.ModelPath = value
 	case "speech.language":
-		cfg.Speech.Language = value
+		cfg.Speech.Language = strings.ToLower(value)
+	case "speech.model_dir":
+		cfg.Speech.ModelDir = value
+	case "speech.num_threads":
+		cfg.Speech.NumThreads, err = parseInteger(1)
 	case "speech.max_file_mb":
 		cfg.Speech.MaxFileMB, err = parseInteger(1)
 	case "speech.max_duration_seconds":

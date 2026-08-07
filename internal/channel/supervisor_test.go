@@ -4,17 +4,40 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/frdel/spynel/internal/config"
-	"github.com/frdel/spynel/internal/workspace"
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/workspace"
 )
 
 type supervisedFixture struct {
 	name    string
 	started chan string
 	stopped chan string
+}
+
+type pairingFixture struct {
+	retried bool
+	phone   string
+}
+
+func (c *pairingFixture) Name() string { return "whatsapp" }
+
+func (c *pairingFixture) Run(ctx context.Context, _ Handler) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (c *pairingFixture) RetryPairing() error {
+	c.retried = true
+	return nil
+}
+
+func (c *pairingFixture) PairPhone(_ context.Context, phone string) (string, error) {
+	c.phone = phone
+	return "ABCD-EFGH", nil
 }
 
 func (c *supervisedFixture) Name() string { return "telegram" }
@@ -87,5 +110,21 @@ func TestSupervisorHotReloadsAndDisablesChannels(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("supervisor did not stop")
+	}
+}
+
+func TestSupervisorRoutesPairingActionsToRunningChannel(t *testing.T) {
+	fixture := &pairingFixture{}
+	supervisor := NewSupervisor(nil, nil, nil, nil, nil)
+	supervisor.running["whatsapp"] = &runningChannel{instance: fixture}
+	if err := supervisor.RetryPairing("whatsapp"); err != nil || !fixture.retried {
+		t.Fatalf("retry pairing = retried %t, err %v", fixture.retried, err)
+	}
+	code, err := supervisor.PairPhone(context.Background(), "whatsapp", "15551234567")
+	if err != nil || code != "ABCD-EFGH" || fixture.phone != "15551234567" {
+		t.Fatalf("phone pairing = code %q phone %q err %v", code, fixture.phone, err)
+	}
+	if err := supervisor.RetryPairing("telegram"); err == nil || !strings.Contains(err.Error(), "not running") {
+		t.Fatalf("missing pairing channel error = %v", err)
 	}
 }

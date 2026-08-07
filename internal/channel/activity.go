@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const activityStopTimeout = 2 * time.Second
+const activitySignalTimeout = 2 * time.Second
 
 // ActivityIndicator keeps a best-effort remote activity signal alive while
 // one or more operations are active for the same conversation. Callers must
@@ -23,7 +23,8 @@ type activityState struct {
 	references int
 	cancel     context.CancelFunc
 	done       <-chan struct{}
-	signalMu   sync.Mutex
+	workerDone chan struct{}
+	refreshNow chan struct{}
 }
 
 func NewActivityIndicator[K comparable](interval time.Duration, signal func(context.Context, K, bool) error) *ActivityIndicator[K] {
@@ -47,13 +48,22 @@ func (a *ActivityIndicator[K]) Start(parent context.Context, key K) func() {
 		return a.reference(parent, key, current)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	state := &activityState{references: 1, cancel: cancel, done: ctx.Done()}
+	state := &activityState{
+		references: 1,
+		cancel:     cancel,
+		done:       ctx.Done(),
+		workerDone: make(chan struct{}),
+		refreshNow: make(chan struct{}, 1),
+	}
 	a.active[key] = state
 	a.mu.Unlock()
 
 	stop := a.reference(parent, key, state)
-	a.send(ctx, key, state, true)
-	go a.refresh(ctx, key, state, stop)
+	started := make(chan struct{})
+	go a.refresh(ctx, key, state, stop, started)
+	// Wait only until the first signal attempt has begun. Attachment handling can
+	// then proceed without waiting for a slow remote API request to finish.
+	<-started
 	return stop
 }
 
@@ -72,16 +82,21 @@ func (a *ActivityIndicator[K]) reference(parent context.Context, key K, state *a
 	return stop
 }
 
-func (a *ActivityIndicator[K]) refresh(ctx context.Context, key K, state *activityState, stop func()) {
+func (a *ActivityIndicator[K]) refresh(ctx context.Context, key K, state *activityState, stop func(), started chan<- struct{}) {
+	defer close(state.workerDone)
 	ticker := time.NewTicker(a.interval)
 	defer ticker.Stop()
+	close(started)
+	a.send(ctx, key, true)
 	for {
 		select {
 		case <-ctx.Done():
 			stop()
 			return
 		case <-ticker.C:
-			a.send(ctx, key, state, true)
+			a.send(ctx, key, true)
+		case <-state.refreshNow:
+			a.send(ctx, key, true)
 		}
 	}
 }
@@ -101,10 +116,17 @@ func (a *ActivityIndicator[K]) release(key K, state *activityState) {
 	delete(a.active, key)
 	state.cancel()
 	a.mu.Unlock()
+	go a.finish(key, state)
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), activityStopTimeout)
-	a.send(ctx, key, state, false)
-	cancel()
+func (a *ActivityIndicator[K]) finish(key K, state *activityState) {
+	// A well-behaved signal observes cancellation immediately. The timeout also
+	// bounds shutdown if an adapter violates that contract.
+	select {
+	case <-state.workerDone:
+	case <-time.After(activitySignalTimeout):
+	}
+	a.send(context.Background(), key, false)
 
 	// A replacement may have started while the inactive signal was in flight.
 	// Reassert it so an old completion can never silence new work in the chat.
@@ -112,17 +134,18 @@ func (a *ActivityIndicator[K]) release(key K, state *activityState) {
 	replacement := a.active[key]
 	a.mu.Unlock()
 	if replacement != nil {
-		ctx, cancel = context.WithTimeout(context.Background(), activityStopTimeout)
-		a.send(ctx, key, replacement, true)
-		cancel()
+		select {
+		case replacement.refreshNow <- struct{}{}:
+		default:
+		}
 	}
 }
 
-func (a *ActivityIndicator[K]) send(ctx context.Context, key K, state *activityState, active bool) {
+func (a *ActivityIndicator[K]) send(parent context.Context, key K, active bool) {
 	if a.signal == nil {
 		return
 	}
-	state.signalMu.Lock()
-	defer state.signalMu.Unlock()
+	ctx, cancel := context.WithTimeout(parent, activitySignalTimeout)
+	defer cancel()
 	_ = a.signal(ctx, key, active)
 }

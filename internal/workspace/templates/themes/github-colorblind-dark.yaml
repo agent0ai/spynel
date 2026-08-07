@@ -1,0 +1,20 @@
+name: github-colorblind-dark
+description: "Color-blind friendly: GitHub Primer blue/orange semantics on a dark canvas"
+appearance: dark
+color_blind_friendly: true
+colors:
+  background: "#0D1117"
+  surface: "#151B23"
+  surface_elevated: "#212830"
+  surface_selected: "#2F3742"
+  text: "#F0F6FC"
+  text_muted: "#9198A1"
+  primary: "#58A6FF"
+  secondary: "#D2A8FF"
+  border: "#656C76"
+  user: "#79C0FF"
+  success: "#58A6FF"
+  warning: "#E3B341"
+  error: "#F0883E"
+  info: "#79C0FF"
+  code: "#D2A8FF"

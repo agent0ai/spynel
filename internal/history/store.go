@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/frdel/spynel/internal/shortid"
+	"github.com/agent0ai/spynel/internal/shortid"
 )
 
 const (
@@ -24,10 +24,13 @@ const (
 )
 
 type Entry struct {
-	At      time.Time `json:"at"`
-	Role    string    `json:"role"`
-	Sender  string    `json:"sender,omitempty"`
-	Content string    `json:"content"`
+	At         time.Time `json:"at"`
+	Role       string    `json:"role"`
+	Sender     string    `json:"sender,omitempty"`
+	Content    string    `json:"content"`
+	EventID    string    `json:"event_id,omitempty"`
+	AfterChars int       `json:"after_chars,omitempty"`
+	Terminal   bool      `json:"terminal,omitempty"`
 }
 
 type Conversation struct {
@@ -88,6 +91,38 @@ func (s *Store) Append(channel, conversation string, entry Entry) (string, error
 		return "", err
 	}
 	return path, file.Sync()
+}
+
+func (s *Store) DeliveryState(channel, conversation, eventID string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	file, err := os.Open(s.Path(channel, conversation))
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
+	state := ""
+	for scanner.Scan() {
+		var entry Entry
+		if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.EventID == eventID {
+			switch entry.Role {
+			case "notification_sending":
+				state = "sending"
+			case "notification_failed":
+				state = "failed"
+			case "assistant":
+				if entry.Sender == "Spy" {
+					state = "sent"
+				}
+			}
+		}
+	}
+	return state, scanner.Err()
 }
 
 func (s *Store) Recent(channel, conversation string, characterLimit int) (string, string, error) {
@@ -214,7 +249,7 @@ func readRecentEntries(path string, messageLimit, characterLimit int) ([]Entry, 
 	for left, right := 0, len(reversed)-1; left < right; left, right = left+1, right-1 {
 		reversed[left], reversed[right] = reversed[right], reversed[left]
 	}
-	return reversed, nil
+	return resolveNotificationOrder(reversed), nil
 }
 
 func formatEntry(entry Entry) string {
@@ -302,6 +337,48 @@ func (s *Store) List(limit int) ([]Conversation, error) {
 	return newestConversations(conversations, limit), nil
 }
 
+// Latest returns the most recently updated conversation for one channel
+// without retaining transcript bodies. Startup uses it to resume the last TUI
+// conversation only when this process becomes the first workspace owner.
+func (s *Store) Latest(channel string) (Conversation, bool, error) {
+	directory := filepath.Join(s.root, clean(channel))
+	files, err := os.ReadDir(directory)
+	if os.IsNotExist(err) {
+		return Conversation{}, false, nil
+	}
+	if err != nil {
+		return Conversation{}, false, err
+	}
+	var latest Conversation
+	found := false
+	for _, file := range files {
+		if file.IsDir() || filepath.Ext(file.Name()) != ".jsonl" {
+			continue
+		}
+		path := filepath.Join(directory, file.Name())
+		info, err := file.Info()
+		if err != nil {
+			return Conversation{}, false, err
+		}
+		candidate := Conversation{
+			Channel: channel, Conversation: strings.TrimSuffix(file.Name(), ".jsonl"),
+			Path: path, UpdatedAt: info.ModTime(),
+		}
+		entries, err := readRecentEntries(path, 1, 4096)
+		if err != nil {
+			return Conversation{}, false, err
+		}
+		if len(entries) > 0 && !entries[0].At.IsZero() {
+			candidate.UpdatedAt = entries[0].At
+		}
+		if !found || candidate.UpdatedAt.After(latest.UpdatedAt) {
+			latest = candidate
+			found = true
+		}
+	}
+	return latest, found, nil
+}
+
 func newestConversations(conversations []Conversation, limit int) []Conversation {
 	sort.Slice(conversations, func(i, j int) bool { return conversations[i].UpdatedAt.After(conversations[j].UpdatedAt) })
 	if limit <= 0 || len(conversations) <= limit {
@@ -313,6 +390,13 @@ func newestConversations(conversations []Conversation, limit int) []Conversation
 // Branch streams an existing transcript to a new TUI conversation. The source
 // transport history remains untouched and future messages append independently.
 func (s *Store) Branch(sourceChannel, sourceConversation string) (string, string, error) {
+	return s.BranchTo(sourceChannel, sourceConversation, "tui")
+}
+
+// BranchTo streams an existing transcript to a new conversation owned by the
+// requested target channel. It captures the source's current size, so later
+// source messages never leak into the independent branch.
+func (s *Store) BranchTo(sourceChannel, sourceConversation, targetChannel string) (string, string, error) {
 	s.mu.Lock()
 	source := s.Path(sourceChannel, sourceConversation)
 	input, err := os.Open(source)
@@ -326,13 +410,13 @@ func (s *Store) Branch(sourceChannel, sourceConversation string) (string, string
 		s.mu.Unlock()
 		return "", "", err
 	}
-	if err := os.MkdirAll(filepath.Join(s.root, "tui"), 0o700); err != nil {
+	targetDirectory := filepath.Join(s.root, clean(targetChannel))
+	if err := os.MkdirAll(targetDirectory, 0o700); err != nil {
 		s.mu.Unlock()
 		return "", "", err
 	}
 	s.mu.Unlock()
-	tuiDirectory := filepath.Join(s.root, "tui")
-	output, err := os.CreateTemp(tuiDirectory, ".resume-*")
+	output, err := os.CreateTemp(targetDirectory, ".resume-*")
 	if err != nil {
 		return "", "", err
 	}
@@ -359,7 +443,7 @@ func (s *Store) Branch(sourceChannel, sourceConversation string) (string, string
 			return "", "", err
 		}
 		conversation := "resume-" + id
-		destination := s.Path("tui", conversation)
+		destination := s.Path(targetChannel, conversation)
 		if err := os.Link(temporary, destination); err == nil {
 			return conversation, destination, nil
 		} else if !os.IsExist(err) {
@@ -402,5 +486,101 @@ func readEntries(path string) ([]Entry, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	return entries, nil
+	return resolveNotificationOrder(entries), nil
+}
+
+func resolveNotificationOrder(entries []Entry) []Entry {
+	type pending struct {
+		entry Entry
+		index int
+		after int
+		ack   bool
+	}
+	acks := map[string]int{}
+	var notices []pending
+	for _, entry := range entries {
+		if entry.Role == "notification_ack" && entry.EventID != "" {
+			acks[entry.EventID] = entry.AfterChars
+		}
+	}
+	for index, entry := range entries {
+		if entry.Role == "notification_pending" {
+			after, ok := acks[entry.EventID]
+			notices = append(notices, pending{entry: entry, index: index, after: after, ack: ok})
+		}
+	}
+	if len(notices) == 0 {
+		var filtered []Entry
+		for _, entry := range entries {
+			if entry.Role != "notification_ack" && entry.Role != "notification_sending" && entry.Role != "notification_failed" {
+				filtered = append(filtered, entry)
+			}
+		}
+		return filtered
+	}
+	targets := map[int][]pending{}
+	fallback := map[int][]pending{}
+	for _, notice := range notices {
+		target := -1
+		if notice.ack {
+			for i := notice.index + 1; i < len(entries); i++ {
+				if entries[i].Role == "assistant" && entries[i].Sender != "Spy" {
+					target = i
+					break
+				}
+				if entries[i].Terminal && entries[i].Role == "error" {
+					break
+				}
+			}
+		}
+		if target >= 0 {
+			targets[target] = append(targets[target], notice)
+			continue
+		}
+		for i := notice.index + 1; i < len(entries); i++ {
+			if entries[i].Terminal {
+				target = i
+				break
+			}
+		}
+		if target < 0 {
+			target = len(entries) - 1
+		}
+		fallback[target] = append(fallback[target], notice)
+	}
+	var output []Entry
+	for index, entry := range entries {
+		if entry.Role == "notification_pending" || entry.Role == "notification_ack" || entry.Role == "notification_sending" || entry.Role == "notification_failed" {
+			for _, notice := range fallback[index] {
+				output = append(output, Entry{At: notice.entry.At, Role: "assistant", Sender: "Spy", Content: notice.entry.Content, EventID: notice.entry.EventID})
+			}
+			continue
+		}
+		group := targets[index]
+		if len(group) > 0 {
+			sort.SliceStable(group, func(i, j int) bool { return group[i].after < group[j].after })
+			runes := []rune(entry.Content)
+			start := 0
+			for _, notice := range group {
+				at := min(max(notice.after, start), len(runes))
+				if at > start {
+					segment := entry
+					segment.Content = string(runes[start:at])
+					output = append(output, segment)
+				}
+				output = append(output, Entry{At: notice.entry.At, Role: "assistant", Sender: "Spy", Content: notice.entry.Content, EventID: notice.entry.EventID})
+				start = at
+			}
+			if start < len(runes) {
+				entry.Content = string(runes[start:])
+				output = append(output, entry)
+			}
+		} else {
+			output = append(output, entry)
+		}
+		for _, notice := range fallback[index] {
+			output = append(output, Entry{At: notice.entry.At, Role: "assistant", Sender: "Spy", Content: notice.entry.Content, EventID: notice.entry.EventID})
+		}
+	}
+	return output
 }

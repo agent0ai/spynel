@@ -1,18 +1,129 @@
 package cli
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
-	"github.com/frdel/spynel/internal/channel"
-	"github.com/frdel/spynel/internal/config"
-	"github.com/frdel/spynel/internal/harness"
-	"github.com/frdel/spynel/internal/workspace"
+	"github.com/agent0ai/spynel/internal/app"
+	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/history"
+	"github.com/agent0ai/spynel/internal/instance"
+	"github.com/agent0ai/spynel/internal/localapi"
+	"github.com/agent0ai/spynel/internal/workspace"
 )
+
+type heldCLIHarness struct {
+	mu      sync.Mutex
+	emits   map[string]core.Emit
+	prompts map[string][]string
+	threads map[string]string
+}
+
+func TestNotifyCommandUsesDurableHistoryWithoutHarness(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	store := history.New(cfg.StatePath("history"))
+	if _, err := store.Append("cli", "alerts", history.Entry{Role: "user", Content: "known"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runNotifyCommand([]string{"--config", cfg.Path, "--origin", "cli/alerts", "complete"}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := store.RecentEntries("cli", "alerts", 10, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[1].Sender != "Spy" || entries[1].Content != "complete" {
+		t.Fatalf("history = %#v", entries)
+	}
+}
+
+func newHeldCLIHarness() *heldCLIHarness {
+	return &heldCLIHarness{
+		emits: map[string]core.Emit{}, prompts: map[string][]string{}, threads: map[string]string{},
+	}
+}
+
+func (h *heldCLIHarness) Start(context.Context) error { return nil }
+
+func (h *heldCLIHarness) Send(_ context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	h.mu.Lock()
+	previous := h.emits[key]
+	steered := previous != nil
+	thread := h.threads[key]
+	if thread == "" {
+		thread = "thread-" + key
+		h.threads[key] = thread
+	}
+	h.prompts[key] = append(h.prompts[key], prompt)
+	h.emits[key] = emit
+	h.mu.Unlock()
+	if previous != nil {
+		previous(core.Event{Kind: core.EventStatus, Done: true, ThreadID: thread})
+	}
+	emit(core.Event{Kind: core.EventStatus, Text: "active", ThreadID: thread})
+	return thread, steered, nil
+}
+
+func (h *heldCLIHarness) Interrupt(_ context.Context, key string) (bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.emits[key] == nil {
+		return false, nil
+	}
+	delete(h.emits, key)
+	return true, nil
+}
+
+func (h *heldCLIHarness) ResetSession(key string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.threads, key)
+	return nil
+}
+
+func (h *heldCLIHarness) ThreadID(key string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.threads[key]
+}
+
+func (h *heldCLIHarness) IsActive(key string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.emits[key] != nil
+}
+
+func (h *heldCLIHarness) Close() error { return nil }
+
+func (h *heldCLIHarness) finish(key, text string) {
+	h.mu.Lock()
+	emit := h.emits[key]
+	delete(h.emits, key)
+	h.mu.Unlock()
+	if emit != nil {
+		emit(core.Event{Kind: core.EventFinal, Text: text, Done: true})
+	}
+}
 
 func TestCompleteRunReplacesProcessForRestartRequest(t *testing.T) {
 	want := []string{"serve", "--tui", "--config", "/tmp/project/spynel.yaml"}
@@ -49,6 +160,79 @@ func TestCompleteRunPreservesOrdinaryErrors(t *testing.T) {
 	}
 }
 
+func TestNPMUpdateRequestReturnsLauncherExitCodeWithoutReplacingProcess(t *testing.T) {
+	called := false
+	err := completeRun(&updateRequest{}, func([]string) error {
+		called = true
+		return nil
+	})
+	exit, ok := err.(interface{ ExitCode() int })
+	if !ok || exit.ExitCode() != npmUpdateExitCode || called {
+		t.Fatalf("update request = %T %v, restart called = %t", err, err, called)
+	}
+}
+
+func TestNPMUpdateRequestPublishesInitContinuationArguments(t *testing.T) {
+	placeholder, err := os.CreateTemp(os.TempDir(), "spynel-update-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	statePath := placeholder.Name()
+	if err := placeholder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(statePath); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(statePath) })
+	t.Setenv("SPYNEL_NPM_UPDATE_STATE", statePath)
+	want := []string{"serve", "--tui", "--config", "/tmp/project/spynel.yaml"}
+	request := &updateRequest{args: want}
+	if code := request.ExitCode(); code != npmUpdateExitCode {
+		t.Fatalf("update exit code = %d", code)
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state struct {
+		Args []string `json:"args"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil || strings.Join(state.Args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("update state = %#v, %v", state, err)
+	}
+}
+
+func TestOfflineUpdateInstallReturnsControlToNPMLauncher(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	packageRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(packageRoot, "npm", "vendor"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(packageRoot, "package.json"), []byte(`{"name":"spynel","version":"1.2.0"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(packageRoot, "npm", "vendor", ".installed.json"), []byte(`{"version":"1.2.0"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"name":"spynel","version":"1.3.0"}`))
+	}))
+	defer registry.Close()
+	t.Setenv("SPYNEL_NPM_PACKAGE_ROOT", packageRoot)
+	t.Setenv("SPYNEL_NPM_LAUNCHER_MANAGED", "1")
+	t.Setenv("SPYNEL_NPM_REGISTRY_URL", registry.URL)
+	var output bytes.Buffer
+	err := runFrameworkMessageMode(filepath.Join(root, config.FileName), "updates", "/update install", "1.2.0", messageRunOptions{Output: &output})
+	exit, ok := err.(interface{ ExitCode() int })
+	if !ok || exit.ExitCode() != npmUpdateExitCode || !strings.Contains(output.String(), "Updating Spynel") {
+		t.Fatalf("offline update = %T %v, output %q", err, err, output.String())
+	}
+}
+
 func TestInitialConnectionStatusesReflectConfiguration(t *testing.T) {
 	cfg := config.Default()
 	cfg.Channels.Telegram.Enabled = true
@@ -78,6 +262,366 @@ func TestInitNoStartCreatesWorkspaceWithoutEnteringTUI(t *testing.T) {
 	}
 }
 
+func TestMessageCommandValidatesScriptableArguments(t *testing.T) {
+	if err := run([]string{"message"}, "test"); err == nil || !strings.Contains(err.Error(), "usage: spynel message") {
+		t.Fatalf("missing message text error = %v", err)
+	}
+	if err := run([]string{"message", "--conversation", "", "hello"}, "test"); err == nil || !strings.Contains(err.Error(), "cannot be empty") {
+		t.Fatalf("empty conversation error = %v", err)
+	}
+	if !strings.Contains(helpText, "spynel message") || !strings.Contains(helpText, "--conversation") {
+		t.Fatalf("message command is not documented in CLI help:\n%s", helpText)
+	}
+}
+
+func TestCLIMessageSupportsStdinStreamingAndJSONEvents(t *testing.T) {
+	text, err := cliMessageText(nil, true, strings.NewReader("first line\nsecond line\n"))
+	if err != nil || text != "first line\nsecond line" {
+		t.Fatalf("stdin message = %q, %v", text, err)
+	}
+	if _, err := cliMessageText([]string{"body"}, true, strings.NewReader("stdin")); err == nil {
+		t.Fatal("CLI accepted both positional text and --stdin")
+	}
+	if _, err := cliMessageText(nil, true, strings.NewReader(strings.Repeat("x", maxCLIInputBytes+1))); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized stdin error = %v", err)
+	}
+
+	handler := func(_ context.Context, message core.Message, emit core.Emit) error {
+		if message.Conversation != "stream-test" || !message.FollowupOnly {
+			t.Fatalf("message = %#v", message)
+		}
+		emit(core.Event{Kind: core.EventStatus, Text: "steered"})
+		emit(core.Event{Kind: core.EventDelta, Text: "routine preamble\nhello "})
+		emit(core.Event{Kind: core.EventDelta, Text: "world"})
+		finalText := "hello world"
+		emit(core.Event{Kind: core.EventFinal, Text: "routine preamble\nhello world", FinalText: &finalText, Done: true})
+		return nil
+	}
+	var finalOnly bytes.Buffer
+	if err := runMessageWithOutput(context.Background(), handler, "stream-test", "follow", messageRunOptions{FollowupOnly: true, Output: &finalOnly}); err != nil {
+		t.Fatal(err)
+	}
+	if finalOnly.String() != "hello world\n" {
+		t.Fatalf("final-only output = %q", finalOnly.String())
+	}
+	var streamed bytes.Buffer
+	if err := runMessageWithOutput(context.Background(), handler, "stream-test", "follow", messageRunOptions{Stream: true, FollowupOnly: true, Output: &streamed}); err != nil {
+		t.Fatal(err)
+	}
+	if streamed.String() != "routine preamble\nhello world\n" {
+		t.Fatalf("streamed output = %q", streamed.String())
+	}
+
+	var events bytes.Buffer
+	if err := runMessageWithOutput(context.Background(), handler, "stream-test", "follow", messageRunOptions{JSON: true, FollowupOnly: true, Output: &events}); err != nil {
+		t.Fatal(err)
+	}
+	var decoded []core.Event
+	for _, line := range strings.Split(strings.TrimSpace(events.String()), "\n") {
+		var event core.Event
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatal(err)
+		}
+		decoded = append(decoded, event)
+	}
+	if len(decoded) != 4 || decoded[1].Kind != core.EventDelta || decoded[3].Kind != core.EventFinal || !decoded[3].Done || decoded[3].FinalText == nil || *decoded[3].FinalText != "hello world" {
+		t.Fatalf("NDJSON events = %#v", decoded)
+	}
+}
+
+func TestCLIMessageCopiesRepeatableAttachmentsIntoWorkspace(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "notes.txt")
+	if err := os.WriteFile(source, []byte("attachment body"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	text, err := addCLIAttachments(context.Background(), cfg, "inspect this", []string{source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text, "inspect this\n\n[Attachment notes.txt]") || !strings.Contains(text, filepath.ToSlash(cfg.StatePath("attachments", "cli"))) {
+		t.Fatalf("attachment message = %q", text)
+	}
+	matches, err := filepath.Glob(cfg.StatePath("attachments", "cli", "notes*.txt"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("copied attachments = %#v, %v", matches, err)
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil || string(data) != "attachment body" {
+		t.Fatalf("copied attachment = %q, %v", data, err)
+	}
+}
+
+func TestConversationCLIListsShowsAndBranchesDiskBackedHistory(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := history.New(cfg.StatePath("history"))
+	if _, err := store.Append("telegram", "TG-42", history.Entry{At: time.Now().UTC(), Role: "user", Sender: "alice", Content: "inspect this"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var listed bytes.Buffer
+	if err := listCLIConversations([]string{"--config", cfg.Path, "--json"}, &listed); err != nil {
+		t.Fatal(err)
+	}
+	var records []conversationListRecord
+	if err := json.Unmarshal(listed.Bytes(), &records); err != nil || len(records) != 1 || records[0].Channel != "telegram" || records[0].Conversation != "TG-42" {
+		t.Fatalf("conversation list = %#v, %v", records, err)
+	}
+
+	var shown bytes.Buffer
+	if err := showCLIConversation([]string{"--config", cfg.Path, "--json", "telegram", "TG-42"}, &shown); err != nil {
+		t.Fatal(err)
+	}
+	var tail conversationTail
+	if err := json.Unmarshal(shown.Bytes(), &tail); err != nil || len(tail.Entries) != 1 || tail.Entries[0].Content != "inspect this" {
+		t.Fatalf("conversation tail = %#v, %v", tail, err)
+	}
+
+	var resumed bytes.Buffer
+	if err := resumeCLIConversation([]string{"--config", cfg.Path, "--json", "telegram", "TG-42"}, &resumed); err != nil {
+		t.Fatal(err)
+	}
+	var branch conversationBranch
+	if err := json.Unmarshal(resumed.Bytes(), &branch); err != nil || branch.Channel != "cli" || !strings.HasPrefix(branch.Conversation, "resume-") {
+		t.Fatalf("conversation branch = %#v, %v", branch, err)
+	}
+	entries, _, err := store.Entries("cli", branch.Conversation)
+	if err != nil || len(entries) != 1 || entries[0].Content != "inspect this" {
+		t.Fatalf("branched entries = %#v, %v", entries, err)
+	}
+}
+
+func TestStatusCLIEmitsStructuredNonSecretState(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := runStatusCLICommand([]string{"--config", cfg.Path, "--conversation", "automation", "--json"}, "test", &output); err != nil {
+		t.Fatal(err)
+	}
+	var status app.StatusSnapshot
+	if err := json.Unmarshal(output.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Title == "" || status.Sandbox == "" || status.HarnessState == "" || len(status.Connections) != 2 {
+		t.Fatalf("CLI status = %#v", status)
+	}
+	if strings.Contains(output.String(), "token") {
+		t.Fatalf("CLI status exposed configuration secrets: %s", output.String())
+	}
+}
+
+func TestOfflineFrameworkCommandDoesNotRequireStartedHarness(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := runFrameworkMessageMode(filepath.Join(root, config.FileName), "framework", "/help commands", "test", messageRunOptions{Output: &output}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "/status") || !strings.Contains(output.String(), "/extension list") {
+		t.Fatalf("framework command output = %q", output.String())
+	}
+}
+
+func TestOfflineCLIExtensionCanHandleMessageWithoutAHarness(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell extension fixture")
+	}
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = ""
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	extension := filepath.Join(cfg.Resolve(cfg.Extensions.Directory), "offline-tool")
+	if err := os.MkdirAll(extension, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "name: offline-tool\nhooks:\n  message.received: [\"./hook.sh\"]\n"
+	script := "#!/bin/sh\nIFS= read -r input\ncase \"$input\" in\n  *\"handle offline\"*) printf '%s\\n' '{\"cancel\":true,\"message\":\"handled without harness\"}' ;;\nesac\n"
+	if err := os.WriteFile(filepath.Join(extension, ".spynel-extension.yaml"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extension, "hook.sh"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	if err := runMessageMode(cfg.Path, "offline", "handle offline", "test", messageRunOptions{Output: &output}); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "handled without harness\n" {
+		t.Fatalf("offline extension output = %q", output.String())
+	}
+	if err := runMessageMode(cfg.Path, "offline", "requires a harness", "test", messageRunOptions{Output: &bytes.Buffer{}}); err == nil || !strings.Contains(err.Error(), "harness unavailable") {
+		t.Fatalf("unhandled offline message error = %v", err)
+	}
+}
+
+func TestCLIJoinsWorkspaceOwnerAndStrictlySteersActiveConversation(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		extension := filepath.Join(cfg.Resolve(cfg.Extensions.Directory), "cli-tool")
+		if err := os.MkdirAll(extension, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		manifest := "name: cli-tool\nhooks:\n  message.received: [\"./hook.sh\"]\n"
+		script := "#!/bin/sh\ninput=$(cat)\ncase \"$input\" in\n  *\"invoke custom tool\"*) printf '%s\\n' '{\"cancel\":true,\"message\":\"extension handled CLI\"}' ;;\nesac\n"
+		if err := os.WriteFile(filepath.Join(extension, ".spynel-extension.yaml"), []byte(manifest), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(extension, "hook.sh"), []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := newHeldCLIHarness()
+	service := app.New(cfg, target)
+	election, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.SetPrimaryInstanceID(election.ID())
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := election.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, acquired, err := election.TryAcquire(listener.Addr().String(), token); err != nil || !acquired {
+		t.Fatalf("acquire workspace owner = %t, %v", acquired, err)
+	}
+	serverContext, stopServer := context.WithCancel(context.Background())
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- (&localapi.Server{Service: service, Token: token}).Serve(serverContext, listener)
+	}()
+	defer func() {
+		stopServer()
+		if err := <-serverDone; err != nil {
+			t.Errorf("local API: %v", err)
+		}
+		_ = election.Release(token)
+	}()
+	readyContext, stopWaiting := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopWaiting()
+	if _, err := localapi.NewClient(election).WaitReady(readyContext); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		var toolOutput bytes.Buffer
+		if err := runMessageMode(cfg.Path, "tool", "invoke custom tool", "test", messageRunOptions{Output: &toolOutput}); err != nil {
+			t.Fatal(err)
+		}
+		if toolOutput.String() != "extension handled CLI\n" || target.IsActive("chat:cli:tool") {
+			t.Fatalf("CLI extension output = %q, harness active = %t", toolOutput.String(), target.IsActive("chat:cli:tool"))
+		}
+	}
+
+	var firstOutput bytes.Buffer
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- runMessageMode(cfg.Path, "active", "start the work", "test", messageRunOptions{Stream: true, Output: &firstOutput})
+	}()
+	key := "chat:cli:active"
+	deadline := time.Now().Add(5 * time.Second)
+	for !target.IsActive(key) {
+		if time.Now().After(deadline) {
+			t.Fatal("initial CLI turn did not become active through the owner")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	var followupOutput bytes.Buffer
+	followupDone := make(chan error, 1)
+	go func() {
+		followupDone <- runMessageMode(cfg.Path, "active", "focus on the API", "test", messageRunOptions{FollowupOnly: true, Stream: true, Output: &followupOutput})
+	}()
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow-up did not release the first CLI response")
+	}
+	target.mu.Lock()
+	prompts := append([]string(nil), target.prompts[key]...)
+	target.mu.Unlock()
+	if len(prompts) != 2 || !strings.Contains(prompts[1], "focus on the API") {
+		t.Fatalf("owner harness prompts = %#v", prompts)
+	}
+	target.finish(key, "follow-up complete")
+	select {
+	case err := <-followupDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow-up CLI did not receive the final response")
+	}
+	if firstOutput.String() != "" || followupOutput.String() != "follow-up complete\n" {
+		t.Fatalf("CLI outputs = first %q, follow-up %q", firstOutput.String(), followupOutput.String())
+	}
+	if err := runMessageMode(cfg.Path, "active", "too late", "test", messageRunOptions{FollowupOnly: true, Output: &bytes.Buffer{}}); err == nil || !strings.Contains(err.Error(), "no active execution") {
+		t.Fatalf("inactive follow-up error = %v", err)
+	}
+}
+
+func TestRunMessageCompletesWhenFollowUpReleasesItsEmitter(t *testing.T) {
+	handler := func(_ context.Context, _ core.Message, emit core.Emit) error {
+		emit(core.Event{Kind: core.EventStatus, Done: true})
+		return nil
+	}
+	if err := runMessageWithHandler(context.Background(), handler, "follow-up", "message"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunMessageCompletesWhenExtensionCancelsWithoutReply(t *testing.T) {
+	handler := func(context.Context, core.Message, core.Emit) error { return nil }
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := runMessageWithOutput(ctx, handler, "cancelled", "message", messageRunOptions{Output: &bytes.Buffer{}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBuildServiceUsesConfiguredHarnessSandbox(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
@@ -98,5 +642,293 @@ func TestBuildServiceUsesConfiguredHarnessSandbox(t *testing.T) {
 	})
 	if !ok || runtimeHarness.HarnessConfig().Sandbox != "read-only" {
 		t.Fatalf("runtime sandbox = %#v, configurable = %t", runtimeHarness, ok)
+	}
+}
+
+func TestTUIStartupResumesHistoryOnlyForInitialElectionWinner(t *testing.T) {
+	store := history.New(t.TempDir())
+	if _, err := store.Append("tui", "local-old", history.Entry{At: time.Now().Add(-time.Hour), Role: "user", Content: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("tui", "local-latest", history.Entry{At: time.Now(), Role: "assistant", Content: "latest"}); err != nil {
+		t.Fatal(err)
+	}
+	ownerLease := instance.Lease{InstanceID: "winner"}
+	if !shouldResumeTUIHistory(false, ownerLease, "winner") {
+		t.Fatal("initial election winner did not qualify to resume TUI history")
+	}
+	for _, test := range []struct {
+		name       string
+		hadPrimary bool
+		lease      instance.Lease
+	}{
+		{name: "existing owner", hadPrimary: true, lease: ownerLease},
+		{name: "initial race loser", lease: instance.Lease{InstanceID: "other"}},
+		{name: "handoff record", lease: instance.Lease{InstanceID: "winner", HandoffTo: "target"}},
+	} {
+		if shouldResumeTUIHistory(test.hadPrimary, test.lease, "winner") {
+			t.Fatalf("%s unexpectedly qualified to resume TUI history", test.name)
+		}
+	}
+	conversation, err := selectTUIConversation(store, "winner", true)
+	if err != nil || conversation != "local-latest" {
+		t.Fatalf("resumed conversation = %q, %v", conversation, err)
+	}
+	conversation, err = selectTUIConversation(store, "secondary", false)
+	if err != nil || conversation != "local-secondary" {
+		t.Fatalf("secondary conversation = %q, %v", conversation, err)
+	}
+}
+
+func TestOwnerElectionRunsOneServerAndHandsOffOnExit(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Root = root
+	cfg.Path = filepath.Join(root, config.FileName)
+	cfg.Harness.Name = ""
+	cfg.Channels.Telegram.Enabled = false
+	cfg.Channels.WhatsApp.Enabled = false
+	cfg.Orchestrator.Enabled = false
+	cfg.Extensions.Enabled = false
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	first, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstContext, stopFirst := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- runOwnerElection(firstContext, cfg, "test", first, func() {}, func() {}) }()
+	waitContext, stopWaiting := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopWaiting()
+	client := localapi.NewClient(first)
+	if _, err := client.WaitReady(waitContext); err != nil {
+		stopFirst()
+		t.Fatal(err)
+	}
+	lease, err := first.Current()
+	if err != nil || lease.InstanceID != first.ID() {
+		stopFirst()
+		t.Fatalf("first lease = %#v, %v", lease, err)
+	}
+
+	secondContext, stopSecond := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- runOwnerElection(secondContext, cfg, "test", second, func() {}, func() {}) }()
+	time.Sleep(2 * instance.RetryInterval)
+	lease, err = second.Current()
+	if err != nil || lease.InstanceID != first.ID() {
+		stopFirst()
+		stopSecond()
+		t.Fatalf("second contender displaced healthy owner: %#v, %v", lease, err)
+	}
+	updated := cfg
+	updated.Channels.TUI.Title = "Reloaded by successor"
+	if err := config.Save(updated); err != nil {
+		stopFirst()
+		stopSecond()
+		t.Fatal(err)
+	}
+
+	stopFirst()
+	if err := <-firstDone; err != nil {
+		stopSecond()
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		lease, err = second.Current()
+		if err == nil && lease.InstanceID == second.ID() {
+			break
+		}
+		if time.Now().After(deadline) {
+			stopSecond()
+			t.Fatalf("secondary did not take over: %#v, %v", lease, err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	state, err := client.WaitReady(waitContext)
+	if err != nil {
+		stopSecond()
+		t.Fatal(err)
+	}
+	if state.Title != "Reloaded by successor" {
+		stopSecond()
+		t.Fatalf("successor used stale startup config: %#v", state)
+	}
+	stopSecond()
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOwnerElectionPromotesAfterObservedPrimaryBecomesStale(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Root = root
+	cfg.Path = filepath.Join(root, config.FileName)
+	cfg.Harness.Name = ""
+	cfg.Channels.Telegram.Enabled = false
+	cfg.Channels.WhatsApp.Enabled = false
+	cfg.Orchestrator.Enabled = false
+	cfg.Extensions.Enabled = false
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	stateDirectory := cfg.Resolve(cfg.Workspace.StateDir)
+	if err := os.MkdirAll(filepath.Join(stateDirectory, "runtime"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	stalled := instance.Lease{
+		InstanceID:  "stalled-primary",
+		PID:         1,
+		Endpoint:    "127.0.0.1:1",
+		Token:       "stalled-primary-token",
+		StartedAt:   now.Add(-time.Hour),
+		HeartbeatAt: now.Add(-instance.StaleAfter + 250*time.Millisecond),
+	}
+	data, err := json.Marshal(stalled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDirectory, "runtime", "primary.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	contender, err := instance.New(stateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runOwnerElection(ctx, cfg, "test", contender, func() {}, func() {}) }()
+
+	waitContext, stopWaiting := context.WithTimeout(context.Background(), 6*time.Second)
+	defer stopWaiting()
+	if _, err := localapi.NewClient(contender).WaitReady(waitContext); err != nil {
+		cancel()
+		<-done
+		t.Fatal(err)
+	}
+	lease, err := contender.Current()
+	if err != nil || lease.InstanceID != contender.ID() {
+		cancel()
+		<-done
+		t.Fatalf("promoted lease = %#v, %v", lease, err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPrimaryCommandHandsOwnershipToRequestingTUI(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Root = root
+	cfg.Path = filepath.Join(root, config.FileName)
+	cfg.Harness.Name = ""
+	cfg.Channels.Telegram.Enabled = false
+	cfg.Channels.WhatsApp.Enabled = false
+	cfg.Orchestrator.Enabled = false
+	cfg.Extensions.Enabled = false
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	first, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstContext, stopFirst := context.WithCancel(context.Background())
+	secondContext, stopSecond := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() { firstDone <- runOwnerElection(firstContext, cfg, "test", first, func() {}, func() {}) }()
+	waitContext, stopWaiting := context.WithTimeout(context.Background(), 8*time.Second)
+	defer stopWaiting()
+	if _, err := localapi.NewClient(first).WaitReady(waitContext); err != nil {
+		stopFirst()
+		t.Fatal(err)
+	}
+	go func() { secondDone <- runOwnerElection(secondContext, cfg, "test", second, func() {}, func() {}) }()
+	defer func() {
+		stopFirst()
+		stopSecond()
+		if err := <-firstDone; err != nil {
+			t.Errorf("first election: %v", err)
+		}
+		if err := <-secondDone; err != nil {
+			t.Errorf("second election: %v", err)
+		}
+	}()
+	client := localapi.NewClient(second)
+	var response core.Event
+	if err := client.Handle(waitContext, core.Message{Channel: "tui", Conversation: "local-" + second.ID(), Text: "/primary"}, func(event core.Event) {
+		if event.Kind == core.EventFinal {
+			response = event
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(response.Text, "Primary handoff requested") {
+		t.Fatalf("primary response = %#v", response)
+	}
+	for {
+		lease, err := second.Current()
+		if err == nil && lease.InstanceID == second.ID() && lease.HandoffTo == "" {
+			break
+		}
+		select {
+		case <-waitContext.Done():
+			t.Fatalf("requesting TUI did not become primary: lease %#v, error %v", lease, err)
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	if _, err := client.WaitReady(waitContext); err != nil {
+		t.Fatalf("new primary API did not become ready: %v", err)
+	}
+}
+
+func TestPromotionRefusesAChangedStateDirectory(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Root = root
+	cfg.Path = filepath.Join(root, config.FileName)
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	election, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	token, _ := election.NewToken()
+	if _, acquired, err := election.TryAcquire(listener.Addr().String(), token); err != nil || !acquired {
+		t.Fatalf("acquire = %t, %v", acquired, err)
+	}
+	defer election.Release(token)
+	updated := cfg
+	updated.Workspace.StateDir = ".spynel-next"
+	if err := config.Save(updated); err != nil {
+		t.Fatal(err)
+	}
+	term, err := startPrimaryTerm(context.Background(), cfg, "test", election, listener, token, func() {}, func() {})
+	if term != nil || err == nil || !strings.Contains(err.Error(), "state directory changed") {
+		t.Fatalf("promotion = %#v, %v", term, err)
 	}
 }

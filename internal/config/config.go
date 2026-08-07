@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/frdel/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/fsx"
 	"gopkg.in/yaml.v3"
 )
 
@@ -54,6 +54,7 @@ type Channels struct {
 type TUI struct {
 	Enabled bool   `yaml:"enabled"`
 	Title   string `yaml:"title"`
+	Theme   string `yaml:"theme"`
 }
 
 type Telegram struct {
@@ -85,14 +86,34 @@ type WhatsApp struct {
 
 type Speech struct {
 	Enabled        bool   `yaml:"enabled"`
-	Command        string `yaml:"command"`
-	FFmpegCommand  string `yaml:"ffmpeg_command"`
-	Model          string `yaml:"model"`
-	ModelPath      string `yaml:"model_path,omitempty"`
+	ModelDir       string `yaml:"model_dir,omitempty"`
 	Language       string `yaml:"language"`
+	NumThreads     int    `yaml:"num_threads"`
 	MaxFileMB      int    `yaml:"max_file_mb"`
 	MaxDurationSec int    `yaml:"max_duration_seconds"`
 	ChunkSeconds   int    `yaml:"chunk_seconds"`
+}
+
+var speechLanguages = []string{
+	"auto", "en", "bg", "hr", "cs", "da", "nl", "et", "fi", "fr", "de", "el", "hu",
+	"it", "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk",
+}
+
+// SpeechLanguages returns the language values supported by the bundled
+// Parakeet models. English uses the English-only model; auto and every other
+// language use the multilingual model.
+func SpeechLanguages() []string {
+	return append([]string(nil), speechLanguages...)
+}
+
+func IsSpeechLanguage(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	for _, language := range speechLanguages {
+		if value == language {
+			return true
+		}
+	}
+	return false
 }
 
 type Startup struct {
@@ -112,6 +133,7 @@ type Route struct {
 	Working        string   `yaml:"working"`
 	Prompt         string   `yaml:"prompt"`
 	RecoveryPrompt string   `yaml:"recovery_prompt"`
+	ReviewPrompt   string   `yaml:"review_prompt,omitempty"`
 	StaleAfter     string   `yaml:"stale_after"`
 	AllowedNext    []string `yaml:"allowed_next"`
 }
@@ -144,17 +166,17 @@ func Default() Config {
 		Workspace: Workspace{StateDir: ".spynel", HistoryMaxMessages: 50, HistoryCharLimit: 12000, AttachmentMaxMB: 100},
 		Harness:   Harness{Name: "", Model: "", Sandbox: "danger-full-access"},
 		Channels: Channels{
-			TUI:      TUI{Enabled: true, Title: "Spynel"},
+			TUI:      TUI{Enabled: true, Title: "Spynel", Theme: "spynel"},
 			Telegram: Telegram{Name: "spynel", TokenEnv: "SPYNEL_TELEGRAM_TOKEN", Mode: "polling", WebhookListen: "127.0.0.1:8787", PollTimeoutSec: 30, GroupMode: "mention", WelcomeMessage: "Welcome, {name}!"},
 			WhatsApp: WhatsApp{Mode: "self-chat", Database: ".spynel/whatsapp.db", PollIntervalSec: 3},
 		},
-		Speech:  Speech{Enabled: true, Command: "whisper-cli", FFmpegCommand: "ffmpeg", Model: "small", Language: "auto", MaxFileMB: 100, MaxDurationSec: 1800, ChunkSeconds: 600},
+		Speech:  Speech{Enabled: true, Language: "en", NumThreads: 2, MaxFileMB: 100, MaxDurationSec: 1800, ChunkSeconds: 600},
 		Startup: Startup{},
 		Orchestrator: Orchestrator{
 			Enabled: true, IntervalSec: 10, MaxParallel: 4,
 			Routes: []Route{
-				{Name: "tasks", Source: ".spynel/tasks/todo", Working: ".spynel/tasks/working", Prompt: ".spynel/prompts/task.md", RecoveryPrompt: ".spynel/prompts/recovery.md", StaleAfter: "30m", AllowedNext: []string{"todo", "working", "waiting", "done", "failed"}},
-				{Name: "goals", Source: ".spynel/goals/active", Working: ".spynel/goals/working", Prompt: ".spynel/prompts/goal.md", RecoveryPrompt: ".spynel/prompts/recovery.md", StaleAfter: "2h", AllowedNext: []string{"active", "working", "waiting", "done"}},
+				{Name: "tasks", Source: ".spynel/tasks/todo", Working: ".spynel/tasks/working", Prompt: ".spynel/prompts/task.md", RecoveryPrompt: ".spynel/prompts/recovery.md", ReviewPrompt: ".spynel/prompts/review.md", StaleAfter: "30m", AllowedNext: []string{"todo", "working", "review", "reviewing", "waiting", "done", "failed", "cancelled"}},
+				{Name: "goals", Source: ".spynel/goals/proposed", Working: ".spynel/goals/planning", Prompt: ".spynel/prompts/goal.md", RecoveryPrompt: ".spynel/prompts/recovery.md", ReviewPrompt: ".spynel/prompts/goal-review.md", StaleAfter: "2h", AllowedNext: []string{"proposed", "planning", "active", "review", "reviewing", "waiting", "done", "abandoned"}},
 			},
 		},
 		Extensions: Extensions{Enabled: true, Directory: ".spynel/extensions", HookTimeout: "30s"},
@@ -219,6 +241,31 @@ func Load(path string) (Config, error) {
 		cfg.Harness.Model = compatibility.Legacy.Model
 	}
 	cfg.Harness.Sandbox = normalizeSandbox(cfg.Harness.Sandbox)
+	cfg.Speech.Language = strings.ToLower(strings.TrimSpace(cfg.Speech.Language))
+	// Upgrade version-one built-in workflow values in memory without
+	// overwriting the user's configuration file. Workspace.Upgrade restores
+	// missing prompts and directories separately and non-destructively.
+	for i := range cfg.Orchestrator.Routes {
+		route := &cfg.Orchestrator.Routes[i]
+		switch route.Name {
+		case "tasks":
+			if route.ReviewPrompt == "" {
+				route.ReviewPrompt = ".spynel/prompts/review.md"
+			}
+			route.AllowedNext = []string{"todo", "working", "review", "reviewing", "waiting", "done", "failed", "cancelled"}
+		case "goals":
+			if filepath.Base(filepath.Clean(route.Source)) == "active" {
+				route.Source = filepath.Join(filepath.Dir(route.Source), "proposed")
+			}
+			if filepath.Base(filepath.Clean(route.Working)) == "working" {
+				route.Working = filepath.Join(filepath.Dir(route.Working), "planning")
+			}
+			if route.ReviewPrompt == "" {
+				route.ReviewPrompt = ".spynel/prompts/goal-review.md"
+			}
+			route.AllowedNext = []string{"proposed", "planning", "active", "review", "reviewing", "waiting", "done", "abandoned"}
+		}
+	}
 	cfg.Path = abs
 	cfg.Root = filepath.Dir(abs)
 	if err := cfg.Validate(); err != nil {
@@ -244,6 +291,9 @@ func (c Config) Validate() error {
 	if c.Workspace.AttachmentMaxMB <= 0 {
 		problems = append(problems, "workspace.attachment_max_mb must be positive")
 	}
+	if strings.TrimSpace(c.Channels.TUI.Theme) == "" {
+		problems = append(problems, "channels.tui.theme is required")
+	}
 	if c.Harness.Name != "" && c.Harness.Name != "codex" && c.Harness.Name != "claude-code" {
 		problems = append(problems, "harness.name must be codex or claude-code")
 	}
@@ -263,6 +313,9 @@ func (c Config) Validate() error {
 		prefix := fmt.Sprintf("orchestrator.routes[%d]", i)
 		if route.Name == "" || route.Source == "" || route.Working == "" || route.Prompt == "" || route.RecoveryPrompt == "" {
 			problems = append(problems, prefix+" requires name, source, working, prompt, and recovery_prompt")
+		}
+		if (route.Name == "tasks" || route.Name == "goals") && strings.TrimSpace(route.ReviewPrompt) == "" {
+			problems = append(problems, prefix+".review_prompt is required for built-in task and goal routes")
 		}
 		if seen[route.Name] {
 			problems = append(problems, "duplicate route name "+route.Name)
@@ -286,8 +339,14 @@ func (c Config) Validate() error {
 	if c.Channels.Telegram.Mode == "webhook" && c.Channels.Telegram.Enabled && strings.TrimSpace(c.Channels.Telegram.WebhookListen) == "" {
 		problems = append(problems, "channels.telegram.webhook_listen is required in webhook mode")
 	}
+	if c.Channels.Telegram.Mode == "webhook" && c.Channels.Telegram.Enabled && strings.TrimSpace(c.Channels.Telegram.WebhookSecret) == "" {
+		problems = append(problems, "channels.telegram.webhook_secret is required in webhook mode")
+	}
 	if c.Channels.Telegram.Enabled && !hasNonemptyValue(c.Channels.Telegram.AllowedUsers) {
 		problems = append(problems, "channels.telegram.allowed_users requires at least one user when Telegram is enabled")
+	}
+	if c.Channels.WhatsApp.Enabled && !HasAllowedWhatsAppNumber(c.Channels.WhatsApp.AllowedNumbers) {
+		problems = append(problems, "channels.whatsapp.allowed_numbers requires at least one number when WhatsApp is enabled")
 	}
 	switch c.Channels.Telegram.GroupMode {
 	case "mention", "all", "off":
@@ -300,11 +359,11 @@ func (c Config) Validate() error {
 	if c.Channels.WhatsApp.PollIntervalSec < 2 {
 		problems = append(problems, "channels.whatsapp.poll_interval_seconds must be at least 2")
 	}
-	if c.Speech.MaxFileMB <= 0 || c.Speech.MaxDurationSec <= 0 || c.Speech.ChunkSeconds <= 0 {
+	if c.Speech.MaxFileMB <= 0 || c.Speech.MaxDurationSec <= 0 || c.Speech.ChunkSeconds <= 0 || c.Speech.NumThreads <= 0 {
 		problems = append(problems, "speech resource limits must be positive")
 	}
-	if c.Speech.Enabled && (strings.TrimSpace(c.Speech.Command) == "" || strings.TrimSpace(c.Speech.FFmpegCommand) == "") {
-		problems = append(problems, "speech.command and speech.ffmpeg_command are required when speech is enabled")
+	if !IsSpeechLanguage(c.Speech.Language) {
+		problems = append(problems, "speech.language must be auto or a supported Parakeet language code")
 	}
 	if strings.TrimSpace(c.Extensions.Directory) == "" {
 		problems = append(problems, "extensions.directory is required")
@@ -325,6 +384,37 @@ func hasNonemptyValue(values []string) bool {
 		}
 	}
 	return false
+}
+
+// HasAllowedWhatsAppNumber reports whether an allow-list contains at least
+// one canonical digit-bearing phone number. Prefix- or punctuation-only
+// entries remain empty so every configuration and adapter boundary fails
+// closed in the same way.
+func HasAllowedWhatsAppNumber(values []string) bool {
+	for _, value := range values {
+		if NormalizeWhatsAppNumber(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeWhatsAppNumber returns the canonical digits used by WhatsApp JIDs
+// and allow-list comparisons. A leading international 00 access prefix is
+// equivalent to +; other domestic trunk prefixes are preserved because they
+// cannot be interpreted safely without country-specific configuration.
+func NormalizeWhatsAppNumber(value string) string {
+	var digits strings.Builder
+	for _, character := range value {
+		if character >= '0' && character <= '9' {
+			digits.WriteRune(character)
+		}
+	}
+	normalized := digits.String()
+	if strings.HasPrefix(normalized, "00") {
+		normalized = normalized[2:]
+	}
+	return normalized
 }
 
 func normalizeSandbox(value string) string {

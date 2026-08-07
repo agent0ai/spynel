@@ -1,0 +1,20 @@
+name: okabe-ito-dark
+description: "Color-blind friendly: Okabe-Ito blue, orange, yellow, and purple on charcoal"
+appearance: dark
+color_blind_friendly: true
+colors:
+  background: "#121212"
+  surface: "#1D1D1D"
+  surface_elevated: "#292929"
+  surface_selected: "#383838"
+  text: "#F2F2F2"
+  text_muted: "#B5B5B5"
+  primary: "#56B4E9"
+  secondary: "#E69F00"
+  border: "#6E6E6E"
+  user: "#72C5ED"
+  success: "#F0E442"
+  warning: "#E69F00"
+  error: "#FF8A52"
+  info: "#E39BC1"
+  code: "#F0E442"

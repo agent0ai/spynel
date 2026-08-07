@@ -1,0 +1,20 @@
+name: gruvbox-light
+description: Warm paper and earthy accents from the original Gruvbox light palette
+appearance: light
+color_blind_friendly: false
+colors:
+  background: "#FBF1C7"
+  surface: "#F2E5BC"
+  surface_elevated: "#EBDBB2"
+  surface_selected: "#D5C4A1"
+  text: "#3C3836"
+  text_muted: "#665C54"
+  primary: "#8D0005"
+  secondary: "#075F70"
+  border: "#7C6F64"
+  user: "#075F70"
+  success: "#526B13"
+  warning: "#805100"
+  error: "#8D0005"
+  info: "#075F70"
+  code: "#7A365F"

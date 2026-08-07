@@ -1,0 +1,20 @@
+name: rose-pine-dawn
+description: Rosé Pine Dawn's warm porcelain canvas and rose, pine, and iris accents
+appearance: light
+color_blind_friendly: false
+colors:
+  background: "#FAF4ED"
+  surface: "#FFFAF3"
+  surface_elevated: "#F2E9E1"
+  surface_selected: "#DFDAD9"
+  text: "#575279"
+  text_muted: "#6F6A86"
+  primary: "#98445F"
+  secondary: "#286983"
+  border: "#8A849C"
+  user: "#286983"
+  success: "#3A6B35"
+  warning: "#795000"
+  error: "#98445F"
+  info: "#286983"
+  code: "#6D4C87"

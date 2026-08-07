@@ -15,6 +15,7 @@ channels:
   tui:
     enabled: true
     title: Spynel
+    theme: spynel
   telegram:
     enabled: false
     name: spynel
@@ -40,11 +41,9 @@ channels:
 
 speech:
   enabled: true
-  command: whisper-cli
-  ffmpeg_command: ffmpeg
-  model: small
-  model_path: ""
-  language: auto
+  model_dir: ""
+  language: en
+  num_threads: 2
   max_file_mb: 100
   max_duration_seconds: 1800
   chunk_seconds: 600
@@ -62,15 +61,17 @@ orchestrator:
       working: .spynel/tasks/working
       prompt: .spynel/prompts/task.md
       recovery_prompt: .spynel/prompts/recovery.md
+      review_prompt: .spynel/prompts/review.md
       stale_after: 30m
-      allowed_next: [todo, working, waiting, done, failed]
+      allowed_next: [todo, working, review, reviewing, waiting, done, failed, cancelled]
     - name: goals
-      source: .spynel/goals/active
-      working: .spynel/goals/working
+      source: .spynel/goals/proposed
+      working: .spynel/goals/planning
       prompt: .spynel/prompts/goal.md
       recovery_prompt: .spynel/prompts/recovery.md
+      review_prompt: .spynel/prompts/goal-review.md
       stale_after: 2h
-      allowed_next: [active, working, waiting, done]
+      allowed_next: [proposed, planning, active, review, reviewing, waiting, done, abandoned]
 
 extensions:
   enabled: true

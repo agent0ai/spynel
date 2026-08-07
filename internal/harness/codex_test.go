@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frdel/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/core"
 )
 
 func TestCodexPreservesMultipleAgentMessages(t *testing.T) {
@@ -37,20 +37,23 @@ func TestCodexPreservesMultipleAgentMessages(t *testing.T) {
 	notify("turn/completed", map[string]any{"threadId": state.threadID, "turn": map[string]any{"id": state.turnID, "status": "completed"}})
 
 	var streamed strings.Builder
-	var final string
+	var final core.Event
 	for _, event := range events {
 		switch event.Kind {
 		case core.EventDelta:
 			streamed.WriteString(event.Text)
 		case core.EventFinal:
-			final = event.Text
+			final = event
 		}
 	}
 	if got, want := streamed.String(), "first message\nsecond message"; got != want {
 		t.Fatalf("streamed response = %q, want %q", got, want)
 	}
-	if want := "first message\nsecond message"; final != want {
-		t.Fatalf("final response = %q, want %q", final, want)
+	if want := "first message\nsecond message"; final.Text != want {
+		t.Fatalf("final response = %q, want %q", final.Text, want)
+	}
+	if final.FinalText == nil || *final.FinalText != "second message" {
+		t.Fatalf("last assistant item = %#v, want second message", final.FinalText)
 	}
 }
 
@@ -112,10 +115,11 @@ while IFS= read -r line; do
     *'"method":"thread/resume"'*) printf '{"id":%s,"result":{"thread":{"id":"thr_test"}}}\n' "$id" ;;
     *'"method":"turn/start"'*)
       printf '{"id":%s,"result":{"turn":{"id":"turn_test","status":"inProgress"}}}\n' "$id"
-      printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"hello "}}\n'
-      sleep 0.1
-      printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"world"}}\n'
-      printf '{"method":"turn/completed","params":{"threadId":"thr_test","turn":{"id":"turn_test","status":"completed"}}}\n'
+      (sleep 0.05
+       printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"hello "}}\n'
+       sleep 0.05
+       printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"world"}}\n'
+       printf '{"method":"turn/completed","params":{"threadId":"thr_test","turn":{"id":"turn_test","status":"completed"}}}\n') &
       ;;
     *'"method":"turn/steer"'*) printf '{"id":%s,"result":{"turnId":"turn_test"}}\n' "$id" ;;
   esac
@@ -135,13 +139,27 @@ done
 	}
 	defer codex.Close()
 	var mu sync.Mutex
-	var events []core.Event
+	var firstEvents []core.Event
+	var secondEvents []core.Event
+	released := make(chan struct{})
 	done := make(chan struct{})
-	emit := func(event core.Event) {
+	firstEmit := func(event core.Event) {
 		mu.Lock()
-		events = append(events, event)
+		firstEvents = append(firstEvents, event)
 		mu.Unlock()
-		if event.Done {
+		if event.Done && event.Kind == core.EventStatus {
+			select {
+			case <-released:
+			default:
+				close(released)
+			}
+		}
+	}
+	secondEmit := func(event core.Event) {
+		mu.Lock()
+		secondEvents = append(secondEvents, event)
+		mu.Unlock()
+		if event.Done && event.Kind == core.EventFinal {
 			select {
 			case <-done:
 			default:
@@ -149,13 +167,18 @@ done
 			}
 		}
 	}
-	thread, steered, err := codex.Send(ctx, "chat:tui:local", "first", emit)
+	thread, steered, err := codex.Send(ctx, "chat:tui:local", "first", firstEmit)
 	if err != nil || steered || thread != "thr_test" {
 		t.Fatalf("first send = %q, %t, %v", thread, steered, err)
 	}
-	_, steered, err = codex.Send(ctx, "chat:tui:local", "follow-up", emit)
+	_, steered, err = codex.Send(ctx, "chat:tui:local", "follow-up", secondEmit)
 	if err != nil || !steered {
 		t.Fatalf("active follow-up was not steered: %t, %v", steered, err)
+	}
+	select {
+	case <-released:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for previous emitter release")
 	}
 	select {
 	case <-done:
@@ -164,14 +187,19 @@ done
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	for _, event := range firstEvents {
+		if event.Kind == core.EventFinal {
+			t.Fatalf("previous emitter received the steered final: %#v", firstEvents)
+		}
+	}
 	foundFinal := false
-	for _, event := range events {
+	for _, event := range secondEvents {
 		if event.Kind == core.EventFinal && strings.Contains(event.Text, "hello world") {
 			foundFinal = true
 		}
 	}
 	if !foundFinal {
-		t.Fatalf("unexpected events: %#v", events)
+		t.Fatalf("unexpected latest-emitter events: %#v", secondEvents)
 	}
 	if codex.ThreadID("chat:tui:local") != "thr_test" {
 		t.Fatal("thread session was not persisted")

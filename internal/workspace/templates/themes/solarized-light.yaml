@@ -1,0 +1,20 @@
+name: solarized-light
+description: Ethan Schoonover's precision-balanced Solarized light palette
+appearance: light
+color_blind_friendly: false
+colors:
+  background: "#FDF6E3"
+  surface: "#EEE8D5"
+  surface_elevated: "#E5DECA"
+  surface_selected: "#EBE3CF"
+  text: "#4B626A"
+  text_muted: "#526A73"
+  primary: "#00689C"
+  secondary: "#575CA0"
+  border: "#71888F"
+  user: "#00689C"
+  success: "#596B00"
+  warning: "#765800"
+  error: "#AA2530"
+  info: "#00736F"
+  code: "#575CA0"

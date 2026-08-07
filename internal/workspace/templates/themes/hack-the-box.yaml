@@ -1,0 +1,20 @@
+name: hack-the-box
+description: Hack The Box chartreuse over deep green-navy surfaces
+appearance: dark
+color_blind_friendly: false
+colors:
+  background: "#111927"
+  surface: "#171717"
+  surface_elevated: "#1A2332"
+  surface_selected: "#26354A"
+  text: "#A4B1CD"
+  text_muted: "#7183A4"
+  primary: "#9FEF00"
+  secondary: "#D5FF80"
+  border: "#3D5276"
+  user: "#5CB8FF"
+  success: "#9FEF00"
+  warning: "#FFCC66"
+  error: "#FF5F5F"
+  info: "#5CB8FF"
+  code: "#D5FF80"

@@ -5,10 +5,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/frdel/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/core"
 )
 
 const (
@@ -38,11 +39,16 @@ func (s *Service) resumeScreen() (core.Screen, error) {
 	}
 	screen := core.Screen{
 		ID: "resume", Title: "Resume a conversation",
-		Subtitle: "Select a disk-backed conversation. Spynel copies it to an independent TUI branch; the original Telegram, WhatsApp, or TUI history is never modified.",
+		Hints: []core.ScreenHint{
+			{Key: "↑↓/⇥", Action: "nav"},
+			{Key: "␠/↵", Action: "choose"},
+			{Key: "⌦", Action: "delete"},
+			{Key: "␛", Action: "exit"},
+		},
 	}
 	for _, conversation := range conversations {
 		updated := conversation.UpdatedAt.Local().Format("2006-01-02 15:04")
-		label := fmt.Sprintf("%s · %s · %s", conversation.Channel, conversation.Conversation, updated)
+		label := fmt.Sprintf("%-3s  %s  %s", resumePlatform(conversation.Channel), updated, filepath.Base(conversation.Path))
 		description := conversation.Preview
 		if description == "" {
 			description = "Empty conversation"
@@ -54,10 +60,26 @@ func (s *Service) resumeScreen() (core.Screen, error) {
 			Kind: "action", Value: label, Description: description,
 		})
 	}
-	if len(screen.Controls) == 0 {
-		screen.Subtitle += "\n\nNo saved conversations were found."
-	}
 	return screen, nil
+}
+
+func resumePlatform(channel string) string {
+	switch strings.ToLower(strings.TrimSpace(channel)) {
+	case "tui":
+		return "TUI"
+	case "cli":
+		return "CLI"
+	case "telegram":
+		return "TG"
+	case "whatsapp":
+		return "WA"
+	default:
+		value := strings.ToUpper(strings.TrimSpace(channel))
+		if runes := []rune(value); len(runes) > 3 {
+			value = string(runes[:3])
+		}
+		return value
+	}
 }
 
 func encodeConversation(channel, conversation string) string {
@@ -107,6 +129,20 @@ func (s *Service) ScreenAction(ctx context.Context, screenID, action string, val
 		}
 		screen := core.Screen{ID: "chat", Conversation: branch, Transcript: transcript, Subtitle: fmt.Sprintf("Branched from %s/%s at %s", channelName, conversation, time.Now().Format(time.RFC3339))}
 		return &screen, nil
+	}
+	if screenID == "resume" && strings.HasPrefix(action, "delete:") {
+		channelName, conversation, err := decodeConversation(strings.TrimPrefix(action, "delete:"))
+		if err != nil {
+			return nil, err
+		}
+		if err := s.Harness.ResetSession(sessionKey(core.Message{Channel: channelName, Conversation: conversation})); err != nil {
+			return nil, fmt.Errorf("cannot discard the conversation's harness thread: %w", err)
+		}
+		if err := s.History.Clear(channelName, conversation); err != nil {
+			return nil, err
+		}
+		screen, err := s.resumeScreen()
+		return &screen, err
 	}
 	if action == "chat" {
 		return nil, nil

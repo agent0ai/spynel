@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	bubblespinner "github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -18,35 +19,62 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 
-	"github.com/frdel/spynel/internal/channel"
-	"github.com/frdel/spynel/internal/core"
-	"github.com/frdel/spynel/internal/history"
-	markdownfmt "github.com/frdel/spynel/internal/markdown"
+	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/history"
+	markdownfmt "github.com/agent0ai/spynel/internal/markdown"
+	"github.com/agent0ai/spynel/internal/theme"
 )
 
-type uiEvent struct{ event core.Event }
+type uiEvent struct {
+	event  core.Event
+	replay bool
+}
 type connectionEvent struct{ status channel.ConnectionStatus }
 type pairingEvent struct{ event channel.PairingEvent }
 type noticeEvent struct{ notice channel.Notice }
 type titleEvent struct{ title string }
 type runtimeEvent struct{ status core.RuntimeStatus }
+type themeEvent struct{ theme theme.Theme }
+type taskNotificationEvent struct{ notification channel.Notification }
+type notificationPauseMsg struct{ sequence uint64 }
+type notificationAckMsg struct {
+	ids   []string
+	after int
+	err   error
+}
+type notificationAckRetryMsg struct{}
 type redrawTickMsg struct{}
 type screenSaveResult struct{ err error }
+type themeSaveResult struct {
+	theme theme.Theme
+	err   error
+}
 type screenActionResult struct {
-	action string
-	screen *core.Screen
-	err    error
+	action        string
+	selectedIndex int
+	screen        *core.Screen
+	err           error
 }
 
 type Options struct {
+	Conversation       string
 	Attachments        string
 	TitlePath          string
 	ConnectionEvents   <-chan channel.ConnectionStatus
 	PairingEvents      <-chan channel.PairingEvent
 	NoticeEvents       <-chan channel.Notice
+	NotificationEvents <-chan channel.Notification
+	AckNotification    func(string, int) error
 	InitialConnections []channel.ConnectionStatus
 	TitleEvents        <-chan string
+	Themes             []theme.Theme
+	InitialTheme       theme.Theme
+	ThemeEvents        <-chan theme.Theme
+	SaveTheme          func(string) error
+	LoadThemes         func() ([]theme.Theme, error)
 	RuntimeEvents      <-chan core.RuntimeStatus
 	InitialRuntime     core.RuntimeStatus
 	SaveSettings       func(map[string]string) error
@@ -75,64 +103,90 @@ type screenFrame struct {
 }
 
 type model struct {
-	ctx            context.Context
-	handler        channel.Handler
-	title          string
-	input          textarea.Model
-	inputWidth     int
-	composerRows   int
-	viewport       viewport.Model
-	events         chan core.Event
-	transcript     []transcriptEntry
-	streaming      string
-	responseText   string
-	responseCommit int
-	working        bool
-	logoSpinner    bubblespinner.Model
-	workingSpinner bubblespinner.Model
-	commands       []core.SlashCommand
-	commandMenu    bool
-	commandIndex   int
-	tokens         []composerToken
-	attachments    string
-	connections    <-chan channel.ConnectionStatus
-	pairings       <-chan channel.PairingEvent
-	notices        <-chan channel.Notice
-	titles         <-chan string
-	runtimeEvents  <-chan core.RuntimeStatus
-	runtimeStatus  core.RuntimeStatus
-	connection     map[string]channel.ConnectionStatus
-	ignoreNextLF   bool
-	pendingMouse   string
-	status         string
-	width          int
-	height         int
-	conversation   string
-	welcome        *core.Screen
-	welcomeFocus   bool
-	screen         *core.Screen
-	screenOriginal map[string]string
-	screenCursors  map[int]int
-	screenIndex    int
-	screenAdvanced bool
-	screenScroll   int
-	screenManual   bool
-	screenSaving   bool
-	screenStack    []screenFrame
-	saveSettings   func(map[string]string) error
-	screenAction   func(context.Context, string, string, map[string]string) (*core.Screen, error)
-	screenResult   string
+	ctx                  context.Context
+	handler              channel.Handler
+	title                string
+	input                textarea.Model
+	inputWidth           int
+	composerRows         int
+	viewport             viewport.Model
+	events               chan core.Event
+	transcript           []transcriptEntry
+	streaming            string
+	responseText         string
+	responseCommit       int
+	working              bool
+	logoSpinner          bubblespinner.Model
+	workingSpinner       bubblespinner.Model
+	commands             []core.SlashCommand
+	commandMenu          bool
+	commandIndex         int
+	themeMenu            bool
+	themeIndex           int
+	themeOriginal        theme.Theme
+	themes               []theme.Theme
+	activeTheme          theme.Theme
+	styles               uiStyles
+	themeEvents          <-chan theme.Theme
+	saveTheme            func(string) error
+	loadThemes           func() ([]theme.Theme, error)
+	tokens               []composerToken
+	attachments          string
+	connections          <-chan channel.ConnectionStatus
+	pairings             <-chan channel.PairingEvent
+	notices              <-chan channel.Notice
+	notifications        <-chan channel.Notification
+	ackNotification      func(string, int) error
+	titles               <-chan string
+	runtimeEvents        <-chan core.RuntimeStatus
+	runtimeStatus        core.RuntimeStatus
+	connection           map[string]channel.ConnectionStatus
+	ignoreNextLF         bool
+	pendingMouse         string
+	status               string
+	width                int
+	height               int
+	conversation         string
+	welcome              *core.Screen
+	welcomeFocus         bool
+	historyCache         []string
+	historyWidth         int
+	historyTheme         theme.Theme
+	historyValid         bool
+	streamCache          string
+	streamRendered       string
+	streamWidth          int
+	streamTheme          theme.Theme
+	screen               *core.Screen
+	screenOriginal       map[string]string
+	screenCursors        map[int]int
+	screenIndex          int
+	screenAdvanced       bool
+	screenScroll         int
+	screenManual         bool
+	screenSaving         bool
+	screenStack          []screenFrame
+	saveSettings         func(map[string]string) error
+	screenAction         func(context.Context, string, string, map[string]string) (*core.Screen, error)
+	screenResult         string
+	pendingNotifications []channel.Notification
+	deltaSequence        uint64
+	notificationAckIDs   []string
+	notificationAckAfter int
+	notificationAckBusy  bool
+	deferredUIEvents     []core.Event
 }
 
 const (
-	minComposerHeight  = 1
-	maxComposerHeight  = 10
-	userChatLabel      = "You"
-	agentChatLabel     = "Spy"
-	chatContentColumn  = 4
-	maxCommandRows     = 7
-	compactPasteChars  = 1000
-	maxTitleChars      = 80
+	minComposerHeight = 1
+	maxComposerHeight = 10
+	userChatLabel     = "You"
+	agentChatLabel    = "Spy"
+	chatContentColumn = 4
+	maxCommandRows    = 7
+	compactPasteChars = 1000
+	maxTitleChars     = 80
+	// Header, footer, history top/bottom insets, and composer borders.
 	layoutOverhead     = 6
 	redrawInterval     = 10 * time.Second
 	maxTranscriptRows  = 500
@@ -141,36 +195,107 @@ const (
 
 const transcriptOmitted = "Older messages are omitted from the live display; use /history for the complete conversation file."
 
-var (
-	accent               = lipgloss.Color("#A78BFA")
-	userAccent           = lipgloss.Color("#60A5FA")
-	muted                = lipgloss.Color("#64748B")
-	borderColor          = lipgloss.Color("#334155")
-	standardBorderStyle  = lipgloss.NewStyle().Foreground(borderColor)
-	scrollThumbStyle     = lipgloss.NewStyle().Foreground(accent)
-	panel                = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(borderColor).Padding(0, 1)
-	titleStyle           = lipgloss.NewStyle().Bold(true).Foreground(accent)
-	userStyle            = lipgloss.NewStyle().Bold(true).Foreground(userAccent)
-	agentStyle           = lipgloss.NewStyle().Bold(true).Foreground(accent)
-	statusStyle          = lipgloss.NewStyle().Foreground(muted)
-	commandStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("#CBD5E1"))
-	selectedCommandStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#0F172A")).Background(accent)
-	tokenStyle           = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FBBF24"))
+const (
+	composerPlaceholder = "Message Spynel, / for commands"
+	emptyConversation   = "A fresh start."
 )
+
+type uiStyles struct {
+	base            lipgloss.Style
+	header          lipgloss.Style
+	headerFill      lipgloss.Style
+	footerFill      lipgloss.Style
+	footer          lipgloss.Style
+	surface         lipgloss.Style
+	elevated        lipgloss.Style
+	selected        lipgloss.Style
+	title           lipgloss.Style
+	user            lipgloss.Style
+	agent           lipgloss.Style
+	status          lipgloss.Style
+	command         lipgloss.Style
+	selectedCommand lipgloss.Style
+	token           lipgloss.Style
+	error           lipgloss.Style
+	success         lipgloss.Style
+	warning         lipgloss.Style
+	track           lipgloss.Style
+	thumb           lipgloss.Style
+}
+
+func stylesFor(active theme.Theme) uiStyles {
+	c := active.Colors
+	background := lipgloss.Color(c.Background)
+	surface := lipgloss.Color(c.Surface)
+	elevated := lipgloss.Color(c.SurfaceElevated)
+	selected := lipgloss.Color(c.SurfaceSelected)
+	text := lipgloss.Color(c.Text)
+	muted := lipgloss.Color(c.TextMuted)
+	primary := lipgloss.Color(c.Primary)
+	ribbon := ribbonThemeColor(c.Background, c.User)
+	return uiStyles{
+		base:            lipgloss.NewStyle().Foreground(text).Background(background),
+		header:          lipgloss.NewStyle().Foreground(muted).Background(background),
+		headerFill:      lipgloss.NewStyle().Foreground(ribbon).Background(background),
+		footerFill:      lipgloss.NewStyle().Foreground(ribbon).Background(background),
+		footer:          lipgloss.NewStyle().Foreground(muted).Background(background),
+		surface:         lipgloss.NewStyle().Foreground(text).Background(surface),
+		elevated:        lipgloss.NewStyle().Foreground(text).Background(elevated),
+		selected:        lipgloss.NewStyle().Foreground(text).Background(selected).Bold(true),
+		title:           lipgloss.NewStyle().Bold(true).Foreground(primary),
+		user:            lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(c.User)),
+		agent:           lipgloss.NewStyle().Bold(true).Foreground(primary),
+		status:          lipgloss.NewStyle().Foreground(muted),
+		command:         lipgloss.NewStyle().Foreground(text).Background(elevated),
+		selectedCommand: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(c.Background)).Background(primary),
+		token:           lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(c.Warning)),
+		error:           lipgloss.NewStyle().Foreground(lipgloss.Color(c.Error)),
+		success:         lipgloss.NewStyle().Foreground(lipgloss.Color(c.Success)),
+		warning:         lipgloss.NewStyle().Foreground(lipgloss.Color(c.Warning)),
+		track:           lipgloss.NewStyle().Foreground(lipgloss.Color(c.Border)),
+		thumb:           lipgloss.NewStyle().Foreground(primary),
+	}
+}
+
+func ribbonThemeColor(background, user string) lipgloss.Color {
+	backgroundValue, backgroundErr := strconv.ParseUint(strings.TrimPrefix(background, "#"), 16, 24)
+	userValue, userErr := strconv.ParseUint(strings.TrimPrefix(user, "#"), 16, 24)
+	if backgroundErr != nil || userErr != nil {
+		return lipgloss.Color(user)
+	}
+	// Retain the user accent's hue while giving the page color equal weight so
+	// the full-width ribbons stay visibly behind the content.
+	blend := func(backgroundComponent, userComponent uint64) uint64 {
+		return (backgroundComponent*50 + userComponent*50 + 50) / 100
+	}
+	red := blend((backgroundValue>>16)&0xff, (userValue>>16)&0xff)
+	green := blend((backgroundValue>>8)&0xff, (userValue>>8)&0xff)
+	blue := blend(backgroundValue&0xff, userValue&0xff)
+	return lipgloss.Color(fmt.Sprintf("#%02X%02X%02X", red, green, blue))
+}
 
 var unsafeAttachmentName = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 
 var mouseReportEscape = regexp.MustCompile(`\[[<>][0-9]+;[0-9]+;[0-9]+[Mm]`)
 
 func Run(ctx context.Context, title string, handler channel.Handler, commands []core.SlashCommand, initialHistory []history.Entry, options Options) error {
+	// Capability probing is unreliable across docker exec and nested PTYs.
+	// Spynel's supported terminals understand 24-bit SGR; selecting it
+	// explicitly keeps semantic theme colors from degrading into gray blocks.
+	lipgloss.SetColorProfile(termenv.TrueColor)
 	resolvedTitle, err := loadTitle(title, options.TitlePath)
 	if err != nil {
 		return fmt.Errorf("load TUI title: %w", err)
 	}
 	input := textarea.New()
-	input.Placeholder = "Message Spynel or type /help…"
+	input.Placeholder = composerPlaceholder
 	input.Prompt = ""
-	styleComposer(&input)
+	activeTheme := options.InitialTheme
+	if err := activeTheme.Validate(); err != nil {
+		activeTheme = theme.Default()
+	}
+	styles := stylesFor(activeTheme)
+	styleComposer(&input, styles)
 	// Keep the textarea's internal viewport at the maximum height so it does
 	// not scroll a newly wrapped row away before the outer layout expands.
 	// composerRows controls how many of those rows are actually rendered.
@@ -178,24 +303,36 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 	input.Focus()
 	input.ShowLineNumbers = false
 	input.CharLimit = 64 * 1024
+	conversation := strings.TrimSpace(options.Conversation)
+	if conversation == "" {
+		conversation = "local"
+	}
 	m := model{
 		ctx: ctx, handler: handler, title: resolvedTitle, input: input,
 		viewport: viewport.New(80, 20), events: make(chan core.Event, 256), composerRows: minComposerHeight,
-		logoSpinner:    newLogoSpinner(),
-		workingSpinner: newWorkingSpinner(),
-		commands:       append([]core.SlashCommand(nil), commands...),
-		transcript:     transcriptFromHistory(initialHistory),
-		attachments:    options.Attachments,
-		connections:    options.ConnectionEvents,
-		pairings:       options.PairingEvents,
-		notices:        options.NoticeEvents,
-		titles:         options.TitleEvents,
-		runtimeEvents:  options.RuntimeEvents,
-		runtimeStatus:  options.InitialRuntime,
-		saveSettings:   options.SaveSettings,
-		screenAction:   options.ScreenAction,
-		connection:     connectionMap(options.InitialConnections),
-		status:         "Ready", conversation: "local",
+		logoSpinner:     newLogoSpinner(),
+		workingSpinner:  newWorkingSpinner(),
+		commands:        append([]core.SlashCommand(nil), commands...),
+		themes:          append([]theme.Theme(nil), options.Themes...),
+		activeTheme:     activeTheme,
+		styles:          styles,
+		themeEvents:     options.ThemeEvents,
+		saveTheme:       options.SaveTheme,
+		loadThemes:      options.LoadThemes,
+		transcript:      transcriptFromHistory(initialHistory),
+		attachments:     options.Attachments,
+		connections:     options.ConnectionEvents,
+		pairings:        options.PairingEvents,
+		notices:         options.NoticeEvents,
+		notifications:   options.NotificationEvents,
+		ackNotification: options.AckNotification,
+		titles:          options.TitleEvents,
+		runtimeEvents:   options.RuntimeEvents,
+		runtimeStatus:   options.InitialRuntime,
+		saveSettings:    options.SaveSettings,
+		screenAction:    options.ScreenAction,
+		connection:      connectionMap(options.InitialConnections),
+		status:          "Ready", conversation: conversation,
 	}
 	if options.InitialScreen != nil {
 		m.openScreen(*options.InitialScreen)
@@ -205,12 +342,31 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 	return err
 }
 
-func styleComposer(input *textarea.Model) {
-	placeholder := lipgloss.NewStyle().Foreground(muted).Italic(true).UnsetBackground()
-	input.FocusedStyle.CursorLine = input.FocusedStyle.Text
+func styleComposer(input *textarea.Model, styles uiStyles) {
+	focused := input.Focused()
+	plain := lipgloss.NewStyle()
+	placeholder := lipgloss.NewStyle().Foreground(styles.status.GetForeground()).Italic(true)
+	// bubbles/cursor renders the active cell with Reverse(true). Put the
+	// accent in the foreground here so reversal produces a visible accent
+	// background block instead of swapping it away into an invisible glyph.
+	input.Cursor.Style = lipgloss.NewStyle().Foreground(styles.selectedCommand.GetBackground())
+	input.Cursor.TextStyle = plain
+	input.FocusedStyle.Base = plain
+	input.FocusedStyle.Text = plain
+	input.FocusedStyle.CursorLine = plain
 	input.FocusedStyle.Placeholder = placeholder
-	input.BlurredStyle.CursorLine = input.BlurredStyle.Text
+	input.BlurredStyle.Base = plain
+	input.BlurredStyle.Text = plain
+	input.BlurredStyle.CursorLine = plain
 	input.BlurredStyle.Placeholder = placeholder
+	// textarea caches a pointer to the active style. Models are copied by the
+	// Bubble Tea update loop, so rebind it after every palette change instead
+	// of leaving a pointer to a stale pre-copy Spynel style.
+	if focused {
+		input.Focus()
+	} else {
+		input.Blur()
+	}
 }
 
 func (m *model) filterMouseEscape(key tea.KeyMsg) (tea.KeyMsg, bool) {
@@ -322,8 +478,12 @@ func (m model) waitEvent() tea.Cmd {
 			return pairingEvent{event: event}
 		case notice := <-m.notices:
 			return noticeEvent{notice: notice}
+		case notification := <-m.notifications:
+			return taskNotificationEvent{notification: notification}
 		case title := <-m.titles:
 			return titleEvent{title: title}
+		case value := <-m.themeEvents:
+			return themeEvent{theme: value}
 		case status := <-m.runtimeEvents:
 			return runtimeEvent{status: status}
 		case <-m.ctx.Done():
@@ -338,6 +498,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	updateViewport := true
 	inputBefore := m.input.Value()
 	inputWasAtEnd := m.inputCursorAtEnd()
+	inputLineRowsBefore := m.input.LineInfo().Height
 	switch value := message.(type) {
 	case tea.WindowSizeMsg:
 		if m.width == value.Width && m.height == value.Height {
@@ -346,8 +507,10 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		m.width, m.height = value.Width, value.Height
-		m.viewport.Width = max(20, value.Width-5)
-		m.inputWidth = max(20, value.Width-7)
+		// Chat owns one left inset, one inset before the right-edge scrollbar,
+		// and the scrollbar column. The bordered composer owns four fewer cells.
+		m.viewport.Width = max(20, value.Width-3)
+		m.inputWidth = max(20, value.Width-4)
 		m.input.SetWidth(m.inputWidth)
 		m.resizeComposer()
 		m.refresh()
@@ -360,6 +523,17 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		value = filtered
 		message = filtered
+		if m.screen != nil && m.screen.ID == core.ScreenWhatsAppQR {
+			updateInput = false
+			updateViewport = false
+			if m.restoreParentScreen() {
+				m.status = "Editing " + m.screen.Title
+			} else {
+				m.clearScreen()
+				m.status = "Ready"
+			}
+			return m, nil
+		}
 		if m.screen != nil {
 			updateInput = false
 			updateViewport = false
@@ -374,11 +548,20 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.ignoreNextLF = false
 		}
 		if value.Type == tea.KeyCtrlC {
-			if m.input.Value() != "" || m.commandMenu {
+			if m.input.Value() != "" {
 				m.ignoreNextLF = false
+				m.cancelThemeMenu()
 				m.resetComposer()
 				m.resizeComposer()
 				return m, nil
+			}
+			if m.working {
+				m.ignoreNextLF = false
+				m.cancelThemeMenu()
+				commands = append(commands, m.repaint())
+				commands = append(commands, m.dispatchMessage("/stop", "/stop")...)
+				m.resizeComposer()
+				return m, tea.Batch(commands...)
 			}
 			return m, tea.Quit
 		}
@@ -392,6 +575,14 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+		if handled, command := m.handleThemeMenuKey(value); handled {
+			updateInput = false
+			updateViewport = false
+			if command != nil {
+				commands = append(commands, command)
+			}
+			break
+		}
 		if m.handleCommandMenuKey(value) {
 			updateInput = false
 			updateViewport = false
@@ -400,6 +591,16 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if value.Type == tea.KeyPgUp || value.Type == tea.KeyPgDown {
 			updateInput = false
 			updateViewport = true
+			break
+		}
+		if value.Type == tea.KeyShiftUp || value.Type == tea.KeyShiftDown {
+			updateInput = false
+			updateViewport = false
+			if value.Type == tea.KeyShiftUp {
+				m.viewport.ScrollUp(1)
+			} else {
+				m.viewport.ScrollDown(1)
+			}
 			break
 		}
 		if m.handleTokenKey(value) {
@@ -440,37 +641,9 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			messageText := m.expandTokens(displayText)
-			wasWorking := m.working
-			isCommand := strings.HasPrefix(displayText, "/")
 			updateInput = false
 			m.ignoreNextLF = true
-			m.resetComposer()
-			if wasWorking {
-				m.commitStreamingResponse()
-			} else {
-				m.resetResponse()
-				m.working = !isCommand
-			}
-			m.appendTranscript(transcriptEntry{role: "user", text: displayText})
-			m.status = "Sending…"
-			m.resizeComposer()
-			m.refresh()
-			msg := core.Message{Channel: "tui", Conversation: m.conversation, Sender: "local", Text: messageText, ReceivedAt: time.Now().UTC()}
-			handler := m.handler
-			events := m.events
-			ctx := m.ctx
-			commands = append(commands, func() tea.Msg {
-				go func() {
-					err := handler(ctx, msg, func(event core.Event) { events <- event })
-					if err != nil {
-						events <- core.Event{Kind: core.EventError, Text: err.Error(), Done: true, Local: isCommand}
-					}
-				}()
-				return nil
-			})
-			if m.working && !wasWorking {
-				commands = append(commands, m.logoSpinner.Tick, m.workingSpinner.Tick)
-			}
+			commands = append(commands, m.dispatchMessage(displayText, messageText)...)
 		}
 	case tea.MouseMsg:
 		// Application mouse reporting is disabled so terminal-native drag
@@ -480,8 +653,18 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		updateViewport = false
 	case uiEvent:
 		event := value.event
+		terminal := !event.Local && (event.Kind == core.EventFinal || event.Kind == core.EventError)
+		if m.notificationAckBusy && (terminal || len(m.deferredUIEvents) > 0) {
+			m.deferredUIEvents = append(m.deferredUIEvents, event)
+			m.refresh()
+			if !value.replay {
+				commands = append(commands, m.waitEvent())
+			}
+			break
+		}
 		switch event.Kind {
 		case core.EventDelta:
+			m.deltaSequence++
 			wasWorking := m.working
 			m.streaming += event.Text
 			m.responseText += event.Text
@@ -489,10 +672,14 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if !wasWorking {
 				commands = append(commands, m.logoSpinner.Tick, m.workingSpinner.Tick)
 			}
+			if len(m.pendingNotifications) > 0 && !m.notificationAckBusy {
+				commands = append(commands, notificationPause(m.deltaSequence))
+			}
 		case core.EventFinal:
 			if event.Clear {
 				m.transcript = nil
 				m.welcome = nil
+				m.invalidateHistoryRender()
 				m.welcomeFocus = false
 				m.resetResponse()
 				m.working = false
@@ -509,15 +696,27 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 			m.finishRecipientResponse(event.Text)
-			m.working = false
-			m.status = "Ready"
+			m.flushNotifications()
+			m.working = event.Continues
+			if event.Continues {
+				m.status = "Harness working"
+			} else {
+				m.status = "Ready"
+			}
 		case core.EventError:
 			if !event.Local {
-				m.working = false
-				m.resetResponse()
+				m.working = event.Continues
+				if m.streaming != "" {
+					m.commitStreamingResponse()
+				} else {
+					m.resetResponse()
+				}
 			}
 			m.appendTranscript(transcriptEntry{role: "error", text: event.Text})
-			if event.Local && m.working {
+			if !event.Continues {
+				m.flushNotifications()
+			}
+			if m.working {
 				m.status = "Harness working"
 			} else {
 				m.status = "Harness error"
@@ -528,9 +727,59 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if event.Screen != nil {
 				m.openScreen(*event.Screen)
 			}
+		case core.EventThemePicker:
+			m.openThemeMenu()
+		}
+		m.refresh()
+		if !value.replay {
+			commands = append(commands, m.waitEvent())
+		}
+		if !m.notificationAckBusy && len(m.deferredUIEvents) > 0 {
+			event := m.deferredUIEvents[0]
+			m.deferredUIEvents = m.deferredUIEvents[1:]
+			commands = append(commands, func() tea.Msg { return uiEvent{event: event, replay: true} })
+		}
+	case taskNotificationEvent:
+		m.pendingNotifications = append(m.pendingNotifications, value.notification)
+		if !m.working {
+			m.flushNotifications()
+		} else if !m.notificationAckBusy {
+			commands = append(commands, notificationPause(m.deltaSequence))
 		}
 		m.refresh()
 		commands = append(commands, m.waitEvent())
+	case notificationPauseMsg:
+		if m.working && !m.notificationAckBusy && m.ackNotification != nil && value.sequence == m.deltaSequence && safeNotificationBoundary(m.streaming) {
+			m.notificationAckAfter = len([]rune(m.responseText))
+			m.notificationAckIDs = notificationIDs(m.pendingNotifications)
+			m.notificationAckBusy = true
+			commands = append(commands, m.ackPendingNotifications())
+		}
+	case notificationAckMsg:
+		if !m.notificationAckBusy {
+			break
+		}
+		if value.err != nil {
+			commands = append(commands, tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return notificationAckRetryMsg{} }))
+			break
+		}
+		m.commitStreamingPrefix(value.after)
+		m.flushNotificationPrefix(len(value.ids))
+		m.notificationAckBusy = false
+		m.notificationAckIDs = nil
+		m.notificationAckAfter = 0
+		m.refresh()
+		if len(m.deferredUIEvents) > 0 {
+			event := m.deferredUIEvents[0]
+			m.deferredUIEvents = m.deferredUIEvents[1:]
+			commands = append(commands, func() tea.Msg { return uiEvent{event: event, replay: true} })
+		} else if len(m.pendingNotifications) > 0 && m.working {
+			commands = append(commands, notificationPause(m.deltaSequence))
+		}
+	case notificationAckRetryMsg:
+		if m.notificationAckBusy {
+			commands = append(commands, m.ackPendingNotifications())
+		}
 	case bubblespinner.TickMsg:
 		updateInput = false
 		updateViewport = false
@@ -558,9 +807,18 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.connection[value.status.Name] = value.status
 		commands = append(commands, m.waitEvent())
 	case pairingEvent:
-		if m.screen != nil && (m.screen.ID == value.event.Name || strings.HasPrefix(m.screen.ID, "wizard:"+value.event.Name+":")) {
-			m.screen.Banner = value.event.Rendered
-			m.screen.Status = value.event.Detail
+		for index := range m.screenStack {
+			applyPairingEvent(m.screenStack[index].screen, value.event)
+		}
+		if m.screen != nil && m.screen.ID == core.ScreenWhatsAppQR {
+			if value.event.State == "code" && strings.TrimSpace(value.event.Rendered) != "" {
+				m.screen.Banner = value.event.Rendered
+			} else if m.restoreParentScreen() {
+				applyPairingEvent(m.screen, value.event)
+				m.status = value.event.Detail
+			}
+			m.refresh()
+		} else if applyPairingEvent(m.screen, value.event) {
 			m.refresh()
 		}
 		commands = append(commands, m.waitEvent())
@@ -572,6 +830,21 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.status = "Title changed to " + value.title
 		m.refresh()
 		commands = append(commands, m.waitEvent())
+	case themeEvent:
+		m.themeMenu = false
+		m.applyTheme(value.theme)
+		m.status = "Theme changed to " + value.theme.Name
+		commands = append(commands, m.waitEvent())
+	case themeSaveResult:
+		if value.err != nil {
+			m.applyTheme(m.themeOriginal)
+			m.status = "Theme save failed: " + value.err.Error()
+		} else {
+			m.applyTheme(value.theme)
+			m.status = "Theme changed to " + value.theme.Name
+		}
+		m.themeMenu = false
+		m.resizeComposer()
 	case runtimeEvent:
 		m.runtimeStatus = value.status
 		commands = append(commands, m.waitEvent())
@@ -590,6 +863,15 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		m.screenResult = value.action
+		if value.screen == nil && value.action == "cancel" && len(m.screenStack) > 0 {
+			m.restoreParentScreen()
+			title := m.screen.Title
+			if title == "" {
+				title = strings.Title(m.screen.ID) //nolint:staticcheck
+			}
+			m.status = "Editing " + title
+			break
+		}
 		selectionScreen := m.screen != nil && (m.screen.ID == "harness" || m.screen.ID == "model")
 		if selectionScreen && len(m.screenStack) > 0 && (value.screen == nil || value.screen.ID != m.screen.ID) {
 			m.restoreParentScreen()
@@ -602,6 +884,12 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if value.screen != nil {
 			m.openScreen(*value.screen)
+			if strings.HasPrefix(value.action, "delete:") && value.screen.ID == "resume" {
+				visible := m.visibleScreenControlIndices()
+				if len(visible) > 0 {
+					m.screenIndex = visible[min(value.selectedIndex, len(visible)-1)]
+				}
+			}
 			break
 		}
 		if m.screen != nil && m.screen.ExitOnAction {
@@ -625,10 +913,18 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	if updateInput {
 		m.input, cmd = m.input.Update(message)
 		commands = append(commands, cmd)
-		if len(m.input.Value()) < len(inputBefore) && inputWasAtEnd && composerVisualRows(m.input.Value(), m.inputWidth) > maxComposerHeight {
+		inputAfter := m.input.Value()
+		visualRowsAfter := composerVisualRows(inputAfter, m.inputWidth)
+		// Bubbles can leave its private viewport on row ten when an unfinished
+		// word creates row eleven, then correct itself only on the next delimiter.
+		// Reanchor on that visual-row transition so the first overflow character
+		// is visible in the same update.
+		wrappedPastCap := m.composerRows == maxComposerHeight && m.input.LineInfo().Height > inputLineRowsBefore
+		shrunkOverCap := len(inputAfter) < len(inputBefore) && visualRowsAfter > maxComposerHeight
+		if inputAfter != inputBefore && inputWasAtEnd && m.inputCursorAtEnd() && (wrappedPastCap || shrunkOverCap) {
 			commands = append(commands, m.reanchorComposerEnd())
 		}
-		if m.input.Value() != inputBefore {
+		if inputAfter != inputBefore {
 			m.pruneTokens()
 			m.syncCommandMenu()
 		}
@@ -642,12 +938,254 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(commands...)
 }
 
+func safeNotificationBoundary(text string) bool {
+	if text == "" {
+		return false
+	}
+	if markdownConstructOpen(text) {
+		return false
+	}
+	if markdownBlockLineOpen(text) {
+		return false
+	}
+	runes := []rune(text)
+	last := runes[len(runes)-1]
+	if unicode.IsSpace(last) {
+		return true
+	}
+	if !strings.ContainsRune(".!?;", last) {
+		return false
+	}
+	start := len(runes) - 2
+	for start >= 0 && !unicode.IsSpace(runes[start]) {
+		start--
+	}
+	word := runes[start+1 : len(runes)-1]
+	if len(word) == 0 {
+		return false
+	}
+	for _, character := range word {
+		if !unicode.IsLetter(character) && !unicode.IsDigit(character) && character != '\'' && character != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func markdownBlockLineOpen(text string) bool {
+	if strings.HasSuffix(text, "\n") || strings.HasSuffix(text, "\r") {
+		return false
+	}
+	line := text
+	if newline := strings.LastIndexByte(line, '\n'); newline >= 0 {
+		line = line[newline+1:]
+	}
+	indent := 0
+	for indent < len(line) && indent < 4 && line[indent] == ' ' {
+		indent++
+	}
+	if indent >= 4 || (len(line) > indent && line[indent] == '\t') {
+		return true
+	}
+	line = line[indent:]
+	if line == "" {
+		return false
+	}
+	if line[0] == '>' {
+		return true
+	}
+	if line[0] == '#' {
+		markerEnd := 0
+		for markerEnd < len(line) && markerEnd < 6 && line[markerEnd] == '#' {
+			markerEnd++
+		}
+		return markerEnd == len(line) || (markerEnd > 0 && unicode.IsSpace(rune(line[markerEnd])))
+	}
+	if strings.ContainsRune("-*+", rune(line[0])) {
+		return len(line) > 1 && unicode.IsSpace(rune(line[1]))
+	}
+	digitEnd := 0
+	for digitEnd < len(line) && digitEnd < 9 && line[digitEnd] >= '0' && line[digitEnd] <= '9' {
+		digitEnd++
+	}
+	return digitEnd > 0 && digitEnd+1 < len(line) && (line[digitEnd] == '.' || line[digitEnd] == ')') && unicode.IsSpace(rune(line[digitEnd+1]))
+}
+
+func markdownConstructOpen(text string) bool {
+	runes := []rune(text)
+	type delimiter struct {
+		character rune
+		length    int
+	}
+	var emphasis []delimiter
+	codeTicks := 0
+	brackets := 0
+	parentheses := 0
+	angles := 0
+	escaped := false
+	lineStart := true
+	for index := 0; index < len(runes); {
+		character := runes[index]
+		if escaped {
+			escaped = false
+			lineStart = character == '\n'
+			index++
+			continue
+		}
+		if character == '\\' {
+			escaped = true
+			index++
+			continue
+		}
+		if character == '`' {
+			end := index + 1
+			for end < len(runes) && runes[end] == '`' {
+				end++
+			}
+			length := end - index
+			if codeTicks == 0 {
+				codeTicks = length
+			} else if codeTicks == length {
+				codeTicks = 0
+			}
+			lineStart = false
+			index = end
+			continue
+		}
+		if codeTicks > 0 {
+			lineStart = character == '\n'
+			index++
+			continue
+		}
+		switch character {
+		case '[':
+			brackets++
+		case ']':
+			brackets = max(0, brackets-1)
+		case '(':
+			parentheses++
+		case ')':
+			parentheses = max(0, parentheses-1)
+		case '<':
+			angles++
+		case '>':
+			angles = max(0, angles-1)
+		case '*', '_', '~':
+			end := index + 1
+			for end < len(runes) && runes[end] == character {
+				end++
+			}
+			length := end - index
+			listMarker := lineStart && (character == '*' || character == '_') && length == 1 && end < len(runes) && unicode.IsSpace(runes[end])
+			if !listMarker {
+				if len(emphasis) > 0 && emphasis[len(emphasis)-1] == (delimiter{character: character, length: length}) {
+					emphasis = emphasis[:len(emphasis)-1]
+				} else {
+					emphasis = append(emphasis, delimiter{character: character, length: length})
+				}
+			}
+			lineStart = false
+			index = end
+			continue
+		}
+		if character == '\n' {
+			lineStart = true
+		} else if !unicode.IsSpace(character) {
+			lineStart = false
+		}
+		index++
+	}
+	return escaped || codeTicks > 0 || brackets > 0 || parentheses > 0 || angles > 0 || len(emphasis) > 0
+}
+
+func notificationPause(sequence uint64) tea.Cmd {
+	return tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return notificationPauseMsg{sequence: sequence} })
+}
+
+func notificationIDs(notifications []channel.Notification) []string {
+	ids := make([]string, len(notifications))
+	for index, notification := range notifications {
+		ids[index] = notification.ID
+	}
+	return ids
+}
+
+func (m *model) ackPendingNotifications() tea.Cmd {
+	ids := append([]string(nil), m.notificationAckIDs...)
+	after := m.notificationAckAfter
+	ack := m.ackNotification
+	return func() tea.Msg {
+		for _, id := range ids {
+			if err := ack(id, after); err != nil {
+				return notificationAckMsg{ids: ids, after: after, err: err}
+			}
+		}
+		return notificationAckMsg{ids: ids, after: after}
+	}
+}
+
+func (m *model) flushNotifications() {
+	m.flushNotificationPrefix(len(m.pendingNotifications))
+}
+
+func (m *model) flushNotificationPrefix(count int) {
+	count = min(count, len(m.pendingNotifications))
+	for _, notification := range m.pendingNotifications[:count] {
+		m.appendTranscript(transcriptEntry{role: "assistant", text: notification.Text})
+	}
+	m.pendingNotifications = m.pendingNotifications[count:]
+}
+
+func (m *model) dispatchMessage(displayText, messageText string) []tea.Cmd {
+	wasWorking := m.working
+	isCommand := strings.HasPrefix(displayText, "/")
+	m.resetComposer()
+	if wasWorking {
+		m.commitStreamingResponse()
+	} else {
+		m.resetResponse()
+		m.working = !isCommand
+	}
+	m.appendTranscript(transcriptEntry{role: "user", text: displayText})
+	m.status = "Sending…"
+	m.resizeComposer()
+	m.refresh()
+	msg := core.Message{Channel: "tui", Conversation: m.conversation, Sender: "local", Text: messageText, ReceivedAt: time.Now().UTC()}
+	handler := m.handler
+	events := m.events
+	ctx := m.ctx
+	commands := []tea.Cmd{func() tea.Msg {
+		go func() {
+			err := handler(ctx, msg, func(event core.Event) { events <- event })
+			if err != nil {
+				events <- core.Event{Kind: core.EventError, Text: err.Error(), Done: true, Local: isCommand}
+			}
+		}()
+		return nil
+	}}
+	if m.working && !wasWorking {
+		commands = append(commands, m.logoSpinner.Tick, m.workingSpinner.Tick)
+	}
+	return commands
+}
+
 func (m *model) commitStreamingResponse() {
 	if m.streaming != "" {
 		m.appendTranscript(transcriptEntry{role: "assistant", text: m.streaming})
 	}
 	m.responseCommit = len(m.responseText)
 	m.streaming = ""
+}
+
+func (m *model) commitStreamingPrefix(afterChars int) {
+	response := []rune(m.responseText)
+	afterChars = min(max(afterChars, 0), len(response))
+	committedChars := len([]rune(m.responseText[:m.responseCommit]))
+	if afterChars > committedChars {
+		m.appendTranscript(transcriptEntry{role: "assistant", text: string(response[committedChars:afterChars])})
+	}
+	m.responseCommit = len(string(response[:afterChars]))
+	m.streaming = string(response[afterChars:])
 }
 
 func (m *model) finishRecipientResponse(final string) {
@@ -1044,6 +1582,7 @@ func transcriptFromHistory(entries []history.Entry) []transcriptEntry {
 func (m *model) appendTranscript(entries ...transcriptEntry) {
 	m.transcript = append(m.transcript, entries...)
 	m.transcript = boundTranscript(m.transcript)
+	m.invalidateHistoryRender()
 }
 
 func boundTranscript(entries []transcriptEntry) []transcriptEntry {
@@ -1126,6 +1665,89 @@ func (m *model) handleCommandMenuKey(key tea.KeyMsg) bool {
 	}
 }
 
+func (m *model) openThemeMenu() {
+	m.themeOriginal = m.activeTheme
+	if m.loadThemes != nil {
+		values, err := m.loadThemes()
+		if err != nil {
+			m.status = "Theme load failed: " + err.Error()
+			return
+		}
+		m.themes = append([]theme.Theme(nil), values...)
+	}
+	if len(m.themes) == 0 {
+		m.themes = []theme.Theme{theme.Default()}
+	}
+	m.commandMenu = false
+	m.themeMenu = true
+	m.themeIndex = 0
+	for index, value := range m.themes {
+		if strings.EqualFold(value.Name, m.activeTheme.Name) {
+			m.themeIndex = index
+			break
+		}
+	}
+	m.applyTheme(m.themes[m.themeIndex])
+	m.status = "Previewing themes"
+	m.resizeComposer()
+}
+
+func (m *model) cancelThemeMenu() {
+	if !m.themeMenu {
+		return
+	}
+	m.applyTheme(m.themeOriginal)
+	m.themeMenu = false
+	m.themeIndex = 0
+	m.status = "Theme preview cancelled"
+	m.resizeComposer()
+}
+
+func (m *model) handleThemeMenuKey(key tea.KeyMsg) (bool, tea.Cmd) {
+	if !m.themeMenu || len(m.themes) == 0 {
+		return false, nil
+	}
+	switch key.Type {
+	case tea.KeyUp, tea.KeyShiftTab:
+		m.themeIndex = (m.themeIndex - 1 + len(m.themes)) % len(m.themes)
+		m.applyTheme(m.themes[m.themeIndex])
+		return true, nil
+	case tea.KeyDown, tea.KeyTab:
+		m.themeIndex = (m.themeIndex + 1) % len(m.themes)
+		m.applyTheme(m.themes[m.themeIndex])
+		return true, nil
+	case tea.KeyEsc:
+		m.cancelThemeMenu()
+		return true, nil
+	case tea.KeyEnter, tea.KeySpace:
+		selected := m.themes[m.themeIndex]
+		m.themeMenu = false
+		m.resizeComposer()
+		if m.saveTheme == nil {
+			m.applyTheme(m.themeOriginal)
+			m.status = "Theme saving is unavailable"
+			return true, nil
+		}
+		save := m.saveTheme
+		return true, func() tea.Msg { return themeSaveResult{theme: selected, err: save(selected.Name)} }
+	default:
+		return true, nil
+	}
+}
+
+func (m *model) applyTheme(value theme.Theme) {
+	if err := value.Validate(); err != nil {
+		return
+	}
+	offset := m.viewport.YOffset
+	m.activeTheme = value
+	m.styles = stylesFor(value)
+	styleComposer(&m.input, m.styles)
+	m.invalidateHistoryRender()
+	m.renderHistory()
+	m.viewport.SetYOffset(offset)
+}
+
 func (m *model) syncCommandMenu() {
 	matches := m.commandMatches()
 	m.commandMenu = len(matches) > 0
@@ -1149,18 +1771,33 @@ func (m model) commandMatches() []core.SlashCommand {
 func (m *model) resizeComposer() bool {
 	height := composerHeight(m.input.Value(), m.inputWidth)
 	oldViewportHeight := m.viewport.Height
+	oldViewportOffset := m.viewport.YOffset
+	wasAtBottom := m.viewport.AtBottom()
 	changed := height != m.composerRows
 	m.composerRows = height
 	if m.input.Height() != maxComposerHeight {
 		m.input.SetHeight(maxComposerHeight)
 	}
 	if m.height > 0 {
-		m.viewport.Height = max(5, m.height-layoutOverhead-height-m.commandMenuHeight())
+		m.viewport.Height = max(5, m.height-layoutOverhead-height-m.inlineMenuHeight())
+	}
+	if m.viewport.Height != oldViewportHeight {
+		if wasAtBottom {
+			// Resizing the composer changes the viewport's maximum offset. Keep
+			// the newest history row anchored immediately above the composer.
+			m.viewport.GotoBottom()
+		} else {
+			// A user who deliberately paged up keeps the same top history row.
+			m.viewport.SetYOffset(oldViewportOffset)
+		}
 	}
 	return changed || oldViewportHeight != m.viewport.Height
 }
 
-func (m model) commandMenuHeight() int {
+func (m model) inlineMenuHeight() int {
+	if m.themeMenu {
+		return min(maxCommandRows, len(m.themes)) + 2
+	}
 	if !m.commandMenu {
 		return 0
 	}
@@ -1200,41 +1837,59 @@ func (m *model) refreshPreservingHistory() {
 }
 
 func (m *model) renderHistory() {
-	entries := make([]string, 0, len(m.transcript)+2)
-	if m.welcome != nil {
-		entries = append(entries, m.renderWelcome(*m.welcome))
+	if !m.historyValid || m.historyWidth != m.viewport.Width || m.historyTheme != m.activeTheme {
+		m.historyCache = make([]string, 0, len(m.transcript)+1)
+		if m.welcome != nil {
+			m.historyCache = append(m.historyCache, m.renderWelcome(*m.welcome))
+		}
+		for _, entry := range m.transcript {
+			m.historyCache = append(m.historyCache, m.renderTranscriptEntry(entry))
+		}
+		m.historyWidth = m.viewport.Width
+		m.historyTheme = m.activeTheme
+		m.historyValid = true
 	}
-	for _, entry := range m.transcript {
-		entries = append(entries, m.renderTranscriptEntry(entry))
-	}
+	entries := append([]string(nil), m.historyCache...)
 	if m.streaming != "" {
-		content := m.renderAgentMarkdown(m.streaming)
+		if m.streamCache != m.streaming || m.streamWidth != m.viewport.Width || m.streamTheme != m.activeTheme {
+			m.streamCache = m.streaming
+			m.streamRendered = m.renderAgentMarkdown(m.streaming)
+			m.streamWidth = m.viewport.Width
+			m.streamTheme = m.activeTheme
+		}
+		content := m.streamRendered
 		if m.working {
 			content += m.workingSpinner.View()
 		}
-		entries = append(entries, m.renderChatMessage(agentChatLabel, agentStyle, content))
+		entries = append(entries, m.renderMarkdownChatMessage(agentChatLabel, m.styles.agent, content))
 	} else if m.working {
-		entries = append(entries, m.renderChatMessage(agentChatLabel, agentStyle, m.workingSpinner.View()))
+		entries = append(entries, m.renderChatMessage(agentChatLabel, m.styles.agent, m.workingSpinner.View()))
 	}
 	content := strings.Join(entries, "\n\n")
 	if content == "" {
-		content = statusStyle.Render("A fresh conversation is ready. Try /help or ask Spynel to create a task.")
+		content = m.styles.status.Render(emptyConversation)
 	}
-	content = lipgloss.NewStyle().Width(max(10, m.viewport.Width-1)).Render(content)
+	content = lipgloss.NewStyle().Width(max(10, m.viewport.Width)).Render(content)
 	m.viewport.SetContent(content)
+}
+
+func (m *model) invalidateHistoryRender() {
+	m.historyValid = false
+	m.streamCache = ""
+	m.streamRendered = ""
 }
 
 func (m model) renderWelcome(welcome core.Screen) string {
 	parts := make([]string, 0, 2)
 	if welcome.Banner != "" {
-		parts = append(parts, titleStyle.Render(welcome.Banner))
+		parts = append(parts, m.styles.title.Render(welcome.Banner))
 	}
 	if welcome.Subtitle != "" {
 		contentWidth := max(20, m.viewport.Width-1)
 		if welcome.Markdown {
-			parts = append(parts, trimRenderedPadding(markdownfmt.Terminal(welcome.Subtitle, contentWidth)))
+			parts = append(parts, trimRenderedPadding(markdownfmt.TerminalWithTheme(welcome.Subtitle, contentWidth, m.activeTheme)))
 		} else {
-			parts = append(parts, statusStyle.Render(ansi.Hardwrap(welcome.Subtitle, contentWidth, true)))
+			parts = append(parts, m.styles.status.Render(ansi.Hardwrap(welcome.Subtitle, contentWidth, true)))
 		}
 	}
 	return strings.Join(parts, "\n\n")
@@ -1243,30 +1898,82 @@ func (m model) renderWelcome(welcome core.Screen) string {
 func (m model) renderTranscriptEntry(entry transcriptEntry) string {
 	switch entry.role {
 	case "user":
-		return m.renderChatMessage(userChatLabel, userStyle, entry.text)
+		return m.renderChatMessage(userChatLabel, m.styles.user, entry.text)
 	case "assistant":
-		return m.renderChatMessage(agentChatLabel, agentStyle, m.renderAgentMarkdown(entry.text))
+		return m.renderMarkdownChatMessage(agentChatLabel, m.styles.agent, m.renderAgentMarkdown(entry.text))
 	case "error":
-		return m.renderChatMessage("Error", lipgloss.NewStyle().Foreground(lipgloss.Color("#FB7185")), entry.text)
+		return m.renderChatMessage("Error", m.styles.error, entry.text)
 	default:
-		return m.renderChatMessage(entry.role, statusStyle, entry.text)
+		return m.renderChatMessage(entry.role, m.styles.status, entry.text)
 	}
 }
 
 func (m model) renderChatMessage(label string, style lipgloss.Style, content string) string {
+	return m.renderChatMessageContent(label, style, content, true)
+}
+
+func (m model) renderMarkdownChatMessage(label string, style lipgloss.Style, content string) string {
+	width := m.chatContentWidth()
+	rows := strings.Split(content, "\n")
+	for index, row := range rows {
+		if lipgloss.Width(row) > width {
+			rows[index] = ansi.Hardwrap(row, width, true)
+		}
+	}
+	return m.renderChatMessageContent(label, style, strings.Join(rows, "\n"), false)
+}
+
+func (m model) renderChatMessageContent(label string, style lipgloss.Style, content string, wrap bool) string {
 	contentWidth := m.chatContentWidth()
-	content = ansi.Hardwrap(content, contentWidth, true)
+	if wrap {
+		content = ansi.Hardwrap(content, contentWidth, true)
+	}
 	padding := strings.Repeat(" ", max(1, chatContentColumn-lipgloss.Width(label)))
 	continuation := strings.Repeat(" ", chatContentColumn)
-	return style.Render(label) + padding + strings.ReplaceAll(content, "\n", "\n"+continuation)
+	body := padding + strings.ReplaceAll(content, "\n", "\n"+continuation)
+	// Style rows independently so Lip Gloss preserves explicit newlines without
+	// padding every row to the widest one. Those hidden cells can exceed the
+	// viewport and soft-wrap an otherwise short Markdown heading.
+	rows := strings.Split(body, "\n")
+	for index, row := range rows {
+		rows[index] = m.styles.base.Inline(true).Render(row)
+	}
+	return style.Render(label) + strings.Join(rows, "\n")
 }
 
 func (m model) chatContentWidth() int {
-	return max(1, m.viewport.Width-chatContentColumn-1)
+	return max(1, m.viewport.Width-chatContentColumn)
 }
 
 func (m model) renderAgentMarkdown(text string) string {
-	return trimRenderedPadding(markdownfmt.Terminal(text, m.chatContentWidth()))
+	if remainder, found := cutSpynelLogoMarkdown(text); found {
+		parts := []string{m.styles.title.Render(core.SpynelASCII)}
+		if remainder = strings.TrimSpace(remainder); remainder != "" {
+			parts = append(parts, trimRenderedPadding(markdownfmt.TerminalWithTheme(remainder, m.chatMarkdownWidth(), m.activeTheme)))
+		}
+		return strings.Join(parts, "\n\n")
+	}
+	return trimRenderedPadding(markdownfmt.TerminalWithTheme(text, m.chatMarkdownWidth(), m.activeTheme))
+}
+
+func (m model) chatMarkdownWidth() int {
+	// TerminalWithTheme converts its inclusive public width to Glamour's
+	// exclusive word-wrap boundary by adding one. Pass the physical content
+	// boundary minus one so padded inline-code spans wrap at the real edge.
+	return max(1, m.chatContentWidth()-1)
+}
+
+// cutSpynelLogoMarkdown treats the fenced logo body as a semantic marker, not
+// immutable transcript art. Older persisted /welcome messages therefore pick
+// up the current canonical logo instead of preserving a superseded design.
+func cutSpynelLogoMarkdown(text string) (string, bool) {
+	const prefix = "```spynel-logo\n"
+	remainder, found := strings.CutPrefix(text, prefix)
+	if !found {
+		return "", false
+	}
+	_, remainder, found = strings.Cut(remainder, "\n```")
+	return remainder, found
 }
 
 func trimRenderedPadding(content string) string {
@@ -1279,32 +1986,268 @@ func trimRenderedPadding(content string) string {
 }
 
 func (m model) View() string {
-	title := titleStyle.Render(m.spynelLogo() + " " + m.title)
-	status := statusStyle.Render(m.connectionBadge("telegram", "TG") + "  " + m.connectionBadge("whatsapp", "WA") + "  " + runtimeCount(m.runtimeStatus.Jobs, "jobs") + "  " + runtimeCount(m.runtimeStatus.Logs, "logs") + "  " + m.status)
+	if m.screen != nil && m.screen.ID == core.ScreenWhatsAppQR {
+		return m.fullscreenWhatsAppQR()
+	}
 	barWidth := max(20, m.width)
-	header := " " + ansi.Truncate(title+"  "+status, barWidth-1, "…")
+	header := m.headerView(barWidth)
 	if m.screen != nil {
 		screenHeight := max(5, m.height-2)
-		content, offset, total := m.screenContent(screenHeight, max(20, m.width))
-		content = fitContent(content, max(1, screenHeight-2), max(1, m.width-2))
-		form := titledPanel(m.screen.Title, content, max(20, m.width), offset, total)
-		footerText := " " + ansi.Truncate(m.screenFooterHint(), barWidth-1, "…")
-		return lipgloss.JoinVertical(lipgloss.Left, header, form, statusStyle.Render(footerText))
+		fixedRows := 0
+		if strings.TrimSpace(m.screen.Title) != "" {
+			fixedRows += 2 // screen title plus one separating row
+		}
+		if len(m.screen.Tabs) > 0 {
+			fixedRows += 3 // labels, underline, and one separating row
+		}
+		contentHeight := max(1, screenHeight-2-fixedRows)
+		contentWidth := max(16, m.width-3)
+		content, offset, total := m.screenContent(contentHeight, contentWidth)
+		content = fitContent(content, contentHeight, contentWidth)
+		form := m.screenPanel(m.screen.Title, content, screenHeight, barWidth, offset, total)
+		return lipgloss.JoinVertical(lipgloss.Left, header, form, m.footerView(m.screenFooterHint(), barWidth))
 	}
 	historyView := fitContent(m.viewport.View(), m.viewport.Height, m.viewport.Width)
-	chat := panel.Width(max(20, m.width-2)).Height(max(5, m.viewport.Height)).Render(historyView)
-	chat = replaceRightBorder(chat, m.viewport.Height, m.viewport.YOffset, m.viewport.TotalLineCount())
+	chat := m.historySurface(historyView, m.viewport.Height, barWidth, m.viewport.YOffset, m.viewport.TotalLineCount())
 	inputOffset, inputRows := m.inputScrollMetrics()
 	inputView := fitContent(m.renderInput(), m.composerRows, m.inputWidth)
-	input := panel.Width(max(20, m.width-2)).Render(inputView)
-	input = replaceRightBorder(input, m.composerRows, inputOffset, inputRows)
+	input := m.borderedSurface("", inputView, m.composerRows, barWidth, inputOffset, inputRows, m.styles.surface)
 	sections := []string{header, chat}
-	if commandMenu := m.commandMenuView(); commandMenu != "" {
-		sections = append(sections, commandMenu)
+	if picker := m.inlineMenuView(); picker != "" {
+		sections = append(sections, picker)
 	}
-	footerText := " " + ansi.Truncate(m.footerHint(), barWidth-1, "…")
-	sections = append(sections, input, statusStyle.Render(footerText))
+	sections = append(sections, input, m.footerView(m.footerHint(), barWidth))
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+func (m model) fullscreenWhatsAppQR() string {
+	if m.screen == nil {
+		return ""
+	}
+	return lipgloss.Place(
+		max(1, m.width), max(1, m.height), lipgloss.Center, lipgloss.Center,
+		m.screen.Banner,
+		lipgloss.WithWhitespaceBackground(m.styles.base.GetBackground()),
+	)
+}
+
+func applyPairingEvent(screen *core.Screen, event channel.PairingEvent) bool {
+	if screen == nil || (screen.ID != event.Name && !strings.HasPrefix(screen.ID, "wizard:"+event.Name+":")) {
+		return false
+	}
+	if screen.ID == "whatsapp" {
+		screen.Banner = ""
+	}
+	screen.Status = event.Detail
+	return true
+}
+
+func (m model) headerView(width int) string {
+	ribbon := m.styles.headerFill.Render("▀▀")
+	identity := m.styles.title.Background(m.styles.header.GetBackground()).Render(m.spynelLogo() + " " + m.title)
+	left := ribbon + identity
+	segments := []string{
+		m.connectionSegment("telegram", "TG"),
+		m.connectionSegment("whatsapp", "WA"),
+		m.styles.status.Background(m.styles.header.GetBackground()).Render(runtimeCount(m.runtimeStatus.Jobs, "jobs")),
+		m.styles.status.Background(m.styles.header.GetBackground()).Render(runtimeCount(m.runtimeStatus.Logs, "logs")),
+	}
+	right := strings.Join(segments, ribbon) + ribbon
+	// Preserve the workspace identity first; compact/truncate volatile status
+	// on narrow terminals instead of squeezing every title into an ellipsis.
+	leftWidth := min(lipgloss.Width(left), max(12, width*2/5))
+	left = ansi.Truncate(left, leftWidth, "…")
+	rightWidth := max(1, width-lipgloss.Width(left)-2)
+	right = ansi.Truncate(right, rightWidth, "…")
+	gapWidth := max(2, width-lipgloss.Width(left)-lipgloss.Width(right))
+	gap := m.styles.headerFill.Render(strings.Repeat("▀", gapWidth))
+	content := left + gap + right
+	return fillLine(m.styles.header, content, width)
+}
+
+func (m model) footerView(hint string, width int) string {
+	width = max(1, width)
+	items := strings.Split(hint, " · ")
+	for index, item := range items {
+		items[index] = m.styles.footer.Render(item)
+	}
+	ribbon := m.styles.footerFill.Render("▄▄")
+	middle := strings.Join(items, ribbon)
+	rightWidth := max(2, width-lipgloss.Width(middle)-2)
+	content := ribbon + middle + m.styles.footerFill.Render(strings.Repeat("▄", rightWidth))
+	return ansi.Truncate(content, width, "")
+}
+
+func (m model) screenPanel(title, content string, height, width, offset, total int) string {
+	parts := make([]string, 0, 5)
+	panelTotal := total
+	if strings.TrimSpace(title) != "" {
+		parts = append(parts, m.styles.title.Render(title), "")
+		panelTotal += 2
+	}
+	if m.screen != nil && len(m.screen.Tabs) > 0 {
+		parts = append(parts, m.tabsView(max(1, width-3)))
+		parts = append(parts, "")
+		panelTotal += 3
+	}
+	parts = append(parts, content)
+	body := fitContent(lipgloss.JoinVertical(lipgloss.Left, parts...), max(1, height-2), max(1, width-3))
+	return m.screenCanvas(body, height, width, offset, panelTotal)
+}
+
+func (m model) tabsView(width int) string {
+	if m.screen == nil || len(m.screen.Tabs) == 0 {
+		return ""
+	}
+	width = max(1, width)
+	const gapWidth = 3
+	labels := make([]string, 0, len(m.screen.Tabs))
+	underlines := make([]string, 0, len(m.screen.Tabs))
+	for index, tab := range m.screen.Tabs {
+		tab = strings.TrimSpace(tab)
+		labelStyle := m.styles.status.Bold(true)
+		underlineStyle := m.styles.track
+		if index == m.screen.ActiveTab {
+			labelStyle = m.styles.base.Bold(true)
+			underlineStyle = m.styles.thumb
+		}
+		labels = append(labels, labelStyle.Render(tab))
+		underlines = append(underlines, underlineStyle.Render(strings.Repeat("━", max(1, lipgloss.Width(tab)))))
+	}
+	gap := strings.Repeat(" ", gapWidth)
+	trackGap := m.styles.track.Render(strings.Repeat("━", gapWidth))
+	labelRow := ansi.Truncate(strings.Join(labels, gap), width, "…")
+	underlineRow := ansi.Truncate(strings.Join(underlines, trackGap), width, "")
+	if remaining := width - lipgloss.Width(underlineRow); remaining > 0 {
+		underlineRow += m.styles.track.Render(strings.Repeat("━", remaining))
+	}
+	return labelRow + "\n" + underlineRow
+}
+
+func (m model) screenCanvas(content string, height, width, offset, total int) string {
+	height = max(3, height)
+	width = max(4, width)
+	bodyHeight := height - 2
+	contentWidth := width - 3
+	lines := strings.Split(content, "\n")
+	edge := make([]string, bodyHeight)
+	if total > bodyHeight {
+		edge = scrollbar(bodyHeight, offset, total, m.styles, m.styles.base.GetBackground())
+	} else {
+		for row := range edge {
+			edge[row] = m.styles.base.Render(" ")
+		}
+	}
+	result := make([]string, 0, height)
+	result = append(result, fillLine(m.styles.base, "", width))
+	for row := 0; row < bodyHeight; row++ {
+		line := ""
+		if row < len(lines) {
+			line = ansi.Truncate(lines[row], contentWidth, "")
+		}
+		line += strings.Repeat(" ", max(0, contentWidth-lipgloss.Width(line)))
+		result = append(result, fillLine(m.styles.base, " "+line+" ", width-1)+edge[row])
+	}
+	result = append(result, fillLine(m.styles.base, "", width))
+	return strings.Join(result, "\n")
+}
+
+func (m model) borderedSurface(title, content string, height, width, offset, total int, style lipgloss.Style) string {
+	height = max(1, height)
+	width = max(4, width)
+	innerWidth := width - 2
+	contentWidth := max(1, innerWidth-2)
+	// Borders sit outside the panel surface and therefore belong to the page,
+	// not the terminal's default background or the control's inner surface.
+	border := m.panelBorderStyle()
+	titlePart := ""
+	if title != "" {
+		titlePart = "─" + title
+	}
+	topFill := strings.Repeat("─", max(0, innerWidth-lipgloss.Width(titlePart)))
+	top := border.Render("╭" + titlePart + topFill + "╮")
+	lines := strings.Split(content, "\n")
+	edge := make([]string, height)
+	if total > height {
+		edge = scrollbar(height, offset, total, m.styles, m.styles.base.GetBackground())
+	} else {
+		for row := range edge {
+			edge[row] = border.Render("│")
+		}
+	}
+	result := make([]string, 0, height+2)
+	result = append(result, top)
+	for row := 0; row < height; row++ {
+		line := ""
+		if row < len(lines) {
+			line = lines[row]
+		}
+		line = ansi.Truncate(line, contentWidth, "")
+		line = " " + line + strings.Repeat(" ", max(0, contentWidth-lipgloss.Width(line))) + " "
+		result = append(result, border.Render("│")+fillLine(style, line, innerWidth)+edge[row])
+	}
+	result = append(result, border.Render("╰"+strings.Repeat("─", innerWidth)+"╯"))
+	return strings.Join(result, "\n")
+}
+
+func (m model) panelBorderStyle() lipgloss.Style {
+	return m.styles.track.Background(m.styles.base.GetBackground())
+}
+
+func (m model) historySurface(content string, height, width, offset, total int) string {
+	height = max(1, height)
+	width = max(4, width)
+	contentWidth := width - 3
+	lines := strings.Split(content, "\n")
+	edge := make([]string, height)
+	if total > height {
+		edge = scrollbar(height, offset, total, m.styles, m.styles.base.GetBackground())
+	} else {
+		for row := range edge {
+			edge[row] = m.styles.base.Render(" ")
+		}
+	}
+	result := make([]string, 0, height+2)
+	// Keep one fixed main-background row above the scrollable transcript.
+	result = append(result, fillLine(m.styles.base, "", width))
+	for row := 0; row < height; row++ {
+		line := ""
+		if row < len(lines) {
+			line = ansi.Truncate(lines[row], contentWidth, "")
+		}
+		line += strings.Repeat(" ", max(0, contentWidth-lipgloss.Width(line)))
+		// One main-background cell before content and one before the scrollbar.
+		result = append(result, fillLine(m.styles.base, " "+line+" ", width-1)+edge[row])
+	}
+	// Match the fixed top inset below the transcript before any picker/input.
+	result = append(result, fillLine(m.styles.base, "", width))
+	return strings.Join(result, "\n")
+}
+
+func fillLine(style lipgloss.Style, content string, width int) string {
+	width = max(1, width)
+	content = ansi.Truncate(content, width, "")
+	padding := strings.Repeat(" ", max(0, width-lipgloss.Width(content)))
+	rendered := style.Render(content + padding)
+	background := style.GetBackground()
+	if _, absent := background.(lipgloss.NoColor); absent {
+		return rendered
+	}
+	backgroundSGR := trueColorBackgroundSGR(background)
+	// Nested component and Markdown styles reset SGR at their boundaries.
+	// Reapply the owning panel background after those resets so the panel is
+	// one continuous surface rather than terminal-colored holes around text.
+	return backgroundSGR + strings.ReplaceAll(rendered, "\x1b[0m", "\x1b[0m"+backgroundSGR) + "\x1b[0m"
+}
+
+func trueColorBackgroundSGR(background lipgloss.TerminalColor) string {
+	if color, ok := background.(lipgloss.Color); ok {
+		if parsed, err := strconv.ParseUint(strings.TrimPrefix(string(color), "#"), 16, 24); err == nil {
+			return fmt.Sprintf("\x1b[48;2;%d;%d;%dm", (parsed>>16)&0xff, (parsed>>8)&0xff, parsed&0xff)
+		}
+	}
+	red, green, blue, _ := background.RGBA()
+	return fmt.Sprintf("\x1b[48;2;%d;%d;%dm", red>>8, green>>8, blue>>8)
 }
 
 func (m *model) openScreen(screen core.Screen) {
@@ -1312,6 +2255,7 @@ func (m *model) openScreen(screen core.Screen) {
 		copyScreen := screen
 		copyScreen.Controls = nil
 		m.welcome = &copyScreen
+		m.invalidateHistoryRender()
 		m.welcomeFocus = true
 		m.screen = nil
 		m.screenOriginal = nil
@@ -1334,6 +2278,7 @@ func (m *model) openScreen(screen core.Screen) {
 			m.transcript = append(m.transcript, transcriptEntry{role: entry.Role, text: entry.Text})
 		}
 		m.transcript = boundTranscript(m.transcript)
+		m.invalidateHistoryRender()
 		m.screen = nil
 		m.screenOriginal = nil
 		m.screenCursors = nil
@@ -1353,7 +2298,13 @@ func (m *model) openScreen(screen core.Screen) {
 		m.screenStack = append(m.screenStack, m.currentScreenFrame())
 	}
 	copyScreen := screen
+	copyScreen.Hints = append([]core.ScreenHint(nil), screen.Hints...)
 	copyScreen.Controls = append([]core.ScreenControl(nil), screen.Controls...)
+	if copyScreen.ID == "whatsapp" {
+		// Do not render QR data on the general WhatsApp settings surface, even
+		// if a stale or older server supplied it through the generic banner.
+		copyScreen.Banner = ""
+	}
 	for index := range copyScreen.Controls {
 		copyScreen.Controls[index].Options = append([]string(nil), screen.Controls[index].Options...)
 	}
@@ -1445,6 +2396,9 @@ func (m *model) handleScreenKey(key tea.KeyMsg) tea.Cmd {
 		return m.saveScreen()
 	}
 	control := &m.screen.Controls[m.screenIndex]
+	if m.screen.ID == "resume" && (key.Type == tea.KeyDelete || key.Type == tea.KeyBackspace) && strings.HasPrefix(control.Key, "resume:") {
+		return m.runScreenAction("delete:" + strings.TrimPrefix(control.Key, "resume:"))
+	}
 	switch control.Kind {
 	case "action":
 		if key.Type == tea.KeyEnter || key.Type == tea.KeySpace {
@@ -1515,6 +2469,8 @@ func cloneScreen(screen *core.Screen) *core.Screen {
 		return nil
 	}
 	copyScreen := *screen
+	copyScreen.Hints = append([]core.ScreenHint(nil), screen.Hints...)
+	copyScreen.Tabs = append([]string(nil), screen.Tabs...)
 	copyScreen.Controls = append([]core.ScreenControl(nil), screen.Controls...)
 	for index := range copyScreen.Controls {
 		copyScreen.Controls[index].Options = append([]string(nil), screen.Controls[index].Options...)
@@ -1640,12 +2596,13 @@ func (m *model) runScreenAction(action string) tea.Cmd {
 		return nil
 	}
 	screenID := m.screen.ID
+	selectedIndex := m.screenIndex
 	values := m.screenValues()
 	m.screenSaving = true
 	ctx := m.ctx
 	return func() tea.Msg {
 		next, err := callback(ctx, screenID, action, values)
-		return screenActionResult{action: action, screen: next, err: err}
+		return screenActionResult{action: action, selectedIndex: selectedIndex, screen: next, err: err}
 	}
 }
 
@@ -1705,26 +2662,35 @@ func (m model) screenContent(height, width int) (string, int, int) {
 	if m.screen == nil {
 		return "", 0, 0
 	}
-	innerWidth := max(12, width-4)
+	innerWidth := max(12, width)
+	// Prose renderers treat their wrap width as an exclusive boundary in a few
+	// styled/Unicode cases. Reserve one cell so a complete boundary word wraps
+	// before screenCanvas applies its final hard safety truncation.
+	textWidth := max(1, innerWidth-1)
 	lines := m.screenConnectionSection(innerWidth)
 	if m.screen.Banner != "" {
 		for _, line := range strings.Split(m.screen.Banner, "\n") {
-			lines = append(lines, agentStyle.Render(line))
+			lines = append(lines, m.styles.agent.Render(line))
 		}
 		lines = append(lines, "")
 	}
 	if m.screen.Status != "" {
-		lines = append(lines, agentStyle.Render(ansi.Hardwrap(m.screen.Status, innerWidth, true)), "")
+		lines = append(lines, m.styles.agent.Render(ansi.Hardwrap(m.screen.Status, textWidth, true)), "")
 	}
-	if m.screen.Markdown {
-		rendered := strings.Trim(trimRenderedPadding(markdownfmt.Terminal(m.screen.Subtitle, innerWidth)), "\n")
-		lines = append(lines, strings.Split(rendered, "\n")...)
-	} else {
-		for _, line := range strings.Split(m.screen.Subtitle, "\n") {
-			lines = append(lines, statusStyle.Render(line))
+	if m.screen.Subtitle != "" {
+		if m.screen.Markdown {
+			rendered := strings.Trim(trimRenderedPadding(markdownfmt.TerminalWithTheme(m.screen.Subtitle, textWidth, m.activeTheme)), "\n")
+			lines = append(lines, strings.Split(rendered, "\n")...)
+		} else {
+			for _, line := range strings.Split(m.screen.Subtitle, "\n") {
+				lines = append(lines, m.styles.status.Render(ansi.Hardwrap(line, textWidth, true)))
+			}
 		}
+		lines = appendBlankScreenRow(lines)
 	}
-	lines = append(lines, "")
+	if section := m.formSectionTitle(); section != "" && !m.screenHasControlSections() {
+		lines = append(lines, m.sectionRule(section, innerWidth), "")
+	}
 	selectedLine := 0
 	previousControlKind := ""
 	previousControlKey := ""
@@ -1732,25 +2698,34 @@ func (m model) screenContent(height, width int) (string, int, int) {
 		if control.Kind == "hidden" || (control.Advanced && !m.screenAdvanced) {
 			continue
 		}
-		separateWizardLauncher := (m.screen.ID == "telegram" || m.screen.ID == "whatsapp") && previousControlKey == "wizard"
+		sectionDisclosure := control.Kind == "disclosure" && control.Section != ""
+		if control.Section != "" {
+			if m.isSettingsScreen() {
+				lines = appendBlankScreenRows(lines, 2)
+			} else {
+				lines = appendBlankScreenRow(lines)
+			}
+			if !sectionDisclosure {
+				lines = append(lines, m.sectionRule(control.Section, innerWidth), "")
+			}
+		}
+		separateWizardLauncher := control.Section == "" && (m.screen.ID == "telegram" || m.screen.ID == "whatsapp") && previousControlKey == "wizard"
 		separateWizardActions := strings.HasPrefix(m.screen.ID, "wizard:") && control.Kind == "action" && previousControlKind != "" && previousControlKind != "action"
-		separateDisclosure := control.Kind == "disclosure" && previousControlKind != ""
-		separateAdvancedControls := control.Advanced && previousControlKind == "disclosure"
+		separateDisclosure := control.Section == "" && control.Kind == "disclosure" && previousControlKind != ""
+		separateAdvancedControls := control.Section == "" && control.Advanced && previousControlKind == "disclosure"
 		if separateWizardLauncher || separateWizardActions || separateDisclosure || separateAdvancedControls {
-			lines = append(lines, "")
+			lines = appendBlankScreenRow(lines)
 		}
 		value := control.Value
-		if control.Kind == "action" {
-			value = "[ " + control.Value + " ]"
-		} else if control.Kind == "disclosure" {
-			value = "[ Show advanced settings ]"
+		if control.Kind == "disclosure" {
+			value = "Show Advanced Settings"
 			if m.screenAdvanced {
-				value = "[ Hide advanced settings ]"
+				value = "Hide Advanced Settings"
 			}
 		}
 		if control.Secret {
 			if value != "" {
-				value = strings.Repeat("•", len([]rune(value)))
+				value = strings.Repeat("*", len([]rune(value)))
 			} else if control.Configured {
 				value = "(configured; type to replace)"
 			}
@@ -1758,30 +2733,58 @@ func (m model) screenContent(height, width int) (string, int, int) {
 		if index == m.screenIndex && (control.Kind == "text" || control.Kind == "password") {
 			value = m.renderScreenTextCursor(index, control, value)
 		}
+		selected := index == m.screenIndex
 		label := strings.Title(control.Label) //nolint:staticcheck
-		line := fmt.Sprintf("%-28s %s", label, value)
-		if control.Kind == "action" || control.Kind == "disclosure" {
-			line = value
+		line := ""
+		switch control.Kind {
+		case "action":
+			line = m.screenButton(value, selected)
+		case "disclosure":
+			if sectionDisclosure {
+				line = m.disclosureSectionRule(value, selected, innerWidth)
+			} else {
+				line = m.screenButton(value, selected)
+			}
+		case "toggle", "select":
+			line = m.screenFieldLine(label, "‹ "+value+" ›", selected, innerWidth)
+		default:
+			line = m.screenFieldLine(label, value, selected, innerWidth)
 		}
 		if index == m.screenIndex {
 			selectedLine = len(lines)
-			line = agentStyle.Render(ansi.Truncate(line, innerWidth, "…"))
-		} else {
-			line = ansi.Truncate(line, innerWidth, "…")
 		}
-		lines = append(lines, line)
+		lines = append(lines, ansi.Truncate(line, innerWidth, "…"))
+		descriptionWidth := textWidth
 		if control.DescriptionMarkdown {
-			rendered := strings.Trim(trimRenderedPadding(markdownfmt.Terminal(control.Description, max(1, innerWidth-2))), "\n")
-			for _, descriptionLine := range strings.Split(rendered, "\n") {
-				lines = append(lines, statusStyle.Render("  "+ansi.Truncate(descriptionLine, max(1, innerWidth-2), "…")))
+			rendered := strings.Trim(trimRenderedPadding(markdownfmt.TerminalWithTheme(control.Description, descriptionWidth, m.activeTheme)), "\n")
+			if rendered != "" {
+				for _, descriptionLine := range strings.Split(rendered, "\n") {
+					lines = append(lines, m.styles.status.Render(ansi.Truncate(descriptionLine, descriptionWidth, "…")))
+				}
 			}
-		} else {
-			lines = append(lines, statusStyle.Render("  "+ansi.Truncate(control.Description, max(1, innerWidth-2), "…")))
+		} else if control.Description != "" {
+			if m.screen.ID == "resume" {
+				const indent = "     "
+				description := strings.Join(strings.Fields(control.Description), " ")
+				description = ansi.Truncate(description, max(1, descriptionWidth-lipgloss.Width(indent)), "…")
+				lines = append(lines, m.styles.status.Render(indent+description))
+			} else {
+				wrapped := ansi.Hardwrap(control.Description, descriptionWidth, true)
+				for _, descriptionLine := range strings.Split(wrapped, "\n") {
+					lines = append(lines, m.styles.status.Render(ansi.Truncate(descriptionLine, descriptionWidth, "…")))
+				}
+			}
+		}
+		if m.isSettingsScreen() {
+			lines = appendBlankScreenRow(lines)
 		}
 		previousControlKind = control.Kind
 		previousControlKey = control.Key
 	}
-	visible := max(1, height-2)
+	for len(lines) > 0 && strings.TrimSpace(ansi.Strip(lines[len(lines)-1])) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	visible := max(1, height)
 	offset := bounded(selectedLine-visible/2, 0, max(0, len(lines)-visible))
 	if m.screenManual {
 		offset = bounded(m.screenScroll, 0, max(0, len(lines)-visible))
@@ -1790,17 +2793,107 @@ func (m model) screenContent(height, width int) (string, int, int) {
 	return strings.Join(lines[offset:end], "\n"), offset, len(lines)
 }
 
-func (m model) screenConnectionSection(innerWidth int) []string {
-	name := ""
-	for _, candidate := range []string{"telegram", "whatsapp"} {
-		if m.screen.ID == candidate || strings.HasPrefix(m.screen.ID, "wizard:"+candidate+":") {
-			name = candidate
-			break
+func appendBlankScreenRow(lines []string) []string {
+	if len(lines) == 0 {
+		return lines
+	}
+	if strings.TrimSpace(ansi.Strip(lines[len(lines)-1])) != "" {
+		return append(lines, "")
+	}
+	return lines
+}
+
+func appendBlankScreenRows(lines []string, count int) []string {
+	if len(lines) == 0 || count <= 0 {
+		return lines
+	}
+	trailing := 0
+	for index := len(lines) - 1; index >= 0 && strings.TrimSpace(ansi.Strip(lines[index])) == ""; index-- {
+		trailing++
+	}
+	for trailing < count {
+		lines = append(lines, "")
+		trailing++
+	}
+	return lines
+}
+
+func (m model) isSettingsScreen() bool {
+	return m.screen != nil && (m.screen.ID == "config" || m.screen.ID == "telegram" || m.screen.ID == "whatsapp")
+}
+
+func (m model) screenHasControlSections() bool {
+	if m.screen == nil {
+		return false
+	}
+	for _, control := range m.screen.Controls {
+		if control.Section != "" {
+			return true
 		}
 	}
-	if name == "" {
+	return false
+}
+
+func (m model) screenFieldLine(label, value string, selected bool, width int) string {
+	width = max(1, width)
+	value = ansi.Truncate(value, max(1, width/2), "…")
+	valueWidth := lipgloss.Width(value)
+	label = ansi.Truncate(label, max(1, width-valueWidth-1), "…")
+	gap := strings.Repeat(" ", max(1, width-lipgloss.Width(label)-valueWidth))
+	labelStyle := m.styles.base
+	valueStyle := m.styles.base
+	if selected {
+		labelStyle = m.styles.title
+		valueStyle = m.styles.title
+	}
+	return labelStyle.Render(label) + gap + valueStyle.Render(value)
+}
+
+func (m model) formSectionTitle() string {
+	if m.screen == nil || strings.HasPrefix(m.screen.ID, "wizard:") {
+		return ""
+	}
+	switch m.screen.ID {
+	case "config":
+		return "Core settings"
+	case "telegram", "whatsapp":
+		return "Basic settings"
+	case "harness", "model":
+		return "Choose an option"
+	default:
+		return ""
+	}
+}
+
+func (m model) sectionRule(label string, width int) string {
+	label = strings.TrimSpace(label)
+	left := m.styles.title.Render(label)
+	rule := strings.Repeat("─", max(0, width-lipgloss.Width(label)-1))
+	return left + " " + m.styles.track.Render(rule)
+}
+
+func (m model) screenButton(value string, selected bool) string {
+	buttonStyle := m.styles.elevated
+	if selected {
+		buttonStyle = m.styles.selected.Foreground(m.styles.title.GetForeground())
+	}
+	return buttonStyle.Render(" " + value + " ↵ ")
+}
+
+func (m model) disclosureSectionRule(value string, selected bool, width int) string {
+	button := m.screenButton(value, selected)
+	rule := strings.Repeat("─", max(0, width-lipgloss.Width(button)))
+	if rule == "" {
+		return button
+	}
+	return button + m.styles.track.Render(rule)
+}
+
+func (m model) screenConnectionSection(innerWidth int) []string {
+	if m.screen.ID != "telegram" && m.screen.ID != "whatsapp" {
 		return nil
 	}
+	name := m.screen.ID
 	status, ok := m.connection[name]
 	if !ok {
 		status = channel.ConnectionStatus{Name: name, State: channel.ConnectionUnconfigured}
@@ -1814,21 +2907,35 @@ func (m model) screenConnectionSection(innerWidth int) []string {
 	case channel.ConnectionError:
 		indicator = "▲ Error"
 	}
-	lines := []string{agentStyle.Render("Status"), statusStyle.Render("  " + indicator)}
-	if name == "telegram" && status.Identity != "" {
+	indicatorStyle := m.styles.status
+	if status.State == channel.ConnectionConnected {
+		indicatorStyle = m.styles.success
+	} else if status.State == channel.ConnectionError {
+		indicatorStyle = m.styles.error
+	}
+	heading := "WhatsApp Status"
+	if m.screen.ID == "telegram" {
+		heading = "Telegram Status"
+	}
+	lines := []string{m.sectionRule(heading, innerWidth), "", indicatorStyle.Render(indicator)}
+	if status.State == channel.ConnectionConnected && status.Identity != "" {
 		identity := status.Identity
 		if status.Link != "" {
 			identity = "[" + status.Identity + "](" + status.Link + ")"
 		}
-		rendered := strings.Trim(trimRenderedPadding(markdownfmt.Terminal("Bot: "+identity, max(1, innerWidth-2))), "\n")
+		label := "Account: "
+		if name == "telegram" {
+			label = "Bot: "
+		}
+		rendered := strings.Trim(trimRenderedPadding(markdownfmt.TerminalWithTheme(label+identity, max(1, innerWidth-2), m.activeTheme)), "\n")
 		for _, line := range strings.Split(rendered, "\n") {
-			lines = append(lines, statusStyle.Render("  "+line))
+			lines = append(lines, m.styles.status.Render(line))
 		}
 	}
-	if detail := strings.Join(strings.Fields(status.Detail), " "); detail != "" {
-		wrapped := ansi.Hardwrap("Detail: "+detail, max(1, innerWidth-2), true)
+	if detail := strings.Join(strings.Fields(status.Detail), " "); status.State == channel.ConnectionError && detail != "" {
+		wrapped := ansi.Hardwrap(detail, max(1, innerWidth-2), true)
 		for _, line := range strings.Split(wrapped, "\n") {
-			lines = append(lines, statusStyle.Render("  "+line))
+			lines = append(lines, m.styles.status.Render(line))
 		}
 	}
 	return append(lines, "")
@@ -1860,23 +2967,51 @@ func (m model) screenFooterHint() string {
 		}
 		return "Saving configuration…"
 	}
-	if m.screen != nil && (m.screen.ID == "harness" || m.screen.ID == "model") {
-		if len(m.screenStack) > 0 {
-			return "↑/↓ or Tab/Shift+Tab navigate · Space/Enter select · Esc back"
+	if m.screen != nil && len(m.screen.Hints) > 0 {
+		hints := make([]string, 0, len(m.screen.Hints))
+		for _, hint := range m.screen.Hints {
+			action := hint.Action
+			if hint.Key == "␛" && len(m.screenStack) > 0 {
+				action = "back"
+			}
+			gap := " "
+			if hint.Key == "⌦" {
+				// This glyph fills its terminal cell visually in several common
+				// fonts, so reserve one extra cell to preserve a visible gap.
+				gap = "  "
+			}
+			hints = append(hints, strings.TrimSpace(hint.Key+gap+action))
 		}
-		return "↑/↓ or Tab/Shift+Tab navigate · Space/Enter select · Esc cancel"
+		return strings.Join(hints, " · ")
+	}
+	if m.screen != nil && (m.screen.ID == "harness" || m.screen.ID == "model") {
+		escape := "cancel"
+		if len(m.screenStack) > 0 {
+			escape = "back"
+		}
+		return "↑↓/⇥ nav · ␠/↵ select · ␛ " + escape
 	}
 	if m.screen != nil && m.screen.SaveDisabled {
-		return "↑/↓ or Tab/Shift+Tab navigate · PgUp/PgDown scroll · type edit · Space/Enter choose · Esc cancel"
+		return "↑↓/⇥ nav · ␠/↵ choose · ␛ cancel"
 	}
-	return "↑/↓ or Tab/Shift+Tab navigate · type edit · Space/Enter choose · Ctrl+S save · Esc chat"
+	return "↑↓/⇥ nav · ␠/↵ choose · ⌃S save · ␛ exit"
 }
 
 func (m model) footerHint() string {
-	if m.commandMenu {
-		return "↑/↓ choose · Tab insert · Enter send · Esc close"
+	if m.themeMenu {
+		return "↑↓ preview · ↵ apply · ␛ cancel"
 	}
-	return "Enter send · Shift+Enter newline · PgUp/PgDown history · Ctrl+C clear/quit"
+	if m.commandMenu {
+		return "↑↓ choose · ⇥ insert · ↵ send · ␛ close"
+	}
+	return "↵ send · ⇧↵ line · PgUp/⇧+↑↓ scroll · ⌃C clear/stop/quit"
+}
+
+func (m model) inlineMenuView() string {
+	if m.themeMenu {
+		return m.themeMenuView()
+	}
+	return m.commandMenuView()
 }
 
 func (m model) spynelLogo() string {
@@ -1893,21 +3028,26 @@ func runtimeCount(count int, label string) string {
 	return fmt.Sprintf("%d %s", count, label)
 }
 
-func (m model) connectionBadge(name, short string) string {
+func (m model) connectionSegment(name, short string) string {
 	status, ok := m.connection[name]
 	if !ok {
 		status = channel.ConnectionStatus{Name: name, State: channel.ConnectionUnconfigured}
 	}
+	icon := "○"
+	iconStyle := m.styles.status
 	switch status.State {
 	case channel.ConnectionConnected:
-		return "● " + short
+		icon = "●"
+		iconStyle = m.styles.success
 	case channel.ConnectionConnecting:
-		return "◐ " + short
+		icon = "◐"
+		iconStyle = m.styles.warning
 	case channel.ConnectionError:
-		return "▲ " + short
-	default:
-		return "○ " + short
+		icon = "▲"
+		iconStyle = m.styles.error
 	}
+	icon = iconStyle.Background(m.styles.header.GetBackground()).Render(icon)
+	return icon + m.styles.status.Background(m.styles.header.GetBackground()).Render(" "+short)
 }
 
 func (m model) commandMenuView() string {
@@ -1929,20 +3069,49 @@ func (m model) commandMenuView() string {
 		command := matches[index]
 		line := fmt.Sprintf("%-28s %s", command.Usage, command.Description)
 		line = truncateWidth(line, lineWidth)
-		style := commandStyle
+		style := m.styles.command
 		if index == m.commandIndex {
-			style = selectedCommandStyle
+			style = m.styles.selectedCommand
 		}
 		lines = append(lines, style.Width(lineWidth).Render(line))
 	}
 	content := strings.Join(lines, "\n")
-	return titledPanel("Commands", content, max(20, m.width), start, len(matches))
+	return m.inlinePicker("Commands", content, end-start, max(20, m.width), start, len(matches))
+}
+
+func (m model) themeMenuView() string {
+	if !m.themeMenu || len(m.themes) == 0 {
+		return ""
+	}
+	start := 0
+	if m.themeIndex >= maxCommandRows {
+		start = m.themeIndex - maxCommandRows + 1
+	}
+	end := min(len(m.themes), start+maxCommandRows)
+	lineWidth := max(10, m.width-1)
+	lines := make([]string, 0, end-start)
+	for index := start; index < end; index++ {
+		value := m.themes[index]
+		line := fmt.Sprintf("%-22s %s", value.Name, value.Description)
+		line = truncateWidth(line, lineWidth)
+		style := m.styles.command
+		if index == m.themeIndex {
+			style = m.styles.selectedCommand
+		}
+		lines = append(lines, style.Width(lineWidth).Render(line))
+	}
+	return m.inlinePicker("Themes", strings.Join(lines, "\n"), end-start, max(20, m.width), start, len(m.themes))
+}
+
+func (m model) inlinePicker(title, content string, rows, width, offset, total int) string {
+	width = max(20, width)
+	return m.borderedSurface(" "+title+" ", content, max(1, rows), width, offset, total, m.styles.elevated)
 }
 
 func (m model) renderInput() string {
 	view := m.input.View()
 	for _, token := range m.tokens {
-		view = strings.ReplaceAll(view, token.label, tokenStyle.Render(token.label))
+		view = strings.ReplaceAll(view, token.label, m.styles.token.Render(token.label))
 	}
 	return view
 }
@@ -1974,7 +3143,7 @@ func fitContent(content string, height, width int) string {
 	return strings.Join(rendered, "\n")
 }
 
-func scrollbar(height, offset, total int) []string {
+func scrollbar(height, offset, total int, styles uiStyles, background lipgloss.TerminalColor) []string {
 	height = max(1, height)
 	total = max(height, total)
 	thumbHeight := height
@@ -1988,56 +3157,16 @@ func scrollbar(height, offset, total int) []string {
 		start = bounded((bounded(offset, 0, maxOffset)*maxStart+maxOffset/2)/maxOffset, 0, maxStart)
 	}
 	result := make([]string, height)
+	track := styles.track.Background(background)
+	thumb := styles.thumb.Background(background)
 	for row := range result {
 		if row >= start && row < start+thumbHeight {
-			result[row] = scrollThumbStyle.Render("┃")
+			result[row] = thumb.Render("┃")
 		} else {
-			result[row] = standardBorderStyle.Render("│")
+			result[row] = track.Render("│")
 		}
 	}
 	return result
-}
-
-func titledPanel(title, content string, width, offset, total int) string {
-	width = max(20, width)
-	innerWidth := max(1, width-2)
-	title = " " + title + " "
-	title = ansi.Truncate(title, max(1, innerWidth-1), "…")
-	top := "╭─" + title + strings.Repeat("─", max(0, innerWidth-1-lipgloss.Width(title))) + "╮"
-	bottom := "╰" + strings.Repeat("─", innerWidth) + "╯"
-	lines := strings.Split(content, "\n")
-	for index, line := range lines {
-		line = ansi.Truncate(line, innerWidth, "")
-		lines[index] = standardBorderStyle.Render("│") + lipgloss.NewStyle().Width(innerWidth).Render(line) + standardBorderStyle.Render("│")
-	}
-	box := standardBorderStyle.Render(top) + "\n" + strings.Join(lines, "\n") + "\n" + standardBorderStyle.Render(bottom)
-	return replaceRightBorder(box, len(lines), offset, total)
-}
-
-func replaceRightBorder(box string, visible, offset, total int) string {
-	lines := strings.Split(box, "\n")
-	if len(lines) < 3 {
-		return box
-	}
-	height := len(lines) - 2
-	edge := make([]string, height)
-	if total > max(1, visible) {
-		edge = scrollbar(height, offset, total)
-	} else {
-		border := standardBorderStyle.Render("│")
-		for row := range edge {
-			edge[row] = border
-		}
-	}
-	for row := 0; row < height; row++ {
-		lineIndex := row + 1
-		width := lipgloss.Width(lines[lineIndex])
-		if width < 1 {
-			continue
-		}
-		lines[lineIndex] = ansi.Truncate(lines[lineIndex], width-1, "") + edge[row]
-	}
-	return strings.Join(lines, "\n")
 }
 
 func bounded(value, lower, upper int) int {

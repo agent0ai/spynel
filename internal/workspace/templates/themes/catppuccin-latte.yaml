@@ -1,0 +1,20 @@
+name: catppuccin-latte
+description: Warm pastel accents on Catppuccin Latte surfaces
+appearance: light
+color_blind_friendly: false
+colors:
+  background: "#EFF1F5"
+  surface: "#E6E9EF"
+  surface_elevated: "#DCE0E8"
+  surface_selected: "#D8DCE4"
+  text: "#3C3F57"
+  text_muted: "#5C5F77"
+  primary: "#1856C9"
+  secondary: "#6F2CC5"
+  border: "#73768C"
+  user: "#1454B8"
+  success: "#347522"
+  warning: "#825000"
+  error: "#B90B31"
+  info: "#006D82"
+  code: "#6F2CC5"

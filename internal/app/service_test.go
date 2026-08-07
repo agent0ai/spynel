@@ -3,18 +3,23 @@ package app
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 
-	"github.com/frdel/spynel/internal/channel"
-	"github.com/frdel/spynel/internal/config"
-	"github.com/frdel/spynel/internal/core"
-	"github.com/frdel/spynel/internal/harness"
-	"github.com/frdel/spynel/internal/history"
-	"github.com/frdel/spynel/internal/workspace"
+	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/history"
+	"github.com/agent0ai/spynel/internal/orchestrator"
+	"github.com/agent0ai/spynel/internal/updater"
+	"github.com/agent0ai/spynel/internal/workspace"
 )
 
 type serviceHarness struct {
@@ -28,6 +33,114 @@ type serviceHarness struct {
 type heldServiceHarness struct {
 	*serviceHarness
 	emits map[string]core.Emit
+}
+
+type notificationRouter struct{ calls []string }
+
+func (r *notificationRouter) Deliver(_ context.Context, channelName, conversation, eventID, text string) error {
+	r.calls = append(r.calls, channelName+"/"+conversation+"/"+eventID+"/"+text)
+	return nil
+}
+
+func TestNotifyDeliversAllOriginsWithStableEventIdentity(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg.Channels.Telegram.AllowedUsers = []string{"7"}
+	cfg.Channels.WhatsApp.AllowedNumbers = []string{"15557654321"}
+	service := New(cfg, newServiceHarness())
+	router := &notificationRouter{}
+	service.DeliveryControl = router
+	for _, origin := range []string{"tui/local", "cli/local", "telegram/TG-7", "whatsapp/WA-15557654321"} {
+		channelName, conversation, _ := strings.Cut(origin, "/")
+		if _, err := service.History.Append(channelName, conversation, history.Entry{Role: "user", Content: "known"}); err != nil {
+			t.Fatal(err)
+		}
+		id, err := service.Notify(context.Background(), origin, "complete")
+		if err != nil {
+			t.Fatalf("%s: %v", origin, err)
+		}
+		if id == "" {
+			t.Fatalf("%s returned no event identity", origin)
+		}
+		entries, _, err := service.History.RecentEntries(channelName, conversation, 10, 10000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if entries[len(entries)-1].Content != "complete" || entries[len(entries)-1].Sender != "Spy" {
+			t.Fatalf("%s history = %#v", origin, entries)
+		}
+	}
+	if len(router.calls) != 2 || !strings.Contains(router.calls[0], "telegram/TG-7/") || !strings.Contains(router.calls[1], "whatsapp/WA-15557654321/") {
+		t.Fatalf("remote calls = %#v", router.calls)
+	}
+}
+
+func TestTaskCommandDelegatesCreationPolicyToCommunicationAgent(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	harness := newServiceHarness()
+	service := New(cfg, harness)
+	if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "deploy", Sender: "cli", Text: "/task ship it"}, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	prompts := harness.prompts["chat:cli:deploy"]
+	if len(prompts) != 1 || !strings.Contains(prompts[0], "explicitly invoked `/task`") || !strings.Contains(prompts[0], "ship it") || !strings.Contains(prompts[0], "origin `cli/deploy`") || !strings.Contains(prompts[0], "cancelled") {
+		t.Fatalf("task creation prompt = %#v", prompts)
+	}
+}
+
+func TestRemoteNotificationEventIsNotRedeliveredAfterRetryOrRestart(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg.Channels.Telegram.AllowedUsers = []string{"7"}
+	service := New(cfg, newServiceHarness())
+	router := &notificationRouter{}
+	service.DeliveryControl = router
+	_, _ = service.History.Append("telegram", "TG-7", history.Entry{Role: "user", Content: "known"})
+	origin := orchestrator.Origin{Channel: "telegram", Conversation: "TG-7"}
+	if err := service.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
+		t.Fatal(err)
+	}
+	restarted := New(cfg, newServiceHarness())
+	restarted.DeliveryControl = router
+	if err := restarted.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
+		t.Fatal(err)
+	}
+	if len(router.calls) != 1 {
+		t.Fatalf("duplicate provider deliveries = %#v", router.calls)
+	}
+}
+
+func TestRemoteNotificationRetriesPreSendCrashMarker(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg.Channels.Telegram.AllowedUsers = []string{"7"}
+	service := New(cfg, newServiceHarness())
+	router := &notificationRouter{}
+	service.DeliveryControl = router
+	_, _ = service.History.Append("telegram", "TG-7", history.Entry{Role: "user", Content: "known"})
+	_, _ = service.History.Append("telegram", "TG-7", history.Entry{Role: "notification_sending", EventID: "interrupted"})
+	if err := service.deliverNotification(context.Background(), orchestrator.Origin{Channel: "telegram", Conversation: "TG-7"}, "interrupted", "complete"); err != nil {
+		t.Fatal(err)
+	}
+	if len(router.calls) != 1 {
+		t.Fatalf("pre-send marker suppressed delivery: %#v", router.calls)
+	}
 }
 
 type reconfigurableServiceHarness struct {
@@ -51,6 +164,23 @@ type fakeStartupManager struct {
 	err   error
 }
 
+type fakePairingManager struct {
+	retries []string
+	phones  []string
+	code    string
+	err     error
+}
+
+func (m *fakePairingManager) RetryPairing(name string) error {
+	m.retries = append(m.retries, name)
+	return m.err
+}
+
+func (m *fakePairingManager) PairPhone(_ context.Context, name, phone string) (string, error) {
+	m.phones = append(m.phones, name+":"+phone)
+	return m.code, m.err
+}
+
 func (m *fakeStartupManager) Sync(_ config.Config, enabled bool) error {
 	m.calls = append(m.calls, enabled)
 	return m.err
@@ -62,16 +192,21 @@ func newHeldServiceHarness() *heldServiceHarness {
 
 func (r *heldServiceHarness) Send(_ context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.prompts[key] = append(r.prompts[key], prompt)
 	thread := r.threads[key]
 	if thread == "" {
 		thread = "thread-" + key
 		r.threads[key] = thread
 	}
+	steered := r.active[key]
+	previousEmit := r.emits[key]
 	r.active[key] = true
 	r.emits[key] = emit
-	return thread, false, nil
+	r.mu.Unlock()
+	if steered && previousEmit != nil {
+		previousEmit(core.Event{Kind: core.EventStatus, Done: true, ThreadID: thread})
+	}
+	return thread, steered, nil
 }
 
 func (r *heldServiceHarness) finish(key string) {
@@ -169,7 +304,145 @@ func TestServiceKeepsChannelContextsSeparateAndLinksFullHistory(t *testing.T) {
 	}
 }
 
-func TestSlashCommandsCreateDurableTasksWithoutCallingRecipient(t *testing.T) {
+func TestRemoteFinalResponseExtractsOutboundAttachment(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsideRoot := t.TempDir()
+	path := filepath.Join(outsideRoot, "report.txt")
+	if err := os.WriteFile(path, []byte("report"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	progressPath := filepath.Join(root, "progress.txt")
+	if err := os.WriteFile(progressPath, []byte("progress"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	message := core.Message{Channel: "telegram", Conversation: "TG-7"}
+	var got core.Event
+	finalText := "Ready.\n\n[Send attachment](<" + path + ">)"
+	service.wrapEmit(message, 0, func(event core.Event) { got = event })(core.Event{
+		Kind: core.EventFinal, Text: "Progress update.\n[Send attachment](<" + progressPath + ">)\n" + finalText, FinalText: &finalText, Done: true,
+	})
+	if got.Text != "Progress update.\nReady." || len(got.Attachments) != 1 || got.Attachments[0].Path != path {
+		t.Fatalf("event = %#v", got)
+	}
+	if got.FinalText == nil || *got.FinalText != "Ready." {
+		value := "<nil>"
+		if got.FinalText != nil {
+			value = *got.FinalText
+		}
+		t.Fatalf("remote final text = %q, want Ready.", value)
+	}
+	recent, _, err := service.History.Recent("telegram", "TG-7", 10000)
+	if err != nil || !strings.Contains(recent, "Progress update.") || !strings.Contains(recent, "[Sent attachment report.txt]") || strings.Contains(recent, "progress.txt") || strings.Contains(recent, "[Send attachment]") {
+		t.Fatalf("history = %q, %v", recent, err)
+	}
+	prompt, err := service.chatPrompt(core.Message{Channel: "telegram", Conversation: "TG-7"})
+	if err != nil || !strings.Contains(prompt, "[Send photo](</absolute/path/to/image.png>)") || !strings.Contains(prompt, "outside the active workspace") {
+		t.Fatalf("remote prompt missing attachment instructions: %v", err)
+	}
+}
+
+func TestNonterminalDoneEventDoesNotEndActiveJob(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	jobID := service.Runtime.BeginJob("chat:telegram:TG-7", "telegram", "TG-7", "first message")
+	emit := service.wrapEmit(core.Message{Channel: "telegram", Conversation: "TG-7"}, jobID, nil)
+	emit(core.Event{Kind: core.EventStatus, Done: true})
+	if service.Runtime.Status().Jobs != 1 {
+		t.Fatal("transport handoff ended the active harness job")
+	}
+	emit(core.Event{Kind: core.EventFinal, Text: "answered follow-up", Done: true})
+	if service.Runtime.Status().Jobs != 0 {
+		t.Fatal("terminal harness event did not end the active job")
+	}
+}
+
+func TestContinuingFinalDoesNotEndActiveJob(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	jobID := service.Runtime.BeginJob("chat:tui:local", "tui", "local", "first message")
+	emit := service.wrapEmit(core.Message{Channel: "tui", Conversation: "local"}, jobID, nil)
+	emit(core.Event{Kind: core.EventFinal, Text: "first answer", Done: true, Continues: true})
+	if service.Runtime.Status().Jobs != 1 {
+		t.Fatal("continuing final ended the logical conversation job")
+	}
+	emit(core.Event{Kind: core.EventFinal, Text: "follow-up answer", Done: true})
+	if service.Runtime.Status().Jobs != 0 {
+		t.Fatal("last queued final did not end the logical conversation job")
+	}
+}
+
+func TestFollowUpTakesOverActiveResponseWithoutAbandoningTurn(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newHeldServiceHarness()
+	service := New(cfg, target)
+	key := "chat:telegram:TG-7"
+	var firstEvents []core.Event
+	var secondEvents []core.Event
+	first := core.Message{Channel: "telegram", Conversation: "TG-7", Text: "dispatch the finite work"}
+	followUp := core.Message{Channel: "telegram", Conversation: "TG-7", Text: "what is its state?", FollowupOnly: true}
+	if err := service.Handle(context.Background(), followUp, nil); err == nil || !strings.Contains(err.Error(), "no active execution") {
+		t.Fatalf("inactive explicit follow-up error = %v", err)
+	}
+	if err := service.Handle(context.Background(), first, func(event core.Event) { firstEvents = append(firstEvents, event) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Handle(context.Background(), followUp, func(event core.Event) { secondEvents = append(secondEvents, event) }); err != nil {
+		t.Fatal(err)
+	}
+	if service.Runtime.Status().Jobs != 1 || !target.IsActive(key) {
+		t.Fatalf("steered turn state = jobs %#v, active %t", service.Runtime.Jobs(), target.IsActive(key))
+	}
+	if len(firstEvents) == 0 || !firstEvents[len(firstEvents)-1].Done || firstEvents[len(firstEvents)-1].Kind != core.EventStatus {
+		t.Fatalf("previous emitter was not released with a nonterminal done status: %#v", firstEvents)
+	}
+	if len(target.prompts[key]) != 2 || !strings.Contains(target.prompts[key][1], "what is its state?") || !strings.Contains(target.prompts[key][1], "dispatch the finite work") {
+		t.Fatalf("follow-up prompt did not retain live conversation context: %#v", target.prompts[key])
+	}
+	target.finish(key)
+	if service.Runtime.Status().Jobs != 0 || target.IsActive(key) {
+		t.Fatalf("completed steered turn state = jobs %#v, active %t", service.Runtime.Jobs(), target.IsActive(key))
+	}
+	foundFinal := false
+	for _, event := range secondEvents {
+		if event.Kind == core.EventFinal && event.Done && event.Text == "finished" {
+			foundFinal = true
+		}
+	}
+	if !foundFinal {
+		t.Fatalf("latest emitter did not receive the final response: %#v", secondEvents)
+	}
+}
+
+func TestSlashCommandsSendCreationPromptsToCommunicationAgent(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
@@ -177,20 +450,21 @@ func TestSlashCommandsCreateDurableTasksWithoutCallingRecipient(t *testing.T) {
 	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
 	harness := newServiceHarness()
 	service := New(cfg, harness)
-	var response core.Event
-	err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "7", Text: "/task inspect the queue"}, func(event core.Event) { response = event })
-	if err != nil {
+	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "7", Text: "/task inspect the queue"}, func(core.Event) {}); err != nil {
 		t.Fatal(err)
 	}
-	if response.Kind != core.EventFinal || !strings.Contains(response.Text, "Created task") {
-		t.Fatalf("unexpected slash response %#v", response)
+	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "7", Text: "/goal keep the queue healthy"}, func(core.Event) {}); err != nil {
+		t.Fatal(err)
 	}
-	if len(harness.prompts) != 0 {
-		t.Fatal("local slash command should not call harness")
+	prompts := harness.prompts["chat:telegram:7"]
+	if len(prompts) != 2 || !strings.Contains(prompts[0], "<user_task_request>\ninspect the queue") || !strings.Contains(prompts[1], "<user_goal_request>\nkeep the queue healthy") || !strings.Contains(prompts[1], "success_criteria") {
+		t.Fatalf("creation prompts = %#v", prompts)
 	}
-	entries, err := filepath.Glob(filepath.Join(cfg.Resolve(cfg.Orchestrator.Routes[0].Source), "*.md"))
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("task files = %#v, %v", entries, err)
+	for _, route := range cfg.Orchestrator.Routes {
+		entries, err := filepath.Glob(filepath.Join(cfg.Resolve(route.Source), "*.md"))
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("framework command bypassed communication agent for %s: %#v, %v", route.Name, entries, err)
+		}
 	}
 }
 
@@ -209,6 +483,62 @@ func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
 	commands[0].Value = "/mutated"
 	if SlashCommands()[0].Value != original {
 		t.Fatal("SlashCommands returned mutable catalog storage")
+	}
+}
+
+func TestThemeCommandOpensPickerListsAndPersistsThemes(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	run := func(channelName, command string) core.Event {
+		var response core.Event
+		if err := service.Handle(context.Background(), core.Message{Channel: channelName, Conversation: "theme-test", Text: command}, func(event core.Event) { response = event }); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	if response := run("tui", "/theme"); response.Kind != core.EventThemePicker {
+		t.Fatalf("TUI theme response = %#v", response)
+	}
+	if response := run("telegram", "/theme"); response.Kind != core.EventFinal || !strings.Contains(response.Text, "hack-the-box") || !strings.Contains(response.Text, "catppuccin-latte") {
+		t.Fatalf("remote theme list = %#v", response)
+	}
+	if response := run("tui", "/theme catppuccin-latte"); response.Kind != core.EventFinal || !strings.Contains(response.Text, "catppuccin-latte") {
+		t.Fatalf("theme selection = %#v", response)
+	}
+	select {
+	case selected := <-service.ThemeChanges():
+		if selected.Name != "catppuccin-latte" {
+			t.Fatalf("theme event = %#v", selected)
+		}
+	default:
+		t.Fatal("theme selection was not published")
+	}
+	reloaded, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil || reloaded.Channels.TUI.Theme != "catppuccin-latte" {
+		t.Fatalf("persisted theme = %q, %v", reloaded.Channels.TUI.Theme, err)
+	}
+	_ = run("telegram", "/theme catppuccin-latte")
+	select {
+	case selected := <-service.ThemeChanges():
+		if selected.Name != "catppuccin-latte" {
+			t.Fatalf("reloaded theme event = %#v", selected)
+		}
+	default:
+		t.Fatal("reselecting the active theme did not publish its reloaded file")
+	}
+	if response := run("tui", "/theme missing"); response.Kind != core.EventFinal || !strings.Contains(response.Text, "Unknown theme") {
+		t.Fatalf("unknown theme response = %#v", response)
+	}
+	changed, err := service.ApplySettings(map[string]string{"channels.tui.theme": "CATPPUCCIN-LATTE"})
+	if err != nil || len(changed) != 1 || changed[0].Value != "catppuccin-latte" {
+		t.Fatalf("canonical theme setting = %#v, %v", changed, err)
 	}
 }
 
@@ -274,6 +604,7 @@ func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
 	target := newServiceHarness()
 	service := New(cfg, target)
+	service.SetPrimaryInstanceID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 	key := "chat:telegram:42"
 	target.threads[key] = "019c9f42-a3b1-7ced-9e10-123456789abc"
 	target.active[key] = true
@@ -286,16 +617,19 @@ func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	}
 
 	var response core.Event
-	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "42", Text: "/status"}, func(event core.Event) { response = event }); err != nil {
+	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "42", InstanceID: "11111111-2222-3333-4444-555555555555", Text: "/status"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"# Status", "Title: Production", "Telegram: ● connected", "WhatsApp: ▲ error — offline", "Jobs: 1", "Logs: 1", "Agent filesystem access: danger-full-access", "Thread: `019c9f42`", "Turn: active", "Orchestrator:"} {
+	for _, want := range []string{"# Status", "Title: Production", "Theme: spynel", "Instance ID: `11111111`", "Primary instance ID: `aaaaaaaa`", "Telegram: ● connected", "WhatsApp: ▲ error — offline", "Jobs: 1", "Logs: 1", "Agent filesystem access: danger-full-access", "Thread: `019c9f42`", "Turn: active", "Orchestrator:"} {
 		if !strings.Contains(response.Text, want) {
 			t.Fatalf("status response does not contain %q:\n%s", want, response.Text)
 		}
 	}
 	if strings.Contains(response.Text, "a3b1-7ced") {
 		t.Fatalf("status exposed full thread ID: %s", response.Text)
+	}
+	if strings.Contains(response.Text, "bbbb-cccc") || strings.Contains(response.Text, "2222-3333") {
+		t.Fatalf("status exposed full instance ID: %s", response.Text)
 	}
 }
 
@@ -466,6 +800,104 @@ func TestRestartCommandAcknowledgesAndRequestsProcessRestartAcrossChannels(t *te
 	}
 }
 
+func TestUpdateCommandChecksNPMAndRequestsLauncherManagedInstall(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	registry := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"name":"spynel","version":"1.3.0"}`))
+	}))
+	defer registry.Close()
+	service := New(cfg, newServiceHarness())
+	service.Updates = &updater.Manager{
+		CurrentVersion: "1.2.0", PackageRoot: root, LauncherManaged: true,
+		RegistryURL: registry.URL,
+	}
+	run := func(command string) core.Event {
+		var response core.Event
+		if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "updates", Text: command}, func(event core.Event) { response = event }); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	if response := run("/update"); !strings.Contains(response.Text, "1.3.0") || !strings.Contains(response.Text, "/update install") {
+		t.Fatalf("update response = %#v", response)
+	}
+	if response := run("/update install"); !strings.Contains(response.Text, "Updating Spynel") {
+		t.Fatalf("install response = %#v", response)
+	}
+	select {
+	case <-service.UpdateRequests():
+	default:
+		t.Fatal("update install did not publish a process request")
+	}
+	found := false
+	for _, command := range SlashCommands() {
+		if command.Value == "/update" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("update command is missing from the canonical picker")
+	}
+}
+
+func TestPrimaryCommandRequestsSafeLocalHandoffOnlyWhileIdle(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	target := newServiceHarness()
+	service := New(cfg, target)
+	service.SetPrimaryInstanceID("primary-instance")
+	run := func(message core.Message) core.Event {
+		var response core.Event
+		if err := service.Handle(context.Background(), message, func(event core.Event) { response = event }); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	if response := run(core.Message{Channel: "telegram", Conversation: "TG-7", Text: "/primary"}); !strings.Contains(response.Text, "only from a local TUI") {
+		t.Fatalf("remote primary response = %#v", response)
+	}
+	if response := run(core.Message{Channel: "tui", Conversation: "local-primary", InstanceID: "primary-instance", Text: "/primary"}); !strings.Contains(response.Text, "already the primary") {
+		t.Fatalf("owner primary response = %#v", response)
+	}
+	jobID := service.Runtime.BeginJob("chat:tui:other", "tui", "other", "busy")
+	if response := run(core.Message{Channel: "tui", Conversation: "local-secondary", InstanceID: "secondary-instance", Text: "/primary"}); !strings.Contains(response.Text, "1 agent job is running") {
+		t.Fatalf("busy primary response = %#v", response)
+	}
+	service.Runtime.EndJob(jobID)
+	response := run(core.Message{Channel: "tui", Conversation: "local-secondary", InstanceID: "secondary-instance", Text: "/primary"})
+	if !strings.Contains(response.Text, "Primary handoff requested") {
+		t.Fatalf("handoff response = %#v", response)
+	}
+	select {
+	case instanceID := <-service.PrimaryRequests():
+		if instanceID != "secondary-instance" {
+			t.Fatalf("handoff target = %q", instanceID)
+		}
+	default:
+		t.Fatal("primary command did not publish a handoff request")
+	}
+	found := false
+	for _, command := range SlashCommands() {
+		if command.Value == "/primary" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("primary command is missing from the canonical picker")
+	}
+	if len(target.prompts) != 0 {
+		t.Fatal("primary command should not call the coding harness")
+	}
+}
+
 func TestJobsListAndKillActiveExecutionsByNumericID(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
@@ -583,6 +1015,50 @@ func TestLogCommandSupportsPaginationSearchAndClear(t *testing.T) {
 	}
 }
 
+func TestLogCommandSanitizesPagesRangesAndSearchAcrossChannels(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	service := New(cfg, newServiceHarness())
+	service.Runtime.Log("\x1b[31mold failure\x1b[0m")
+	for index := 1; index < logPageEntries; index++ {
+		service.Runtime.Log(fmt.Sprintf("filler-%02d", index))
+	}
+	service.Runtime.Log("\x1b[2mnew failure\x1b[0m\n原因 🧪\x00")
+
+	run := func(channel, command string) string {
+		t.Helper()
+		var response core.Event
+		if err := service.Handle(context.Background(), core.Message{Channel: channel, Conversation: "clean-log", Text: command}, func(event core.Event) { response = event }); err != nil {
+			t.Fatal(err)
+		}
+		return response.Text
+	}
+
+	outputs := map[string]string{
+		"ordinary": run("tui", "/log"),
+		"page":     run("telegram", "/log page 2"),
+		"range":    run("whatsapp", "/log page 1-2"),
+		"search":   run("tui", "/log search failure"),
+	}
+	for name, output := range outputs {
+		if strings.ContainsRune(output, '\x1b') || strings.Contains(output, "[31m") || strings.Contains(output, "[2m") || strings.Contains(output, "[0m") || strings.ContainsRune(output, '\x00') {
+			t.Errorf("%s command leaked terminal formatting: %q", name, output)
+		}
+	}
+	if !strings.Contains(outputs["range"], "old failure") || !strings.Contains(outputs["range"], "new failure\n  原因 🧪") {
+		t.Fatalf("range did not preserve clean multiline content: %q", outputs["range"])
+	}
+	if !strings.Contains(outputs["search"], "2 matches") {
+		t.Fatalf("search did not find sanitized content: %q", outputs["search"])
+	}
+	if logs := service.Runtime.Logs(); logs[0].Text != "\x1b[31mold failure\x1b[0m" {
+		t.Fatalf("rendering altered captured source log: %#v", logs[0])
+	}
+}
+
 func TestLogCommandRejectsInvalidOptions(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
@@ -590,7 +1066,7 @@ func TestLogCommandRejectsInvalidOptions(t *testing.T) {
 	}
 	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
 	service := New(cfg, newServiceHarness())
-	for _, command := range []string{"/log page 0", "/log page nope", "/log page", "/log search", "/log clear extra", "/log unknown"} {
+	for _, command := range []string{"/log page 0", "/log page nope", "/log page 1-", "/log page -1-2", "/log page 3-2", "/log page 1-6", "/log page", "/log search", "/log clear extra", "/log unknown"} {
 		var response core.Event
 		if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: command}, func(event core.Event) { response = event }); err != nil {
 			t.Fatal(err)
@@ -598,6 +1074,37 @@ func TestLogCommandRejectsInvalidOptions(t *testing.T) {
 		if !strings.Contains(response.Text, "Usage: /log") {
 			t.Fatalf("%s response = %q", command, response.Text)
 		}
+	}
+}
+
+func TestParseLogPageSpec(t *testing.T) {
+	tests := []struct {
+		spec      string
+		wantFirst int
+		wantLast  int
+		wantErr   string
+	}{
+		{spec: "2", wantFirst: 2, wantLast: 2},
+		{spec: "1-5", wantFirst: 1, wantLast: 5},
+		{spec: "1-two", wantErr: "positive numbers"},
+		{spec: "0-2", wantErr: "positive numbers"},
+		{spec: "-1-2", wantErr: "positive number or inclusive range"},
+		{spec: "4-2", wantErr: "lower page"},
+		{spec: "1-6", wantErr: "at most 5 pages"},
+	}
+	for _, test := range tests {
+		t.Run(test.spec, func(t *testing.T) {
+			first, last, err := parseLogPageSpec(test.spec)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("parseLogPageSpec(%q) error = %v, want containing %q", test.spec, err, test.wantErr)
+				}
+				return
+			}
+			if err != nil || first != test.wantFirst || last != test.wantLast {
+				t.Fatalf("parseLogPageSpec(%q) = %d, %d, %v", test.spec, first, last, err)
+			}
+		})
 	}
 }
 
@@ -639,6 +1146,12 @@ func TestConfigurationCommandsPersistAcrossChannelsAndProtectOwnChannel(t *testi
 	if response := run("whatsapp", "/config set channels.whatsapp.enabled off"); !strings.Contains(response.Text, "cannot be configured from WhatsApp itself") {
 		t.Fatalf("WhatsApp bypassed own-channel protection through /config: %#v", response)
 	}
+	if response := run("telegram", "/whatsapp on"); !strings.Contains(response.Text, "allowed_numbers requires at least one number") {
+		t.Fatalf("WhatsApp enabled without a whitelist: %#v", response)
+	}
+	if response := run("telegram", "/whatsapp set allowed_numbers 15551234567"); !strings.Contains(response.Text, "channels.whatsapp.allowed_numbers") {
+		t.Fatalf("WhatsApp whitelist response = %#v", response)
+	}
 	if response := run("telegram", "/whatsapp on"); !strings.Contains(response.Text, "channels.whatsapp.enabled") {
 		t.Fatalf("WhatsApp cross-channel toggle response = %#v", response)
 	}
@@ -650,7 +1163,7 @@ func TestConfigurationCommandsPersistAcrossChannelsAndProtectOwnChannel(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reloaded.Channels.Telegram.Enabled || reloaded.Channels.Telegram.Token != "123:super-secret" || len(reloaded.Channels.Telegram.AllowedUsers) != 1 || reloaded.Channels.Telegram.AllowedUsers[0] != "42" || !reloaded.Channels.WhatsApp.Enabled || reloaded.Workspace.HistoryMaxMessages != 7 {
+	if !reloaded.Channels.Telegram.Enabled || reloaded.Channels.Telegram.Token != "123:super-secret" || len(reloaded.Channels.Telegram.AllowedUsers) != 1 || reloaded.Channels.Telegram.AllowedUsers[0] != "42" || !reloaded.Channels.WhatsApp.Enabled || len(reloaded.Channels.WhatsApp.AllowedNumbers) != 1 || reloaded.Workspace.HistoryMaxMessages != 7 {
 		t.Fatalf("configuration commands were not persisted: %#v", reloaded)
 	}
 	historyEntries, _, err := service.History.Entries("whatsapp", "settings")
@@ -805,12 +1318,105 @@ func TestUnchangedStartupSettingDoesNotTouchOperatingSystem(t *testing.T) {
 	}
 }
 
-func TestBareTUIConfigurationCommandOpensTypedScreen(t *testing.T) {
+func TestBareUnconfiguredTUIChannelCommandsOpenSetupWizards(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	if err := os.WriteFile(cfg.Resolve(cfg.Channels.WhatsApp.Database), []byte("existing session store"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	for _, test := range []struct {
+		command string
+		wantID  string
+	}{
+		{command: "/telegram", wantID: "wizard:telegram:intro"},
+		{command: "/whatsapp", wantID: "wizard:whatsapp:mode"},
+	} {
+		var response core.Event
+		if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: test.command}, func(event core.Event) { response = event }); err != nil {
+			t.Fatal(err)
+		}
+		if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != test.wantID || response.Screen.ParentID != "" || !response.Screen.StartAtTop || !response.Screen.SaveDisabled {
+			t.Fatalf("%s initial setup screen = %#v", test.command, response)
+		}
+	}
+}
+
+func TestBareTUIChannelCommandsEvaluateSetupIndependently(t *testing.T) {
+	tests := []struct {
+		name         string
+		configure    func(*config.Config)
+		wantTelegram string
+		wantWhatsApp string
+	}{
+		{
+			name: "only Telegram configured",
+			configure: func(cfg *config.Config) {
+				cfg.Channels.Telegram.Token = "123:secret"
+				cfg.Channels.Telegram.AllowedUsers = []string{"123456789"}
+			},
+			wantTelegram: "telegram",
+			wantWhatsApp: "wizard:whatsapp:mode",
+		},
+		{
+			name: "only WhatsApp configured",
+			configure: func(cfg *config.Config) {
+				cfg.Channels.WhatsApp.AllowedNumbers = []string{"15551234567"}
+			},
+			wantTelegram: "wizard:telegram:intro",
+			wantWhatsApp: "whatsapp",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.configure(&cfg)
+			service := New(cfg, newServiceHarness())
+
+			for _, command := range []struct {
+				text   string
+				wantID string
+			}{
+				{text: "/telegram", wantID: test.wantTelegram},
+				{text: "/whatsapp", wantID: test.wantWhatsApp},
+			} {
+				var response core.Event
+				if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: command.text}, func(event core.Event) { response = event }); err != nil {
+					t.Fatal(err)
+				}
+				if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != command.wantID {
+					t.Fatalf("%s screen = %#v, want %q", command.text, response, command.wantID)
+				}
+				if strings.HasPrefix(command.wantID, "wizard:") && response.Screen.ParentID != "" {
+					t.Fatalf("direct %s wizard unexpectedly has parent %q", command.text, response.Screen.ParentID)
+				}
+			}
+		})
+	}
+}
+
+func TestBareConfiguredTUIChannelCommandOpensTypedScreen(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg.Channels.Telegram.Token = "123:secret"
+	cfg.Channels.Telegram.AllowedUsers = []string{"123456789"}
+	cfg.Channels.WhatsApp.AllowedNumbers = []string{"15551234567"}
+	if err := os.WriteFile(cfg.Resolve(cfg.Channels.WhatsApp.Database), []byte("existing session store"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	service := New(cfg, newServiceHarness())
 	var response core.Event
 	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "/telegram"}, func(event core.Event) { response = event }); err != nil {
@@ -819,7 +1425,10 @@ func TestBareTUIConfigurationCommandOpensTypedScreen(t *testing.T) {
 	if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != "telegram" || !response.Screen.StartAtTop || len(response.Screen.Controls) == 0 {
 		t.Fatalf("configuration screen response = %#v", response)
 	}
-	wantFirst := []string{"wizard", "channels.telegram.token", "channels.telegram.allowed_users", "channels.telegram.enabled", "advanced"}
+	if response.Screen.Title != "" || response.Screen.Subtitle != "" {
+		t.Fatalf("Telegram configuration has redundant title copy: title %q subtitle %q", response.Screen.Title, response.Screen.Subtitle)
+	}
+	wantFirst := []string{"channels.telegram.enabled", "wizard", "channels.telegram.token", "channels.telegram.allowed_users", "advanced"}
 	if len(response.Screen.Controls) < len(wantFirst) {
 		t.Fatalf("Telegram controls = %#v", response.Screen.Controls)
 	}
@@ -827,6 +1436,9 @@ func TestBareTUIConfigurationCommandOpensTypedScreen(t *testing.T) {
 		if response.Screen.Controls[index].Key != key {
 			t.Fatalf("Telegram control %d = %q, want %q", index, response.Screen.Controls[index].Key, key)
 		}
+	}
+	if response.Screen.Controls[0].Section != "" || response.Screen.Controls[1].Section != "Setup" || response.Screen.Controls[2].Section != "Basic settings" || response.Screen.Controls[4].Section != "Advanced settings" {
+		t.Fatalf("Telegram control sections = %#v", response.Screen.Controls[:5])
 	}
 	if response.Screen.Controls[4].Kind != "disclosure" || !response.Screen.Controls[5].Advanced {
 		t.Fatalf("Telegram advanced disclosure = %#v", response.Screen.Controls)
@@ -854,11 +1466,17 @@ func TestBareTUIConfigurationCommandOpensTypedScreen(t *testing.T) {
 	if !whatsapp.StartAtTop {
 		t.Fatal("WhatsApp configuration screen does not start at its status section")
 	}
-	wantFirst = []string{"wizard", "channels.whatsapp.mode", "channels.whatsapp.allowed_numbers", "channels.whatsapp.enabled", "advanced"}
+	if whatsapp.Title != "" || whatsapp.Subtitle != "" {
+		t.Fatalf("WhatsApp configuration has redundant title copy: title %q subtitle %q", whatsapp.Title, whatsapp.Subtitle)
+	}
+	wantFirst = []string{"channels.whatsapp.enabled", "wizard", "channels.whatsapp.mode", "channels.whatsapp.allowed_numbers", "advanced"}
 	for index, key := range wantFirst {
 		if whatsapp.Controls[index].Key != key {
 			t.Fatalf("WhatsApp control %d = %q, want %q", index, whatsapp.Controls[index].Key, key)
 		}
+	}
+	if whatsapp.Controls[0].Section != "" || whatsapp.Controls[1].Section != "Setup" || whatsapp.Controls[2].Section != "Basic settings" || whatsapp.Controls[4].Section != "Advanced settings" {
+		t.Fatalf("WhatsApp control sections = %#v", whatsapp.Controls[:5])
 	}
 }
 
@@ -876,6 +1494,9 @@ func TestMainConfigurationStartsWithHarnessModelAndEssentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if screen.Title != "" || screen.Subtitle != "" {
+		t.Fatalf("main configuration has redundant heading copy: title %q subtitle %q", screen.Title, screen.Subtitle)
+	}
 	want := []string{"harness", "model", "harness.sandbox", "workspace.history_max_messages", "workspace.history_char_limit", "startup.enabled", "advanced"}
 	if len(screen.Controls) < len(want)+1 {
 		t.Fatalf("main configuration controls = %#v", screen.Controls)
@@ -887,6 +1508,9 @@ func TestMainConfigurationStartsWithHarnessModelAndEssentials(t *testing.T) {
 	}
 	if screen.Controls[0].Kind != "action" || screen.Controls[1].Kind != "action" || screen.Controls[2].Kind != "select" || screen.Controls[6].Kind != "disclosure" || !screen.Controls[7].Advanced {
 		t.Fatalf("main control kinds/order = %#v", screen.Controls)
+	}
+	if screen.Controls[0].Section != "Core settings" || screen.Controls[6].Section != "Advanced settings" {
+		t.Fatalf("main control sections = %#v", screen.Controls[:7])
 	}
 	harnessScreen, err := service.ScreenAction(context.Background(), "config", "harness", nil)
 	if err != nil || harnessScreen == nil || harnessScreen.ID != "harness" || harnessScreen.ParentID != "config" || len(harnessScreen.Controls) != 2 {
@@ -909,7 +1533,7 @@ func TestTelegramSetupWizardCarriesAndAtomicallySavesEssentials(t *testing.T) {
 	}
 	service := New(cfg, newServiceHarness())
 	screen, err := service.ScreenAction(context.Background(), "telegram", "wizard", nil)
-	if err != nil || screen == nil || screen.ID != "wizard:telegram:intro" || !screen.Markdown || !screen.SaveDisabled || !screen.StartAtTop || !strings.Contains(screen.Subtitle, "desktop.\n\nUse Telegram's verified bot-management account: [@BotFather](https://t.me/BotFather)") {
+	if err != nil || screen == nil || screen.ID != "wizard:telegram:intro" || screen.ParentID != "telegram" || !screen.Markdown || !screen.SaveDisabled || !screen.StartAtTop || !strings.Contains(screen.Subtitle, "desktop.\n\nUse Telegram's verified bot-management account: [@BotFather](https://t.me/BotFather)") {
 		t.Fatalf("Telegram wizard intro = %#v, %v", screen, err)
 	}
 	screen, err = service.ScreenAction(context.Background(), screen.ID, "next", map[string]string{})
@@ -957,7 +1581,7 @@ func TestTelegramSetupWizardCarriesAndAtomicallySavesEssentials(t *testing.T) {
 	}
 }
 
-func TestWhatsAppSetupWizardEnablesThenShowsPairingStep(t *testing.T) {
+func TestWhatsAppSetupWizardEnablesAfterAccessThenShowsPairingStep(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
@@ -968,29 +1592,118 @@ func TestWhatsAppSetupWizardEnablesThenShowsPairingStep(t *testing.T) {
 	}
 	service := New(cfg, newServiceHarness())
 	screen, err := service.ScreenAction(context.Background(), "whatsapp", "wizard", nil)
-	if err != nil || screen == nil || screen.ID != "wizard:whatsapp:mode" || screen.Controls[0].Key != whatsappModeKey {
+	if err != nil || screen == nil || screen.ID != "wizard:whatsapp:mode" || screen.ParentID != "whatsapp" || screen.Controls[0].Key != whatsappModeKey {
 		t.Fatalf("WhatsApp mode step = %#v, %v", screen, err)
 	}
 	values := map[string]string{
 		whatsappModeKey:    "dedicated",
 		whatsappAllowedKey: "15551234567",
-		whatsappEnabledKey: "on",
 	}
 	screen, err = service.ScreenAction(context.Background(), screen.ID, "next", values)
 	if err != nil || screen.ID != "wizard:whatsapp:access" {
 		t.Fatalf("WhatsApp access step = %#v, %v", screen, err)
 	}
-	screen, err = service.ScreenAction(context.Background(), screen.ID, "next", values)
-	if err != nil || screen.ID != "wizard:whatsapp:enable" || !strings.Contains(screen.Subtitle, "youtube.com") {
-		t.Fatalf("WhatsApp enable step = %#v, %v", screen, err)
+	emptyValues := map[string]string{
+		whatsappModeKey:    values[whatsappModeKey],
+		whatsappAllowedKey: " + ",
 	}
-	screen, err = service.ScreenAction(context.Background(), screen.ID, "finish", values)
-	if err != nil || screen.ID != "wizard:whatsapp:pair" || !screen.StartAtTop {
+	if _, err = service.ScreenAction(context.Background(), screen.ID, "next", emptyValues); err == nil || !strings.Contains(err.Error(), "at least one allowed WhatsApp number") {
+		t.Fatalf("WhatsApp wizard accepted an empty whitelist: %v", err)
+	}
+	screen, err = service.ScreenAction(context.Background(), screen.ID, "next", values)
+	if err != nil || screen.ID != "wizard:whatsapp:pair" || !screen.StartAtTop || screen.Banner != "" || !strings.Contains(screen.Subtitle, "terminal can use every") {
 		t.Fatalf("WhatsApp pair step = %#v, %v", screen, err)
+	}
+	if got := []string{screen.Controls[0].Key, screen.Controls[1].Key, screen.Controls[2].Key}; !reflect.DeepEqual(got, []string{"show_qr", "phone", "retry"}) {
+		t.Fatalf("WhatsApp pair actions = %#v", screen.Controls)
+	}
+	if got := strings.Join(screen.Tabs, ","); got != "Mode,Access,Pair" || screen.ActiveTab != 2 {
+		t.Fatalf("WhatsApp wizard tabs = %q at %d", got, screen.ActiveTab)
+	}
+	back, err := service.ScreenAction(context.Background(), screen.ID, "back", nil)
+	if err != nil || back == nil || back.ID != "wizard:whatsapp:access" || back.Controls[0].Value != values[whatsappAllowedKey] {
+		t.Fatalf("WhatsApp pair Back step = %#v, %v", back, err)
 	}
 	saved := service.Settings.Snapshot().Channels.WhatsApp
 	if !saved.Enabled || saved.Mode != "dedicated" || len(saved.AllowedNumbers) != 1 {
 		t.Fatalf("WhatsApp wizard saved %#v", saved)
+	}
+}
+
+func TestWhatsAppPairingActionsShowFullscreenRetryAndPhoneCode(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	manager := &fakePairingManager{code: "ABCD-EFGH"}
+	service.PairingControl = manager
+	service.SetPairing(channel.PairingEvent{Name: "whatsapp", State: "code", Rendered: "FULL-QR", Detail: "WhatsApp is ready to pair"})
+
+	screen, err := service.ScreenAction(context.Background(), "wizard:whatsapp:pair", "show_qr", nil)
+	if err != nil || screen == nil || screen.ID != core.ScreenWhatsAppQR || screen.ParentID != "wizard:whatsapp:pair" || screen.Banner != "FULL-QR" || screen.Title != "" || len(screen.Controls) != 0 {
+		t.Fatalf("fullscreen QR screen = %#v, %v", screen, err)
+	}
+	service.SetPairing(channel.PairingEvent{Name: "whatsapp", State: "phone-code", Rendered: "FULL-QR", Detail: "Enter the code"})
+	if screen, err = service.ScreenAction(context.Background(), "wizard:whatsapp:pair", "show_qr", nil); err != nil || screen == nil || screen.Banner != "FULL-QR" {
+		t.Fatalf("QR after phone-code selection = %#v, %v", screen, err)
+	}
+	general, err := service.ScreenAction(context.Background(), "wizard:whatsapp:pair", "done", nil)
+	if err != nil || general == nil || general.ID != "whatsapp" || general.Banner != "" || general.Status != "" {
+		t.Fatalf("general WhatsApp settings exposed QR data = %#v, %v", general, err)
+	}
+
+	screen, err = service.ScreenAction(context.Background(), "wizard:whatsapp:pair", "phone", nil)
+	if err != nil || screen == nil || screen.ID != "wizard:whatsapp:phone" || !strings.Contains(screen.Subtitle, "Link with phone number instead") {
+		t.Fatalf("phone pairing screen = %#v, %v", screen, err)
+	}
+	values := map[string]string{whatsappPhoneKey: "+1 (555) 123-4567"}
+	screen, err = service.ScreenAction(context.Background(), screen.ID, "generate", values)
+	if err != nil || screen == nil || screen.Banner != "Pairing code: ABCD-EFGH" || len(manager.phones) != 1 || manager.phones[0] != "whatsapp:+1 (555) 123-4567" {
+		t.Fatalf("generated phone code = %#v, calls %#v, err %v", screen, manager.phones, err)
+	}
+
+	service.SetPairing(channel.PairingEvent{Name: "whatsapp", State: "timeout", Detail: "WhatsApp pairing: timeout"})
+	screen, err = service.ScreenAction(context.Background(), "wizard:whatsapp:pair", "retry", nil)
+	if err != nil || screen == nil || screen.ID != "wizard:whatsapp:pair" || len(manager.retries) != 1 || screen.Status != "Starting a fresh WhatsApp pairing session…" {
+		t.Fatalf("retry pairing = %#v, calls %#v, err %v", screen, manager.retries, err)
+	}
+	pairing, ok := service.Pairing("whatsapp")
+	if !ok || pairing.State != "starting" || pairing.Rendered != "" {
+		t.Fatalf("pairing state after retry = %#v, %t", pairing, ok)
+	}
+}
+
+func TestWhatsAppTimeoutReopensPairingAndStartOverRetries(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	manager := &fakePairingManager{}
+	service.PairingControl = manager
+	if _, err := service.ApplySettings(map[string]string{
+		whatsappModeKey: "self-chat", whatsappAllowedKey: "15551234567", whatsappEnabledKey: "on",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service.SetPairing(channel.PairingEvent{Name: "whatsapp", State: "timeout", Rendered: "STALE-QR", Detail: "WhatsApp pairing: timeout"})
+	screen, err := service.Screen("whatsapp")
+	if err != nil || screen.ID != "wizard:whatsapp:pair" || screen.Banner != "" || screen.Status != "WhatsApp pairing: timeout" {
+		t.Fatalf("resumed timeout screen = %#v, %v", screen, err)
+	}
+	values := map[string]string{whatsappModeKey: "self-chat", whatsappAllowedKey: "15551234567"}
+	screenPtr, err := service.ScreenAction(context.Background(), "wizard:whatsapp:access", "next", values)
+	if err != nil || screenPtr == nil || screenPtr.Status != "Starting a fresh WhatsApp pairing session…" || len(manager.retries) != 1 {
+		t.Fatalf("start-over retry = %#v, calls %#v, err %v", screenPtr, manager.retries, err)
 	}
 }
 
@@ -1035,15 +1748,32 @@ func TestResumeBranchesExternalConversationIntoIndependentTUIChat(t *testing.T) 
 	if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != "resume" || len(response.Screen.Controls) == 0 {
 		t.Fatalf("resume screen = %#v", response)
 	}
+	if response.Screen.Subtitle != "" {
+		t.Fatalf("resume screen has redundant prose: %q", response.Screen.Subtitle)
+	}
+	wantHints := []core.ScreenHint{
+		{Key: "↑↓/⇥", Action: "nav"},
+		{Key: "␠/↵", Action: "choose"},
+		{Key: "⌦", Action: "delete"},
+		{Key: "␛", Action: "exit"},
+	}
+	if !reflect.DeepEqual(response.Screen.Hints, wantHints) {
+		t.Fatalf("resume hints = %#v, want %#v", response.Screen.Hints, wantHints)
+	}
 	var action string
+	var resumeChoice core.ScreenControl
 	for _, control := range response.Screen.Controls {
 		if strings.Contains(control.Value, "TG-7") {
 			action = control.Key
+			resumeChoice = control
 			break
 		}
 	}
 	if action == "" {
 		t.Fatalf("Telegram conversation missing from %#v", response.Screen.Controls)
+	}
+	if !strings.HasPrefix(resumeChoice.Value, "TG   ") || !strings.HasSuffix(resumeChoice.Value, "  TG-7.jsonl") {
+		t.Fatalf("Telegram resume row is not platform/date/filename aligned: %q", resumeChoice.Value)
 	}
 	chat, err := service.ScreenAction(context.Background(), "resume", action, nil)
 	if err != nil {
@@ -1058,6 +1788,23 @@ func TestResumeBranchesExternalConversationIntoIndependentTUIChat(t *testing.T) 
 		t.Fatalf("source history changed: %#v", source)
 	}
 
+	deleteScreen, err := service.ScreenAction(context.Background(), "resume", "delete:"+strings.TrimPrefix(action, "resume:"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleteScreen == nil || deleteScreen.ID != "resume" {
+		t.Fatalf("delete did not return the refreshed resume screen: %#v", deleteScreen)
+	}
+	deleted, _, err := service.History.RecentEntries("telegram", "TG-7", 1, 1000)
+	if err != nil || len(deleted) != 0 {
+		t.Fatalf("deleted source remains: entries=%#v err=%v", deleted, err)
+	}
+	for _, control := range deleteScreen.Controls {
+		if strings.Contains(control.Value, "TG-7") {
+			t.Fatalf("deleted conversation remains in picker: %#v", deleteScreen.Controls)
+		}
+	}
+
 	response = core.Event{}
 	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "TG-7", Text: "/resume"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
@@ -1067,7 +1814,54 @@ func TestResumeBranchesExternalConversationIntoIndependentTUIChat(t *testing.T) 
 	}
 }
 
-func TestWelcomeScreenIsAutomaticOnlyOnceAndRemainsInvokable(t *testing.T) {
+func TestResumePlatformUsesFixedThreeCellCodes(t *testing.T) {
+	for channelName, want := range map[string]string{
+		"tui": "TUI", "cli": "CLI", "telegram": "TG", "whatsapp": "WA", "extension-channel": "EXT",
+	} {
+		if got := resumePlatform(channelName); got != want {
+			t.Errorf("resumePlatform(%q) = %q, want %q", channelName, got, want)
+		}
+	}
+}
+
+func TestCustomScreensDeclareContextSpecificHints(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	service := New(cfg, newServiceHarness())
+
+	tests := []struct {
+		name   string
+		screen core.Screen
+		want   []core.ScreenHint
+	}{
+		{name: "configuration", screen: settingsScreen(cfg, "config"), want: formScreenHints()},
+		{name: "telegram wizard", screen: service.telegramWizardScreen("token", nil), want: wizardScreenHints()},
+		{name: "whatsapp wizard", screen: service.whatsappWizardScreen("mode", nil), want: wizardScreenHints()},
+		{name: "harness selection", screen: service.HarnessScreen(false), want: selectionScreenHints()},
+	}
+	model, err := service.modelScreen(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests = append(tests, struct {
+		name   string
+		screen core.Screen
+		want   []core.ScreenHint
+	}{name: "model selection", screen: *model, want: selectionScreenHints()})
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if !reflect.DeepEqual(test.screen.Hints, test.want) {
+				t.Fatalf("hints = %#v, want %#v", test.screen.Hints, test.want)
+			}
+		})
+	}
+}
+
+func TestWelcomeScreenIsAutomaticOnceAndCommandPrintsAChannelAppropriateMessage(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
@@ -1075,30 +1869,41 @@ func TestWelcomeScreenIsAutomaticOnlyOnceAndRemainsInvokable(t *testing.T) {
 	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
 	service := New(cfg, newServiceHarness())
 	first, err := service.InitialWelcome()
-	if err != nil || first == nil || first.ID != "welcome" || first.Banner != core.SpynelASCII || len(first.Controls) != 0 || first.Markdown {
+	if err != nil || first == nil || first.ID != "welcome" || first.Banner != core.SpynelASCII || len(first.Controls) != 0 || !first.Markdown {
 		t.Fatalf("first welcome = %#v, %v", first, err)
 	}
-	for _, command := range []string{"/help", "/config", "/telegram", "/whatsapp"} {
-		if !strings.Contains(first.Subtitle, command) {
-			t.Fatalf("welcome guidance is missing %s: %q", command, first.Subtitle)
+	for _, want := range []string{"👋 Hey, I'm **Spynel**", "call me **Spy**", "I handle tasks and orchestrate agents", "ask me for updates anytime", "👍", "- type `/help` if you ever feel lost", "- type `/telegram` to connect Telegram", "- type `/whatsapp` to connect WhatsApp"} {
+		if !strings.Contains(first.Subtitle, want) {
+			t.Fatalf("welcome message is missing %q: %q", want, first.Subtitle)
 		}
+	}
+	if !strings.Contains(first.Subtitle, "leave the rest to me.\nFeel free") || strings.Contains(first.Subtitle, "leave the rest to me.\n\nFeel free") {
+		t.Fatalf("welcome intro spacing = %q", first.Subtitle)
 	}
 	second, err := service.InitialWelcome()
 	if err != nil || second != nil {
 		t.Fatalf("welcome was automatic more than once: %#v, %v", second, err)
 	}
+	service.SetConnectionStatus(channel.ConnectionStatus{Name: "telegram", State: channel.ConnectionConnected})
 	var response core.Event
 	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "/welcome"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
-	if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != "welcome" || len(response.Screen.Controls) != 0 {
+	if response.Kind != core.EventFinal || !response.Done || !response.Local || response.Screen != nil || !strings.HasPrefix(response.Text, core.SpynelLogoMarkdown) || !strings.Contains(response.Text, "**Spynel**") || !strings.Contains(response.Text, "**Spy**") || !strings.Contains(response.Text, "`/help`") || strings.Contains(response.Text, "`/telegram`") || !strings.Contains(response.Text, "`/whatsapp`") {
 		t.Fatalf("manual TUI welcome = %#v", response)
 	}
-	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "42", Text: "/welcome"}, func(event core.Event) { response = event }); err != nil {
-		t.Fatal(err)
+	recent, _, err := service.History.Recent("tui", "local", 100000)
+	if err != nil || !strings.Contains(recent, core.SpynelASCII) {
+		t.Fatalf("manual TUI welcome was not persisted as chat: %q, %v", recent, err)
 	}
-	if response.Kind != core.EventFinal || !strings.Contains(response.Text, "Welcome to Spynel") || !strings.Contains(response.Text, "/config") {
-		t.Fatalf("remote welcome = %#v", response)
+	for _, channelName := range []string{"telegram", "whatsapp"} {
+		response = core.Event{}
+		if err := service.Handle(context.Background(), core.Message{Channel: channelName, Conversation: "remote", Text: "/welcome"}, func(event core.Event) { response = event }); err != nil {
+			t.Fatal(err)
+		}
+		if response.Kind != core.EventFinal || !response.Done || !response.Local || !strings.Contains(response.Text, "**Spynel**") || !strings.Contains(response.Text, "**Spy**") || !strings.Contains(response.Text, "`/help`") || strings.Contains(response.Text, core.SpynelASCII) || strings.Contains(response.Text, "`/telegram`") || strings.Contains(response.Text, "`/whatsapp`") || strings.Contains(response.Text, "Heads up") {
+			t.Fatalf("%s welcome = %#v", channelName, response)
+		}
 	}
 }
 

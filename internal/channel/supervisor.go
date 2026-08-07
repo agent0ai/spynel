@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/frdel/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/config"
 )
 
 // Managed describes one hot-reloadable transport without coupling the shared
@@ -24,6 +24,7 @@ type runningChannel struct {
 	cancel      context.CancelFunc
 	fingerprint string
 	generation  uint64
+	instance    Channel
 }
 
 // Supervisor owns channel lifecycles. It consumes the persisted config stream,
@@ -39,6 +40,7 @@ type Supervisor struct {
 	mu         sync.Mutex
 	running    map[string]*runningChannel
 	generation uint64
+	wait       sync.WaitGroup
 }
 
 func NewSupervisor(settings *config.Store, handler Handler, managed []Managed, report StatusReporter, log io.Writer) *Supervisor {
@@ -51,7 +53,10 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	defer s.stopAll()
+	defer func() {
+		s.stopAll()
+		s.wait.Wait()
+	}()
 	for {
 		select {
 		case <-ctx.Done():
@@ -121,10 +126,74 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 		if logger, ok := instance.(LogWriterSetter); ok {
 			logger.SetLogWriter(s.log)
 		}
+		s.mu.Lock()
+		if s.running[managed.Name] == running {
+			running.instance = instance
+		}
+		s.mu.Unlock()
 		s.publish(ConnectionStatus{Name: managed.Name, State: ConnectionConnecting})
-		go s.runOne(channelContext, managed.Name, running, instance)
+		s.wait.Add(1)
+		go func() {
+			defer s.wait.Done()
+			s.runOne(channelContext, managed.Name, running, instance)
+		}()
 	}
 	return errors.Join(problems...)
+}
+
+func (s *Supervisor) pairingController(name string) (PairingController, error) {
+	s.mu.Lock()
+	running := s.running[name]
+	var instance Channel
+	if running != nil {
+		instance = running.instance
+	}
+	s.mu.Unlock()
+	if instance == nil {
+		return nil, fmt.Errorf("%s is not running", name)
+	}
+	controller, ok := instance.(PairingController)
+	if !ok {
+		return nil, fmt.Errorf("%s does not support interactive pairing", name)
+	}
+	return controller, nil
+}
+
+// RetryPairing asks the active channel instance to replace its expired pairing
+// session without changing persisted settings.
+func (s *Supervisor) RetryPairing(name string) error {
+	controller, err := s.pairingController(name)
+	if err != nil {
+		return err
+	}
+	return controller.RetryPairing()
+}
+
+// PairPhone asks the active channel instance for a phone-linking code.
+func (s *Supervisor) PairPhone(ctx context.Context, name, phone string) (string, error) {
+	controller, err := s.pairingController(name)
+	if err != nil {
+		return "", err
+	}
+	return controller.PairPhone(ctx, phone)
+}
+
+func (s *Supervisor) Deliver(ctx context.Context, name, conversation, eventID, text string) error {
+	s.mu.Lock()
+	running := s.running[name]
+	var instance Channel
+	if running != nil {
+		instance = running.instance
+	}
+	s.mu.Unlock()
+	if instance == nil {
+		return fmt.Errorf("%s is disconnected", name)
+	}
+	deliverer, ok := instance.(ProactiveDeliverer)
+	if !ok {
+		return fmt.Errorf("%s does not support proactive delivery", name)
+	}
+	return deliverer.Deliver(ctx, conversation, eventID, text)
 }
 
 func (s *Supervisor) runOne(ctx context.Context, name string, running *runningChannel, instance Channel) {

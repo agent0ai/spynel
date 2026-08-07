@@ -112,6 +112,14 @@ func TestConversationDiscoveryAndBranchingStayDiskBacked(t *testing.T) {
 	if !strings.HasPrefix(branch, "resume-") || path != store.Path("tui", branch) {
 		t.Fatalf("branch = %q, %q", branch, path)
 	}
+	cliBranch, cliPath, err := store.BranchTo("telegram", "TG-alice-42", "cli")
+	if err != nil || !strings.HasPrefix(cliBranch, "resume-") || cliPath != store.Path("cli", cliBranch) {
+		t.Fatalf("CLI branch = %q, %q, %v", cliBranch, cliPath, err)
+	}
+	cliTail, _, err := store.RecentEntries("cli", cliBranch, 1, 1000)
+	if err != nil || len(cliTail) != 1 || cliTail[0].Content != "message-19" {
+		t.Fatalf("CLI branch tail = %#v, %v", cliTail, err)
+	}
 	tail, _, err := store.RecentEntries("tui", branch, 3, 1000)
 	if err != nil || len(tail) != 3 || tail[0].Content != "message-17" || tail[2].Content != "message-19" {
 		t.Fatalf("branch tail = %#v, %v", tail, err)
@@ -135,5 +143,27 @@ func TestConversationDiscoveryKeepsOnlyNewestBoundedMetadata(t *testing.T) {
 	}
 	if len(conversations) != 10 || conversations[0].Conversation != "TG-074" || conversations[9].Conversation != "TG-065" {
 		t.Fatalf("bounded conversation metadata = %#v", conversations)
+	}
+}
+
+func TestLatestReturnsMostRecentConversationForOneChannel(t *testing.T) {
+	store := New(t.TempDir())
+	older := time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Hour)
+	if _, err := store.Append("tui", "local-old", Entry{At: older, Role: "user", Content: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("telegram", "TG-newest", Entry{At: newer.Add(time.Hour), Role: "user", Content: "remote"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append("tui", "local-new", Entry{At: newer, Role: "assistant", Content: "new"}); err != nil {
+		t.Fatal(err)
+	}
+	latest, found, err := store.Latest("tui")
+	if err != nil || !found || latest.Channel != "tui" || latest.Conversation != "local-new" || !latest.UpdatedAt.Equal(newer) {
+		t.Fatalf("latest TUI conversation = %#v, found = %t, err = %v", latest, found, err)
+	}
+	if _, found, err := store.Latest("whatsapp"); err != nil || found {
+		t.Fatalf("missing latest conversation found = %t, err = %v", found, err)
 	}
 }

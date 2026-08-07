@@ -8,21 +8,26 @@ import (
 	"testing"
 	"time"
 
-	"github.com/frdel/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/core"
 )
 
 type supervisorHarness struct {
 	name            string
 	startErr        error
+	refuseSteer     bool
+	followUp        FollowUpMode
 	mu              sync.Mutex
 	active          map[string]bool
 	emits           map[string]core.Emit
+	prompts         map[string][]string
 	closed          bool
 	resetKeys       []string
 	isActiveEntered chan struct{}
 	isActiveRelease <-chan struct{}
 	isActiveOnce    sync.Once
 }
+
+func (r *supervisorHarness) FollowUpMode() FollowUpMode { return r.followUp }
 
 func (r *supervisorHarness) Start(context.Context) error { return r.startErr }
 func (r *supervisorHarness) Close() error {
@@ -31,8 +36,16 @@ func (r *supervisorHarness) Close() error {
 	r.mu.Unlock()
 	return nil
 }
-func (r *supervisorHarness) Send(_ context.Context, key, _ string, emit core.Emit) (string, bool, error) {
+func (r *supervisorHarness) Send(_ context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
 	r.mu.Lock()
+	if r.active[key] && r.refuseSteer {
+		r.mu.Unlock()
+		return r.name + "-thread", true, errors.New("active turns cannot be steered")
+	}
+	if r.prompts == nil {
+		r.prompts = map[string][]string{}
+	}
+	r.prompts[key] = append(r.prompts[key], prompt)
 	r.active[key] = true
 	r.emits[key] = emit
 	r.mu.Unlock()
@@ -145,6 +158,87 @@ func TestSupervisorReconfiguresOnlyWhenIdle(t *testing.T) {
 	}
 	if !created["codex"][0].closed {
 		t.Fatal("previous harness was not closed after a successful swap")
+	}
+}
+
+func TestSupervisorKeepsTurnActiveAcrossEmitterHandoff(t *testing.T) {
+	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "chat", "first", nil); err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	firstEmit := target.emits["chat"]
+	target.mu.Unlock()
+	if _, _, err := supervisor.Send(context.Background(), "chat", "follow-up", nil); err != nil {
+		t.Fatal(err)
+	}
+	firstEmit(core.Event{Kind: core.EventStatus, Done: true})
+	if !supervisor.IsActive("chat") {
+		t.Fatal("transport-only emitter completion ended the harness turn")
+	}
+	target.finish("chat")
+	if supervisor.IsActive("chat") {
+		t.Fatal("terminal event from the latest emitter left the harness turn active")
+	}
+}
+
+func TestSupervisorQueuesFollowUpWhenHarnessCannotSteer(t *testing.T) {
+	target := &supervisorHarness{
+		name: "claude-code", refuseSteer: true, active: map[string]bool{}, emits: map[string]core.Emit{},
+	}
+	registry := NewRegistry()
+	registry.Register("claude-code", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "claude-code"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var firstEvents []core.Event
+	var secondEvents []core.Event
+	if _, _, err := supervisor.Send(context.Background(), "chat", "first", func(event core.Event) {
+		firstEvents = append(firstEvents, event)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	followContext, cancelFollow := context.WithCancel(context.Background())
+	if _, steered, err := supervisor.Send(followContext, "chat", "follow-up", func(event core.Event) {
+		secondEvents = append(secondEvents, event)
+	}); err != nil || !steered {
+		t.Fatalf("queued follow-up = steered %t, error %v", steered, err)
+	}
+	// A queued message belongs to the durable conversation even if the
+	// transport request that accepted it ends before the provider turn does.
+	cancelFollow()
+	target.finish("chat")
+	if !supervisor.IsActive("chat") || !target.IsActive("chat") {
+		t.Fatal("queued follow-up did not become the active turn")
+	}
+	if len(firstEvents) == 0 || !firstEvents[len(firstEvents)-1].Continues {
+		t.Fatalf("first final did not preserve logical activity: %#v", firstEvents)
+	}
+	target.mu.Lock()
+	prompts := append([]string(nil), target.prompts["chat"]...)
+	target.mu.Unlock()
+	if len(prompts) != 2 || prompts[0] != "first" || prompts[1] != "follow-up" {
+		t.Fatalf("executed prompts = %#v", prompts)
+	}
+	target.finish("chat")
+	if supervisor.IsActive("chat") || target.IsActive("chat") {
+		t.Fatal("queued follow-up remained active after its final")
+	}
+	foundFinal := false
+	for _, event := range secondEvents {
+		if event.Kind == core.EventFinal && event.Done && !event.Continues {
+			foundFinal = true
+		}
+	}
+	if !foundFinal {
+		t.Fatalf("queued emitter did not receive terminal final: %#v", secondEvents)
 	}
 }
 
