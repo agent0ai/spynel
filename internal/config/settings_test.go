@@ -1,0 +1,181 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestSetSettingParsesSharedCommandValues(t *testing.T) {
+	cfg := Default()
+	for _, test := range []struct {
+		key   string
+		value string
+	}{
+		{"workspace.history_max_messages", "24"},
+		{"harness.name", "claude"},
+		{"harness.sandbox", "unrestricted"},
+		{"channels.telegram.allowed_users", "@one, 42"},
+		{"channels.whatsapp.mode", "dedicated"},
+		{"speech.model", "small"},
+		{"orchestrator.interval_seconds", "15"},
+		{"extensions.hook_timeout", "45s"},
+	} {
+		if _, err := SetSetting(&cfg, test.key, test.value); err != nil {
+			t.Fatalf("set %s: %v", test.key, err)
+		}
+	}
+	if cfg.Workspace.HistoryMaxMessages != 24 || cfg.Harness.Name != "claude-code" || cfg.Harness.Sandbox != "danger-full-access" || len(cfg.Channels.Telegram.AllowedUsers) != 2 || cfg.Channels.WhatsApp.Mode != "dedicated" || cfg.Speech.Model != "small" || cfg.Orchestrator.IntervalSec != 15 || cfg.Extensions.HookTimeout != "45s" {
+		t.Fatalf("unexpected config after settings: %#v", cfg)
+	}
+}
+
+func TestChannelSettingsPutEssentialsFirstAndRemovePromptOverrides(t *testing.T) {
+	cfg := Default()
+	wantEssential := map[string][]string{
+		"telegram": {"channels.telegram.token", "channels.telegram.allowed_users", "channels.telegram.enabled"},
+		"whatsapp": {"channels.whatsapp.mode", "channels.whatsapp.allowed_numbers", "channels.whatsapp.enabled"},
+	}
+	for section, want := range wantEssential {
+		var essential []string
+		advancedStarted := false
+		for _, setting := range Settings(cfg) {
+			if setting.Section != section {
+				continue
+			}
+			if setting.Advanced {
+				advancedStarted = true
+				continue
+			}
+			if advancedStarted {
+				t.Fatalf("%s essential setting %q follows advanced settings", section, setting.Key)
+			}
+			essential = append(essential, setting.Key)
+		}
+		if len(essential) != len(want) {
+			t.Fatalf("%s essentials = %#v, want %#v", section, essential, want)
+		}
+		for index := range want {
+			if essential[index] != want[index] {
+				t.Fatalf("%s essentials = %#v, want %#v", section, essential, want)
+			}
+		}
+	}
+	for _, removed := range []string{
+		"channels.telegram.default_project",
+		"channels.telegram.user_projects",
+		"channels.telegram.agent_instructions",
+		"channels.whatsapp.project",
+		"channels.whatsapp.agent_instructions",
+	} {
+		if _, ok := SettingByKey(cfg, removed); ok {
+			t.Fatalf("removed channel setting %q is still exposed", removed)
+		}
+		if _, err := SetSetting(&cfg, removed, "stale"); err == nil {
+			t.Fatalf("removed channel setting %q can still be changed", removed)
+		}
+	}
+}
+
+func TestMainSettingsExposeOnlySimpleHarnessChoicesAndPutAdvancedLast(t *testing.T) {
+	cfg := Default()
+	var essential []string
+	advancedStarted := false
+	for _, setting := range Settings(cfg) {
+		if setting.Section != "config" {
+			continue
+		}
+		if setting.Advanced {
+			advancedStarted = true
+			continue
+		}
+		if advancedStarted {
+			t.Fatalf("essential setting %q follows advanced settings", setting.Key)
+		}
+		essential = append(essential, setting.Key)
+	}
+	want := []string{"harness.sandbox", "workspace.history_max_messages", "workspace.history_char_limit", "startup.enabled"}
+	if len(essential) != len(want) {
+		t.Fatalf("main essentials = %#v, want %#v", essential, want)
+	}
+	for index := range want {
+		if essential[index] != want[index] {
+			t.Fatalf("main essentials = %#v, want %#v", essential, want)
+		}
+	}
+	for _, key := range []string{
+		"harness.command", "harness.cwd", "harness.effort", "harness.approval_policy", "harness.network",
+		"recipient.command", "recipient.cwd", "recipient.effort", "recipient.approval_policy", "recipient.sandbox", "recipient.network",
+	} {
+		if _, ok := SettingByKey(cfg, key); ok {
+			t.Fatalf("implementation setting %q is still exposed", key)
+		}
+		if _, err := SetSetting(&cfg, key, "unsafe"); err == nil {
+			t.Fatalf("implementation setting %q is still configurable", key)
+		}
+	}
+	for _, key := range []string{"harness.name", "harness.model"} {
+		setting, ok := SettingByKey(cfg, key)
+		if !ok || setting.Section != "harness" {
+			t.Fatalf("simple harness setting %q = %#v, %t", key, setting, ok)
+		}
+	}
+	sandbox, ok := SettingByKey(cfg, "harness.sandbox")
+	if !ok || sandbox.Section != "config" || len(sandbox.Choices) != 3 || sandbox.Value != "danger-full-access" {
+		t.Fatalf("sandbox setting = %#v, %t", sandbox, ok)
+	}
+}
+
+func TestSetSettingRejectsInvalidAndMasksSecrets(t *testing.T) {
+	cfg := Default()
+	if _, err := SetSetting(&cfg, "channels.whatsapp.poll_interval_seconds", "1"); err == nil {
+		t.Fatal("invalid polling interval succeeded")
+	}
+	if _, err := SetSetting(&cfg, "not.real", "value"); err == nil {
+		t.Fatal("unknown setting succeeded")
+	}
+	setting, err := SetSetting(&cfg, "channels.telegram.token", "123:secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !setting.Secret || setting.Value != "set" || !IsSecretSetting(setting.Key) {
+		t.Fatalf("secret setting was exposed: %#v", setting)
+	}
+}
+
+func TestSetSettingsValidatesRelatedFormFieldsTogether(t *testing.T) {
+	cfg := Default()
+	cfg.Channels.Telegram.Enabled = true
+	cfg.Channels.Telegram.AllowedUsers = []string{"123456789"}
+	changed, err := SetSettings(&cfg, map[string]string{
+		"channels.telegram.mode":        "webhook",
+		"channels.telegram.webhook_url": "https://spynel.example",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 2 || cfg.Channels.Telegram.Mode != "webhook" || cfg.Channels.Telegram.WebhookURL == "" {
+		t.Fatalf("related settings were not applied: %#v, %#v", changed, cfg.Channels.Telegram)
+	}
+}
+
+func TestTelegramWhitelistAndEnabledStateValidateAtomically(t *testing.T) {
+	cfg := Default()
+	if _, err := SetSetting(&cfg, "channels.telegram.enabled", "on"); err == nil || !strings.Contains(err.Error(), "allowed_users requires at least one user") {
+		t.Fatalf("Telegram enabled without a whitelist: %v", err)
+	}
+	if cfg.Channels.Telegram.Enabled {
+		t.Fatal("failed Telegram enable changed the configuration")
+	}
+	if _, err := SetSettings(&cfg, map[string]string{
+		"channels.telegram.allowed_users": "123456789",
+		"channels.telegram.enabled":       "on",
+	}); err != nil {
+		t.Fatalf("Telegram whitelist and enable transaction failed: %v", err)
+	}
+	if _, err := SetSetting(&cfg, "channels.telegram.allowed_users", ""); err == nil || !strings.Contains(err.Error(), "allowed_users requires at least one user") {
+		t.Fatalf("enabled Telegram whitelist was cleared: %v", err)
+	}
+	if len(cfg.Channels.Telegram.AllowedUsers) != 1 {
+		t.Fatal("failed whitelist clear changed the configuration")
+	}
+}

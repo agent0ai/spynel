@@ -1,0 +1,27 @@
+{
+  "name": "spynel",
+  "version": "0.2.0",
+  "description": "Extensible chat and markdown orchestrator for coding agents",
+  "license": "MIT",
+  "bin": {
+    "spynel": "npm/bin/spynel.js"
+  },
+  "scripts": {
+    "postinstall": "node npm/install.js",
+    "test:npm": "node npm/test.js"
+  },
+  "files": [
+    "npm/bin/",
+    "npm/install.js",
+    "npm/platform.js",
+    "npm/test.js",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/frdel/spynel.git"
+  }
+}

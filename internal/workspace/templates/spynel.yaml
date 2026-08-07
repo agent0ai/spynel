@@ -1,0 +1,78 @@
+version: 1
+
+workspace:
+  state_dir: .spynel
+  history_max_messages: 50
+  history_char_limit: 12000
+  attachment_max_mb: 100
+
+harness:
+  name: ""
+  model: ""
+  sandbox: danger-full-access
+
+channels:
+  tui:
+    enabled: true
+    title: Spynel
+  telegram:
+    enabled: false
+    name: spynel
+    token_env: SPYNEL_TELEGRAM_TOKEN
+    mode: polling
+    webhook_url: ""
+    webhook_listen: 127.0.0.1:8787
+    webhook_secret: ""
+    allowed_users: []
+    poll_timeout_seconds: 30
+    group_mode: mention
+    welcome_enabled: false
+    welcome_message: "Welcome, {name}!"
+    notify_messages: false
+    attachment_max_age_hours: 0
+  whatsapp:
+    enabled: false
+    mode: self-chat
+    database: .spynel/whatsapp.db
+    allowed_numbers: []
+    allow_groups: false
+    poll_interval_seconds: 3
+
+speech:
+  enabled: true
+  command: whisper-cli
+  ffmpeg_command: ffmpeg
+  model: small
+  model_path: ""
+  language: auto
+  max_file_mb: 100
+  max_duration_seconds: 1800
+  chunk_seconds: 600
+
+startup:
+  enabled: false
+
+orchestrator:
+  enabled: true
+  interval_seconds: 10
+  max_parallel: 4
+  routes:
+    - name: tasks
+      source: .spynel/tasks/todo
+      working: .spynel/tasks/working
+      prompt: .spynel/prompts/task.md
+      recovery_prompt: .spynel/prompts/recovery.md
+      stale_after: 30m
+      allowed_next: [todo, working, waiting, done, failed]
+    - name: goals
+      source: .spynel/goals/active
+      working: .spynel/goals/working
+      prompt: .spynel/prompts/goal.md
+      recovery_prompt: .spynel/prompts/recovery.md
+      stale_after: 2h
+      allowed_next: [active, working, waiting, done]
+
+extensions:
+  enabled: true
+  directory: .spynel/extensions
+  hook_timeout: 30s
