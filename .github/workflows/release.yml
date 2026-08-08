@@ -95,10 +95,23 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: ./scripts/package-native.sh "$RELEASE_TAG" "${{ matrix.os }}" "${{ matrix.arch }}" release
 
+      - name: Run native harness contract and packaged-archive smoke
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: go run ./scripts/native-evidence --archive-dir release --output "evidence/native-${{ matrix.os }}-${{ matrix.arch }}.json" --ref "$RELEASE_TAG"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: spynel-${{ matrix.os }}-${{ matrix.arch }}
+          name: spynel-archive-${{ matrix.os }}-${{ matrix.arch }}
           path: release/*
+          if-no-files-found: error
+
+      - name: Retain native compatibility evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: spynel-evidence-${{ matrix.os }}-${{ matrix.arch }}
+          path: evidence/native-${{ matrix.os }}-${{ matrix.arch }}.json
           if-no-files-found: error
 
   publish:
@@ -114,7 +127,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: spynel-*
+          pattern: spynel-archive-*
           path: release
           merge-multiple: true
 

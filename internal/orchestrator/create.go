@@ -27,6 +27,7 @@ type CreateOptions struct {
 	ParentTaskID string
 	GoalID       string
 	GoalRound    int
+	NoReview     bool
 }
 
 func CreateWithOptions(cfg config.Config, routeName, title, body string, options CreateOptions) (string, error) {
@@ -58,6 +59,7 @@ func CreateWithOptions(cfg config.Config, routeName, title, body string, options
 		"id": id, "title": title, "status": status,
 		"created_at": now.Format(time.RFC3339), "updated_at": now.Format(time.RFC3339), "attempt": 0,
 	}
+	taskReviewRequired := true
 	if routeName == "goals" {
 		front["round"] = 0
 		front["review_trigger"] = "all_round_tasks_settled"
@@ -67,6 +69,11 @@ func CreateWithOptions(cfg config.Config, routeName, title, body string, options
 		}}
 	}
 	if routeName == "tasks" {
+		taskReviewRequired = !options.NoReview
+		if strings.TrimSpace(options.GoalID) != "" {
+			taskReviewRequired = true
+		}
+		front["review_required"] = taskReviewRequired
 		enabled := options.Notify
 		notify := map[string]any{"enabled": enabled}
 		if enabled {
@@ -101,7 +108,11 @@ func CreateWithOptions(cfg config.Config, routeName, title, body string, options
 		if routeName == "goals" {
 			body = "# " + title + "\n\n## Objective\n\n" + title + "\n\n## Boundaries\n\n- To be refined during planning.\n\n## Target conditions\n\n- `criterion-1`: " + title + "\n\n## Current evidence\n\n- No evidence recorded yet.\n\n## Planning history\n\n- Awaiting the initial planning pass.\n\n## Review history\n\n- No reviews yet.\n\n## Progress\n\n- Created by Spynel.\n"
 		} else {
-			body = "# " + title + "\n\n## Objective\n\n" + title + "\n\n## Acceptance criteria\n\n- The requested finite outcome is implemented and independently verified.\n\n## Context\n\n- Created by Spynel.\n\n## Progress\n\n- Not started.\n"
+			acceptance := "The requested finite outcome is implemented and independently verified."
+			if !taskReviewRequired {
+				acceptance = "The requested information is collected read-only, with sources, evidence boundaries, uncertainty, and an exact UTC completion time recorded."
+			}
+			body = "# " + title + "\n\n## Objective\n\n" + title + "\n\n## Acceptance criteria\n\n- " + acceptance + "\n\n## Context\n\n- Created by Spynel.\n\n## Progress\n\n- Not started.\n"
 		}
 	}
 	document := Document{FrontMatter: front, Body: body}

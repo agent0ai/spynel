@@ -35,12 +35,44 @@ func TestDefaultIsValidAndRoutesAreExtensible(t *testing.T) {
 	if cfg.Channels.TUI.Theme != "spynel" {
 		t.Fatalf("unexpected default TUI theme: %#v", cfg.Channels.TUI)
 	}
+	if cfg.Orchestrator.SemanticHeartbeatMinutes != 15 {
+		t.Fatalf("semantic heartbeat default = %d, want 15", cfg.Orchestrator.SemanticHeartbeatMinutes)
+	}
 	if got := strings.Join(cfg.Orchestrator.Routes[0].AllowedNext, ","); got != "todo,working,review,reviewing,waiting,done,failed,cancelled" {
 		t.Fatalf("task workflow statuses = %q", got)
 	}
 	goals := cfg.Orchestrator.Routes[1]
 	if filepath.Base(goals.Source) != "proposed" || filepath.Base(goals.Working) != "planning" || filepath.Base(goals.ReviewPrompt) != "goal-review.md" || strings.Join(goals.AllowedNext, ",") != "proposed,planning,active,review,reviewing,waiting,done,abandoned" {
 		t.Fatalf("goal workflow defaults = %#v", goals)
+	}
+}
+
+func TestSemanticHeartbeatValidationSupportsExplicitDisable(t *testing.T) {
+	cfg := Default()
+	cfg.Orchestrator.SemanticHeartbeatMinutes = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("disabled semantic heartbeat was rejected: %v", err)
+	}
+	for _, invalid := range []int{-1, 1, 4, 1441} {
+		cfg.Orchestrator.SemanticHeartbeatMinutes = invalid
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "semantic_heartbeat_minutes") {
+			t.Fatalf("invalid semantic heartbeat %d produced %v", invalid, err)
+		}
+	}
+}
+
+func TestNotificationContactBindingsRequireExplicitUniqueOrigins(t *testing.T) {
+	cfg := Default()
+	cfg.Notifications.ContactBindings = []ContactBinding{{Principal: "owner", Contacts: []string{"tui/local", "telegram/TG-7"}}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid binding rejected: %v", err)
+	}
+	cfg.Notifications.ContactBindings = []ContactBinding{
+		{Principal: "owner", Contacts: []string{"telegram/TG-7"}},
+		{Principal: "other", Contacts: []string{"telegram/TG-7"}},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "more than one principal") {
+		t.Fatalf("ambiguous binding produced %v", err)
 	}
 }
 
@@ -278,5 +310,22 @@ func TestStorePersistsValidatedUpdatesAndPublishesSnapshot(t *testing.T) {
 	}
 	if store.Snapshot().Workspace.HistoryMaxMessages != 25 {
 		t.Fatal("invalid update changed the in-memory snapshot")
+	}
+}
+
+func TestNotificationQuietHoursValidation(t *testing.T) {
+	cfg := Default()
+	cfg.Notifications.QuietHours = QuietHours{Enabled: true, Start: "22:00", End: "07:00"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid cross-midnight quiet hours: %v", err)
+	}
+	for _, policy := range []QuietHours{
+		{Enabled: true, Start: "night", End: "07:00"},
+		{Enabled: true, Start: "22:00", End: "22:00"},
+	} {
+		cfg.Notifications.QuietHours = policy
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "quiet_hours") {
+			t.Fatalf("invalid quiet hours %#v: %v", policy, err)
+		}
 	}
 }

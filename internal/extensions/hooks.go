@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,11 @@ import (
 )
 
 const ManifestName = ".spynel-extension.yaml"
+
+const (
+	maxHookStdout = 1 << 20
+	maxHookStderr = 64 << 10
+)
 
 type Manifest struct {
 	Name  string              `yaml:"name"`
@@ -35,20 +41,54 @@ type HookOutput struct {
 type Runner struct {
 	Directory string
 	Timeout   time.Duration
+	Log       io.Writer
+}
+
+type boundedBuffer struct {
+	bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *boundedBuffer) Write(data []byte) (int, error) {
+	length := len(data)
+	remaining := b.limit - b.Len()
+	if remaining > 0 {
+		_, _ = b.Buffer.Write(data[:min(len(data), remaining)])
+	}
+	if length > remaining {
+		b.truncated = true
+	}
+	return length, nil
 }
 
 type discovered struct {
+	id       string
 	root     string
 	manifest Manifest
 }
 
 func (r Runner) Run(ctx context.Context, hook string, payload map[string]any) (HookOutput, error) {
+	return r.run(ctx, hook, payload, nil, nil)
+}
+
+// RunTracked executes matching hooks using durable successful-completion
+// receipts. A missing receipt deliberately causes retry, so externally visible
+// effects must be persistently deduplicated by the stable event_id in payload.
+func (r Runner) RunTracked(ctx context.Context, hook string, payload map[string]any, completed map[string]bool, onCompleted func(string) error) (HookOutput, error) {
+	return r.run(ctx, hook, payload, completed, onCompleted)
+}
+
+func (r Runner) run(ctx context.Context, hook string, payload map[string]any, completed map[string]bool, onCompleted func(string) error) (HookOutput, error) {
 	result := HookOutput{Payload: clone(payload)}
 	extensions, err := r.discover()
 	if err != nil {
 		return result, err
 	}
 	for _, extension := range extensions {
+		if completed[extension.id] {
+			continue
+		}
 		resolvedHook := hook
 		command := extension.manifest.Hooks[resolvedHook]
 		// Keep version-one extensions working while making harness.* the
@@ -76,26 +116,43 @@ func (r Runner) Run(ctx context.Context, hook string, payload map[string]any) (H
 		cmd.Dir = extension.root
 		cmd.Stdin = bytes.NewReader(input)
 		cmd.Env = append(os.Environ(), "SPYNEL_HOOK="+resolvedHook, "SPYNEL_EXTENSION="+extension.manifest.Name)
-		var stdout, stderr bytes.Buffer
+		stdout := boundedBuffer{limit: maxHookStdout}
+		stderr := boundedBuffer{limit: maxHookStderr}
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
-		err := cmd.Run()
-		cancel()
-		if err != nil {
-			return result, fmt.Errorf("extension %s hook %s: %w: %s", extension.manifest.Name, resolvedHook, err, stderr.String())
+		err := cmd.Start()
+		if err == nil {
+			err = cmd.Wait()
 		}
-		if stdout.Len() == 0 {
-			continue
+		cancel()
+		if r.Log != nil && stderr.Len() > 0 {
+			_, _ = fmt.Fprintf(r.Log, "extension=%s hook=%s stderr_truncated=%t stderr=%s\n", extension.manifest.Name, resolvedHook, stderr.truncated, stderr.String())
+		}
+		if err != nil {
+			if r.Log != nil {
+				_, _ = fmt.Fprintf(r.Log, "extension=%s hook=%s process_failed=%v stderr_present=%t\n", extension.manifest.Name, resolvedHook, err, stderr.Len() > 0)
+			}
+			return result, fmt.Errorf("extension %s hook %s failed: %w", extension.manifest.Name, resolvedHook, err)
+		}
+		if stdout.truncated {
+			return result, fmt.Errorf("extension %s hook %s exceeded %d-byte stdout limit", extension.manifest.Name, resolvedHook, maxHookStdout)
 		}
 		var output HookOutput
-		if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
-			return result, fmt.Errorf("extension %s returned invalid JSON: %w", extension.manifest.Name, err)
+		if stdout.Len() > 0 {
+			if err := json.Unmarshal(stdout.Bytes(), &output); err != nil {
+				return result, fmt.Errorf("extension %s returned invalid JSON: %w", extension.manifest.Name, err)
+			}
+			if output.Payload != nil {
+				result.Payload = output.Payload
+			}
+			if output.Message != "" {
+				result.Message = output.Message
+			}
 		}
-		if output.Payload != nil {
-			result.Payload = output.Payload
-		}
-		if output.Message != "" {
-			result.Message = output.Message
+		if onCompleted != nil {
+			if err := onCompleted(extension.id); err != nil {
+				return result, fmt.Errorf("record extension %s hook %s completion: %w", extension.manifest.Name, resolvedHook, err)
+			}
 		}
 		if output.Cancel {
 			result.Cancel = true
@@ -133,7 +190,7 @@ func (r Runner) discover() ([]discovered, error) {
 		if manifest.Name == "" {
 			manifest.Name = entry.Name()
 		}
-		result = append(result, discovered{root: root, manifest: manifest})
+		result = append(result, discovered{id: entry.Name(), root: root, manifest: manifest})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].manifest.Name < result[j].manifest.Name })
 	return result, nil

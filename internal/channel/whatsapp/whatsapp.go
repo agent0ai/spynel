@@ -109,11 +109,11 @@ func (c *Client) SetMedia(store *media.Store, speech media.Transcriber) {
 	c.speech = speech
 }
 
-func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string) error {
+func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string) (channel.DeliveryReceipt, error) {
 	var chat types.JID
 	if strings.HasPrefix(conversation, "WA-group-") {
 		if !c.config.AllowGroups {
-			return errors.New("WhatsApp group delivery is disabled")
+			return channel.DeliveryReceipt{}, errors.New("WhatsApp group delivery is disabled")
 		}
 		chat = types.NewJID(strings.TrimPrefix(conversation, "WA-group-"), types.GroupServer)
 	} else if strings.HasPrefix(conversation, "WA-") {
@@ -123,13 +123,14 @@ func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string
 			authorized = authorized || config.NormalizeWhatsAppNumber(allowed) == number
 		}
 		if number == "" || !authorized {
-			return errors.New("WhatsApp origin is not in allowed_numbers")
+			return channel.DeliveryReceipt{}, errors.New("WhatsApp origin is not in allowed_numbers")
 		}
 		chat = types.NewJID(number, types.DefaultUserServer)
 	} else {
-		return errors.New("invalid WhatsApp conversation origin")
+		return channel.DeliveryReceipt{}, errors.New("invalid WhatsApp conversation origin")
 	}
-	return c.sendEvent(ctx, chat, eventID, text)
+	ids, err := c.sendEvent(ctx, chat, eventID, text)
+	return channel.DeliveryReceipt{MessageIDs: ids}, err
 }
 
 func stableWhatsAppMessageID(eventID string, index int) types.MessageID {
@@ -137,10 +138,11 @@ func stableWhatsAppMessageID(eventID string, index int) types.MessageID {
 	return types.MessageID("3EB0" + strings.ToUpper(hex.EncodeToString(sum[:9])))
 }
 
-func (c *Client) sendEvent(ctx context.Context, chat types.JID, eventID, text string) error {
+func (c *Client) sendEvent(ctx context.Context, chat types.JID, eventID, text string) ([]string, error) {
 	if c.client == nil && c.deliver == nil && c.deliverID == nil {
-		return errors.New("WhatsApp is not connected")
+		return nil, errors.New("WhatsApp is not connected")
 	}
+	var ids []string
 	for index, chunk := range split(markdownfmt.WhatsApp(text), 60000) {
 		id := stableWhatsAppMessageID(eventID, index)
 		var response whatsmeow.SendResponse
@@ -153,11 +155,16 @@ func (c *Client) sendEvent(ctx context.Context, chat types.JID, eventID, text st
 			response, err = c.client.SendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)}, whatsmeow.SendRequestExtra{ID: id})
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
-		c.recordSent(response.ID)
+		nativeID := response.ID
+		if nativeID == "" {
+			nativeID = id
+		}
+		c.recordSent(nativeID)
+		ids = append(ids, string(nativeID))
 	}
-	return nil
+	return ids, nil
 }
 
 func (c *Client) Run(ctx context.Context, handler channel.Handler) error {
@@ -539,7 +546,12 @@ func (c *Client) messageWorker(ctx context.Context) {
 				finishActivity()
 				continue
 			}
-			c.handleWithActivity(incoming.received, incoming.chat, incoming.sender, text, finishActivity)
+			contextInfo := messageContext(incoming.message)
+			replyTo := ""
+			if contextInfo != nil {
+				replyTo = contextInfo.GetStanzaID()
+			}
+			c.handleWithNativeActivity(incoming.received, incoming.chat, incoming.sender, text, string(incoming.id), replyTo, finishActivity)
 		}
 	}
 }
@@ -615,6 +627,10 @@ func (c *Client) handle(received time.Time, chat types.JID, sender, text string)
 }
 
 func (c *Client) handleWithActivity(received time.Time, chat types.JID, sender, text string, finishActivity func()) {
+	c.handleWithNativeActivity(received, chat, sender, text, "", "", finishActivity)
+}
+
+func (c *Client) handleWithNativeActivity(received time.Time, chat types.JID, sender, text, nativeMessageID, nativeReplyToID string, finishActivity func()) {
 	ctx := c.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -639,7 +655,7 @@ func (c *Client) handleWithActivity(received time.Time, chat types.JID, sender, 
 	}
 	err := c.handler(ctx, core.Message{
 		Channel: c.Name(), Conversation: whatsappConversation(chat, sender), Sender: sender,
-		Text:       text,
+		Text: text, NativeMessageID: nativeMessageID, NativeReplyToID: nativeReplyToID,
 		ReceivedAt: received.UTC(),
 	}, emit)
 	if err != nil {

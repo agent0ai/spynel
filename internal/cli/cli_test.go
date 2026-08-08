@@ -35,6 +35,74 @@ type heldCLIHarness struct {
 	threads map[string]string
 }
 
+func TestRecordCommandFailurePersistsGenericEvidenceWithoutErrorContent(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, config.FileName)
+	recordCommandFailure([]string{"serve", "--config", configPath}, errors.New("authorization: Bearer must-not-persist"))
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), "command-failure-reader")
+	defer runtimeState.Close()
+	found := false
+	for _, entry := range runtimeState.Logs() {
+		found = found || entry.Component == "process" && entry.Event == "command_failed"
+		if strings.Contains(entry.Text, "must-not-persist") {
+			t.Fatalf("top-level error content leaked into runtime log: %#v", entry)
+		}
+	}
+	if !found {
+		t.Fatalf("command failure evidence missing: %#v", runtimeState.Logs())
+	}
+}
+
+func TestConfigPathArgument(t *testing.T) {
+	for _, test := range []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"status"}, want: ""},
+		{args: []string{"status", "--config", "/tmp/project/spynel.yaml"}, want: "/tmp/project/spynel.yaml"},
+		{args: []string{"send", "--config=/tmp/other.yaml", "hello"}, want: "/tmp/other.yaml"},
+	} {
+		if got := configPathArgument(test.args); got != test.want {
+			t.Errorf("configPathArgument(%q) = %q, want %q", test.args, got, test.want)
+		}
+	}
+}
+
+func TestTaskInspectShowsEffectiveFailSafeReviewPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		front string
+		want  []string
+	}{
+		{name: "explicit false", front: "review_required: false\n", want: []string{"Review required: false"}},
+		{name: "missing", front: "id: task\n", want: []string{"Review required: true"}},
+		{name: "malformed", front: "review_required: nope\n", want: []string{"Review required: true", "Policy warning:", "treated as review required"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "task.md")
+			if err := os.WriteFile(path, []byte("---\n"+test.front+"---\n# Task\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			if err := inspectTaskPolicy(path, &output); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range test.want {
+				if !strings.Contains(output.String(), want) {
+					t.Fatalf("inspection = %q, missing %q", output.String(), want)
+				}
+			}
+		})
+	}
+}
+
 func TestNotifyCommandUsesDurableHistoryWithoutHarness(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
@@ -414,6 +482,10 @@ func TestStatusCLIEmitsStructuredNonSecretState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitingPath := filepath.Join(root, ".spynel", "tasks", "waiting", "waiting.md")
+	if err := os.WriteFile(waitingPath, []byte("---\nid: waiting\nstatus: waiting\n---\n# Waiting\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	var output bytes.Buffer
 	if err := runStatusCLICommand([]string{"--config", cfg.Path, "--conversation", "automation", "--json"}, "test", &output); err != nil {
 		t.Fatal(err)
@@ -425,8 +497,26 @@ func TestStatusCLIEmitsStructuredNonSecretState(t *testing.T) {
 	if status.Title == "" || status.Sandbox == "" || status.HarnessState == "" || len(status.Connections) != 2 {
 		t.Fatalf("CLI status = %#v", status)
 	}
+	if status.TasksActive != 1 || status.TasksWaiting != 1 {
+		t.Fatalf("CLI durable waiting count = active %d waiting %d", status.TasksActive, status.TasksWaiting)
+	}
 	if strings.Contains(output.String(), "token") {
 		t.Fatalf("CLI status exposed configuration secrets: %s", output.String())
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(output.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fields["theme"]; ok {
+		t.Fatalf("structured CLI status retained theme: %s", output.String())
+	}
+	if _, ok := fields["thread"]; ok {
+		t.Fatalf("structured CLI status retained thread: %s", output.String())
+	}
+	for _, field := range []string{"tasks_active", "tasks_waiting", "goals_active", "heartbeat_state"} {
+		if _, ok := fields[field]; !ok {
+			t.Fatalf("structured CLI status is missing %q: %s", field, output.String())
+		}
 	}
 }
 
@@ -566,6 +656,24 @@ func TestCLIJoinsWorkspaceOwnerAndStrictlySteersActiveConversation(t *testing.T)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	var jobsOutput bytes.Buffer
+	if err := runFrameworkMessageMode(cfg.Path, "inspect", "/jobs", "test", messageRunOptions{Output: &jobsOutput}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(jobsOutput.String(), "1▶ · running · cli/active") || strings.Contains(jobsOutput.String(), "↻") || !strings.Contains(jobsOutput.String(), "Use `/job info <number>`") || !strings.Contains(jobsOutput.String(), "Use `/job kill <number>`") {
+		t.Fatalf("plain CLI live jobs output = %q", jobsOutput.String())
+	}
+	jobs := service.Runtime.Jobs()
+	if len(jobs) != 1 {
+		t.Fatalf("owner jobs = %#v", jobs)
+	}
+	var infoOutput bytes.Buffer
+	if err := runFrameworkMessageMode(cfg.Path, "inspect", fmt.Sprintf("/job info %d", jobs[0].ID), "test", messageRunOptions{Output: &infoOutput}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(infoOutput.String(), "Provider steps (▶): 1 (live conversation)") || strings.Contains(infoOutput.String(), "Implementation attempts") {
+		t.Fatalf("plain CLI live job info = %q", infoOutput.String())
+	}
 
 	var followupOutput bytes.Buffer
 	followupDone := make(chan error, 1)
@@ -636,7 +744,7 @@ func TestBuildServiceUsesConfiguredHarnessSandbox(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer service.Harness.Close()
+	defer service.Close()
 	runtimeHarness, ok := service.Harness.(interface {
 		HarnessConfig() harness.HarnessConfig
 	})
@@ -930,5 +1038,40 @@ func TestPromotionRefusesAChangedStateDirectory(t *testing.T) {
 	term, err := startPrimaryTerm(context.Background(), cfg, "test", election, listener, token, func() {}, func() {})
 	if term != nil || err == nil || !strings.Contains(err.Error(), "state directory changed") {
 		t.Fatalf("promotion = %#v, %v", term, err)
+	}
+}
+
+func TestPromotionRecordsConfigurationReloadFailure(t *testing.T) {
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Root = root
+	cfg.Path = filepath.Join(root, config.FileName)
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	election, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := os.WriteFile(cfg.Path, []byte("invalid: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	term, startErr := startPrimaryTerm(context.Background(), cfg, "test", election, listener, "unused", func() {}, func() {})
+	if term != nil || startErr == nil {
+		t.Fatalf("promotion with invalid config = %#v, %v", term, startErr)
+	}
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), "reload-reader")
+	defer runtimeState.Close()
+	found := false
+	for _, entry := range runtimeState.Logs() {
+		found = found || entry.Component == "config" && entry.Event == "reload_failed"
+	}
+	if !found {
+		t.Fatalf("configuration reload failure evidence missing: %#v", runtimeState.Logs())
 	}
 }

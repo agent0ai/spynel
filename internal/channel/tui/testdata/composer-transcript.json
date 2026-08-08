@@ -1,0 +1,10 @@
+[
+  {
+    "role": "user",
+    "content": "Run every 15 minutes by default, configurable from the config screen. Ordinary fitting words should move intact."
+  },
+  {
+    "role": "assistant",
+    "content": "The semantic workflow heartbeat checks tasks and jobs. It should preserve `config` and avoid anomalously short rows."
+  }
+]

@@ -204,6 +204,22 @@ func (c *Client) ApplySettings(ctx context.Context, values map[string]string) er
 	return responseError(response)
 }
 
+// Diagnostic forwards a bounded local-surface observation to the elected
+// owner's structured runtime logger. Callers keep this best-effort and off
+// their event loop.
+func (c *Client) Diagnostic(ctx context.Context, event, message string) error {
+	body, err := json.Marshal(diagnosticRequest{Event: event, Message: message})
+	if err != nil {
+		return err
+	}
+	response, err := c.request(ctx, http.MethodPost, "/v1/diagnostic", body)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	return responseError(response)
+}
+
 func (c *Client) RunOnce(ctx context.Context) error {
 	response, err := c.request(ctx, http.MethodPost, "/v1/run-once", nil)
 	if err != nil {

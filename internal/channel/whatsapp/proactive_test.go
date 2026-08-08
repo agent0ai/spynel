@@ -3,8 +3,10 @@ package whatsapp
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
 	"go.mau.fi/whatsmeow"
 	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
@@ -19,8 +21,12 @@ func TestProactiveDeliveryReappliesWhatsAppAuthorization(t *testing.T) {
 		firstID = id
 		return whatsmeow.SendResponse{}, nil
 	}
-	if err := client.Deliver(context.Background(), "WA-15557654321", "event-1", "complete"); err != nil {
+	receipt, err := client.Deliver(context.Background(), "WA-15557654321", "event-1", "complete")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(receipt.MessageIDs) != 1 || receipt.MessageIDs[0] != string(firstID) {
+		t.Fatalf("receipt = %#v", receipt)
 	}
 	if delivered.User != "15557654321" {
 		t.Fatalf("delivered to %s", delivered.String())
@@ -28,7 +34,21 @@ func TestProactiveDeliveryReappliesWhatsAppAuthorization(t *testing.T) {
 	if firstID == "" || firstID != stableWhatsAppMessageID("event-1", 0) {
 		t.Fatalf("unstable WhatsApp event ID %q", firstID)
 	}
-	if err := client.Deliver(context.Background(), "WA-1999", "event-2", "blocked"); err == nil {
+	if _, err := client.Deliver(context.Background(), "WA-1999", "event-2", "blocked"); err == nil {
 		t.Fatal("unauthorized WhatsApp origin delivered")
+	}
+}
+
+func TestWhatsAppInboundCarriesNativeReplyIdentity(t *testing.T) {
+	client := New(config.WhatsApp{}, t.TempDir()+"/wa.db")
+	client.ctx = context.Background()
+	var received core.Message
+	client.handler = func(_ context.Context, message core.Message, _ core.Emit) error {
+		received = message
+		return nil
+	}
+	client.handleWithNativeActivity(time.Now(), types.NewJID("1555", types.DefaultUserServer), "1555", "answer", "message-2", "message-1", func() {})
+	if received.NativeMessageID != "message-2" || received.NativeReplyToID != "message-1" {
+		t.Fatalf("native identity = %#v", received)
 	}
 }

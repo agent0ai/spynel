@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -43,8 +44,46 @@ const (
 	npmUpdateExitCode         = 75
 )
 
-func Run(args []string, version string) error {
-	return completeRun(run(args, version), replaceCurrentProcess)
+func Run(args []string, version string) (runErr error) {
+	defer func() {
+		if value := recover(); value != nil {
+			if cfg, err := config.Load(configPathArgument(args)); err == nil {
+				runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d", os.Getpid()))
+				runtimeState.LogEvent("fatal", "process", "top_level_panic", fmt.Sprintf("panic: %v\n%s", value, debug.Stack()))
+				runtimeState.Close()
+			}
+			panic(value)
+		}
+		if runErr != nil {
+			if _, controlledExit := runErr.(interface{ ExitCode() int }); !controlledExit {
+				recordCommandFailure(args, runErr)
+			}
+		}
+	}()
+	runErr = completeRun(run(args, version), replaceCurrentProcess)
+	return runErr
+}
+
+func recordCommandFailure(args []string, runErr error) {
+	cfg, err := config.Load(configPathArgument(args))
+	if err != nil {
+		return
+	}
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d-error", os.Getpid()))
+	runtimeState.LogEvent("error", "process", "command_failed", fmt.Sprintf("Spynel command failed (%T)", runErr))
+	runtimeState.Close()
+}
+
+func configPathArgument(args []string) string {
+	for index, argument := range args {
+		if argument == "--config" && index+1 < len(args) {
+			return args[index+1]
+		}
+		if strings.HasPrefix(argument, "--config=") {
+			return strings.TrimPrefix(argument, "--config=")
+		}
+	}
+	return ""
 }
 
 func run(args []string, version string) error {
@@ -55,6 +94,8 @@ func run(args []string, version string) error {
 	case "help", "--help", "-h":
 		fmt.Print(helpText)
 		return nil
+	case "docs":
+		return runDocsCommand(args[1:], os.Stdout)
 	case "version", "--version", "-v":
 		fmt.Println("spynel " + version)
 		return nil
@@ -111,8 +152,20 @@ func run(args []string, version string) error {
 	case "conversation", "conversations":
 		return runConversationCommand(args[1:], os.Stdout)
 	case "task", "todo", "goal":
-		if len(args) < 2 {
-			return fmt.Errorf("usage: spynel %s <request>", args[0])
+		if len(args) >= 2 && args[0] != "goal" && args[1] == "inspect" {
+			if len(args) != 3 {
+				return errors.New("usage: spynel task inspect FILE")
+			}
+			return inspectTaskPolicy(args[2], os.Stdout)
+		}
+		noReview := false
+		requestArgs := args[1:]
+		if len(requestArgs) > 0 && requestArgs[0] == "--no-review" && args[0] != "goal" {
+			noReview = true
+			requestArgs = requestArgs[1:]
+		}
+		if len(requestArgs) == 0 {
+			return fmt.Errorf("usage: spynel %s [--no-review] <request>", args[0])
 		}
 		cfg, err := config.Load("")
 		if err != nil {
@@ -122,13 +175,13 @@ func run(args []string, version string) error {
 		if args[0] == "goal" {
 			route = "goals"
 		}
-		request := strings.Join(args[1:], " ")
+		request := strings.Join(requestArgs, " ")
 		if route == "tasks" {
 			_, _ = history.New(cfg.StatePath("history")).Append("cli", "local", history.Entry{Role: "user", Sender: "cli", Content: "/task " + request})
 		}
 		options := orchestrator.CreateOptions{}
 		if route == "tasks" {
-			options = orchestrator.CreateOptions{Notify: true, Origin: "cli/local", Outcomes: []string{"done", "failed", "waiting", "cancelled"}}
+			options = orchestrator.CreateOptions{Notify: true, Origin: "cli/local", Outcomes: []string{"done", "failed", "waiting", "cancelled"}, NoReview: noReview}
 		}
 		path, err := orchestrator.CreateWithOptions(cfg, route, request, "", options)
 		if err != nil {
@@ -158,6 +211,19 @@ func run(args []string, version string) error {
 	default:
 		return fmt.Errorf("unknown command %q; run 'spynel help'", args[0])
 	}
+}
+
+func inspectTaskPolicy(path string, output io.Writer) error {
+	document, err := orchestrator.ReadDocument(path)
+	if err != nil {
+		return err
+	}
+	policy, policyErr := orchestrator.TaskPolicyFromDocument(document)
+	_, _ = fmt.Fprintf(output, "Review required: %t\n", policy.ReviewRequired)
+	if policyErr != nil {
+		_, _ = fmt.Fprintln(output, "Policy warning: "+policyErr.Error()+"; treated as review required")
+	}
+	return nil
 }
 
 type restartRequest struct {
@@ -378,6 +444,7 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 			},
 			InitialScreen: initialScreen,
 			ScreenAction:  client.ScreenAction,
+			Diagnostic:    client.Diagnostic,
 		})
 		return serverResult(err)
 	}
@@ -429,10 +496,11 @@ func runOnce(configPath, version string) error {
 	if err != nil {
 		return err
 	}
+	defer service.Close()
 	if err := service.Start(ctx); err != nil {
+		service.Runtime.LogEvent("error", "startup", "service_start_failed", "Service startup failed")
 		return err
 	}
-	defer service.Harness.Close()
 	if err := service.Orchestrator.ScanOnce(ctx); err != nil {
 		return err
 	}
@@ -473,7 +541,7 @@ func runMessageMode(configPath, conversation, text, version string, options mess
 	// or rewrite the input. If no extension completes the operation, Handle
 	// reaches the supervisor and returns the original availability failure.
 	_ = service.Start(ctx)
-	defer service.Harness.Close()
+	defer service.Close()
 
 	return runMessageWithOutput(ctx, service.Handle, conversation, text, options)
 }
@@ -637,7 +705,7 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 	if err := workspace.Upgrade(cfg.Root); err != nil {
 		return nil, fmt.Errorf("upgrade Spynel workspace: %w", err)
 	}
-	runtimeState := app.NewRuntime()
+	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d", os.Getpid()))
 	registry := harness.NewBuiltinRegistry()
 	command, commandErr := harness.ResolveCommand(cfg.Harness.Name, nil)
 	if commandErr != nil {
@@ -650,24 +718,33 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 		Model: cfg.Harness.Model, Effort: "medium",
 		ApprovalPolicy: "never", Sandbox: cfg.Harness.Sandbox,
 		Network: false, SessionsFile: cfg.HarnessSessionsPath(cfg.Harness.Name),
-		Version: version, Stderr: runtimeState,
+		Version: version, Stderr: runtimeState.Writer("harness"),
 	})
 	service := app.NewWithRuntime(cfg, target, runtimeState)
 	service.Updates = updater.Detect(version, cfg.StatePath("runtime", "application-version.json"))
 	if err := service.Updates.Migrate(context.Background(), cfg, cfg.Extensions.Enabled, service.Hooks); err != nil {
+		service.Runtime.LogEvent("error", "startup", "migration_failed", "Application migration failed")
+		_ = service.Close()
 		return nil, fmt.Errorf("migrate Spynel workspace from application update: %w", err)
 	}
 	startup, err := startupmanager.New("")
 	if err != nil {
+		service.Runtime.LogEvent("error", "startup", "manager_failed", "Startup manager initialization failed")
+		_ = service.Close()
 		return nil, fmt.Errorf("initialize startup manager: %w", err)
 	}
+	startup.Log = service.Runtime.Writer("startup.registration")
 	service.Startup = startup
 	return service, nil
 }
 
-func startChannels(ctx context.Context, service *app.Service, report channel.StatusReporter) <-chan error {
+func startChannels(ctx context.Context, service *app.Service, report channel.StatusReporter) (<-chan error, error) {
 	initial := service.Settings.Snapshot()
-	speech := media.NewParakeet(service.Settings, initial.StatePath("models", "parakeet"), service.Runtime)
+	cacheRoot, cacheErr := media.SpeechCacheDir()
+	if cacheErr != nil && initial.Speech.Enabled && strings.TrimSpace(initial.Speech.ModelDir) == "" {
+		return nil, cacheErr
+	}
+	speech := media.NewParakeet(service.Settings, cacheRoot, initial.StatePath("models", "parakeet"), cacheErr, service.Runtime.Writer("media"))
 	managed := []channel.Managed{
 		{
 			Name:    "telegram",
@@ -681,7 +758,7 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 				}{cfg.Channels.Telegram, cfg.TelegramToken(), cfg.Speech, cfg.Workspace.AttachmentMaxMB})
 			},
 			Build: func(cfg config.Config) (channel.Channel, error) {
-				bot := telegram.New(cfg.Channels.Telegram, cfg.TelegramToken())
+				bot := telegram.NewWithIdentityStore(cfg.Channels.Telegram, cfg.TelegramToken(), cfg.StatePath("runtime", "telegram-identities.json"))
 				bot.SetNoticeReporter(service.SetNotice)
 				store := &media.Store{Directory: cfg.StatePath("attachments", "telegram"), MaxBytes: int64(cfg.Workspace.AttachmentMaxMB) * 1024 * 1024}
 				var transcriber media.Transcriber
@@ -715,18 +792,20 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 			},
 		},
 	}
-	supervisor := channel.NewSupervisor(service.Settings, service.Handle, managed, report, service.Runtime)
+	supervisor := channel.NewSupervisor(service.Settings, service.Handle, managed, report, service.Runtime.Writer("channel"))
+	supervisor.SetEventLogger(service.Runtime.LogEvent)
 	service.PairingControl = supervisor
 	service.DeliveryControl = supervisor
 	done := make(chan error, 1)
 	go func() {
+		defer service.Runtime.RecoverPanic("channel", "supervisor_panic")
 		err := supervisor.Run(ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
-			service.Runtime.Log("channel supervisor: " + err.Error())
+			service.Runtime.LogEvent("error", "channel", "supervisor_stopped", "Channel supervisor: "+err.Error())
 		}
 		done <- err
 	}()
-	return done
+	return done, nil
 }
 
 func configFingerprint(value any) string {
@@ -777,7 +856,9 @@ func extensionCommand(args []string) error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		path, err := extensions.Install(ctx, directory, args[1], name)
+		runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d-extension", os.Getpid()))
+		defer runtimeState.Close()
+		path, err := extensions.Install(ctx, directory, args[1], name, runtimeState.Writer("extension.install"))
 		if err != nil {
 			return err
 		}
@@ -871,10 +952,17 @@ Usage:
   spynel conversations resume   Branch any saved conversation into CLI
   spynel status [flags]          Show workspace and current conversation status
   spynel command [flags] NAME    Run any non-visual framework slash command
+	spynel job message N TEXT      Guide a live orchestrator job in place
+	spynel job ping N              Request durable progress from a live job
+  spynel docs [TOPIC]            Read curated offline documentation
+    search QUERY [page NUMBER]   Search bounded topic sections
+    --format text|json           Select plain Markdown or versioned JSON
   spynel jobs|log|stop|clear...  Concise aliases for common framework commands
 	spynel update                  Check npm for an update (/update install applies it)
   spynel run --once              Dispatch one orchestration scan and wait
-  spynel task REQUEST            Create a task markdown file
+  spynel task [--no-review] REQUEST
+                                Create a task (reviewed by default)
+  spynel task inspect FILE      Show the task's effective review policy
   spynel goal OBJECTIVE          Create a goal markdown file
   spynel extension ...           List, install, or remove Git extensions
   spynel whatsapp pair           Pair a WhatsApp account by QR code

@@ -112,7 +112,7 @@ func runNotifyCommand(args []string, version string) error {
 		if buildErr != nil {
 			return buildErr
 		}
-		defer service.Harness.Close()
+		defer service.Close()
 		id, err = service.Notify(ctx, *origin, text)
 	}
 	if err != nil {
@@ -203,7 +203,7 @@ func runFrameworkMessageMode(configPath, conversation, text, version string, opt
 	if err != nil {
 		return err
 	}
-	defer service.Harness.Close()
+	defer service.Close()
 	if err := runMessageWithOutput(ctx, service.Handle, conversation, text, options); err != nil {
 		return err
 	}
@@ -242,7 +242,7 @@ func runStatusCLICommand(args []string, version string, output io.Writer) error 
 		if buildErr != nil {
 			return buildErr
 		}
-		defer service.Harness.Close()
+		defer service.Close()
 		status, err = service.Status(core.Message{Channel: "cli", Conversation: *conversation, Sender: "cli"})
 	}
 	if err != nil {

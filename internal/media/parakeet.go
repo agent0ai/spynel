@@ -38,23 +38,25 @@ type recognizerFactory func(parakeetFiles, int) (speechRecognizer, error)
 // decodes WAV, FLAC, and MP3 with miniaudio, keeps only one bounded PCM chunk
 // in memory, and reuses the selected sherpa-onnx recognizer between messages.
 type Parakeet struct {
-	settings      *config.Store
-	modelDir      string
-	client        *http.Client
-	modelBaseURL  string
-	log           io.Writer
-	serial        chan struct{}
-	models        map[string]parakeetModel
-	openAudio     func(string) (audioDecoder, error)
-	newRecognizer recognizerFactory
-	cachedModel   string
-	cachedThreads int
-	cached        speechRecognizer
+	settings       *config.Store
+	modelDir       string
+	legacyModelDir string
+	cacheInitErr   error
+	client         *http.Client
+	modelBaseURL   string
+	log            io.Writer
+	serial         chan struct{}
+	models         map[string]parakeetModel
+	openAudio      func(string) (audioDecoder, error)
+	newRecognizer  recognizerFactory
+	cachedModel    string
+	cachedThreads  int
+	cached         speechRecognizer
 }
 
-func NewParakeet(settings *config.Store, modelDir string, log io.Writer) *Parakeet {
+func NewParakeet(settings *config.Store, modelDir, legacyModelDir string, cacheInitErr error, log io.Writer) *Parakeet {
 	return &Parakeet{
-		settings: settings, modelDir: modelDir, client: http.DefaultClient, log: log,
+		settings: settings, modelDir: modelDir, legacyModelDir: legacyModelDir, cacheInitErr: cacheInitErr, client: http.DefaultClient, log: log,
 		modelBaseURL: parakeetModelBaseURL,
 		serial:       make(chan struct{}, 1), models: defaultParakeetModels(),
 		openAudio: openAudioFile, newRecognizer: newSherpaRecognizer,

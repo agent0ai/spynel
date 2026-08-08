@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -65,6 +66,43 @@ const (
 // provider turn completes, using the same durable conversation session.
 type FollowUpProvider interface {
 	FollowUpMode() FollowUpMode
+}
+
+// NativeSteerer delivers only to an already-active provider turn. It must
+// never fall back to starting a new turn when completion wins a race. The
+// beforeDelivery callback is the atomic durable reservation boundary: the
+// adapter calls it exactly once after fencing completion and immediately
+// before provider delivery, or not at all when the turn is already inactive.
+type NativeSteerer interface {
+	Steer(context.Context, string, string, core.Emit, func() bool) (threadID string, err error)
+}
+
+var (
+	errNativeTurnInactive       = errors.New("native provider turn is no longer active")
+	errNativeDeliveryUnreserved = errors.New("native provider delivery was not reserved")
+)
+
+// ControlRequest is a non-owning coordination message for an existing turn.
+// The supervisor delivers it through the current execution emitter so the
+// command caller never becomes responsible for provider output or completion.
+type ControlRequest struct {
+	ID                  string
+	Prompt              string
+	ContinuationPrompt  string
+	Validate            func() bool
+	PrepareContinuation func() bool
+	ReserveProviderTurn func() bool
+}
+
+type ControlResult struct {
+	Queued    bool
+	Duplicate bool
+}
+
+// ControlSender is implemented by the provider-neutral supervisor. Harness
+// adapters continue to expose only their declared native-steer/queue behavior.
+type ControlSender interface {
+	SendControl(context.Context, string, ControlRequest) (ControlResult, error)
 }
 
 type Harness interface {

@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -12,22 +13,58 @@ import (
 )
 
 type supervisorHarness struct {
-	name            string
-	startErr        error
-	refuseSteer     bool
-	followUp        FollowUpMode
-	mu              sync.Mutex
-	active          map[string]bool
-	emits           map[string]core.Emit
-	prompts         map[string][]string
-	closed          bool
-	resetKeys       []string
-	isActiveEntered chan struct{}
-	isActiveRelease <-chan struct{}
-	isActiveOnce    sync.Once
+	name             string
+	startErr         error
+	refuseSteer      bool
+	interruptErr     error
+	interruptEntered chan struct{}
+	interruptRelease <-chan struct{}
+	followUp         FollowUpMode
+	mu               sync.Mutex
+	active           map[string]bool
+	emits            map[string]core.Emit
+	prompts          map[string][]string
+	closed           bool
+	resetKeys        []string
+	isActiveEntered  chan struct{}
+	isActiveRelease  <-chan struct{}
+	isActiveOnce     sync.Once
+}
+
+func waitSupervisorState(t *testing.T, predicate func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if predicate() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for supervisor state")
 }
 
 func (r *supervisorHarness) FollowUpMode() FollowUpMode { return r.followUp }
+
+func (r *supervisorHarness) Steer(_ context.Context, key, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+	if !r.IsActive(key) {
+		return r.name + "-thread", errNativeTurnInactive
+	}
+	if beforeDelivery != nil && !beforeDelivery() {
+		return r.name + "-thread", errNativeDeliveryUnreserved
+	}
+	r.mu.Lock()
+	if r.refuseSteer {
+		r.mu.Unlock()
+		return r.name + "-thread", errors.New("active turns cannot be steered")
+	}
+	if r.prompts == nil {
+		r.prompts = map[string][]string{}
+	}
+	r.prompts[key] = append(r.prompts[key], prompt)
+	r.emits[key] = emit
+	r.mu.Unlock()
+	return r.name + "-thread", nil
+}
 
 func (r *supervisorHarness) Start(context.Context) error { return r.startErr }
 func (r *supervisorHarness) Close() error {
@@ -65,11 +102,77 @@ func (r *supervisorHarness) finish(key string) {
 func (r *supervisorHarness) Interrupt(_ context.Context, key string) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.interruptErr != nil {
+		return false, r.interruptErr
+	}
 	if !r.active[key] {
 		return false, nil
 	}
 	delete(r.active, key)
+	if r.interruptEntered != nil {
+		close(r.interruptEntered)
+		<-r.interruptRelease
+	}
 	return true, nil
+}
+
+func TestSupervisorFailedInterruptRetainsActivityAndBlocksReconfigure(t *testing.T) {
+	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}, interruptErr: errors.New("interrupt transport failed")}
+	replacement := &supervisorHarness{name: "claude-code", active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	registry.Register("claude-code", func(HarnessConfig) (Harness, error) { return replacement, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "job", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	if stopped, err := supervisor.Interrupt(context.Background(), "job"); err == nil || stopped {
+		t.Fatalf("interrupt = stopped %t, err %v", stopped, err)
+	}
+	if !supervisor.IsActive("job") {
+		t.Fatal("failed interrupt hid the still-active provider turn")
+	}
+	if err := supervisor.Reconfigure(HarnessConfig{Name: "claude-code"}); err == nil {
+		t.Fatal("reconfigure replaced a harness after failed interrupt")
+	}
+}
+
+func TestSupervisorSerializesSuccessorSendAfterInterruptCleanup(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}, interruptEntered: entered, interruptRelease: release}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "job", "old turn", nil); err != nil {
+		t.Fatal(err)
+	}
+	interruptDone := make(chan error, 1)
+	go func() { _, err := supervisor.Interrupt(context.Background(), "job"); interruptDone <- err }()
+	<-entered
+	sendDone := make(chan error, 1)
+	go func() { _, _, err := supervisor.Send(context.Background(), "job", "successor", nil); sendDone <- err }()
+	select {
+	case err := <-sendDone:
+		t.Fatalf("successor escaped interrupt fence: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-interruptDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-sendDone; err != nil {
+		t.Fatal(err)
+	}
+	if !supervisor.IsActive("job") || !target.IsActive("job") {
+		t.Fatalf("successor turn was hidden: supervisor=%t target=%t", supervisor.IsActive("job"), target.IsActive("job"))
+	}
 }
 func (r *supervisorHarness) ResetSession(key string) error {
 	r.mu.Lock()
@@ -198,15 +301,20 @@ func TestSupervisorQueuesFollowUpWhenHarnessCannotSteer(t *testing.T) {
 	if err := supervisor.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	var eventsMu sync.Mutex
 	var firstEvents []core.Event
 	var secondEvents []core.Event
 	if _, _, err := supervisor.Send(context.Background(), "chat", "first", func(event core.Event) {
+		eventsMu.Lock()
+		defer eventsMu.Unlock()
 		firstEvents = append(firstEvents, event)
 	}); err != nil {
 		t.Fatal(err)
 	}
 	followContext, cancelFollow := context.WithCancel(context.Background())
 	if _, steered, err := supervisor.Send(followContext, "chat", "follow-up", func(event core.Event) {
+		eventsMu.Lock()
+		defer eventsMu.Unlock()
 		secondEvents = append(secondEvents, event)
 	}); err != nil || !steered {
 		t.Fatalf("queued follow-up = steered %t, error %v", steered, err)
@@ -215,11 +323,16 @@ func TestSupervisorQueuesFollowUpWhenHarnessCannotSteer(t *testing.T) {
 	// transport request that accepted it ends before the provider turn does.
 	cancelFollow()
 	target.finish("chat")
+	waitSupervisorState(t, func() bool { return target.IsActive("chat") })
 	if !supervisor.IsActive("chat") || !target.IsActive("chat") {
 		t.Fatal("queued follow-up did not become the active turn")
 	}
-	if len(firstEvents) == 0 || !firstEvents[len(firstEvents)-1].Continues {
-		t.Fatalf("first final did not preserve logical activity: %#v", firstEvents)
+	eventsMu.Lock()
+	firstContinues := len(firstEvents) > 0 && firstEvents[len(firstEvents)-1].Continues
+	firstSnapshot := append([]core.Event(nil), firstEvents...)
+	eventsMu.Unlock()
+	if !firstContinues {
+		t.Fatalf("first final did not preserve logical activity: %#v", firstSnapshot)
 	}
 	target.mu.Lock()
 	prompts := append([]string(nil), target.prompts["chat"]...)
@@ -232,14 +345,327 @@ func TestSupervisorQueuesFollowUpWhenHarnessCannotSteer(t *testing.T) {
 		t.Fatal("queued follow-up remained active after its final")
 	}
 	foundFinal := false
+	eventsMu.Lock()
 	for _, event := range secondEvents {
 		if event.Kind == core.EventFinal && event.Done && !event.Continues {
 			foundFinal = true
 		}
 	}
+	secondSnapshot := append([]core.Event(nil), secondEvents...)
+	eventsMu.Unlock()
 	if !foundFinal {
-		t.Fatalf("queued emitter did not receive terminal final: %#v", secondEvents)
+		t.Fatalf("queued emitter did not receive terminal final: %#v", secondSnapshot)
 	}
+}
+
+func TestSupervisorControlRetainsEmitterAndContinuesOnlyOnce(t *testing.T) {
+	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var stateMu sync.Mutex
+	var events []core.Event
+	if _, _, err := supervisor.Send(context.Background(), "job", "original", func(event core.Event) {
+		stateMu.Lock()
+		events = append(events, event)
+		stateMu.Unlock()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	prepared, reserved := 0, 0
+	result, err := supervisor.SendControl(context.Background(), "job", ControlRequest{
+		ID: "control-1", Prompt: "guidance", ContinuationPrompt: "continue original",
+		PrepareContinuation: func() bool { stateMu.Lock(); prepared++; stateMu.Unlock(); return true },
+		ReserveProviderTurn: func() bool { stateMu.Lock(); reserved++; stateMu.Unlock(); return true },
+	})
+	if err != nil || result.Queued || result.Duplicate {
+		t.Fatalf("control result = %#v, %v", result, err)
+	}
+	target.finish("job")
+	waitSupervisorState(t, func() bool { return target.IsActive("job") })
+	stateMu.Lock()
+	preparedSnapshot, reservedSnapshot := prepared, reserved
+	stateMu.Unlock()
+	if preparedSnapshot != 1 || reservedSnapshot != 2 || !supervisor.IsActive("job") || !target.IsActive("job") {
+		t.Fatalf("continuation state: prepared=%d reserved=%d supervisor=%t target=%t", preparedSnapshot, reservedSnapshot, supervisor.IsActive("job"), target.IsActive("job"))
+	}
+	target.mu.Lock()
+	prompts := append([]string(nil), target.prompts["job"]...)
+	target.mu.Unlock()
+	if strings.Join(prompts, ",") != "original,guidance,continue original" {
+		t.Fatalf("prompts = %#v", prompts)
+	}
+	foundContinuingFinal := false
+	stateMu.Lock()
+	for _, event := range events {
+		foundContinuingFinal = foundContinuingFinal || event.Kind == core.EventFinal && event.Continues
+	}
+	eventsSnapshot := append([]core.Event(nil), events...)
+	stateMu.Unlock()
+	if !foundContinuingFinal {
+		t.Fatalf("control terminal did not preserve original execution: %#v", eventsSnapshot)
+	}
+	target.finish("job")
+	stateMu.Lock()
+	preparedSnapshot = prepared
+	stateMu.Unlock()
+	if preparedSnapshot != 1 || supervisor.IsActive("job") {
+		t.Fatalf("continuation repeated: prepared=%d active=%t", preparedSnapshot, supervisor.IsActive("job"))
+	}
+}
+
+func TestSupervisorQueuesControlsInOrderDeduplicatesAndBoundsBackpressure(t *testing.T) {
+	target := &supervisorHarness{name: "claude-code", followUp: FollowUpQueue, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("claude-code", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "claude-code"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "job", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < maxPendingControls; index++ {
+		result, err := supervisor.SendControl(context.Background(), "job", ControlRequest{ID: fmt.Sprintf("id-%d", index), Prompt: fmt.Sprintf("control-%d", index)})
+		if err != nil || !result.Queued {
+			t.Fatalf("queue %d = %#v, %v", index, result, err)
+		}
+	}
+	if _, err := supervisor.SendControl(context.Background(), "job", ControlRequest{ID: "overflow", Prompt: "overflow"}); err == nil || !strings.Contains(err.Error(), "queue is full") {
+		t.Fatalf("overflow error = %v", err)
+	}
+	if result, err := supervisor.SendControl(context.Background(), "job", ControlRequest{ID: "id-0", Prompt: "control-0"}); err != nil || !result.Duplicate {
+		t.Fatalf("duplicate = %#v, %v", result, err)
+	}
+	for index := 0; index <= maxPendingControls; index++ {
+		target.finish("job")
+		if index < maxPendingControls {
+			waitSupervisorState(t, func() bool { return target.IsActive("job") })
+		}
+	}
+	waitSupervisorState(t, func() bool { return !supervisor.IsActive("job") })
+	target.mu.Lock()
+	prompts := append([]string(nil), target.prompts["job"]...)
+	target.mu.Unlock()
+	if len(prompts) != maxPendingControls+1 {
+		t.Fatalf("prompt count = %d: %#v", len(prompts), prompts)
+	}
+	for index := 0; index < maxPendingControls; index++ {
+		if prompts[index+1] != fmt.Sprintf("control-%d", index) {
+			t.Fatalf("ordered prompts = %#v", prompts)
+		}
+	}
+}
+
+func TestSupervisorDropsQueuedControlAfterDurableTransition(t *testing.T) {
+	target := &supervisorHarness{name: "claude-code", followUp: FollowUpQueue, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("claude-code", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "claude-code"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "job", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	valid := true
+	if result, err := supervisor.SendControl(context.Background(), "job", ControlRequest{ID: "transition", Prompt: "stale guidance", Validate: func() bool { return valid }}); err != nil || !result.Queued {
+		t.Fatalf("queue result = %#v, %v", result, err)
+	}
+	valid = false
+	target.finish("job")
+	waitSupervisorState(t, func() bool { return !supervisor.IsActive("job") })
+	target.mu.Lock()
+	prompts := append([]string(nil), target.prompts["job"]...)
+	target.mu.Unlock()
+	if len(prompts) != 1 || supervisor.IsActive("job") {
+		t.Fatalf("stale queued control executed: prompts=%#v active=%t", prompts, supervisor.IsActive("job"))
+	}
+}
+
+func TestSupervisorNativeControlNeverStartsTurnAfterCompletionRace(t *testing.T) {
+	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "job", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err := supervisor.SendControl(context.Background(), "job", ControlRequest{
+		ID: "completion-race", Prompt: "must not become a new turn",
+		Validate: func() bool {
+			target.finish("job")
+			return true
+		},
+	})
+	if err == nil || (!strings.Contains(err.Error(), "no longer active") && !strings.Contains(err.Error(), "completed before control delivery")) {
+		t.Fatalf("completion race error = %v", err)
+	}
+	target.mu.Lock()
+	prompts := append([]string(nil), target.prompts["job"]...)
+	target.mu.Unlock()
+	if len(prompts) != 1 || prompts[0] != "original" {
+		t.Fatalf("control started a new turn after completion: %#v", prompts)
+	}
+}
+
+func TestSupervisorDoesNotReserveNativeControlAfterCompletionWins(t *testing.T) {
+	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "job", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	reserved := 0
+	_, err := supervisor.SendControl(context.Background(), "job", ControlRequest{
+		ID: "completion-before-reservation", Prompt: "must not be counted",
+		Validate: func() bool {
+			target.finish("job")
+			return true
+		},
+		ReserveProviderTurn: func() bool { reserved++; return true },
+	})
+	if err == nil || reserved != 0 {
+		t.Fatalf("completion race = err %v, reserved %d; want rejection without reservation", err, reserved)
+	}
+}
+
+func TestSupervisorNativeReservationCommitsDeliveryWhenCompletionRaces(t *testing.T) {
+	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "job", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	reserved := 0
+	result, err := supervisor.SendControl(context.Background(), "job", ControlRequest{
+		ID: "completion-during-reservation", Prompt: "counted control",
+		ReserveProviderTurn: func() bool {
+			reserved++
+			target.finish("job")
+			return true
+		},
+	})
+	if err != nil || result.Queued || result.Duplicate {
+		t.Fatalf("control = %#v, %v", result, err)
+	}
+	target.mu.Lock()
+	prompts := append([]string(nil), target.prompts["job"]...)
+	target.mu.Unlock()
+	if reserved != 1 || strings.Join(prompts, ",") != "original,counted control" {
+		t.Fatalf("reserved=%d prompts=%#v", reserved, prompts)
+	}
+}
+
+func TestSupervisorDeduplicatesRetryAfterAmbiguousNativeSteerError(t *testing.T) {
+	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, refuseSteer: true, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	target.refuseSteer = false
+	if _, _, err := supervisor.Send(context.Background(), "job", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	target.refuseSteer = true
+	request := ControlRequest{ID: "ambiguous", Prompt: "possibly accepted"}
+	if _, err := supervisor.SendControl(context.Background(), "job", request); err == nil {
+		t.Fatal("ambiguous steer unexpectedly succeeded")
+	}
+	if result, err := supervisor.SendControl(context.Background(), "job", request); err != nil || !result.Duplicate {
+		t.Fatalf("retry = %#v, %v", result, err)
+	}
+}
+
+func TestSupervisorFencesQueuedStartWhenCancellationWinsRevalidation(t *testing.T) {
+	target := &supervisorHarness{name: "claude-code", followUp: FollowUpQueue, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("claude-code", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "claude-code"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "job", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	cancelled := false
+	if result, err := supervisor.SendControl(context.Background(), "job", ControlRequest{
+		ID: "cancel-race", Prompt: "must not start", Validate: func() bool { return true },
+		PrepareContinuation: func() bool {
+			close(entered)
+			<-release
+			return !cancelled
+		},
+	}); err != nil || !result.Queued {
+		t.Fatalf("queue result = %#v, %v", result, err)
+	}
+	target.finish("job")
+	<-entered
+	cancelled = true
+	interrupted := make(chan bool, 1)
+	go func() {
+		stopped, _ := supervisor.Interrupt(context.Background(), "job")
+		interrupted <- stopped
+	}()
+	close(release)
+	<-interrupted
+	target.mu.Lock()
+	prompts := append([]string(nil), target.prompts["job"]...)
+	target.mu.Unlock()
+	if len(prompts) != 1 {
+		t.Fatalf("queued control started after cancellation: %#v", prompts)
+	}
+}
+
+func TestSupervisorPreparesEachQueuedControlTurnAfterTerminal(t *testing.T) {
+	target := &supervisorHarness{name: "claude-code", followUp: FollowUpQueue, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("claude-code", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "claude-code"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "job", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	prepared, reserved := 0, 0
+	prepare := func() bool { mu.Lock(); prepared++; mu.Unlock(); return true }
+	reserve := func() bool { mu.Lock(); reserved++; mu.Unlock(); return true }
+	for _, id := range []string{"one", "two"} {
+		if result, err := supervisor.SendControl(context.Background(), "job", ControlRequest{ID: id, Prompt: id, Validate: func() bool { return true }, PrepareContinuation: prepare, ReserveProviderTurn: reserve}); err != nil || !result.Queued {
+			t.Fatalf("queue %s = %#v, %v", id, result, err)
+		}
+	}
+	for index := 0; index < 2; index++ {
+		target.finish("job")
+		waitSupervisorState(t, func() bool { return target.IsActive("job") })
+	}
+	mu.Lock()
+	count, reservationCount := prepared, reserved
+	mu.Unlock()
+	if count != 2 || reservationCount != 2 {
+		t.Fatalf("prepared/reserved queued turns = %d/%d, want 2/2", count, reservationCount)
+	}
+	target.finish("job")
 }
 
 func TestSupervisorKeepsPreviousHarnessWhenReplacementFails(t *testing.T) {

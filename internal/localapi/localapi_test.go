@@ -143,6 +143,24 @@ func TestServerRejectsMissingToken(t *testing.T) {
 	}
 }
 
+func TestDiagnosticUsesOwnerRuntimeLogger(t *testing.T) {
+	state := t.TempDir()
+	election, server, _, cancel, done := startTestServer(t, state)
+	defer func() {
+		cancel()
+		<-done
+	}()
+	client := NewClient(election)
+	if err := client.Diagnostic(context.Background(), "slow_markdown", "stream Markdown render took 125ms"); err != nil {
+		t.Fatal(err)
+	}
+	logs := server.Service.Runtime.Logs()
+	entry := logs[len(logs)-1]
+	if entry.Component != "tui" || entry.Event != "slow_markdown" || !strings.Contains(entry.Text, "125ms") {
+		t.Fatalf("diagnostic log entry = %#v", entry)
+	}
+}
+
 func TestDecodeJSONRejectsOversizedAndTrailingRequests(t *testing.T) {
 	var request notifyRequest
 	oversized := `{"origin":"tui/local","message":"` + strings.Repeat("x", maxRequestBytes) + `"}`

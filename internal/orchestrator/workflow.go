@@ -212,6 +212,11 @@ func linkedRoundTasks(tasksBase, goalID string, round int) ([]linkedTask, error)
 }
 
 func moveDocument(path, target, status string, now time.Time) error {
+	lock, err := lockProviderTurn(path)
+	if err != nil {
+		return err
+	}
+	defer unlockProviderTurn(lock)
 	document, err := ReadDocument(path)
 	if err != nil {
 		return err

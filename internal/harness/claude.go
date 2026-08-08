@@ -11,10 +11,12 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/fsx"
@@ -44,19 +46,20 @@ type claudeSession struct {
 }
 
 type claudeTurn struct {
-	key       string
-	cmd       *exec.Cmd
-	cancel    context.CancelFunc
-	ready     chan error
-	done      chan struct{}
-	readyOnce sync.Once
-	doneOnce  sync.Once
-	sessionID string
-	text      strings.Builder
-	finalText strings.Builder
-	sawText   bool
-	separator bool
-	stderr    *tailBuffer
+	key        string
+	executable string
+	cmd        *exec.Cmd
+	cancel     context.CancelFunc
+	ready      chan error
+	done       chan struct{}
+	readyOnce  sync.Once
+	doneOnce   sync.Once
+	sessionID  string
+	text       strings.Builder
+	finalText  strings.Builder
+	sawText    bool
+	separator  bool
+	stderr     *tailBuffer
 
 	emitMu sync.RWMutex
 	emit   core.Emit
@@ -67,6 +70,59 @@ type claudeTurn struct {
 }
 
 var errClaudeTurnClosing = errors.New("Claude Code turn is finishing")
+
+var claudeReconnectDiagnostic = regexp.MustCompile(`^Attempting to reconnect(?:\.{3}|…)?(?: \(attempt ([1-9][0-9]*)(?:/([1-9][0-9]*))?\))?$`)
+
+// parseClaudeLifecycleDiagnostic is intentionally narrow. Claude Code does not
+// currently expose reconnects in stream-json, so only its stable standalone
+// transport diagnostic is adapted; arbitrary stderr prose remains diagnostic.
+func parseClaudeLifecycleDiagnostic(line string) *core.ExecutionStatus {
+	line = strings.TrimSpace(line)
+	if line == "Connection restored" {
+		return &core.ExecutionStatus{State: "running"}
+	}
+	match := claudeReconnectDiagnostic.FindStringSubmatch(line)
+	if match == nil {
+		return nil
+	}
+	status := &core.ExecutionStatus{State: "reconnecting"}
+	if match[1] != "" {
+		status.ReconnectAttempt, _ = strconv.Atoi(match[1])
+	}
+	if match[2] != "" {
+		status.ReconnectTotal, _ = strconv.Atoi(match[2])
+	}
+	return status
+}
+
+type claudeLifecycleWriter struct {
+	mu      sync.Mutex
+	partial string
+	dst     io.Writer
+	turn    *claudeTurn
+}
+
+func (w *claudeLifecycleWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.dst.Write(data)
+	w.partial += string(data)
+	for {
+		index := strings.IndexByte(w.partial, '\n')
+		if index < 0 {
+			break
+		}
+		line := strings.TrimSuffix(w.partial[:index], "\r")
+		w.partial = w.partial[index+1:]
+		if status := parseClaudeLifecycleDiagnostic(line); status != nil {
+			w.turn.emitEvent(core.Event{Kind: core.EventStatus, Execution: status})
+		}
+	}
+	if len(w.partial) > 512 {
+		w.partial = w.partial[len(w.partial)-512:]
+	}
+	return n, err
+}
 
 type claudeEvent struct {
 	Type      string          `json:"type"`
@@ -107,13 +163,15 @@ func (c *Claude) FollowUpMode() FollowUpMode {
 
 func (c *Claude) Start(parent context.Context) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		return errors.New("Claude Code harness is closed")
 	}
 	if c.ctx != nil {
+		c.mu.Unlock()
 		return nil
 	}
+	c.mu.Unlock()
 	if _, err := exec.LookPath(c.config.Command); err != nil {
 		return fmt.Errorf("find Claude Code executable %q: %w", c.config.Command, err)
 	}
@@ -121,9 +179,58 @@ func (c *Claude) Start(parent context.Context) error {
 	if err != nil || !info.IsDir() {
 		return fmt.Errorf("Claude Code working directory %q is unavailable", c.config.Cwd)
 	}
+	if err := checkClaudeCapabilities(parent, c.config); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return errors.New("Claude Code harness is closed")
+	}
+	if c.ctx != nil {
+		return nil
+	}
 	c.ctx, c.cancel = context.WithCancel(parent)
 	if claudeUsesPrivilegedFallback(c.config) && c.config.Stderr != nil {
 		_, _ = fmt.Fprintln(c.config.Stderr, "Claude Code refuses --dangerously-skip-permissions for a privileged account; using acceptEdits with all tools allowed")
+	}
+	return nil
+}
+
+func checkClaudeCapabilities(parent context.Context, cfg HarnessConfig) error {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	output := newTailBuffer(256 * 1024)
+	cmd := exec.CommandContext(ctx, cfg.Command, "--help")
+	cmd.Dir = cfg.Cwd
+	cmd.Stdout = output
+	cmd.Stderr = output
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("Claude Code executable %q did not complete --help capability discovery within 5s: %w", cfg.Command, ctx.Err())
+		}
+		return fmt.Errorf("Claude Code executable %q failed --help capability discovery: %w", cfg.Command, err)
+	}
+	help := output.String()
+	required := []string{"--print", "--output-format", "--verbose", "--include-partial-messages", "--resume"}
+	if claudeUsesStreamingInput(cfg) {
+		required = append(required, "--input-format")
+	}
+	if cfg.Model != "" && cfg.Model != "default" {
+		required = append(required, "--model")
+	}
+	if cfg.Effort != "" && cfg.Effort != "auto" {
+		required = append(required, "--effort")
+	}
+	for _, argument := range claudePermissionArgs(cfg) {
+		if strings.HasPrefix(argument, "--") {
+			required = append(required, argument)
+		}
+	}
+	for _, flag := range required {
+		if !strings.Contains(help, flag) {
+			return fmt.Errorf("Claude Code executable %q is incompatible: --help is missing required flag %s; update Claude Code or select another harness", cfg.Command, flag)
+		}
 	}
 	return nil
 }
@@ -207,6 +314,38 @@ func (c *Claude) Send(ctx context.Context, key, prompt string, emit core.Emit) (
 	}
 }
 
+// Steer writes only to an active streaming-input turn. Closing or absent
+// turns are refused instead of being resumed as a new process.
+func (c *Claude) Steer(_ context.Context, key, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+	if strings.TrimSpace(prompt) == "" {
+		return "", errors.New("harness prompt is empty")
+	}
+	lock := c.lockForKey(key)
+	lock.Lock()
+	defer lock.Unlock()
+	c.mu.Lock()
+	active := c.active[key]
+	threadID := c.sessions[key].ID
+	c.mu.Unlock()
+	if active == nil {
+		return threadID, fmt.Errorf("Claude Code turn is no longer active: %w", errNativeTurnInactive)
+	}
+	previous, err := active.writePromptPrepared(prompt, emit, true, beforeDelivery)
+	if err != nil {
+		if errors.Is(err, errClaudeTurnClosing) {
+			err = fmt.Errorf("%w: %v", errNativeTurnInactive, err)
+		}
+		return threadID, fmt.Errorf("steer active Claude Code turn: %w", err)
+	}
+	if previous != nil {
+		previous(core.Event{Kind: core.EventStatus, Text: "Response continued on a newer message", ThreadID: threadID, Done: true})
+	}
+	if emit != nil {
+		emit(core.Event{Kind: core.EventStatus, Text: "Steering active Claude Code turn", ThreadID: threadID})
+	}
+	return threadID, nil
+}
+
 func (c *Claude) resumeSessionLocked(key string, cfg HarnessConfig) string {
 	session := c.sessions[key]
 	if session.Policy != claudeSessionPolicy(cfg) {
@@ -252,15 +391,15 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 		return "", false, err
 	}
 	stderr := newTailBuffer(64 * 1024)
-	if cfg.Stderr != nil {
-		cmd.Stderr = io.MultiWriter(cfg.Stderr, stderr)
-	} else {
-		cmd.Stderr = stderr
-	}
 	turn := &claudeTurn{
-		key: key, cmd: cmd, cancel: cancel, emit: emit, stdin: stdin, accepting: streamingInput,
+		key: key, executable: cfg.Command, cmd: cmd, cancel: cancel, emit: emit, stdin: stdin, accepting: streamingInput,
 		ready: make(chan error, 1), done: make(chan struct{}), stderr: stderr,
 	}
+	diagnosticOutput := io.Writer(stderr)
+	if cfg.Stderr != nil {
+		diagnosticOutput = io.MultiWriter(cfg.Stderr, stderr)
+	}
+	cmd.Stderr = &claudeLifecycleWriter{dst: diagnosticOutput, turn: turn}
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return "", false, fmt.Errorf("start Claude Code: %w", err)
@@ -364,6 +503,10 @@ func claudeSessionPolicy(cfg HarnessConfig) string {
 }
 
 func (turn *claudeTurn) writePrompt(prompt string, emit core.Emit, replace bool) (core.Emit, error) {
+	return turn.writePromptPrepared(prompt, emit, replace, nil)
+}
+
+func (turn *claudeTurn) writePromptPrepared(prompt string, emit core.Emit, replace bool, beforeDelivery func() bool) (core.Emit, error) {
 	message := map[string]any{
 		"type": "user",
 		"message": map[string]any{
@@ -379,6 +522,9 @@ func (turn *claudeTurn) writePrompt(prompt string, emit core.Emit, replace bool)
 	defer turn.inputMu.Unlock()
 	if !turn.accepting || turn.stdin == nil {
 		return nil, errClaudeTurnClosing
+	}
+	if beforeDelivery != nil && !beforeDelivery() {
+		return nil, errNativeDeliveryUnreserved
 	}
 	var previous core.Emit
 	if replace {
@@ -433,10 +579,18 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
 			continue
 		}
-		if event.SessionID != "" && turn.sessionID == "" {
+		if event.Type == "system" && event.Subtype == "init" && event.SessionID != "" && turn.sessionID == "" {
 			turn.sessionID = event.SessionID
 			c.rememberSession(turn.key, event.SessionID)
 			turn.readyOnce.Do(func() { turn.ready <- nil })
+			turn.emitEvent(core.Event{Kind: core.EventStatus, Text: "Claude Code turn started", ThreadID: event.SessionID,
+				Execution: &core.ExecutionStatus{State: "running"}})
+		}
+		if turn.sessionID == "" && event.Type != "system" {
+			terminal = core.Event{Kind: core.EventError, Text: fmt.Sprintf("Claude Code executable %q returned an incompatible stream: expected system/init with required session_id before output; update Claude Code or select another harness", turn.executable), Done: true}
+			completed = true
+			turn.cancel()
+			break
 		}
 		if event.Type == "stream_event" {
 			switch event.Event.Type {
@@ -474,7 +628,11 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 			if event.IsError {
 				kind = core.EventError
 			}
-			terminal = core.Event{Kind: kind, Text: text, FinalText: &finalText, ThreadID: turn.sessionID, Done: true}
+			execution := &core.ExecutionStatus{State: "finishing"}
+			if kind == core.EventError {
+				execution = &core.ExecutionStatus{State: "error", Detail: text}
+			}
+			terminal = core.Event{Kind: kind, Text: text, FinalText: &finalText, ThreadID: turn.sessionID, Done: true, Execution: execution}
 			completed = true
 			// Streaming input keeps print mode alive for more user messages.
 			// Close it after the provider result so this finite Spynel turn can
@@ -485,6 +643,9 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 	waitErr := turn.cmd.Wait()
 	turn.cancel()
 	if completed {
+		if waitErr != nil && c.config.Stderr != nil {
+			_, _ = fmt.Fprintf(c.config.Stderr, "Claude Code returned a result but its process failed: %v\n", waitErr)
+		}
 		// Wait for print mode to exit before releasing the session. Closing its
 		// streaming input after the result keeps each Spynel execution bounded.
 		c.finishClaudeTurn(turn, terminal)
@@ -495,12 +656,16 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 		err = waitErr
 	}
 	message := "Claude Code stopped before returning a final response"
+	if turn.sessionID == "" {
+		message = fmt.Sprintf("Claude Code executable %q returned an incompatible stream: expected system/init with required session_id before output", turn.executable)
+	}
 	if detail := strings.TrimSpace(turn.stderr.String()); detail != "" {
 		message += ": " + detail
 	} else if err != nil {
 		message += ": " + err.Error()
 	}
-	c.finishClaudeTurn(turn, core.Event{Kind: core.EventError, Text: message, ThreadID: turn.sessionID, Done: true})
+	c.finishClaudeTurn(turn, core.Event{Kind: core.EventError, Text: message, ThreadID: turn.sessionID, Done: true,
+		Execution: &core.ExecutionStatus{State: "error", Detail: message}})
 }
 
 func (c *Claude) emitClaudeDelta(turn *claudeTurn, text string) {

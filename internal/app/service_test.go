@@ -8,11 +8,16 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+	"unicode"
 
+	"github.com/agent0ai/spynel/internal/agentdocs"
 	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/channel/telegram"
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
@@ -21,6 +26,17 @@ import (
 	"github.com/agent0ai/spynel/internal/updater"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
+
+func TestFormatStatusShowsScheduledGoalCheckpoint(t *testing.T) {
+	text := FormatStatus(StatusSnapshot{ScheduledGoals: []orchestrator.ScheduledCheckpoint{{
+		ID: "goals-12345678", Title: "release", At: time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC), Reason: "bounded rollout check",
+	}}})
+	for _, want := range []string{"Scheduled goal checkpoint", "release", "2026-08-08T00:00:00Z", "bounded rollout check"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("status missing %q:\n%s", want, text)
+		}
+	}
+}
 
 type serviceHarness struct {
 	mu       sync.Mutex
@@ -37,9 +53,9 @@ type heldServiceHarness struct {
 
 type notificationRouter struct{ calls []string }
 
-func (r *notificationRouter) Deliver(_ context.Context, channelName, conversation, eventID, text string) error {
+func (r *notificationRouter) Deliver(_ context.Context, channelName, conversation, eventID, text string) (channel.DeliveryReceipt, error) {
 	r.calls = append(r.calls, channelName+"/"+conversation+"/"+eventID+"/"+text)
-	return nil
+	return channel.DeliveryReceipt{MessageIDs: []string{"native-" + eventID}}, nil
 }
 
 func TestNotifyDeliversAllOriginsWithStableEventIdentity(t *testing.T) {
@@ -78,6 +94,36 @@ func TestNotifyDeliversAllOriginsWithStableEventIdentity(t *testing.T) {
 	}
 }
 
+func TestNotifyUsesVerifiedTelegramUsernameMappingAndRechecksRevocation(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg.Channels.Telegram.AllowedUsers = []string{" @FrD3L "}
+	service := New(cfg, newServiceHarness())
+	service.DeliveryControl = &notificationRouter{}
+	if _, err := service.History.Append("telegram", "TG-518743883", history.Entry{Role: "user", Content: "known"}); err != nil {
+		t.Fatal(err)
+	}
+	identities := telegram.NewIdentityStore(cfg.StatePath("runtime", "telegram-identities.json"))
+	if err := identities.RecordVerifiedPrivate(518743883, 518743883, "frd3l"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Notify(context.Background(), "telegram/TG-518743883", "complete"); err != nil {
+		t.Fatalf("verified username notification: %v", err)
+	}
+	if _, err := service.Settings.Update(func(next *config.Config) error {
+		next.Channels.Telegram.AllowedUsers = []string{"someone_else"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.validateOrigin(orchestrator.Origin{Channel: "telegram", Conversation: "TG-518743883"}); err == nil {
+		t.Fatal("revoked mapped username remained authorized")
+	}
+}
+
 func TestTaskCommandDelegatesCreationPolicyToCommunicationAgent(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
@@ -90,7 +136,7 @@ func TestTaskCommandDelegatesCreationPolicyToCommunicationAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	prompts := harness.prompts["chat:cli:deploy"]
-	if len(prompts) != 1 || !strings.Contains(prompts[0], "explicitly invoked `/task`") || !strings.Contains(prompts[0], "ship it") || !strings.Contains(prompts[0], "origin `cli/deploy`") || !strings.Contains(prompts[0], "cancelled") {
+	if len(prompts) != 1 || !strings.Contains(prompts[0], "explicitly invoked `/task`") || !strings.Contains(prompts[0], "ship it") || !strings.Contains(prompts[0], "origin `cli/deploy`") || !strings.Contains(prompts[0], "review_required") || !strings.Contains(prompts[0], "cancelled") {
 		t.Fatalf("task creation prompt = %#v", prompts)
 	}
 }
@@ -107,16 +153,18 @@ func TestRemoteNotificationEventIsNotRedeliveredAfterRetryOrRestart(t *testing.T
 	service.DeliveryControl = router
 	_, _ = service.History.Append("telegram", "TG-7", history.Entry{Role: "user", Content: "known"})
 	origin := orchestrator.Origin{Channel: "telegram", Conversation: "TG-7"}
-	if err := service.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
+	if _, err := service.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
+	if _, err := service.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
 		t.Fatal(err)
 	}
 	restarted := New(cfg, newServiceHarness())
 	restarted.DeliveryControl = router
-	if err := restarted.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
+	if receipt, err := restarted.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
 		t.Fatal(err)
+	} else if len(receipt) != 1 || receipt[0] != "native-stable-id" {
+		t.Fatalf("restart receipt = %#v", receipt)
 	}
 	if len(router.calls) != 1 {
 		t.Fatalf("duplicate provider deliveries = %#v", router.calls)
@@ -135,7 +183,7 @@ func TestRemoteNotificationRetriesPreSendCrashMarker(t *testing.T) {
 	service.DeliveryControl = router
 	_, _ = service.History.Append("telegram", "TG-7", history.Entry{Role: "user", Content: "known"})
 	_, _ = service.History.Append("telegram", "TG-7", history.Entry{Role: "notification_sending", EventID: "interrupted"})
-	if err := service.deliverNotification(context.Background(), orchestrator.Origin{Channel: "telegram", Conversation: "TG-7"}, "interrupted", "complete"); err != nil {
+	if _, err := service.deliverNotification(context.Background(), orchestrator.Origin{Channel: "telegram", Conversation: "TG-7"}, "interrupted", "complete"); err != nil {
 		t.Fatal(err)
 	}
 	if len(router.calls) != 1 {
@@ -473,10 +521,21 @@ func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
 	if len(commands) == 0 {
 		t.Fatal("slash command catalog is empty")
 	}
+	const statusDescription = "Show work, runtime, channel, and orchestrator state"
+	statusFound := false
 	for _, command := range commands {
 		if !strings.Contains(commandHelp, command.Usage) || !strings.Contains(commandHelp, command.Description) {
 			t.Fatalf("command help does not contain %#v", command)
 		}
+		if command.Value == "/status" {
+			statusFound = true
+			if command.Description != statusDescription {
+				t.Fatalf("status command description = %q, want %q", command.Description, statusDescription)
+			}
+		}
+	}
+	if !statusFound {
+		t.Fatal("slash command catalog does not contain /status")
 	}
 
 	original := commands[0].Value
@@ -542,6 +601,39 @@ func TestThemeCommandOpensPickerListsAndPersistsThemes(t *testing.T) {
 	}
 }
 
+func TestApplySettingsPublishesLiveHeartbeatConfiguration(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, config.FileName))
+	service := New(cfg, newServiceHarness())
+	service.SetPrimaryInstanceID("primary-instance")
+
+	changed, err := service.ApplySettings(map[string]string{
+		"orchestrator.enabled":                    "off",
+		"orchestrator.semantic_heartbeat_minutes": "30",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, setting := range changed {
+		if setting.Restart {
+			t.Fatalf("live heartbeat setting remained restart-bound: %#v", setting)
+		}
+	}
+	snapshot, err := service.Status(core.Message{Channel: "cli", Conversation: "local"})
+	if err != nil || snapshot.HeartbeatState != "disabled" {
+		t.Fatalf("live disabled heartbeat status = %#v, %v", snapshot, err)
+	}
+	if _, err := service.ApplySettings(map[string]string{"orchestrator.enabled": "on"}); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot, err = service.Status(core.Message{Channel: "cli", Conversation: "local"}); err != nil || snapshot.HeartbeatState != "unavailable" {
+		t.Fatalf("live enabled heartbeat status = %#v, %v", snapshot, err)
+	}
+}
+
 func TestHelpRoutesToBriefIndexAndFocusedTopics(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
@@ -596,6 +688,54 @@ func TestHelpRoutesToBriefIndexAndFocusedTopics(t *testing.T) {
 	}
 }
 
+func TestCommunicationPromptGetsOneCallableDocsGuidance(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, config.FileName))
+	service := New(cfg, newServiceHarness())
+	prompt, err := service.chatPrompt(core.Message{Channel: "cli", Conversation: "docs-guidance"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(prompt, " docs <topic>") != 1 || strings.Contains(prompt, "{{SPYNEL_DOCS_GUIDANCE}}") || !strings.Contains(prompt, "AGENTS.md") {
+		t.Fatalf("communication guidance is missing, duplicated, or unresolved:\n%s", prompt)
+	}
+}
+
+func TestAgentDocsCommandsExistInCanonicalSlashCatalog(t *testing.T) {
+	available := map[string]bool{}
+	for _, command := range SlashCommands() {
+		base := strings.Fields(command.Value)[0]
+		available[base] = true
+	}
+	for _, command := range agentdocs.DocumentedSlashCommands() {
+		if !available[command] {
+			t.Errorf("agent docs name missing slash command %q", command)
+		}
+	}
+}
+
+func TestSharedHelpMetadataHasExactlyOneRoutedBody(t *testing.T) {
+	bodies := map[string]int{}
+	for _, topic := range helpTopics {
+		bodies[topic.name]++
+	}
+	shared := map[string]int{}
+	for _, topic := range agentdocs.HelpTopics() {
+		shared[topic.ID]++
+		if bodies[topic.ID] != 1 {
+			t.Errorf("shared help topic %q has %d routed bodies", topic.ID, bodies[topic.ID])
+		}
+	}
+	for name, count := range bodies {
+		if count != 1 || shared[name] != 1 {
+			t.Errorf("routed help topic %q has %d bodies and %d shared metadata records", name, count, shared[name])
+		}
+	}
+}
+
 func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
@@ -620,7 +760,7 @@ func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "42", InstanceID: "11111111-2222-3333-4444-555555555555", Text: "/status"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"# Status", "Title: Production", "Theme: spynel", "Instance ID: `11111111`", "Primary instance ID: `aaaaaaaa`", "Telegram: ● connected", "WhatsApp: ▲ error — offline", "Jobs: 1", "Logs: 1", "Agent filesystem access: danger-full-access", "Thread: `019c9f42`", "Turn: active", "Orchestrator:"} {
+	for _, want := range []string{"# Status", "Title: Production", "Instance ID: `11111111`", "Primary instance ID: `aaaaaaaa`", "Jobs: 1", "Tasks: 0 active (0 waiting)", "Goals: 0 active", "Orchestrator:", "Next heartbeat: unavailable", "Telegram: ● connected", "WhatsApp: ▲ error — offline", "Logs: 2", "Agent filesystem access: danger-full-access", "Turn: active"} {
 		if !strings.Contains(response.Text, want) {
 			t.Fatalf("status response does not contain %q:\n%s", want, response.Text)
 		}
@@ -628,8 +768,163 @@ func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	if strings.Contains(response.Text, "a3b1-7ced") {
 		t.Fatalf("status exposed full thread ID: %s", response.Text)
 	}
+	if strings.Contains(response.Text, "Theme:") || strings.Contains(response.Text, "Thread:") || strings.Contains(response.Text, "019c9f42") {
+		t.Fatalf("status retained low-value theme/thread output: %s", response.Text)
+	}
 	if strings.Contains(response.Text, "bbbb-cccc") || strings.Contains(response.Text, "2222-3333") {
 		t.Fatalf("status exposed full instance ID: %s", response.Text)
+	}
+	message := core.Message{Channel: "telegram", Conversation: "42", InstanceID: "11111111-2222-3333-4444-555555555555"}
+	snapshot, err := service.Status(message)
+	if err != nil || snapshot.HeartbeatState != "unavailable" || snapshot.NextHeartbeatAt != nil {
+		t.Fatalf("primary startup heartbeat snapshot = %#v, %v", snapshot, err)
+	}
+	cfg.Orchestrator.Enabled = false
+	disabled := New(cfg, newServiceHarness())
+	disabled.SetPrimaryInstanceID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	disabledSnapshot, err := disabled.Status(message)
+	if err != nil || disabledSnapshot.HeartbeatState != "disabled" || disabledSnapshot.NextHeartbeatAt != nil || !strings.Contains(FormatStatus(disabledSnapshot), "Next heartbeat: disabled") {
+		t.Fatalf("disabled primary heartbeat snapshot = %#v, %v", disabledSnapshot, err)
+	}
+}
+
+func TestFormatStatusGroupsWorkAndRoundsHeartbeatUp(t *testing.T) {
+	now := time.Date(2026, 8, 8, 14, 0, 0, 0, time.UTC)
+	status := StatusSnapshot{
+		Title: "Production", Instance: "instance", PrimaryInstance: "primary",
+		Runtime: core.RuntimeStatus{Jobs: 3, Logs: 4}, TasksActive: 5, TasksWaiting: 2, GoalsActive: 2,
+		OrchestratorLease: 6, OrchestratorRuns: 1, HeartbeatState: "scheduled", NextHeartbeatAt: timePointer(now.Add(time.Second)),
+	}
+	if got := formatNextHeartbeat(status, now); got != "in 1m" {
+		t.Fatalf("one-second heartbeat = %q", got)
+	}
+	status.NextHeartbeatAt = timePointer(now.Add(61 * time.Second))
+	if got := formatNextHeartbeat(status, now); got != "in 2m" {
+		t.Fatalf("61-second heartbeat = %q", got)
+	}
+	status.NextHeartbeatAt = timePointer(now)
+	if got := formatNextHeartbeat(status, now); got != "now" {
+		t.Fatalf("due heartbeat = %q", got)
+	}
+	status.HeartbeatState = "running"
+	if got := formatNextHeartbeat(status, now); got != "now" {
+		t.Fatalf("running heartbeat = %q", got)
+	}
+	status.HeartbeatState = "disabled"
+	if got := formatNextHeartbeat(status, now); got != "disabled" {
+		t.Fatalf("disabled heartbeat = %q", got)
+	}
+	status.HeartbeatState = "not_primary"
+	if got := formatNextHeartbeat(status, now); got != "not primary" {
+		t.Fatalf("secondary heartbeat = %q", got)
+	}
+
+	status.HeartbeatState = "disabled"
+	status.NextHeartbeatAt = nil
+	status.Harness = "codex"
+	status.HarnessState = "connected"
+	status.Sandbox = "danger-full-access"
+	text := FormatStatus(status)
+	want := "# Status\n\n" + strings.Join([]string{
+		"- Title: Production",
+		"- Instance ID: `instance`",
+		"- Primary instance ID: `primary`",
+		"- Jobs: 3 — `/jobs`",
+		"- Tasks: 5 active (2 waiting)",
+		"- Goals: 2 active",
+		"- Orchestrator: 6 leases, 1 dispatch goroutines",
+		"- Notifications: 0 triage pending, 0 running, 0 failed; 0 awaiting response",
+		"- Next heartbeat: disabled",
+		"- Telegram: ○ not configured",
+		"- WhatsApp: ○ not configured",
+		"- Coding harness: codex (connected)",
+		"- Model: harness default",
+		"- Agent filesystem access: danger-full-access",
+		"- Run at startup: disabled",
+		"- Logs: 4 — `/log`",
+		"- Turn: idle",
+	}, "\n")
+	if text != want {
+		t.Fatalf("exact status changed:\ngot:\n%s\nwant:\n%s", text, want)
+	}
+	ordered := []string{"Title:", "Instance ID:", "Primary instance ID:", "Jobs:", "Tasks:", "Goals:", "Orchestrator:", "Notifications:", "Next heartbeat:", "Telegram:", "Coding harness:", "Agent filesystem access:", "Run at startup:", "Logs:", "Turn:"}
+	previous := -1
+	for _, row := range ordered {
+		index := strings.Index(text, row)
+		if index <= previous {
+			t.Fatalf("status row %q is out of order:\n%s", row, text)
+		}
+		previous = index
+	}
+	if strings.Contains(text, "Theme:") || strings.Contains(text, "Thread:") {
+		t.Fatalf("compact status contains omitted rows:\n%s", text)
+	}
+}
+
+func timePointer(value time.Time) *time.Time { return &value }
+
+func TestStatusSurvivesUnreadableGoalCheckpointPath(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	active := filepath.Join(root, ".spynel", "goals", "active")
+	if err := os.Remove(active); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(active, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, err := New(cfg, newServiceHarness()).Status(core.Message{Channel: "cli", Conversation: "local"})
+	if err != nil {
+		t.Fatalf("status failed on unreadable checkpoint path: %v", err)
+	}
+	if status.GoalsActive != 0 || len(status.WorkDiagnostics) == 0 || !strings.Contains(strings.Join(status.WorkDiagnostics, "\n"), "lower bound") {
+		t.Fatalf("degraded status = %#v", status)
+	}
+	for _, diagnostic := range status.WorkDiagnostics {
+		if len([]rune(diagnostic)) > 240 || strings.ContainsAny(diagnostic, "\r\n\t") {
+			t.Fatalf("unbounded work diagnostic = %q", diagnostic)
+		}
+	}
+}
+
+func TestStatusBoundsGoalCheckpointFilesystemDiagnostic(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range cfg.Orchestrator.Routes {
+		if cfg.Orchestrator.Routes[index].Name == "goals" {
+			cfg.Orchestrator.Routes[index].Source = filepath.Join(".spynel", strings.Repeat("x", 300)+"\u0085\nraw-path", "todo")
+		}
+	}
+	status, err := New(cfg, newServiceHarness()).Status(core.Message{Channel: "cli", Conversation: "local"})
+	if err != nil {
+		t.Fatalf("status failed on overlong checkpoint path: %v", err)
+	}
+	if len(status.WorkDiagnostics) == 0 || len(status.WorkDiagnostics) > 8 {
+		t.Fatalf("work diagnostics count = %d, want 1..8: %#v", len(status.WorkDiagnostics), status.WorkDiagnostics)
+	}
+	foundCheckpoint := false
+	for _, diagnostic := range status.WorkDiagnostics {
+		if strings.Contains(diagnostic, "goal checkpoint display is incomplete") {
+			foundCheckpoint = true
+		}
+		if len([]rune(diagnostic)) > 240 || strings.IndexFunc(diagnostic, unicode.IsControl) >= 0 {
+			t.Fatalf("unbounded work diagnostic = %q", diagnostic)
+		}
+	}
+	if !foundCheckpoint {
+		t.Fatalf("missing checkpoint diagnostic: %#v", status.WorkDiagnostics)
 	}
 }
 
@@ -1054,8 +1349,8 @@ func TestLogCommandSanitizesPagesRangesAndSearchAcrossChannels(t *testing.T) {
 	if !strings.Contains(outputs["search"], "2 matches") {
 		t.Fatalf("search did not find sanitized content: %q", outputs["search"])
 	}
-	if logs := service.Runtime.Logs(); logs[0].Text != "\x1b[31mold failure\x1b[0m" {
-		t.Fatalf("rendering altered captured source log: %#v", logs[0])
+	if logs := service.Runtime.Logs(); logs[0].Text != "old failure" {
+		t.Fatalf("capture boundary did not sanitize source log: %#v", logs[0])
 	}
 }
 
@@ -1066,7 +1361,8 @@ func TestLogCommandRejectsInvalidOptions(t *testing.T) {
 	}
 	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
 	service := New(cfg, newServiceHarness())
-	for _, command := range []string{"/log page 0", "/log page nope", "/log page 1-", "/log page -1-2", "/log page 3-2", "/log page 1-6", "/log page", "/log search", "/log clear extra", "/log unknown"} {
+	overflowingPage := strconv.FormatUint(uint64(^uint(0)>>1), 10) + "0"
+	for _, command := range []string{"/log page 0", "/log page nope", "/log page 1-", "/log page -1-2", "/log page 3-2", "/log page 1-" + overflowingPage, "/log page", "/log search", "/log clear extra", "/log unknown"} {
 		var response core.Event
 		if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: command}, func(event core.Event) { response = event }); err != nil {
 			t.Fatal(err)
@@ -1090,7 +1386,9 @@ func TestParseLogPageSpec(t *testing.T) {
 		{spec: "0-2", wantErr: "positive numbers"},
 		{spec: "-1-2", wantErr: "positive number or inclusive range"},
 		{spec: "4-2", wantErr: "lower page"},
-		{spec: "1-6", wantErr: "at most 5 pages"},
+		{spec: "1-6", wantFirst: 1, wantLast: 6},
+		{spec: "1-" + strconv.FormatUint(uint64(^uint(0)>>1), 10), wantFirst: 1, wantLast: int(^uint(0) >> 1)},
+		{spec: "1-" + strconv.FormatUint(uint64(^uint(0)>>1), 10) + "0", wantErr: "positive numbers"},
 	}
 	for _, test := range tests {
 		t.Run(test.spec, func(t *testing.T) {
@@ -1105,6 +1403,30 @@ func TestParseLogPageSpec(t *testing.T) {
 				t.Fatalf("parseLogPageSpec(%q) = %d, %d, %v", test.spec, first, last, err)
 			}
 		})
+	}
+}
+
+func TestLogCommandLargeRangeStopsAtAvailableRetainedPages(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	service := New(cfg, newServiceHarness())
+	for index := 1; index <= 121; index++ {
+		service.Runtime.Log(fmt.Sprintf("bounded-range-%03d", index))
+	}
+
+	maxPage := strconv.FormatUint(uint64(^uint(0)>>1), 10)
+	var response core.Event
+	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "large-range", Text: "/log page 1-" + maxPage}, func(event core.Event) { response = event }); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(response.Text, "121 entries. Pages 1-7 of 7, showing 121.") || !strings.Contains(response.Text, "bounded-range-001") || !strings.Contains(response.Text, "bounded-range-121") {
+		t.Fatalf("large range was not clamped to available pages: %s", response.Text)
+	}
+	if strings.Contains(response.Text, "Usage: /log") {
+		t.Fatalf("range beyond five pages was rejected: %s", response.Text)
 	}
 }
 
@@ -1174,6 +1496,17 @@ func TestConfigurationCommandsPersistAcrossChannelsAndProtectOwnChannel(t *testi
 		if strings.Contains(entry.Content, "super-secret") {
 			t.Fatalf("secret leaked into conversation history: %#v", historyEntries)
 		}
+	}
+	persisted, rejected := false, false
+	for _, entry := range service.Runtime.Logs() {
+		persisted = persisted || entry.Component == "config" && entry.Event == "persisted"
+		rejected = rejected || entry.Component == "config" && entry.Event == "validation_failed"
+		if strings.Contains(entry.Text, "super-secret") {
+			t.Fatalf("secret leaked into configuration lifecycle log: %#v", entry)
+		}
+	}
+	if !persisted || !rejected {
+		t.Fatalf("configuration lifecycle evidence = persisted %t rejected %t; logs=%#v", persisted, rejected, service.Runtime.Logs())
 	}
 }
 
@@ -1728,6 +2061,38 @@ func TestChatPromptNeutralizesRetiredChannelOverridesInExistingTemplates(t *test
 	for _, retired := range []string{"{{PROJECT}}", "{{INSTRUCTIONS}}", "Project binding:", "Channel instructions:"} {
 		if strings.Contains(prompt, retired) {
 			t.Fatalf("retired channel override %q remains in prompt: %q", retired, prompt)
+		}
+	}
+}
+
+func TestRenderedRemotePromptKeepsRoutineConfirmationsHumanFacing(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	for _, channelName := range []string{"telegram", "whatsapp"} {
+		prompt, err := service.creationCommandPrompt(core.Message{Channel: channelName, Conversation: "remote"}, "task", "Fix the report")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{
+			"Understood—this is being worked on.",
+			"never include a local-path Markdown link",
+			"explicitly asks for technical details",
+			"/status`, `/jobs`, `/job info`, `/log`",
+			"exact blocker",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("%s prompt is missing %q:\n%s", channelName, want, prompt)
+			}
+		}
+		if strings.Contains(prompt, "provide the durable path") || strings.Contains(prompt, "its durable path") {
+			t.Fatalf("%s routine task confirmation still requires a durable path", channelName)
 		}
 	}
 }

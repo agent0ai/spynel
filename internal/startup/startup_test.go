@@ -1,15 +1,47 @@
 package startup
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/agent0ai/spynel/internal/config"
 )
+
+func TestStartupCommandHelper(t *testing.T) {
+	if os.Getenv("SPYNEL_STARTUP_COMMAND_HELPER") == "" {
+		return
+	}
+	_, _ = os.Stderr.WriteString("authorization: Bearer startup-secret\nstartup helper failed")
+	code, _ := strconv.Atoi(os.Getenv("SPYNEL_STARTUP_COMMAND_EXIT"))
+	os.Exit(code)
+}
+
+func TestRunCommandCapturesBoundedAttributedFailureEvidence(t *testing.T) {
+	t.Setenv("SPYNEL_STARTUP_COMMAND_HELPER", "1")
+	t.Setenv("SPYNEL_STARTUP_COMMAND_EXIT", "17")
+	var log bytes.Buffer
+	err := runCommand(context.Background(), &log, os.Args[0], "-test.run=TestStartupCommandHelper")
+	if err == nil {
+		t.Fatal("runCommand succeeded")
+	}
+	entry := log.String()
+	for _, want := range []string{"process=" + filepath.Base(os.Args[0]), "stream=stderr", "truncated=false", "startup helper failed", "event=exit", "status=failed", "exit_code=17"} {
+		if !strings.Contains(entry, want) {
+			t.Fatalf("command evidence missing %q (length %d)", want, len(entry))
+		}
+	}
+	bounded := &boundedOutput{}
+	_, _ = bounded.Write([]byte(strings.Repeat("x", maxCommandOutput+1024)))
+	if bounded.Len() != maxCommandOutput || !bounded.truncated {
+		t.Fatalf("bounded output = %d bytes, truncated=%t", bounded.Len(), bounded.truncated)
+	}
+}
 
 func startupTestConfig(root string) config.Config {
 	cfg := config.Default()

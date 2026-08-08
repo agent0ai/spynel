@@ -51,6 +51,12 @@ type Notification struct {
 	Text string `json:"text"`
 }
 
+// DeliveryReceipt contains opaque native IDs for every delivered text chunk.
+// Callers persist them privately for exact reply correlation only.
+type DeliveryReceipt struct {
+	MessageIDs []string
+}
+
 type Channel interface {
 	Name() string
 	Run(context.Context, Handler) error
@@ -60,11 +66,11 @@ type Channel interface {
 // request lifecycle has ended. Implementations must re-apply transport
 // authorization rather than trusting a locally supplied origin string.
 type ProactiveDeliverer interface {
-	Deliver(context.Context, string, string, string) error
+	Deliver(context.Context, string, string, string) (DeliveryReceipt, error)
 }
 
 type DeliveryRouter interface {
-	Deliver(context.Context, string, string, string, string) error
+	Deliver(context.Context, string, string, string, string) (DeliveryReceipt, error)
 }
 
 type ConnectionReporter interface {

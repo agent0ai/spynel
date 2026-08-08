@@ -18,16 +18,39 @@ const FileName = "spynel.yaml"
 var ErrNotInitialized = errors.New("Spynel is not initialized")
 
 type Config struct {
-	Version      int          `yaml:"version"`
-	Workspace    Workspace    `yaml:"workspace"`
-	Harness      Harness      `yaml:"harness"`
-	Channels     Channels     `yaml:"channels"`
-	Speech       Speech       `yaml:"speech"`
-	Startup      Startup      `yaml:"startup"`
-	Orchestrator Orchestrator `yaml:"orchestrator"`
-	Extensions   Extensions   `yaml:"extensions"`
-	Path         string       `yaml:"-"`
-	Root         string       `yaml:"-"`
+	Version       int           `yaml:"version"`
+	Workspace     Workspace     `yaml:"workspace"`
+	Harness       Harness       `yaml:"harness"`
+	Channels      Channels      `yaml:"channels"`
+	Speech        Speech        `yaml:"speech"`
+	Startup       Startup       `yaml:"startup"`
+	Orchestrator  Orchestrator  `yaml:"orchestrator"`
+	Extensions    Extensions    `yaml:"extensions"`
+	Notifications Notifications `yaml:"notifications,omitempty"`
+	Path          string        `yaml:"-"`
+	Root          string        `yaml:"-"`
+}
+
+// Notifications contains explicit user identity bindings used only for
+// actionable reminder routing. Contacts are canonical channel/conversation
+// origins (for example telegram/TG-7); Spynel never infers bindings.
+type Notifications struct {
+	ContactBindings []ContactBinding `yaml:"contact_bindings,omitempty"`
+	QuietHours      QuietHours       `yaml:"quiet_hours,omitempty"`
+}
+
+// QuietHours suppresses non-urgent actionable reminders during one daily UTC
+// interval. Start and End use 24-hour HH:MM values; an interval may cross
+// midnight. Urgent requests bypass the interval.
+type QuietHours struct {
+	Enabled bool   `yaml:"enabled"`
+	Start   string `yaml:"start"`
+	End     string `yaml:"end"`
+}
+
+type ContactBinding struct {
+	Principal string   `yaml:"principal"`
+	Contacts  []string `yaml:"contacts"`
 }
 
 type Workspace struct {
@@ -121,10 +144,11 @@ type Startup struct {
 }
 
 type Orchestrator struct {
-	Enabled     bool    `yaml:"enabled"`
-	IntervalSec int     `yaml:"interval_seconds"`
-	MaxParallel int     `yaml:"max_parallel"`
-	Routes      []Route `yaml:"routes"`
+	Enabled                  bool    `yaml:"enabled"`
+	IntervalSec              int     `yaml:"interval_seconds"`
+	SemanticHeartbeatMinutes int     `yaml:"semantic_heartbeat_minutes"`
+	MaxParallel              int     `yaml:"max_parallel"`
+	Routes                   []Route `yaml:"routes"`
 }
 
 type Route struct {
@@ -173,7 +197,7 @@ func Default() Config {
 		Speech:  Speech{Enabled: true, Language: "en", NumThreads: 2, MaxFileMB: 100, MaxDurationSec: 1800, ChunkSeconds: 600},
 		Startup: Startup{},
 		Orchestrator: Orchestrator{
-			Enabled: true, IntervalSec: 10, MaxParallel: 4,
+			Enabled: true, IntervalSec: 10, SemanticHeartbeatMinutes: 15, MaxParallel: 4,
 			Routes: []Route{
 				{Name: "tasks", Source: ".spynel/tasks/todo", Working: ".spynel/tasks/working", Prompt: ".spynel/prompts/task.md", RecoveryPrompt: ".spynel/prompts/recovery.md", ReviewPrompt: ".spynel/prompts/review.md", StaleAfter: "30m", AllowedNext: []string{"todo", "working", "review", "reviewing", "waiting", "done", "failed", "cancelled"}},
 				{Name: "goals", Source: ".spynel/goals/proposed", Working: ".spynel/goals/planning", Prompt: ".spynel/prompts/goal.md", RecoveryPrompt: ".spynel/prompts/recovery.md", ReviewPrompt: ".spynel/prompts/goal-review.md", StaleAfter: "2h", AllowedNext: []string{"proposed", "planning", "active", "review", "reviewing", "waiting", "done", "abandoned"}},
@@ -307,6 +331,46 @@ func (c Config) Validate() error {
 	}
 	if c.Orchestrator.MaxParallel <= 0 {
 		problems = append(problems, "orchestrator.max_parallel must be positive")
+	}
+	if minutes := c.Orchestrator.SemanticHeartbeatMinutes; minutes != 0 && (minutes < 5 || minutes > 1440) {
+		problems = append(problems, "orchestrator.semantic_heartbeat_minutes must be 0 (disabled) or between 5 and 1440")
+	}
+	principals, contacts := map[string]bool{}, map[string]bool{}
+	for i, binding := range c.Notifications.ContactBindings {
+		prefix := fmt.Sprintf("notifications.contact_bindings[%d]", i)
+		principal := strings.TrimSpace(binding.Principal)
+		if principal == "" || strings.ContainsAny(principal, "\r\n\x00/\\") {
+			problems = append(problems, prefix+".principal is invalid")
+		} else if principals[principal] {
+			problems = append(problems, "duplicate notification principal "+principal)
+		}
+		principals[principal] = true
+		if len(binding.Contacts) == 0 {
+			problems = append(problems, prefix+".contacts requires at least one explicit origin")
+		}
+		for _, raw := range binding.Contacts {
+			origin := strings.TrimSpace(raw)
+			channel, conversation, ok := strings.Cut(origin, "/")
+			if !ok || conversation == "" || strings.ContainsAny(conversation, "\r\n\x00") || (channel != "tui" && channel != "telegram" && channel != "whatsapp") {
+				problems = append(problems, prefix+" contains invalid contact "+origin)
+			} else if contacts[origin] {
+				problems = append(problems, "notification contact belongs to more than one principal: "+origin)
+			}
+			contacts[origin] = true
+		}
+	}
+	if c.Notifications.QuietHours.Enabled {
+		start, startErr := time.Parse("15:04", strings.TrimSpace(c.Notifications.QuietHours.Start))
+		end, endErr := time.Parse("15:04", strings.TrimSpace(c.Notifications.QuietHours.End))
+		if startErr != nil {
+			problems = append(problems, "notifications.quiet_hours.start must use UTC HH:MM")
+		}
+		if endErr != nil {
+			problems = append(problems, "notifications.quiet_hours.end must use UTC HH:MM")
+		}
+		if startErr == nil && endErr == nil && start.Hour() == end.Hour() && start.Minute() == end.Minute() {
+			problems = append(problems, "notifications.quiet_hours.start and end must differ")
+		}
 	}
 	seen := map[string]bool{}
 	for i, route := range c.Orchestrator.Routes {

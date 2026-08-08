@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,12 +26,26 @@ const (
 
 var requiredParakeetFiles = []string{"encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"}
 
+const parakeetManifestVersion = 1
+
+type parakeetAsset struct {
+	SHA256 string `json:"sha256"`
+	Bytes  int64  `json:"bytes"`
+}
+
+type parakeetManifest struct {
+	Version       int                      `json:"version"`
+	ArchiveSHA256 string                   `json:"archive_sha256"`
+	Files         map[string]parakeetAsset `json:"files"`
+}
+
 type parakeetModel struct {
 	ID           string
 	Archive      string
 	SHA256       string
 	ArchiveBytes int64
 	Notice       string
+	Files        map[string]parakeetAsset
 }
 
 type parakeetFiles struct {
@@ -48,14 +63,26 @@ func defaultParakeetModels() map[string]parakeetModel {
 			Archive:      "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2",
 			SHA256:       "99f63605b3a85a54c250c0869670a687b7d6598a47bf2421515e1f839a76e150",
 			ArchiveBytes: 501350460,
-			Notice:       "NVIDIA Parakeet Unified EN 0.6B\nGoverning terms: NVIDIA Open Model License Agreement\nhttps://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/\n\nDownloaded as the k2-fsa sherpa-onnx INT8 ONNX conversion.\n",
+			Files: map[string]parakeetAsset{
+				"encoder.int8.onnx": {SHA256: "6716910b7a0833997fec7a410494c995d70124001a0e9b66d6370d6aced577e0", Bytes: 654040552},
+				"decoder.int8.onnx": {SHA256: "a5e223392c90e75f8144cdb5eb95af7625db389e39edef2bd1a9c872b3298fe6", Bytes: 7257753},
+				"joiner.int8.onnx":  {SHA256: "869f43f7d24595c55581ad3bf249a935fb8a71389fbdaa7504b9f46f93140f8a", Bytes: 1735860},
+				"tokens.txt":        {SHA256: "dc0b4584ab2e4ddbf888425c076c61b736e7356a015250db7d307e6f1a8188ff", Bytes: 8952},
+			},
+			Notice: "NVIDIA Parakeet Unified EN 0.6B\nGoverning terms: NVIDIA Open Model License Agreement\nhttps://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/\n\nDownloaded as the k2-fsa sherpa-onnx INT8 ONNX conversion.\n",
 		},
 		parakeetMultiModel: {
 			ID:           "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
 			Archive:      "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
 			SHA256:       "5793d0fd397c5778d2cf2126994d58e9d56b1be7c04d13c7a15bb1b4eafb16bf",
 			ArchiveBytes: 487170055,
-			Notice:       "NVIDIA Parakeet TDT 0.6B v3\nCopyright NVIDIA Corporation\nLicensed under CC BY 4.0: https://creativecommons.org/licenses/by/4.0/\n\nDownloaded as the k2-fsa converted and INT8-quantized ONNX form; Spynel does not modify the weights.\n",
+			Files: map[string]parakeetAsset{
+				"encoder.int8.onnx": {SHA256: "acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247", Bytes: 652184281},
+				"decoder.int8.onnx": {SHA256: "179e50c43d1a9de79c8a24149a2f9bac6eb5981823f2a2ed88d655b24248db4e", Bytes: 11845275},
+				"joiner.int8.onnx":  {SHA256: "3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3", Bytes: 6355277},
+				"tokens.txt":        {SHA256: "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d", Bytes: 93939},
+			},
+			Notice: "NVIDIA Parakeet TDT 0.6B v3\nCopyright NVIDIA Corporation\nLicensed under CC BY 4.0: https://creativecommons.org/licenses/by/4.0/\n\nDownloaded as the k2-fsa converted and INT8-quantized ONNX form; Spynel does not modify the weights.\n",
 		},
 	}
 }
@@ -75,18 +102,35 @@ func (p *Parakeet) model(ctx context.Context, cfg config.Speech) (parakeetFiles,
 	if !ok {
 		return parakeetFiles{}, fmt.Errorf("no Parakeet model configured for language %q", cfg.Language)
 	}
-	if err := os.MkdirAll(p.modelDir, 0o700); err != nil {
-		return parakeetFiles{}, err
+	if p.cacheInitErr != nil {
+		return parakeetFiles{}, p.cacheInitErr
 	}
+	if err := os.MkdirAll(p.modelDir, 0o700); err != nil {
+		return parakeetFiles{}, fmt.Errorf("create shared speech model cache %q: %w", p.modelDir, err)
+	}
+	lock, err := lockSpeechCache(ctx, filepath.Join(p.modelDir, ".install.lock"))
+	if err != nil {
+		return parakeetFiles{}, fmt.Errorf("coordinate shared speech cache %q: %w", p.modelDir, err)
+	}
+	defer unlockSpeechCache(lock)
 	destination := filepath.Join(p.modelDir, spec.ID)
-	if _, statErr := os.Stat(destination); statErr == nil {
-		files, inspectErr := inspectParakeetModel(destination)
-		if inspectErr != nil {
-			return parakeetFiles{}, fmt.Errorf("managed Parakeet model is incomplete: %w", inspectErr)
-		}
+	if files, inspectErr := inspectManagedParakeetModel(destination, spec); inspectErr == nil {
 		return files, nil
+	}
+	if _, statErr := os.Lstat(destination); statErr == nil {
+		if err := os.RemoveAll(destination); err != nil {
+			return parakeetFiles{}, fmt.Errorf("remove incomplete managed Parakeet model %q: %w", destination, err)
+		}
 	} else if !os.IsNotExist(statErr) {
 		return parakeetFiles{}, fmt.Errorf("inspect managed Parakeet model: %w", statErr)
+	}
+	legacy := filepath.Join(p.legacyModelDir, spec.ID)
+	if _, legacyErr := verifyParakeetAssets(legacy, spec.Files); legacyErr == nil {
+		if err := adoptLegacyParakeetModel(legacy, destination, spec); err != nil {
+			return parakeetFiles{}, fmt.Errorf("adopt legacy Parakeet model: %w", err)
+		}
+		p.logf("Adopted legacy Parakeet model into shared cache: %s", destination)
+		return inspectManagedParakeetModel(destination, spec)
 	}
 
 	p.logf("Downloading Parakeet model %s (first use)", spec.ID)
@@ -95,7 +139,7 @@ func (p *Parakeet) model(ctx context.Context, cfg config.Speech) (parakeetFiles,
 		return parakeetFiles{}, err
 	}
 	defer cleanup()
-	temporary, err := os.MkdirTemp(p.modelDir, "."+spec.ID+"-*")
+	temporary, err := os.MkdirTemp(p.modelDir, "."+spec.ID+"-*.partial")
 	if err != nil {
 		return parakeetFiles{}, err
 	}
@@ -106,25 +150,148 @@ func (p *Parakeet) model(ctx context.Context, cfg config.Speech) (parakeetFiles,
 	if err := os.WriteFile(filepath.Join(temporary, "MODEL_NOTICE.txt"), []byte(spec.Notice), 0o600); err != nil {
 		return parakeetFiles{}, fmt.Errorf("write Parakeet model notice: %w", err)
 	}
-	files, err := inspectParakeetModel(temporary)
+	files, err := verifyParakeetAssets(temporary, spec.Files)
 	if err != nil {
 		return parakeetFiles{}, fmt.Errorf("verify extracted Parakeet model: %w", err)
 	}
-	if existing, existingErr := inspectParakeetModel(destination); existingErr == nil {
-		return existing, nil
+	if err := writeParakeetManifest(temporary, spec); err != nil {
+		return parakeetFiles{}, err
 	}
 	if err := os.Rename(temporary, destination); err != nil {
-		if existing, existingErr := inspectParakeetModel(destination); existingErr == nil {
-			return existing, nil
-		}
 		return parakeetFiles{}, fmt.Errorf("install Parakeet model: %w", err)
 	}
-	files, err = inspectParakeetModel(destination)
+	files, err = inspectManagedParakeetModel(destination, spec)
 	if err != nil {
 		return parakeetFiles{}, err
 	}
 	p.logf("Parakeet model ready: %s", destination)
 	return files, nil
+}
+
+func inspectManagedParakeetModel(directory string, spec parakeetModel) (parakeetFiles, error) {
+	files, err := verifyParakeetAssets(directory, spec.Files)
+	if err != nil {
+		return parakeetFiles{}, err
+	}
+	data, err := os.ReadFile(filepath.Join(directory, "MODEL_SHA256"))
+	var manifest parakeetManifest
+	if err != nil || json.Unmarshal(data, &manifest) != nil || manifest.Version != parakeetManifestVersion ||
+		!strings.EqualFold(manifest.ArchiveSHA256, spec.SHA256) || !equalParakeetAssets(manifest.Files, spec.Files) {
+		return parakeetFiles{}, errors.New("managed model integrity marker is missing or incompatible")
+	}
+	return files, nil
+}
+
+func writeParakeetManifest(directory string, spec parakeetModel) error {
+	manifest := parakeetManifest{Version: parakeetManifestVersion, ArchiveSHA256: spec.SHA256, Files: spec.Files}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return fmt.Errorf("encode Parakeet model integrity marker: %w", err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(filepath.Join(directory, "MODEL_SHA256"), data, 0o600); err != nil {
+		return fmt.Errorf("write Parakeet model integrity marker: %w", err)
+	}
+	return nil
+}
+
+func adoptLegacyParakeetModel(source, destination string, spec parakeetModel) error {
+	temporary, err := os.MkdirTemp(filepath.Dir(destination), ".legacy-"+spec.ID+"-*.partial")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(temporary)
+	for _, name := range append(append([]string(nil), requiredParakeetFiles...), "MODEL_NOTICE.txt") {
+		input, err := os.Open(filepath.Join(source, name))
+		if err != nil {
+			if name == "MODEL_NOTICE.txt" && os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		output, err := os.OpenFile(filepath.Join(temporary, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			_ = input.Close()
+			return err
+		}
+		_, copyErr := io.Copy(output, input)
+		syncErr := output.Sync()
+		closeOutputErr := output.Close()
+		closeInputErr := input.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if syncErr != nil {
+			return syncErr
+		}
+		if closeOutputErr != nil {
+			return closeOutputErr
+		}
+		if closeInputErr != nil {
+			return closeInputErr
+		}
+	}
+	if _, err := verifyParakeetAssets(temporary, spec.Files); err != nil {
+		return err
+	}
+	if err := writeParakeetManifest(temporary, spec); err != nil {
+		return err
+	}
+	return os.Rename(temporary, destination)
+}
+
+func verifyParakeetAssets(directory string, expected map[string]parakeetAsset) (parakeetFiles, error) {
+	files, err := inspectParakeetModel(directory)
+	if err != nil {
+		return parakeetFiles{}, err
+	}
+	if len(expected) != len(requiredParakeetFiles) {
+		return parakeetFiles{}, errors.New("model specification has incomplete installed-file integrity metadata")
+	}
+	for _, name := range requiredParakeetFiles {
+		want, ok := expected[name]
+		if !ok || want.Bytes <= 0 || len(want.SHA256) != sha256.Size*2 {
+			return parakeetFiles{}, fmt.Errorf("model specification has invalid integrity metadata for %q", name)
+		}
+		file := filepath.Join(directory, name)
+		info, err := os.Stat(file)
+		if err != nil {
+			return parakeetFiles{}, err
+		}
+		if info.Size() != want.Bytes {
+			return parakeetFiles{}, fmt.Errorf("required model file %q has size %d, want %d", file, info.Size(), want.Bytes)
+		}
+		input, err := os.Open(file)
+		if err != nil {
+			return parakeetFiles{}, err
+		}
+		hash := sha256.New()
+		_, copyErr := io.Copy(hash, input)
+		closeErr := input.Close()
+		if copyErr != nil {
+			return parakeetFiles{}, copyErr
+		}
+		if closeErr != nil {
+			return parakeetFiles{}, closeErr
+		}
+		if !strings.EqualFold(hex.EncodeToString(hash.Sum(nil)), want.SHA256) {
+			return parakeetFiles{}, fmt.Errorf("required model file %q checksum mismatch", file)
+		}
+	}
+	return files, nil
+}
+
+func equalParakeetAssets(left, right map[string]parakeetAsset) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for name, expected := range right {
+		actual, ok := left[name]
+		if !ok || actual.Bytes != expected.Bytes || !strings.EqualFold(actual.SHA256, expected.SHA256) {
+			return false
+		}
+	}
+	return true
 }
 
 func inspectParakeetModel(directory string) (parakeetFiles, error) {

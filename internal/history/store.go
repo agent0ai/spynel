@@ -24,13 +24,14 @@ const (
 )
 
 type Entry struct {
-	At         time.Time `json:"at"`
-	Role       string    `json:"role"`
-	Sender     string    `json:"sender,omitempty"`
-	Content    string    `json:"content"`
-	EventID    string    `json:"event_id,omitempty"`
-	AfterChars int       `json:"after_chars,omitempty"`
-	Terminal   bool      `json:"terminal,omitempty"`
+	At               time.Time `json:"at"`
+	Role             string    `json:"role"`
+	Sender           string    `json:"sender,omitempty"`
+	Content          string    `json:"content"`
+	EventID          string    `json:"event_id,omitempty"`
+	AfterChars       int       `json:"after_chars,omitempty"`
+	Terminal         bool      `json:"terminal,omitempty"`
+	NativeMessageIDs []string  `json:"native_message_ids,omitempty"`
 }
 
 type Conversation struct {
@@ -94,19 +95,25 @@ func (s *Store) Append(channel, conversation string, entry Entry) (string, error
 }
 
 func (s *Store) DeliveryState(channel, conversation, eventID string) (string, error) {
+	state, _, err := s.DeliveryInfo(channel, conversation, eventID)
+	return state, err
+}
+
+func (s *Store) DeliveryInfo(channel, conversation, eventID string) (string, []string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	file, err := os.Open(s.Path(channel, conversation))
 	if os.IsNotExist(err) {
-		return "", nil
+		return "", nil, nil
 	}
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
 	state := ""
+	var nativeMessageIDs []string
 	for scanner.Scan() {
 		var entry Entry
 		if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.EventID == eventID {
@@ -118,11 +125,12 @@ func (s *Store) DeliveryState(channel, conversation, eventID string) (string, er
 			case "assistant":
 				if entry.Sender == "Spy" {
 					state = "sent"
+					nativeMessageIDs = append([]string(nil), entry.NativeMessageIDs...)
 				}
 			}
 		}
 	}
-	return state, scanner.Err()
+	return state, nativeMessageIDs, scanner.Err()
 }
 
 func (s *Store) Recent(channel, conversation string, characterLimit int) (string, string, error) {

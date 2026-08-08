@@ -1,12 +1,14 @@
 package startup
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,6 +32,26 @@ type Manager struct {
 	SystemUnitDirectory   string
 	SystemLaunchDirectory string
 	RunCommand            CommandRunner
+	Log                   io.Writer
+}
+
+const maxCommandOutput = 64 << 10
+
+type boundedOutput struct {
+	bytes.Buffer
+	truncated bool
+}
+
+func (b *boundedOutput) Write(data []byte) (int, error) {
+	length := len(data)
+	remaining := maxCommandOutput - b.Len()
+	if remaining > 0 {
+		_, _ = b.Buffer.Write(data[:min(length, remaining)])
+	}
+	if length > remaining {
+		b.truncated = true
+	}
+	return length, nil
 }
 
 func New(executable string) (*Manager, error) {
@@ -54,7 +76,9 @@ func New(executable string) (*Manager, error) {
 	manager := &Manager{
 		GOOS: runtime.GOOS, Home: home, Executable: executable, SystemWide: systemWide,
 		SystemUnitDirectory: "/etc/systemd/system", SystemLaunchDirectory: "/Library/LaunchDaemons",
-		RunCommand: runCommand,
+	}
+	manager.RunCommand = func(ctx context.Context, name string, arguments ...string) error {
+		return runCommand(ctx, manager.Log, name, arguments...)
 	}
 	nodeExecutable := strings.TrimSpace(os.Getenv("SPYNEL_NPM_NODE"))
 	npmLauncher := strings.TrimSpace(os.Getenv("SPYNEL_NPM_LAUNCHER"))
@@ -232,13 +256,40 @@ func windowsQuote(value string) string {
 	return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
 }
 
-func runCommand(ctx context.Context, name string, arguments ...string) error {
+func runCommand(ctx context.Context, logWriter io.Writer, name string, arguments ...string) error {
 	command := exec.CommandContext(ctx, name, arguments...)
-	output, err := command.CombinedOutput()
+	stdout := &boundedOutput{}
+	stderr := &boundedOutput{}
+	command.Stdout = stdout
+	command.Stderr = stderr
+	err := command.Run()
+	commandName := filepath.Base(name)
+	writeCommandOutput(logWriter, commandName, "stdout", stdout)
+	writeCommandOutput(logWriter, commandName, "stderr", stderr)
 	if err != nil {
-		return fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(string(output)))
+		if logWriter != nil {
+			_, _ = fmt.Fprintf(logWriter, "process=%s event=exit status=failed exit_code=%d error=%v\n", commandName, processExitCode(command), err)
+		}
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	if logWriter != nil {
+		_, _ = fmt.Fprintf(logWriter, "process=%s event=exit status=success exit_code=0\n", commandName)
 	}
 	return nil
+}
+
+func processExitCode(command *exec.Cmd) int {
+	if command.ProcessState == nil {
+		return -1
+	}
+	return command.ProcessState.ExitCode()
+}
+
+func writeCommandOutput(logWriter io.Writer, commandName, stream string, output *boundedOutput) {
+	if logWriter == nil || output.Len() == 0 {
+		return
+	}
+	_, _ = fmt.Fprintf(logWriter, "process=%s stream=%s truncated=%t output=%s\n", commandName, stream, output.truncated, strings.TrimSpace(output.String()))
 }
 
 func systemdQuote(value string) string {

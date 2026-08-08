@@ -5,12 +5,15 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/ansi"
 	"github.com/charmbracelet/glamour/styles"
 	charmansi "github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
+	"github.com/rivo/uniseg"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
 	"github.com/yuin/goldmark/extension"
@@ -26,6 +29,8 @@ const (
 	codeBlockStart    = "\x04\x04\x04"
 	codeBlockEnd      = "\x05\x05\x05"
 	osc8Close         = "\x1b]8;;\x1b\\"
+	inlineCodeSpace   = "\U000F0000"
+	compoundHyphen    = "\uE000"
 )
 
 // Terminal renders GitHub-flavored Markdown for an ANSI terminal.
@@ -37,7 +42,10 @@ func Terminal(input string, width int) string {
 // active semantic theme.
 func TerminalWithTheme(input string, width int, active theme.Theme) string {
 	width = max(1, width)
-	style := terminalStyle(active)
+	compoundMarker, inlineMarker := terminalRenderMarkers(input)
+	breakMarker := terminalBreakMarker(input)
+	renderInput := protectTerminalCompounds(input, width, compoundMarker, breakMarker)
+	style := terminalStyle(active, inlineMarker)
 	zero := uint(0)
 	style.Document.Margin = &zero
 	style.Document.BlockPrefix = ""
@@ -77,22 +85,325 @@ func TerminalWithTheme(input string, width int, active theme.Theme) string {
 	if err != nil {
 		return input
 	}
-	result, err := renderer.Render(input)
+	result, err := renderer.Render(renderInput)
 	if err != nil {
 		return input
 	}
+	result = strings.NewReplacer(inlineMarker, " ", compoundMarker, "-", breakMarker, "\n").Replace(result)
 	result = applyTerminalLinks(result, terminalLinkTargets(input))
 	result = trimTerminalLinePadding(strings.TrimSpace(compactCodeBlockSpacing(result)))
 	return trimTerminalOuterBlankRows(result)
 }
 
+// protectTerminalCompounds removes ASCII hyphens from Glamour's discretionary
+// break set only for ordinary prose compounds that fit on a fresh content row.
+// Goldmark's source segments keep Markdown syntax, URLs, and code out of the
+// candidate set; the private marker is restored immediately after rendering.
+func protectTerminalCompounds(input string, width int, marker, breakMarker string) string {
+	source := []byte(input)
+	parser := goldmark.New(goldmark.WithExtensions(extension.GFM)).Parser()
+	document := parser.Parse(text.NewReader(source))
+	replacements := make(map[int]string)
+	_ = ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		value, ok := node.(*ast.Text)
+		if !entering || !ok || terminalCompoundExcluded(node) {
+			return ast.WalkContinue, nil
+		}
+		segment := value.Segment
+		available := width - terminalCompoundIndent(node)
+		protectCompoundSegment(source, segment.Start, segment.Stop, available, marker, breakMarker, terminalCompoundAllowsSourceBreak(node), replacements)
+		return ast.WalkContinue, nil
+	})
+	if len(replacements) == 0 {
+		return input
+	}
+	var result strings.Builder
+	result.Grow(len(input) + len(replacements)*(len(marker)-1))
+	for index, value := range source {
+		if replacement, ok := replacements[index]; ok {
+			result.WriteString(replacement)
+			if replacement == marker {
+				continue
+			}
+		}
+		result.WriteByte(value)
+	}
+	return result.String()
+}
+
+func terminalBreakMarker(input string) string {
+	for _, value := range []rune{'\u2000', '\u2001', '\u2002', '\u2003', '\u2004', '\u2005', '\u2006', '\u2008', '\u2009', '\u200A', '\u205F', '\u3000'} {
+		if !strings.ContainsRune(input, value) {
+			return string(value)
+		}
+	}
+	longest, run := 0, 0
+	for _, value := range input {
+		if value == '\u200A' {
+			run++
+			longest = max(longest, run)
+		} else {
+			run = 0
+		}
+	}
+	return strings.Repeat("\u200A", longest+1)
+}
+
+func terminalRenderMarkers(input string) (string, string) {
+	used := make(map[rune]struct{}, len(input)/4)
+	for _, value := range input {
+		used[value] = struct{}{}
+	}
+	markers := make([]string, 0, 2)
+	for _, bounds := range [][2]rune{{0xE000, 0xF8FF}, {0xF0000, 0xFFFFD}, {0x100000, 0x10FFFD}} {
+		for value := bounds[0]; value <= bounds[1] && len(markers) < 2; value++ {
+			if _, found := used[value]; !found {
+				markers = append(markers, string(value))
+			}
+		}
+		if len(markers) == 2 {
+			return markers[0], markers[1]
+		}
+	}
+	return compoundHyphen, inlineCodeSpace
+}
+
+func terminalCompoundExcluded(node ast.Node) bool {
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		switch parent.(type) {
+		case *ast.CodeSpan, *ast.Link, *ast.Image, *ast.AutoLink:
+			return true
+		}
+	}
+	return false
+}
+
+func terminalCompoundIndent(node ast.Node) int {
+	indent := 0
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		switch value := parent.(type) {
+		case *ast.List:
+			indent += terminalListMarkerWidth(node, value)
+		case *ast.Blockquote:
+			indent += 2
+		case *ast.Heading:
+			indent += 2
+		}
+	}
+	return indent
+}
+
+func terminalListMarkerWidth(node ast.Node, list *ast.List) int {
+	if !list.IsOrdered() {
+		return 2
+	}
+	item := node
+	for item != nil && item.Parent() != list {
+		item = item.Parent()
+	}
+	index := list.Start
+	if item != nil {
+		for sibling := list.FirstChild(); sibling != nil && sibling != item; sibling = sibling.NextSibling() {
+			index++
+		}
+	}
+	return len(strconv.Itoa(max(1, index))) + 2
+}
+
+func protectCompoundSegment(source []byte, start, stop, available int, marker, breakMarker string, allowSourceBreak bool, replacements map[int]string) {
+	if available < 3 || start < 0 || stop > len(source) || start >= stop {
+		return
+	}
+	for cursor := start; cursor < stop; {
+		r, size := utf8.DecodeRune(source[cursor:stop])
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			cursor += size
+			continue
+		}
+		tokenStart := cursor
+		hyphens := make([]int, 0, 2)
+		componentHasLetter := unicode.IsLetter(r)
+		allComponentsHaveLetters := true
+		cursor += size
+		for cursor < stop {
+			r, size = utf8.DecodeRune(source[cursor:stop])
+			switch {
+			case unicode.IsLetter(r):
+				componentHasLetter = true
+				cursor += size
+			case unicode.IsDigit(r) || unicode.IsMark(r):
+				cursor += size
+			case r == '-' && cursor+size < stop:
+				next, _ := utf8.DecodeRune(source[cursor+size : stop])
+				if !unicode.IsLetter(next) && !unicode.IsDigit(next) {
+					goto tokenDone
+				}
+				allComponentsHaveLetters = allComponentsHaveLetters && componentHasLetter
+				componentHasLetter = false
+				hyphens = append(hyphens, cursor)
+				cursor += size
+			default:
+				goto tokenDone
+			}
+		}
+	tokenDone:
+		allComponentsHaveLetters = allComponentsHaveLetters && componentHasLetter
+		if !allComponentsHaveLetters || terminalCompoundURLAdjacent(source, tokenStart, cursor) {
+			continue
+		}
+		tokenWidth := charmansi.StringWidth(string(source[tokenStart:cursor]))
+		if tokenWidth > available {
+			separator := "\n"
+			if !allowSourceBreak {
+				separator = breakMarker
+			}
+			addTerminalCompoundHardBreaks(source, tokenStart, cursor, available, separator, replacements)
+			continue
+		}
+		if len(hyphens) == 0 {
+			continue
+		}
+		lineStart := bytesLastIndexByte(source[:tokenStart], '\n') + 1
+		if prefixWidth := charmansi.StringWidth(string(source[lineStart:tokenStart])); allowSourceBreak && prefixWidth > 0 && prefixWidth+tokenWidth > available+terminalCompoundIndentForSource(source, lineStart) {
+			replacements[tokenStart] = "\n"
+		}
+		for _, index := range hyphens {
+			replacements[index] = marker
+		}
+	}
+}
+
+func terminalCompoundAllowsSourceBreak(node ast.Node) bool {
+	for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+		switch parent.(type) {
+		case *ast.Heading, *extast.TableCell, *extast.TableHeader, *extast.TableRow, *extast.Table:
+			return false
+		}
+	}
+	return true
+}
+
+func bytesLastIndexByte(value []byte, target byte) int {
+	for index := len(value) - 1; index >= 0; index-- {
+		if value[index] == target {
+			return index
+		}
+	}
+	return -1
+}
+
+func terminalCompoundIndentForSource(source []byte, lineStart int) int {
+	line := source[lineStart:]
+	for index, value := range line {
+		if value != ' ' && value != '\t' && value != '>' && value != '-' && value != '+' && value != '*' && value != '.' && !unicode.IsDigit(rune(value)) {
+			return index
+		}
+	}
+	return 0
+}
+
+func addTerminalCompoundHardBreaks(source []byte, start, stop, available int, separator string, replacements map[int]string) {
+	componentStart := start
+	for componentStart < stop {
+		hyphen := componentStart
+		for hyphen < stop && source[hyphen] != '-' {
+			hyphen++
+		}
+		capacity := available
+		if hyphen < stop {
+			capacity = max(1, available-1) // retain the visible trailing hyphen
+		}
+		cells := 0
+		graphemes := uniseg.NewGraphemes(string(source[componentStart:hyphen]))
+		for graphemes.Next() {
+			from, _ := graphemes.Positions()
+			cursor := componentStart + from
+			width := charmansi.StringWidth(graphemes.Str())
+			if cells > 0 && cells+width > capacity {
+				replacements[cursor] = separator
+				cells = 0
+			}
+			cells += width
+		}
+		if hyphen == stop {
+			break
+		}
+		if hyphen+1 < stop {
+			replacements[hyphen+1] = separator
+		}
+		componentStart = hyphen + 1
+	}
+}
+
+func terminalCompoundURLAdjacent(source []byte, start, stop int) bool {
+	const urlPunctuation = "-/:@.?&#%="
+	return start > 0 && strings.ContainsRune(urlPunctuation, rune(source[start-1])) ||
+		stop < len(source) && strings.ContainsRune(urlPunctuation, rune(source[stop]))
+}
+
 func trimTerminalLinePadding(value string) string {
 	lines := strings.Split(value, "\n")
 	for index, line := range lines {
-		trimmed := strings.TrimRight(charmansi.Strip(line), " \t")
-		lines[index] = charmansi.Truncate(line, charmansi.StringWidth(trimmed), "")
+		lines[index] = trimTerminalRowPadding(line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// TrimTerminalLinePadding removes unstyled renderer padding from every row
+// without discarding background-colored display cells. It is exported for TUI
+// layout stages that defensively normalize already-rendered Markdown.
+func TrimTerminalLinePadding(value string) string {
+	return trimTerminalLinePadding(value)
+}
+
+// trimTerminalRowPadding removes layout whitespace emitted after the last
+// rendered cell while retaining whitespace whose background is part of the
+// presentation. In particular, Glamour renders inline code as a foreground
+// token between two background-colored spaces. Plain-text trimming cannot
+// distinguish that right padding from document padding at the end of a row.
+func trimTerminalRowPadding(line string) string {
+	parser := charmansi.NewParser()
+	state := byte(charmansi.NormalState)
+	background := false
+	width := 0
+	keepWidth := 0
+	rest := line
+	for len(rest) > 0 {
+		sequence, cellWidth, consumed, nextState := charmansi.DecodeSequence(rest, state, parser)
+		if consumed <= 0 {
+			break
+		}
+		state = nextState
+		rest = rest[consumed:]
+		if cellWidth > 0 {
+			width += cellWidth
+			if strings.Trim(string(sequence), " \t") != "" || background {
+				keepWidth = width
+			}
+			continue
+		}
+		if byte(parser.Command()) == 'm' {
+			background = sgrBackground(parser, background)
+		}
+	}
+	return charmansi.Truncate(line, keepWidth, "")
+}
+
+func sgrBackground(parser *charmansi.Parser, active bool) bool {
+	parameters := parser.Params()
+	if len(parameters) == 0 {
+		return false
+	}
+	for index := range parameters {
+		parameter, _ := parser.Param(index, 0)
+		switch {
+		case parameter == 0 || parameter == 49:
+			active = false
+		case parameter == 48, parameter >= 40 && parameter <= 47, parameter >= 100 && parameter <= 107:
+			active = true
+		}
+	}
+	return active
 }
 
 func trimTerminalOuterBlankRows(value string) string {
@@ -106,7 +417,7 @@ func trimTerminalOuterBlankRows(value string) string {
 	return strings.Join(lines, "\n")
 }
 
-func terminalStyle(active theme.Theme) ansi.StyleConfig { //nolint:gocyclo
+func terminalStyle(active theme.Theme, inlineMarkers ...string) ansi.StyleConfig { //nolint:gocyclo
 	style := styles.DarkStyleConfig
 	if style.CodeBlock.Chroma != nil {
 		chroma := *style.CodeBlock.Chroma
@@ -145,6 +456,17 @@ func terminalStyle(active theme.Theme) ansi.StyleConfig { //nolint:gocyclo
 	set(&style.Image, c.Secondary)
 	set(&style.ImageText, c.TextMuted)
 	set(&style.Code.StylePrimitive, c.Code, c.SurfaceElevated)
+	// A private render-only padding cell keeps the left cell attached to inline
+	// code during Glamour's word reflow. It is converted to an ordinary styled
+	// space immediately after rendering, so source/history semantics are
+	// unchanged, user-authored nonbreaking spaces survive, and terminal
+	// selection sees a normal space.
+	inlineMarker := inlineCodeSpace
+	if len(inlineMarkers) > 0 {
+		inlineMarker = inlineMarkers[0]
+	}
+	style.Code.Prefix = inlineMarker
+	style.Code.Suffix = inlineMarker
 	set(&style.CodeBlock.StylePrimitive, c.Code)
 	set(&style.Table.StylePrimitive, c.Text)
 	set(&style.DefinitionList.StylePrimitive, c.Text)

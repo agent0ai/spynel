@@ -10,10 +10,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/agent0ai/spynel/internal/agentdocs"
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/extensions"
@@ -23,39 +26,145 @@ import (
 )
 
 type Lease struct {
-	ID                string    `json:"id"`
-	ClaimID           string    `json:"claim_id,omitempty"`
-	DocumentType      string    `json:"document_type,omitempty"`
-	OwnerID           string    `json:"owner_id,omitempty"`
-	Route             string    `json:"route"`
-	File              string    `json:"file"`
-	SourceFile        string    `json:"source_file,omitempty"`
-	SessionKey        string    `json:"session_key"`
-	ThreadID          string    `json:"thread_id,omitempty"`
-	State             string    `json:"state"`
-	StartedAt         time.Time `json:"started_at"`
-	HeartbeatAt       time.Time `json:"heartbeat_at"`
-	RecoveryCount     int       `json:"recovery_count"`
-	LastError         string    `json:"last_error,omitempty"`
-	Phase             string    `json:"phase,omitempty"`
-	ImplementerThread string    `json:"implementer_thread,omitempty"`
+	ID                     string          `json:"id"`
+	ClaimID                string          `json:"claim_id,omitempty"`
+	DocumentType           string          `json:"document_type,omitempty"`
+	OwnerID                string          `json:"owner_id,omitempty"`
+	Route                  string          `json:"route"`
+	File                   string          `json:"file"`
+	SourceFile             string          `json:"source_file,omitempty"`
+	SessionKey             string          `json:"session_key"`
+	ThreadID               string          `json:"thread_id,omitempty"`
+	State                  string          `json:"state"`
+	StartedAt              time.Time       `json:"started_at"`
+	HeartbeatAt            time.Time       `json:"heartbeat_at"`
+	RecoveryCount          int             `json:"recovery_count"`
+	LastError              string          `json:"last_error,omitempty"`
+	Phase                  string          `json:"phase,omitempty"`
+	ClaimAttempt           int             `json:"claim_attempt,omitempty"`
+	ImplementerThread      string          `json:"implementer_thread,omitempty"`
+	TerminalHooksCompleted map[string]bool `json:"terminal_hooks_completed,omitempty"`
+	// TerminalHooksStarted is a legacy intent/process-start fence. It is read
+	// only for compatibility and deliberately ignored because it cannot prove
+	// successful delivery.
+	TerminalHooksStarted map[string]bool `json:"terminal_hooks_started,omitempty"`
+}
+
+type ScheduledCheckpoint struct {
+	ID     string    `json:"id"`
+	Title  string    `json:"title"`
+	At     time.Time `json:"at"`
+	Reason string    `json:"reason,omitempty"`
 }
 
 type Manager struct {
-	Config      config.Config
-	Harness     harness.Harness
-	Hooks       extensions.Runner
-	Log         func(string)
-	JobStarted  func(sessionKey, description string) int
-	JobFinished func(id int)
+	Config                      config.Config
+	Harness                     harness.Harness
+	Hooks                       extensions.Runner
+	Log                         func(string)
+	JobStarted                  func(lease Lease, description string, firstAssignedAt time.Time, providerIterations, implementationAttempts int) int
+	JobUpdated                  func(id int, lease Lease)
+	JobTimingUpdated            func(id int, firstAssignedAt time.Time, providerIterations int)
+	JobExecutionUpdated         func(id int, status core.ExecutionStatus)
+	JobFinished                 func(id int)
+	AuthorizeNotificationOrigin func(Origin) error
+	notificationActivityMu      sync.Mutex
+	notificationRequestMu       sync.Mutex
+	notificationTriageTimeout   time.Duration
+	notificationTriageRunning   atomic.Bool
 
-	mu       sync.Mutex
-	scanMu   sync.Mutex
-	inflight map[string]bool
-	jobs     sync.WaitGroup
-	sem      chan struct{}
-	Outbox   *Outbox
-	ownerID  string
+	mu                          sync.Mutex
+	scanMu                      sync.Mutex
+	inflight                    map[string]bool
+	runtimeJobs                 map[string]int
+	controlCancelled            map[string]bool
+	jobs                        sync.WaitGroup
+	sem                         chan struct{}
+	Outbox                      *Outbox
+	ownerID                     string
+	scanNow                     chan struct{}
+	heartbeatNow                func() time.Time
+	heartbeatTicks              <-chan time.Time
+	heartbeatTimeout            time.Duration
+	heartbeatCommit             sync.Mutex
+	heartbeatTerm               uint64
+	heartbeatProviderActive     atomic.Bool
+	heartbeatProviderMu         sync.Mutex
+	heartbeatProviderDone       chan struct{}
+	heartbeatProviderReleasedAt time.Time
+	heartbeatRunningTerm        atomic.Uint64
+	primaryOwned                atomic.Bool
+	orchestratorEnabled         atomic.Bool
+	heartbeatMinutes            atomic.Int64
+	heartbeatConfigChanged      chan struct{}
+	heartbeatConfigAcceptedAt   atomic.Int64
+	heartbeatConfigGeneration   atomic.Uint64
+	heartbeatAppliedGeneration  atomic.Uint64
+	heartbeatTimerMu            sync.Mutex
+	heartbeatTimer              *time.Timer
+	heartbeatStatusMu           sync.RWMutex
+	heartbeatOwned              bool
+	heartbeatOwnedTerm          uint64
+	heartbeatNext               time.Time
+	claimDocument               func(source, target, status, attemptField string, now time.Time) (Document, error)
+}
+
+// SetPrimaryOwned records whether this manager belongs to the elected
+// workspace owner. The scheduler publishes its deadline separately, allowing
+// status to distinguish a primary that is still starting from a secondary.
+func (m *Manager) SetPrimaryOwned(owned bool) {
+	m.primaryOwned.Store(owned)
+}
+
+// ApplyRuntimeConfig publishes the orchestrator controls whose scheduler
+// semantics are live. Structural routes, scan cadence, and parallelism remain
+// fixed for the manager lifetime and continue to require a restart.
+func (m *Manager) ApplyRuntimeConfig(cfg config.Config) {
+	wasEnabled := m.orchestratorEnabled.Load()
+	acceptedAt := m.semanticHeartbeatNow()
+	m.heartbeatCommit.Lock()
+	m.orchestratorEnabled.Store(cfg.Orchestrator.Enabled)
+	m.heartbeatMinutes.Store(int64(cfg.Orchestrator.SemanticHeartbeatMinutes))
+	m.heartbeatConfigAcceptedAt.Store(acceptedAt.UnixNano())
+	m.heartbeatConfigGeneration.Add(1)
+	// Fence result commit, deadline publication, timer ownership, and tick
+	// dispatch synchronously with the accepted configuration change. The
+	// scheduler will cancel the superseded audit context and establish a fresh
+	// term when it consumes the notification below.
+	m.heartbeatTerm++
+	m.stopSemanticHeartbeatTimer(nil)
+	// A previously published deadline belongs to the superseded configuration.
+	// Leave status honestly unavailable until the scheduler owns its new timer.
+	m.setSemanticHeartbeatSchedule(false, time.Time{})
+	m.heartbeatCommit.Unlock()
+	select {
+	case m.heartbeatConfigChanged <- struct{}{}:
+	default:
+	}
+	if cfg.Orchestrator.Enabled && !wasEnabled {
+		m.requestScan()
+	}
+}
+
+// stopSemanticHeartbeatTimer stops the registered production timer. Callers
+// that accept configuration hold heartbeatCommit so acceptance, publication,
+// and dispatch have one ordering boundary. A nil expected value stops any
+// timer.
+func (m *Manager) stopSemanticHeartbeatTimer(expected *time.Timer) {
+	m.heartbeatTimerMu.Lock()
+	defer m.heartbeatTimerMu.Unlock()
+	if expected != nil && m.heartbeatTimer != expected {
+		return
+	}
+	if m.heartbeatTimer != nil {
+		if !m.heartbeatTimer.Stop() {
+			select {
+			case <-m.heartbeatTimer.C:
+			default:
+			}
+		}
+		m.heartbeatTimer = nil
+	}
 }
 
 func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Manager {
@@ -63,31 +172,44 @@ func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Ma
 	if parallel <= 0 {
 		parallel = 1
 	}
-	return &Manager{
-		Config: cfg, Harness: target, Hooks: hooks, inflight: map[string]bool{}, sem: make(chan struct{}, parallel),
-		Outbox:  &Outbox{Directory: cfg.StatePath("runtime", "outbox")},
-		ownerID: fmt.Sprintf("%d-%d-%s", os.Getpid(), time.Now().UTC().UnixNano(), randomSuffix()),
+	manager := &Manager{
+		Config: cfg, Harness: target, Hooks: hooks, inflight: map[string]bool{}, runtimeJobs: map[string]int{}, controlCancelled: map[string]bool{}, sem: make(chan struct{}, parallel),
+		Outbox:                 &Outbox{Directory: cfg.StatePath("runtime", "outbox")},
+		ownerID:                fmt.Sprintf("%d-%d-%s", os.Getpid(), time.Now().UTC().UnixNano(), randomSuffix()),
+		scanNow:                make(chan struct{}, 1),
+		heartbeatConfigChanged: make(chan struct{}, 1),
+		heartbeatNow:           time.Now, heartbeatTimeout: 5 * time.Minute,
 	}
+	manager.orchestratorEnabled.Store(cfg.Orchestrator.Enabled)
+	manager.heartbeatMinutes.Store(int64(cfg.Orchestrator.SemanticHeartbeatMinutes))
+	manager.Outbox.OnDelivered = manager.markActionDelivered
+	return manager
 }
 
-func (m *Manager) SetNotificationDelivery(deliver func(context.Context, Origin, string, string) error) {
+func (m *Manager) SetNotificationDelivery(deliver func(context.Context, Origin, string, string) ([]string, error)) {
 	m.Outbox.Deliver = deliver
 }
 
 func (m *Manager) Run(ctx context.Context) error {
-	if !m.Config.Orchestrator.Enabled {
-		<-ctx.Done()
-		return ctx.Err()
-	}
 	if err := m.ScanOnce(ctx); err != nil {
 		m.log("orchestrator scan: " + err.Error())
 	}
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		m.runSemanticHeartbeat(ctx)
+	}()
+	defer func() { <-heartbeatDone }()
 	ticker := time.NewTicker(time.Duration(m.Config.Orchestrator.IntervalSec) * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-m.scanNow:
+			if err := m.ScanOnce(ctx); err != nil {
+				m.log("orchestrator event scan: " + err.Error())
+			}
 		case <-ticker.C:
 			if err := m.ScanOnce(ctx); err != nil {
 				m.log("orchestrator scan: " + err.Error())
@@ -96,10 +218,17 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 }
 
+func (m *Manager) requestScan() {
+	select {
+	case m.scanNow <- struct{}{}:
+	default:
+	}
+}
+
 func (m *Manager) ScanOnce(ctx context.Context) error {
 	m.scanMu.Lock()
 	defer m.scanMu.Unlock()
-	if !m.Config.Orchestrator.Enabled {
+	if !m.orchestratorEnabled.Load() {
 		return nil
 	}
 	if err := os.MkdirAll(m.leaseDirectory(), 0o700); err != nil {
@@ -129,6 +258,10 @@ func (m *Manager) ScanOnce(ctx context.Context) error {
 	if err := m.advanceActiveGoals(); err != nil {
 		return err
 	}
+	if err := m.reconcileActionRequests(); err != nil {
+		m.log("action request reconciliation deferred: " + err.Error())
+	}
+	m.startNotificationTriage(ctx)
 	for _, route := range m.Config.Orchestrator.Routes {
 		var err error
 		switch route.Name {
@@ -217,7 +350,9 @@ func (m *Manager) scanRoute(ctx context.Context, route config.Route) error {
 			if output.Cancel {
 				lease.State = "hook_cancelled"
 				lease.LastError = output.Message
-				_ = m.saveLease(lease)
+				if err := m.saveLease(lease); err != nil {
+					m.log("save hook-cancelled lease: " + err.Error())
+				}
 				continue
 			}
 		}
@@ -239,7 +374,7 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route config.Route, source
 			continue
 		}
 		source := filepath.Join(sourceDir, entry.Name())
-		due, dueErr := DocumentDue(source, time.Now())
+		due, dueErr := documentDueForPhase(source, time.Now(), phase)
 		if dueErr != nil {
 			m.log("read queued document " + source + ": " + dueErr.Error())
 			continue
@@ -257,7 +392,15 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route config.Route, source
 			documentID = leaseID(route.Name+":"+phase, source)
 		}
 		key := leaseID(route.Name+":"+phase, documentID)
-		if m.isInflight(key) || m.leaseExists(key) {
+		// A provider can move a document after the reconciliation pass but
+		// before this queue is scanned. Do not claim the next phase while the
+		// preceding phase still owns the same durable document; its lease must
+		// reconcile the move first.
+		_, documentLeased, leaseErr := m.leaseForDocument(route.Name, entry.Name(), "", "")
+		if leaseErr != nil {
+			return leaseErr
+		}
+		if m.isInflight(key) || m.leaseExists(key) || documentLeased {
 			continue
 		}
 		target := filepath.Join(claimedDir, entry.Name())
@@ -268,7 +411,7 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route config.Route, source
 			ID: key, ClaimID: key, DocumentType: strings.TrimSuffix(route.Name, "s"), Route: route.Name,
 			OwnerID: m.ownerID,
 			File:    target, SourceFile: source, SessionKey: phaseSessionKey(route.Name, documentID, phase, attempt),
-			State: "claiming", Phase: phase, StartedAt: now, HeartbeatAt: now,
+			State: "claiming", Phase: phase, ClaimAttempt: attempt, StartedAt: now, HeartbeatAt: now,
 		}
 		if phase == phaseTaskReview {
 			lease.ImplementerThread, _ = document.FrontMatter["implementation_thread"].(string)
@@ -276,9 +419,13 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route config.Route, source
 		if err := m.saveLease(lease); err != nil {
 			return err
 		}
-		claimed, claimErr := ClaimDocument(source, target, phaseClaimedStatus(phase), now)
+		claimed, claimErr := m.claimPhaseDocument(source, target, phaseClaimedStatus(phase), attemptField, now)
 		if claimErr != nil {
-			_ = os.Remove(m.leasePath(key))
+			_, targetErr := os.Stat(target)
+			_, sourceErr := os.Stat(source)
+			if targetErr != nil || !os.IsNotExist(sourceErr) {
+				_ = os.Remove(m.leasePath(key))
+			}
 			m.log("claim " + source + ": " + claimErr.Error())
 			continue
 		}
@@ -300,7 +447,9 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route config.Route, source
 			if output.Cancel {
 				lease.State = "hook_cancelled"
 				lease.LastError = output.Message
-				_ = m.saveLease(lease)
+				if err := m.saveLease(lease); err != nil {
+					m.log("save hook-cancelled lease: " + err.Error())
+				}
 				continue
 			}
 		}
@@ -366,6 +515,18 @@ func numberValue(value any) int {
 	return 0
 }
 
+func claimAttemptFromSession(sessionKey string) int {
+	separator := strings.LastIndexByte(sessionKey, ':')
+	if separator < 0 || separator == len(sessionKey)-1 {
+		return 0
+	}
+	attempt, err := strconv.Atoi(sessionKey[separator+1:])
+	if err != nil || attempt < 1 {
+		return 0
+	}
+	return attempt
+}
+
 func (m *Manager) ensureRouteDirectories() error {
 	for _, route := range m.Config.Orchestrator.Routes {
 		paths := []string{m.Config.Resolve(route.Source), m.Config.Resolve(route.Working)}
@@ -387,7 +548,13 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 	m.jobs.Add(1)
 	go func() {
 		defer m.jobs.Done()
-		defer m.setInflight(lease.ID, false)
+		defer func() {
+			m.setInflight(lease.ID, false)
+			// Harness completion is the event that makes agent-authored durable
+			// transitions observable. Wake the manager immediately instead of
+			// waiting for the periodic recovery scan.
+			m.requestScan()
+		}()
 		select {
 		case m.sem <- struct{}{}:
 			defer func() { <-m.sem }()
@@ -405,28 +572,34 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 			m.recordError(lease, err)
 			return
 		}
+		firstAssignedAt, providerIterations, err := ReserveProviderTurn(lease.File, time.Now().UTC())
+		if err != nil {
+			m.recordError(lease, err)
+			return
+		}
 		jobID := 0
 		if m.JobStarted != nil {
-			jobID = m.JobStarted(lease.SessionKey, filepath.Base(lease.File))
-		}
-		var finishJob sync.Once
-		finish := func() {
-			finishJob.Do(func() {
-				if jobID > 0 && m.JobFinished != nil {
-					m.JobFinished(jobID)
+			implementationAttempts := 0
+			if route.Name == "tasks" {
+				if document, readErr := ReadDocument(lease.File); readErr == nil {
+					implementationAttempts = numberValue(document.FrontMatter["attempt"])
 				}
-			})
+			}
+			jobID = m.JobStarted(lease, filepath.Base(lease.File), firstAssignedAt, providerIterations, implementationAttempts)
+			m.setRuntimeJob(lease.ID, jobID)
 		}
+		finish := func() { m.finishRuntimeJob(lease.ID) }
 		emit := func(event core.Event) {
+			terminal := event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError)
 			// Runtime job bookkeeping is process-local and must not depend on
 			// the durable lease still existing. A fast agent can move its task,
 			// then a concurrent recovery scan can remove the obsolete lease
 			// before the provider emits its final event.
-			if event.Done {
-				finish()
-			}
 			current, err := m.loadLease(lease.ID)
 			if err != nil {
+				if terminal {
+					finish()
+				}
 				return
 			}
 			current.HeartbeatAt = time.Now().UTC()
@@ -436,10 +609,20 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 			if event.Kind == core.EventError {
 				current.LastError = event.Text
 			}
-			if event.Done {
+			if terminal {
 				current.State = "awaiting_transition"
 			}
-			_ = m.saveLease(current)
+			if err := m.saveLease(current); err != nil {
+				m.log("save lease event state: " + err.Error())
+			}
+			if jobID > 0 && m.JobUpdated != nil {
+				m.JobUpdated(jobID, current)
+			}
+			if jobID > 0 && event.Execution != nil && !(terminal && event.Execution.State == "finishing") && m.JobExecutionUpdated != nil {
+				m.JobExecutionUpdated(jobID, *event.Execution)
+			}
+			// Terminal provider completion remains visible as awaiting_transition
+			// until reconciliation observes the agent-authored durable file move.
 		}
 		threadID, steered, err := m.Harness.Send(ctx, lease.SessionKey, prompt, emit)
 		if err != nil {
@@ -462,7 +645,12 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 				lease.State = "recovering"
 			}
 		}
-		_ = m.saveLease(lease)
+		if err := m.saveLease(lease); err != nil {
+			m.log("save lease dispatch state: " + err.Error())
+		}
+		if jobID > 0 && m.JobUpdated != nil {
+			m.JobUpdated(jobID, lease)
+		}
 		verb := "started"
 		if steered {
 			verb = "steered"
@@ -501,6 +689,7 @@ func (m *Manager) reconcileTransitions(ctx context.Context) error {
 		}
 		if status == "" {
 			_ = os.Remove(m.leasePath(lease.ID))
+			m.finishRuntimeJob(lease.ID)
 			continue
 		}
 		phase := normalizeLeasePhase(route.Name, lease.Phase)
@@ -514,6 +703,7 @@ func (m *Manager) reconcileTransitions(ctx context.Context) error {
 			return err
 		}
 		_ = os.Remove(m.leasePath(lease.ID))
+		m.finishRuntimeJob(lease.ID)
 		if route.Name == "goals" && phase == phaseGoalReview && status == "planning" {
 			if err := m.startExistingClaim(ctx, route, path, phaseGoalPlanning, false, true); err != nil {
 				return err
@@ -543,14 +733,49 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route config.Rout
 	base := filepath.Dir(m.Config.Resolve(route.Source))
 	name := filepath.Base(path)
 	if phase == phaseTaskImplementation {
-		if status == "done" || status == "reviewing" {
+		document, readErr := ReadDocument(path)
+		if readErr != nil {
+			return status, path, readErr
+		}
+		policy, policyErr := TaskPolicyFromDocument(document)
+		if policyErr != nil {
+			// Persist the conservative interpretation so retries and inspection
+			// see the same unambiguous policy.
+			document.FrontMatter["review_required"] = true
+			if err := WriteDocument(path, document); err != nil {
+				return status, path, err
+			}
+			m.log("normalized unsafe task review policy in " + path + ": " + policyErr.Error())
+		}
+		// Older managers, or an in-flight scan that crossed a provider move,
+		// may already have claimed review before this implementation lease is
+		// reconciled. Once a review lease exists it owns every subsequent
+		// transition for the document. Preserve its file and backfill the
+		// implementer identity instead of stealing the claim back to review.
+		reviewLease, claimed, leaseErr := m.leaseForDocument(route.Name, name, phaseTaskReview, lease.ID)
+		if leaseErr != nil {
+			return status, path, leaseErr
+		}
+		if claimed {
+			document.FrontMatter["implementation_thread"] = lease.ThreadID
+			document.FrontMatter["implementation_session"] = lease.SessionKey
+			if err := WriteDocument(path, document); err != nil {
+				return status, path, err
+			}
+			reviewLease.ImplementerThread = lease.ThreadID
+			if err := m.saveLease(reviewLease); err != nil {
+				return status, path, err
+			}
+			return status, path, nil
+		}
+		if status == "reviewing" || (status == "done" && policy.ReviewRequired) {
 			var err error
 			status, path, err = m.redirectTransition(path, statusPath(base, "review", name), "review", "Implementation cannot bypass independent review; Spynel redirected this task to review.")
 			if err != nil {
 				return status, path, err
 			}
 		}
-		if !map[string]bool{"todo": true, "review": true, "waiting": true, "failed": true, "cancelled": true}[status] {
+		if !map[string]bool{"todo": true, "review": true, "waiting": true, "done": true, "failed": true, "cancelled": true}[status] {
 			var err error
 			status, path, err = m.redirectTransition(path, statusPath(base, "todo", name), "todo", "Invalid task implementation transition; Spynel returned this task to todo.")
 			if err != nil {
@@ -568,7 +793,17 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route config.Rout
 				return status, path, err
 			}
 		}
-		if status == "waiting" || status == "failed" || status == "cancelled" {
+		if status == "done" && !policy.ReviewRequired {
+			if evidenceErr := validateDirectCompletionEvidence(document); evidenceErr != nil {
+				var err error
+				status, path, err = m.redirectTransition(path, statusPath(base, "todo", name), "todo", "Direct completion rejected: "+evidenceErr.Error())
+				return status, path, err
+			}
+		}
+		if status == "done" {
+			m.finalizeTaskNotificationSummary(path, status)
+		}
+		if status == "done" || status == "waiting" || status == "failed" || status == "cancelled" {
 			if err := m.completeTransition(ctx, route, lease, status, path); err != nil {
 				return status, path, err
 			}
@@ -588,6 +823,7 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route config.Rout
 			return status, path, err
 		}
 	}
+	m.finalizeTaskNotificationSummary(path, status)
 	if status == "done" {
 		if err := m.completeTransition(ctx, route, lease, status, path); err != nil {
 			return status, path, err
@@ -605,7 +841,7 @@ func (m *Manager) reconcileGoalTransition(_ context.Context, route config.Route,
 	}
 	if phase == phaseGoalPlanning {
 		if status == "active" {
-			if err := m.validateGoalActivation(document); err == nil {
+			if err := m.validateGoalPlanningTransition(document); err == nil {
 				return status, path, nil
 			} else {
 				return m.redirectTransition(path, statusPath(base, "proposed", name), "proposed", "Goal activation rejected: "+err.Error())
@@ -630,6 +866,11 @@ func (m *Manager) reconcileGoalTransition(_ context.Context, route config.Route,
 }
 
 func (m *Manager) redirectTransition(path, target, status, note string) (string, string, error) {
+	lock, lockErr := lockProviderTurn(path)
+	if lockErr != nil {
+		return status, path, lockErr
+	}
+	defer unlockProviderTurn(lock)
 	document, err := ReadDocument(path)
 	if err != nil {
 		return status, path, err
@@ -656,31 +897,38 @@ func (m *Manager) completeTransition(ctx context.Context, route config.Route, le
 	policy, err := NotificationFromDocument(document)
 	if err != nil {
 		m.log("invalid notification metadata in " + path + ": " + err.Error())
-		return nil
+		policy = NotificationPolicy{}
 	}
-	if m.Config.Extensions.Enabled {
-		if _, hookErr := m.Hooks.Run(ctx, "task.completed", map[string]any{"route": route.Name, "file": path, "thread_id": lease.ThreadID, "outcome": status}); hookErr != nil {
-			m.log("task.completed hook: " + hookErr.Error())
+	if policy.Enabled && policy.Outcomes[status] {
+		id, _ := document.FrontMatter["id"].(string)
+		if id == "" {
+			id = lease.ID
+		}
+		if err = m.enqueueTriage(document, lease, status, path, policy); err != nil {
+			return err
 		}
 	}
-	if !policy.Enabled || !policy.Outcomes[status] {
-		return nil
+	if m.Config.Extensions.Enabled {
+		if lease.TerminalHooksCompleted == nil {
+			lease.TerminalHooksCompleted = map[string]bool{}
+		}
+		// Enqueue first, then persist a receipt after each extension completes
+		// successfully. A crash or receipt-write failure retries with the same
+		// event ID; extensions must persistently deduplicate visible effects.
+		var receiptErr error
+		if _, hookErr := m.Hooks.RunTracked(ctx, "task.completed", map[string]any{
+			"route": route.Name, "file": path, "thread_id": lease.ThreadID,
+			"outcome": status, "event_id": lease.ID + ":" + status,
+		}, lease.TerminalHooksCompleted, func(extensionID string) error {
+			lease.TerminalHooksCompleted[extensionID] = true
+			receiptErr = m.saveLease(lease)
+			return receiptErr
+		}); hookErr != nil {
+			m.log("task.completed hook: " + hookErr.Error())
+			return hookErr
+		}
 	}
-	id, _ := document.FrontMatter["id"].(string)
-	title, _ := document.FrontMatter["title"].(string)
-	if id == "" {
-		id = lease.ID
-	}
-	if title == "" {
-		title = filepath.Base(path)
-	}
-	summary := "Task reached " + status + "."
-	if status == "done" {
-		summary = "Independent review accepted the implementation."
-	}
-	message := fmt.Sprintf("%s — %s\n%s\nTask ID: %s\nStatus: spynel status; task: %s", title, status, summary, id, path)
-	_, err = m.Outbox.Enqueue(id, status, policy.Origin.Channel+"/"+policy.Origin.Conversation, message)
-	return err
+	return nil
 }
 
 func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
@@ -694,16 +942,14 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		}
 		if _, err := os.Stat(lease.File); os.IsNotExist(err) && lease.SourceFile != "" {
 			if _, sourceErr := os.Stat(lease.SourceFile); sourceErr == nil {
-				document, claimErr := ClaimDocument(lease.SourceFile, lease.File, phaseClaimedStatus(normalizeLeasePhase(lease.Route, lease.Phase)), time.Now())
+				phase := normalizeLeasePhase(lease.Route, lease.Phase)
+				field := phaseAttemptField(phase)
+				document, claimErr := m.claimPhaseDocument(lease.SourceFile, lease.File, phaseClaimedStatus(phase), field, time.Now())
 				if claimErr != nil {
 					return claimErr
 				}
-				field := phaseAttemptField(normalizeLeasePhase(lease.Route, lease.Phase))
-				if numberValue(document.FrontMatter[field]) == 0 {
-					document.FrontMatter[field] = 1
-					if err := WriteDocument(lease.File, document); err != nil {
-						return err
-					}
+				if lease.ClaimAttempt == 0 {
+					lease.ClaimAttempt = numberValue(document.FrontMatter[field])
 				}
 			}
 		}
@@ -711,6 +957,51 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 			route, ok := m.route(lease.Route)
 			if !ok {
 				continue
+			}
+			phase := normalizeLeasePhase(lease.Route, lease.Phase)
+			field := phaseAttemptField(phase)
+			document, readErr := ReadDocument(lease.File)
+			if readErr != nil {
+				return readErr
+			}
+			attempt := lease.ClaimAttempt
+			if attempt == 0 {
+				attempt = claimAttemptFromSession(lease.SessionKey)
+				currentAttempt := numberValue(document.FrontMatter[field])
+				claimedStatus := stringField(document, "status") == phaseClaimedStatus(phase)
+				if attempt == 0 {
+					attempt = currentAttempt
+				}
+				if attempt == 0 || (!claimedStatus && attempt <= currentAttempt) {
+					attempt++
+				}
+				if attempt < 1 {
+					attempt = 1
+				}
+				// Older phase claims first used the generic ClaimDocument, which
+				// incremented `attempt` before a second write populated the real
+				// phase field. This exact mismatch identifies that interrupted
+				// first write and lets recovery remove its spurious increment.
+				if field != "attempt" && claimedStatus && stringField(document, "_spynel_attempt_repair_claim") != lease.ID {
+					implementationAttempt := numberValue(document.FrontMatter["attempt"])
+					if implementationAttempt > 0 {
+						document.FrontMatter["attempt"] = implementationAttempt - 1
+					}
+					// This marker makes the cross-file legacy migration replay-safe if
+					// the process exits after the document write but before the lease
+					// records ClaimAttempt. It is intentionally retained as evidence.
+					document.FrontMatter["_spynel_attempt_repair_claim"] = lease.ID
+				}
+				lease.ClaimAttempt = attempt
+			}
+			document.FrontMatter["status"] = phaseClaimedStatus(phase)
+			document.FrontMatter["updated_at"] = lease.StartedAt.UTC().Format(time.RFC3339)
+			if first, ok := frontMatterTime(document.FrontMatter["first_assigned_at"]); !ok || first.After(lease.StartedAt) {
+				document.FrontMatter["first_assigned_at"] = lease.StartedAt.UTC().Format(time.RFC3339)
+			}
+			document.FrontMatter[field] = attempt
+			if err := WriteDocument(lease.File, document); err != nil {
+				return err
 			}
 			lease.State = "recovering"
 			lease.OwnerID = m.ownerID
@@ -730,6 +1021,13 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (m *Manager) claimPhaseDocument(source, target, status, attemptField string, now time.Time) (Document, error) {
+	if m.claimDocument != nil {
+		return m.claimDocument(source, target, status, attemptField, now)
+	}
+	return claimDocument(source, target, status, attemptField, now)
 }
 
 func (m *Manager) recoverOrphanClaims(ctx context.Context) error {
@@ -783,6 +1081,23 @@ func (m *Manager) hasLeaseForFile(path string) bool {
 		}
 	}
 	return false
+}
+
+func (m *Manager) leaseForDocument(routeName, name, phase, exceptID string) (Lease, bool, error) {
+	leases, err := m.loadLeases()
+	if err != nil {
+		return Lease{}, false, err
+	}
+	for _, lease := range leases {
+		if lease.ID == exceptID || lease.Route != routeName || filepath.Base(lease.File) != name {
+			continue
+		}
+		if phase != "" && normalizeLeasePhase(routeName, lease.Phase) != phase {
+			continue
+		}
+		return lease, true, nil
+	}
+	return Lease{}, false, nil
 }
 
 func (m *Manager) wakeWaitingDocuments(ctx context.Context) error {
@@ -888,7 +1203,16 @@ func (m *Manager) advanceActiveGoals() error {
 				continue
 			}
 		}
-		if !settled && !checkpoint {
+		ready := false
+		switch trigger {
+		case "all_round_tasks_settled":
+			ready = settled
+		case "all_round_tasks_settled_or_checkpoint":
+			ready = settled || checkpoint
+		case "scheduled":
+			ready = checkpoint
+		}
+		if !ready {
 			continue
 		}
 		target := filepath.Join(base, "review", entry.Name())
@@ -904,8 +1228,24 @@ func (m *Manager) validateGoalActivation(document Document) error {
 	if err := validSuccessCriteria(document); err != nil {
 		return err
 	}
-	if stringField(document, "review_trigger") == "" {
-		return errors.New("review_trigger is required")
+	trigger := stringField(document, "review_trigger")
+	switch trigger {
+	case "all_round_tasks_settled":
+	case "all_round_tasks_settled_or_checkpoint":
+		if _, exists := document.FrontMatter["next_review_at"]; exists {
+			if _, err := checkpointDue(document, time.Now()); err != nil {
+				return err
+			}
+		}
+	case "scheduled":
+		if _, exists := document.FrontMatter["next_review_at"]; !exists {
+			return errors.New("scheduled review_trigger requires next_review_at")
+		}
+		if _, err := checkpointDue(document, time.Now()); err != nil {
+			return err
+		}
+	default:
+		return errors.New("review_trigger must be all_round_tasks_settled, all_round_tasks_settled_or_checkpoint, or scheduled")
 	}
 	if numberValue(document.FrontMatter["round"]) <= 0 {
 		return errors.New("round must be positive before activation")
@@ -944,6 +1284,16 @@ func (m *Manager) validateGoalActivation(document Document) error {
 		if !linked[id] {
 			return fmt.Errorf("round_task_ids references missing task %q", id)
 		}
+	}
+	return nil
+}
+
+func (m *Manager) validateGoalPlanningTransition(document Document) error {
+	if err := m.validateGoalActivation(document); err != nil {
+		return err
+	}
+	if _, exists := document.FrontMatter["next_review_at"]; exists && stringField(document, "checkpoint_reason") == "" {
+		return errors.New("next_review_at requires checkpoint_reason")
 	}
 	return nil
 }
@@ -1057,6 +1407,7 @@ func (m *Manager) renderPrompt(route config.Route, file, promptPath string) (str
 		"{{GOAL_SOURCE}}":    m.routeSource("goals"),
 	}
 	prompt := string(data)
+	prompt = agentdocs.InjectPromptGuidance(prompt)
 	for from, to := range replacements {
 		prompt = strings.ReplaceAll(prompt, from, to)
 	}
@@ -1149,6 +1500,67 @@ func (m *Manager) Status() (int, int, error) {
 	return len(leases), active, nil
 }
 
+func (m *Manager) ScheduledCheckpoints(now time.Time) ([]ScheduledCheckpoint, error) {
+	route, ok := m.route("goals")
+	if !ok {
+		return nil, nil
+	}
+	directory := filepath.Join(filepath.Dir(m.Config.Resolve(route.Source)), "active")
+	entries, truncated, err := readDirectoryEntries(directory, maxStatusDirectoryEntries)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	waits := make([]ScheduledCheckpoint, 0)
+	inspected := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") || entry.Name() == "AGENTS.md" {
+			continue
+		}
+		if inspected >= maxStatusDocuments {
+			return waits, fmt.Errorf("scheduled goal checkpoints are incomplete: document limit reached")
+		}
+		inspected++
+		data, err := readStatusDocument(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			continue
+		}
+		document, err := ParseDocument(data)
+		if err != nil {
+			continue
+		}
+		trigger := stringField(document, "review_trigger")
+		if trigger != "scheduled" && trigger != "all_round_tasks_settled_or_checkpoint" {
+			continue
+		}
+		value, ok := document.FrontMatter["next_review_at"]
+		if !ok {
+			continue
+		}
+		var at time.Time
+		switch typed := value.(type) {
+		case string:
+			at, err = time.Parse(time.RFC3339, typed)
+		case time.Time:
+			at = typed
+		}
+		if err != nil || at.IsZero() || !at.After(now) {
+			continue
+		}
+		waits = append(waits, ScheduledCheckpoint{
+			ID: documentID(document), Title: stringField(document, "title"), At: at.UTC(),
+			Reason: stringField(document, "checkpoint_reason"),
+		})
+	}
+	if truncated {
+		return waits, fmt.Errorf("scheduled goal checkpoints are incomplete: directory entry limit reached")
+	}
+	sort.Slice(waits, func(i, j int) bool { return waits[i].At.Before(waits[j].At) })
+	return waits, nil
+}
+
 func (m *Manager) route(name string) (config.Route, bool) {
 	for _, route := range m.Config.Orchestrator.Routes {
 		if route.Name == name {
@@ -1212,11 +1624,126 @@ func (m *Manager) loadLeases() ([]Lease, error) {
 	return leases, nil
 }
 
+// LeaseForSession returns the newest persisted lease for an orchestrator
+// session. The value copy remains safe if the lease is concurrently updated.
+func (m *Manager) LeaseForSession(sessionKey string) (Lease, bool) {
+	leases, err := m.loadLeases()
+	if err != nil {
+		return Lease{}, false
+	}
+	for index := len(leases) - 1; index >= 0; index-- {
+		if leases[index].SessionKey == sessionKey {
+			return leases[index], true
+		}
+	}
+	return Lease{}, false
+}
+
+// PrepareControlContinuation performs the one durable gate immediately before
+// a control-attributable continuation. It refuses moved documents, changed
+// owners/sessions, cancellation/error states, and executions no longer owned
+// by this manager. A successful gate returns the lease to processing; the
+// provider's subsequent events remain responsible for heartbeat activity.
+func (m *Manager) PrepareControlContinuation(expected Lease, expectedDocumentID string) bool {
+	if !m.ControlStillValid(expected, expectedDocumentID) || !m.Harness.IsActive(expected.SessionKey) {
+		return false
+	}
+	current, err := m.loadLease(expected.ID)
+	if err != nil {
+		return false
+	}
+	if current.State != "awaiting_transition" && current.State != "processing" && current.State != "recovering" {
+		return false
+	}
+	current.State = "processing"
+	current.LastError = ""
+	if err := m.saveLease(current); err != nil {
+		m.log("save control continuation lease: " + err.Error())
+		return false
+	}
+	if jobID := m.runtimeJob(expected.ID); jobID > 0 && m.JobUpdated != nil {
+		m.JobUpdated(jobID, current)
+	}
+	return true
+}
+
+// ReserveControlProviderTurn performs the same durable provider-turn
+// reservation used by ordinary dispatch immediately before a native control,
+// queued control, or guarded continuation reaches the harness.
+func (m *Manager) ReserveControlProviderTurn(expected Lease, expectedDocumentID string) bool {
+	if !m.ControlStillValid(expected, expectedDocumentID) {
+		return false
+	}
+	first, iterations, err := ReserveProviderTurn(expected.File, time.Now().UTC())
+	if err != nil {
+		m.log("reserve control provider turn: " + err.Error())
+		return false
+	}
+	if jobID := m.runtimeJob(expected.ID); jobID > 0 && m.JobTimingUpdated != nil {
+		m.JobTimingUpdated(jobID, first, iterations)
+	}
+	return true
+}
+
+// ControlStillValid checks immutable execution identity and durable claimed
+// state without advancing heartbeats or workflow status.
+func (m *Manager) ControlStillValid(expected Lease, expectedDocumentID string) bool {
+	if expected.ID == "" || expectedDocumentID == "" || m.runtimeJob(expected.ID) == 0 || m.isControlCancelled(expected.ID) {
+		return false
+	}
+	current, err := m.loadLease(expected.ID)
+	if err != nil || current.OwnerID != expected.OwnerID || current.SessionKey != expected.SessionKey || current.File != expected.File || current.Phase != expected.Phase {
+		return false
+	}
+	if current.State != "awaiting_transition" && current.State != "processing" && current.State != "recovering" {
+		return false
+	}
+	document, err := ReadDocument(current.File)
+	if err != nil {
+		return false
+	}
+	if documentID(document) != expectedDocumentID {
+		return false
+	}
+	status, _ := document.FrontMatter["status"].(string)
+	expectedStatus := ""
+	switch normalizeLeasePhase(expected.Route, expected.Phase) {
+	case phaseTaskImplementation:
+		expectedStatus = "working"
+	case phaseTaskReview, phaseGoalReview:
+		expectedStatus = "reviewing"
+	case phaseGoalPlanning:
+		expectedStatus = "planning"
+	}
+	return expectedStatus != "" && status == expectedStatus
+}
+
+// MarkControlCancellation fences automatic control continuation before a job
+// interrupt races the provider's terminal event. It is process-local: a later
+// owner may still use ordinary durable stale recovery for unfinished work.
+func (m *Manager) MarkControlCancellation(sessionKey string) {
+	lease, ok := m.LeaseForSession(sessionKey)
+	if !ok {
+		return
+	}
+	m.mu.Lock()
+	m.controlCancelled[lease.ID] = true
+	m.mu.Unlock()
+}
+
+func (m *Manager) isControlCancelled(leaseID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.controlCancelled[leaseID]
+}
+
 func (m *Manager) recordError(lease Lease, err error) {
 	lease.LastError = err.Error()
 	lease.State = "error"
 	lease.HeartbeatAt = time.Now().UTC()
-	_ = m.saveLease(lease)
+	if saveErr := m.saveLease(lease); saveErr != nil {
+		m.log("save failed lease: " + saveErr.Error())
+	}
 	m.log(fmt.Sprintf("dispatch %s: %v", lease.File, err))
 }
 
@@ -1233,6 +1760,32 @@ func (m *Manager) setInflight(key string, value bool) {
 		m.inflight[key] = true
 	} else {
 		delete(m.inflight, key)
+	}
+}
+
+func (m *Manager) setRuntimeJob(leaseID string, jobID int) {
+	if jobID <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.runtimeJobs[leaseID] = jobID
+	m.mu.Unlock()
+}
+
+func (m *Manager) runtimeJob(leaseID string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.runtimeJobs[leaseID]
+}
+
+func (m *Manager) finishRuntimeJob(leaseID string) {
+	m.mu.Lock()
+	jobID := m.runtimeJobs[leaseID]
+	delete(m.runtimeJobs, leaseID)
+	delete(m.controlCancelled, leaseID)
+	m.mu.Unlock()
+	if jobID > 0 && m.JobFinished != nil {
+		m.JobFinished(jobID)
 	}
 }
 

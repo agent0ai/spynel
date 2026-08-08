@@ -48,6 +48,8 @@ var files = []fileSpec{
 	{Path: ".spynel/prompts/goal-review.md", Template: "templates/goal-review.md"},
 	{Path: ".spynel/prompts/recovery.md", Template: "templates/recovery.md"},
 	{Path: ".spynel/prompts/review.md", Template: "templates/review.md"},
+	{Path: ".spynel/prompts/heartbeat.md", Template: "templates/heartbeat.md"},
+	{Path: ".spynel/prompts/notification.md", Template: "templates/notification.md"},
 	{Path: ".spynel/extensions/README.md", Template: "templates/extensions.md"},
 }
 

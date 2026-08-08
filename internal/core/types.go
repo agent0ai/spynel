@@ -17,13 +17,17 @@ const ScreenWhatsAppQR = "fullscreen:whatsapp:qr"
 
 // Message is the transport-neutral input accepted by the application.
 type Message struct {
-	Channel      string    `json:"channel"`
-	Conversation string    `json:"conversation"`
-	Sender       string    `json:"sender,omitempty"`
-	InstanceID   string    `json:"instance_id,omitempty"`
-	FollowupOnly bool      `json:"followup_only,omitempty"`
-	Text         string    `json:"text"`
-	ReceivedAt   time.Time `json:"received_at"`
+	Channel      string `json:"channel"`
+	Conversation string `json:"conversation"`
+	Sender       string `json:"sender,omitempty"`
+	// NativeMessageID and NativeReplyToID are opaque transport identifiers from
+	// an accepted inbound event. They are used only for exact reply correlation.
+	NativeMessageID string    `json:"native_message_id,omitempty"`
+	NativeReplyToID string    `json:"native_reply_to_id,omitempty"`
+	InstanceID      string    `json:"instance_id,omitempty"`
+	FollowupOnly    bool      `json:"followup_only,omitempty"`
+	Text            string    `json:"text"`
+	ReceivedAt      time.Time `json:"received_at"`
 }
 
 // Event is a streamed harness or application response.
@@ -41,6 +45,22 @@ type Event struct {
 	Local       bool                 `json:"local,omitempty"`
 	Screen      *Screen              `json:"screen,omitempty"`
 	Attachments []OutboundAttachment `json:"attachments,omitempty"`
+	// Execution is a provider-neutral lifecycle signal. Adapters populate it
+	// from structured protocol events; renderers must never infer it from Text.
+	Execution *ExecutionStatus `json:"execution,omitempty"`
+}
+
+// ExecutionStatus describes a live provider turn without mixing in a durable
+// task/goal phase or outcome. A stalled state is valid only when the provider
+// supplies explicit structured evidence; consumers must not infer it from a
+// quiet text stream. Detail is optional, sanitized by the application, and
+// intended for short retry/error context only.
+type ExecutionStatus struct {
+	State            string    `json:"state"`
+	Detail           string    `json:"detail,omitempty"`
+	At               time.Time `json:"at,omitempty"`
+	ReconnectAttempt int       `json:"reconnect_attempt,omitempty"`
+	ReconnectTotal   int       `json:"reconnect_total,omitempty"`
 }
 
 // OutboundAttachment is a validated local file that a channel may deliver

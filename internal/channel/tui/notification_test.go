@@ -5,10 +5,10 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/channel/tui/textarea"
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/charmbracelet/bubbles/viewport"
 )
 
 func notificationTestModel() model {

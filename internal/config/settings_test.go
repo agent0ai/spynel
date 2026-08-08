@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+func TestHeartbeatSettingsAreLiveWhileOtherOrchestratorControlsRequireRestart(t *testing.T) {
+	cfg := Default()
+	for _, key := range []string{"orchestrator.enabled", "orchestrator.semantic_heartbeat_minutes"} {
+		setting, ok := SettingByKey(cfg, key)
+		if !ok || setting.Restart {
+			t.Fatalf("live setting %q = %#v, present %t", key, setting, ok)
+		}
+	}
+	for _, key := range []string{"orchestrator.interval_seconds", "orchestrator.max_parallel"} {
+		setting, ok := SettingByKey(cfg, key)
+		if !ok || !setting.Restart {
+			t.Fatalf("restart-bound setting %q = %#v, present %t", key, setting, ok)
+		}
+	}
+}
+
 func TestSetSettingParsesSharedCommandValues(t *testing.T) {
 	cfg := Default()
 	for _, test := range []struct {
@@ -19,13 +35,14 @@ func TestSetSettingParsesSharedCommandValues(t *testing.T) {
 		{"channels.whatsapp.mode", "dedicated"},
 		{"speech.language", "fr"},
 		{"orchestrator.interval_seconds", "15"},
+		{"orchestrator.semantic_heartbeat_minutes", "30"},
 		{"extensions.hook_timeout", "45s"},
 	} {
 		if _, err := SetSetting(&cfg, test.key, test.value); err != nil {
 			t.Fatalf("set %s: %v", test.key, err)
 		}
 	}
-	if cfg.Workspace.HistoryMaxMessages != 24 || cfg.Harness.Name != "claude-code" || cfg.Harness.Sandbox != "danger-full-access" || cfg.Channels.TUI.Theme != "catppuccin-latte" || len(cfg.Channels.Telegram.AllowedUsers) != 2 || cfg.Channels.WhatsApp.Mode != "dedicated" || cfg.Speech.Language != "fr" || cfg.Orchestrator.IntervalSec != 15 || cfg.Extensions.HookTimeout != "45s" {
+	if cfg.Workspace.HistoryMaxMessages != 24 || cfg.Harness.Name != "claude-code" || cfg.Harness.Sandbox != "danger-full-access" || cfg.Channels.TUI.Theme != "catppuccin-latte" || len(cfg.Channels.Telegram.AllowedUsers) != 2 || cfg.Channels.WhatsApp.Mode != "dedicated" || cfg.Speech.Language != "fr" || cfg.Orchestrator.IntervalSec != 15 || cfg.Orchestrator.SemanticHeartbeatMinutes != 30 || cfg.Extensions.HookTimeout != "45s" {
 		t.Fatalf("unexpected config after settings: %#v", cfg)
 	}
 }

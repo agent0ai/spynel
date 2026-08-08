@@ -51,9 +51,21 @@ speech:
 startup:
   enabled: false
 
+# Cross-channel reminders are disabled unless contacts are explicitly bound
+# to the same authenticated principal.
+notifications:
+  contact_bindings: []
+  # Non-urgent actionable reminders are deferred during this daily UTC window.
+  quiet_hours:
+    enabled: false
+    start: "22:00"
+    end: "07:00"
+
 orchestrator:
   enabled: true
   interval_seconds: 10
+  # Higher-level agent audit; 0 disables it. Changes take effect after restart.
+  semantic_heartbeat_minutes: 15
   max_parallel: 4
   routes:
     - name: tasks

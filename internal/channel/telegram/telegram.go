@@ -36,14 +36,20 @@ type Bot struct {
 	speech   media.Transcriber
 	me       telegramUser
 	activity *channel.ActivityIndicator[string]
+	identity *IdentityStore
+	log      io.Writer
 }
 
 func New(cfg config.Telegram, token string) *Bot {
+	return NewWithIdentityStore(cfg, token, "")
+}
+
+func NewWithIdentityStore(cfg config.Telegram, token, identityPath string) *Bot {
 	timeout := time.Duration(cfg.PollTimeoutSec+10) * time.Second
 	if timeout < 20*time.Second {
 		timeout = 20 * time.Second
 	}
-	bot := &Bot{config: cfg, token: token, client: &http.Client{Timeout: timeout}, baseURL: "https://api.telegram.org"}
+	bot := &Bot{config: cfg, token: token, client: &http.Client{Timeout: timeout}, baseURL: "https://api.telegram.org", identity: NewIdentityStore(identityPath)}
 	bot.activity = newTelegramActivity(bot, 4*time.Second)
 	return bot
 }
@@ -63,34 +69,33 @@ func (b *Bot) SetStatusReporter(report channel.StatusReporter) { b.report = repo
 
 func (b *Bot) SetNoticeReporter(report channel.NoticeReporter) { b.notice = report }
 
+func (b *Bot) SetLogWriter(writer io.Writer) { b.log = writer }
+
 func (b *Bot) SetMedia(store *media.Store, speech media.Transcriber) {
 	b.store = store
 	b.speech = speech
 }
 
-func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string) error {
+func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string) (channel.DeliveryReceipt, error) {
 	var chatID string
 	if strings.HasPrefix(conversation, "TG-group-") {
 		if b.config.GroupMode == "off" {
-			return errors.New("Telegram group delivery is disabled")
+			return channel.DeliveryReceipt{}, errors.New("Telegram group delivery is disabled")
 		}
 		chatID = strings.TrimPrefix(conversation, "TG-group-")
 	} else if strings.HasPrefix(conversation, "TG-") {
 		chatID = strings.TrimPrefix(conversation, "TG-")
-		authorized := false
-		for _, allowed := range b.config.AllowedUsers {
-			authorized = authorized || strings.TrimSpace(strings.TrimPrefix(allowed, "@")) == chatID
-		}
-		if !authorized {
-			return errors.New("Telegram origin is not in allowed_users")
+		if !b.identity.AuthorizedPrivate(b.config.AllowedUsers, chatID) {
+			return channel.DeliveryReceipt{}, errors.New("Telegram origin is not in allowed_users")
 		}
 	} else {
-		return errors.New("invalid Telegram conversation origin")
+		return channel.DeliveryReceipt{}, errors.New("invalid Telegram conversation origin")
 	}
 	if _, err := strconv.ParseInt(chatID, 10, 64); err != nil {
-		return errors.New("invalid Telegram chat identifier")
+		return channel.DeliveryReceipt{}, errors.New("invalid Telegram chat identifier")
 	}
-	return b.send(ctx, chatID, text, 0)
+	ids, err := b.sendWithIDs(ctx, chatID, text, 0, true)
+	return channel.DeliveryReceipt{MessageIDs: ids}, err
 }
 
 func (b *Bot) Run(ctx context.Context, handler channel.Handler) error {
@@ -252,6 +257,11 @@ func (b *Bot) processUpdate(ctx context.Context, handler channel.Handler, update
 	if message == nil || !message.hasContent() || !b.allowed(message.From) {
 		return
 	}
+	if message.Chat.Type == "private" && message.Chat.ID == message.From.ID {
+		if err := b.identity.RecordVerifiedPrivate(message.From.ID, message.From.ID, message.From.Username); err != nil && b.log != nil {
+			_, _ = fmt.Fprintln(b.log, "telegram: persist verified private identity:", err)
+		}
+	}
 	if b.config.WelcomeEnabled && len(message.NewChatMembers) > 0 {
 		b.welcome(ctx, message)
 	}
@@ -322,7 +332,7 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 	}
 	err = handler(ctx, core.Message{
 		Channel: b.Name(), Conversation: b.conversationID(message), Sender: b.sender(message.From),
-		Text:       text,
+		Text: text, NativeMessageID: strconv.FormatInt(message.MessageID, 10), NativeReplyToID: telegramReplyID(message),
 		ReceivedAt: time.Unix(message.Date, 0).UTC(),
 	}, emit)
 	if err != nil {
@@ -406,9 +416,9 @@ func (b *Bot) allowed(user telegramUser) bool {
 		return false
 	}
 	id := strconv.FormatInt(user.ID, 10)
-	username := strings.ToLower(strings.TrimPrefix(user.Username, "@"))
+	username := normalizeUsername(user.Username)
 	for _, allowed := range b.config.AllowedUsers {
-		allowed = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(allowed, "@")))
+		allowed = normalizeAllowedUser(allowed)
 		if allowed == id || (username != "" && allowed == username) {
 			return true
 		}
@@ -474,17 +484,41 @@ func (b *Bot) updates(ctx context.Context, offset int64) ([]telegramUpdate, erro
 }
 
 func (b *Bot) send(ctx context.Context, chatID, text string, replyTo int64) error {
+	_, err := b.sendWithIDs(ctx, chatID, text, replyTo, false)
+	return err
+}
+
+func (b *Bot) sendWithIDs(ctx context.Context, chatID, text string, replyTo int64, requireID bool) ([]string, error) {
+	var ids []string
 	for _, chunk := range telegramChunks(text, 4096) {
 		payload := map[string]any{"chat_id": chatID, "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": true}
 		if replyTo > 0 {
 			payload["reply_parameters"] = map[string]any{"message_id": replyTo}
 		}
-		if err := b.post(ctx, "sendMessage", payload); err != nil {
-			return err
+		result, err := b.call(ctx, "sendMessage", payload)
+		if err != nil {
+			return nil, err
 		}
+		var sent struct {
+			MessageID int64 `json:"message_id"`
+		}
+		if json.Unmarshal(result, &sent) != nil || sent.MessageID <= 0 {
+			if requireID {
+				return nil, errors.New("Telegram sendMessage returned no message identifier")
+			}
+			continue
+		}
+		ids = append(ids, strconv.FormatInt(sent.MessageID, 10))
 		replyTo = 0
 	}
-	return nil
+	return ids, nil
+}
+
+func telegramReplyID(message *telegramMessage) string {
+	if message != nil && message.ReplyToMessage != nil && message.ReplyToMessage.MessageID > 0 {
+		return strconv.FormatInt(message.ReplyToMessage.MessageID, 10)
+	}
+	return ""
 }
 
 func (b *Bot) sendAttachment(ctx context.Context, chatID string, attachment core.OutboundAttachment, replyTo int64) error {

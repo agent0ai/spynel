@@ -57,6 +57,8 @@ type turnState struct {
 	key              string
 	threadID         string
 	turnID           string
+	deliveryMu       sync.Mutex
+	completed        bool
 	emitMu           sync.RWMutex
 	emit             core.Emit
 	messages         []string
@@ -90,6 +92,19 @@ type rpcError struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+type rpcCallError struct {
+	Method  string
+	Code    int
+	Message string
+}
+
+func (e *rpcCallError) Error() string {
+	if e.Code == -32601 {
+		return fmt.Sprintf("Codex app-server is incompatible: required method %q is unavailable: %s (%d); update the Codex executable or select another harness", e.Method, e.Message, e.Code)
+	}
+	return fmt.Sprintf("Codex app-server method %q failed: %s (%d)", e.Method, e.Message, e.Code)
 }
 
 type codexModelList struct {
@@ -218,9 +233,15 @@ func (c *Codex) Start(parent context.Context) error {
 		"clientInfo":   map[string]any{"name": "spynel", "title": "Spynel", "version": c.config.Version},
 		"capabilities": map[string]any{"experimentalApi": false},
 	}
-	if _, err := c.call(parent, "initialize", params); err != nil {
+	result, err := c.call(parent, "initialize", params)
+	if err != nil {
 		_ = c.Close()
-		return fmt.Errorf("initialize codex app-server: %w", err)
+		return fmt.Errorf("Codex executable %q failed app-server initialization: %w", c.config.Command, err)
+	}
+	var initialized map[string]json.RawMessage
+	if err := json.Unmarshal(result, &initialized); err != nil || initialized == nil {
+		_ = c.Close()
+		return fmt.Errorf("Codex executable %q returned an incompatible initialize result; expected the documented app-server object", c.config.Command)
 	}
 	return c.notify("initialized", map[string]any{})
 }
@@ -282,15 +303,18 @@ func (c *Codex) Send(ctx context.Context, key, prompt string, emit core.Emit) (s
 	}
 	result, err := c.call(ctx, "turn/start", params)
 	if err != nil {
-		return threadID, false, err
+		return threadID, false, fmt.Errorf("start Codex turn with required method turn/start: %w", err)
 	}
 	var response struct {
 		Turn struct {
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	if err := json.Unmarshal(result, &response); err != nil || response.Turn.ID == "" {
-		return threadID, false, fmt.Errorf("invalid turn/start response: %w", err)
+	if err := json.Unmarshal(result, &response); err != nil {
+		return threadID, false, fmt.Errorf("Codex app-server returned an incompatible turn/start result: decode required field turn.id: %w", err)
+	}
+	if response.Turn.ID == "" {
+		return threadID, false, errors.New("Codex app-server returned an incompatible turn/start result: required field turn.id is missing")
 	}
 	state := &turnState{key: key, threadID: threadID, turnID: response.Turn.ID, emit: emit}
 	c.mu.Lock()
@@ -302,9 +326,62 @@ func (c *Codex) Send(ctx context.Context, key, prompt string, emit core.Emit) (s
 		c.handleNotification(message)
 	}
 	if emit != nil {
-		emit(core.Event{Kind: core.EventStatus, Text: "Codex turn started", ThreadID: threadID, TurnID: response.Turn.ID})
+		emit(core.Event{Kind: core.EventStatus, Text: "Codex turn started", ThreadID: threadID, TurnID: response.Turn.ID,
+			Execution: &core.ExecutionStatus{State: "running"}})
 	}
 	return threadID, false, nil
+}
+
+// Steer addresses only the current turn and cannot fall back to turn/start.
+func (c *Codex) Steer(ctx context.Context, key, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+	if strings.TrimSpace(prompt) == "" {
+		return "", errors.New("harness prompt is empty")
+	}
+	lock := c.lockForKey(key)
+	lock.Lock()
+	defer lock.Unlock()
+	c.mu.Lock()
+	threadID := c.session[key]
+	active := c.active[threadID]
+	c.mu.Unlock()
+	if threadID == "" || active == nil {
+		return threadID, fmt.Errorf("Codex turn is no longer active: %w", errNativeTurnInactive)
+	}
+	active.deliveryMu.Lock()
+	if active.completed {
+		active.deliveryMu.Unlock()
+		return threadID, fmt.Errorf("Codex turn is no longer active: %w", errNativeTurnInactive)
+	}
+	if beforeDelivery != nil && !beforeDelivery() {
+		active.deliveryMu.Unlock()
+		return threadID, errNativeDeliveryUnreserved
+	}
+	previousEmit := active.replaceEmit(emit)
+	params := map[string]any{
+		"threadId": threadID, "expectedTurnId": active.turnID,
+		"input": []map[string]any{{"type": "text", "text": prompt}},
+	}
+	id, response, err := c.beginCall("turn/steer", params)
+	active.deliveryMu.Unlock()
+	if err == nil {
+		_, err = c.awaitCall(ctx, "turn/steer", id, response)
+	}
+	if err != nil {
+		c.mu.Lock()
+		stillActive := c.active[threadID] == active
+		c.mu.Unlock()
+		if stillActive {
+			active.replaceEmit(previousEmit)
+		}
+		return threadID, err
+	}
+	if previousEmit != nil {
+		previousEmit(core.Event{Kind: core.EventStatus, Done: true, ThreadID: threadID, TurnID: active.turnID})
+	}
+	if emit != nil {
+		emit(core.Event{Kind: core.EventStatus, Text: "Steering active Codex turn", ThreadID: threadID, TurnID: active.turnID})
+	}
+	return threadID, nil
 }
 
 func (c *Codex) ensureThread(ctx context.Context, key string) (string, error) {
@@ -317,18 +394,24 @@ func (c *Codex) ensureThread(ctx context.Context, key string) (string, error) {
 	}
 	if threadID != "" {
 		result, err := c.call(ctx, "thread/resume", map[string]any{"threadId": threadID})
-		if err == nil {
+		if err != nil {
+			var callErr *rpcCallError
+			if errors.As(err, &callErr) && callErr.Code == -32601 {
+				return "", fmt.Errorf("cannot safely resume persisted Codex thread %q: required method thread/resume is unavailable: %w", threadID, err)
+			}
+		} else {
 			var response struct {
 				Thread struct {
 					ID string `json:"id"`
 				} `json:"thread"`
 			}
-			if json.Unmarshal(result, &response) == nil && response.Thread.ID != "" {
-				c.mu.Lock()
-				c.loaded[response.Thread.ID] = true
-				c.mu.Unlock()
-				return response.Thread.ID, nil
+			if decodeErr := json.Unmarshal(result, &response); decodeErr != nil || response.Thread.ID == "" {
+				return "", fmt.Errorf("cannot safely resume persisted Codex thread %q: incompatible thread/resume result missing required field thread.id", threadID)
 			}
+			c.mu.Lock()
+			c.loaded[response.Thread.ID] = true
+			c.mu.Unlock()
+			return response.Thread.ID, nil
 		}
 	}
 	params := map[string]any{
@@ -342,15 +425,18 @@ func (c *Codex) ensureThread(ctx context.Context, key string) (string, error) {
 	}
 	result, err := c.call(ctx, "thread/start", params)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("start Codex session with required method thread/start: %w", err)
 	}
 	var response struct {
 		Thread struct {
 			ID string `json:"id"`
 		} `json:"thread"`
 	}
-	if err := json.Unmarshal(result, &response); err != nil || response.Thread.ID == "" {
-		return "", fmt.Errorf("invalid thread/start response: %w", err)
+	if err := json.Unmarshal(result, &response); err != nil {
+		return "", fmt.Errorf("Codex app-server returned an incompatible thread/start result: decode required field thread.id: %w", err)
+	}
+	if response.Thread.ID == "" {
+		return "", errors.New("Codex app-server returned an incompatible thread/start result: required field thread.id is missing")
 	}
 	c.mu.Lock()
 	c.session[key] = response.Thread.ID
@@ -504,8 +590,12 @@ func (c *Codex) handleNotification(message wireMessage) {
 	case "error":
 		errorObject, _ := params["error"].(map[string]any)
 		text, _ := errorObject["message"].(string)
-		state.emitEvent(core.Event{Kind: core.EventError, Text: text, ThreadID: state.threadID, TurnID: state.turnID})
+		state.emitEvent(core.Event{Kind: core.EventError, Text: text, ThreadID: state.threadID, TurnID: state.turnID,
+			Execution: &core.ExecutionStatus{State: "error", Detail: text}})
 	case "turn/completed":
+		state.deliveryMu.Lock()
+		state.completed = true
+		state.deliveryMu.Unlock()
 		turn, _ := params["turn"].(map[string]any)
 		status, _ := turn["status"].(string)
 		messages := append([]string(nil), state.messages...)
@@ -526,21 +616,37 @@ func (c *Codex) handleNotification(message wireMessage) {
 				}
 			}
 			finalText = text
+		} else if status != "completed" && status != "interrupted" {
+			kind = core.EventError
+			text = fmt.Sprintf("Codex app-server returned incompatible terminal status %q; expected completed, interrupted, or failed", status)
+			finalText = text
 		}
-		state.emitEvent(core.Event{Kind: kind, Text: text, FinalText: &finalText, ThreadID: state.threadID, TurnID: state.turnID, Done: true})
+		execution := &core.ExecutionStatus{State: "finishing"}
+		if kind == core.EventError {
+			execution = &core.ExecutionStatus{State: "error", Detail: text}
+		}
 		c.mu.Lock()
 		delete(c.active, state.threadID)
 		c.mu.Unlock()
+		state.emitEvent(core.Event{Kind: kind, Text: text, FinalText: &finalText, ThreadID: state.threadID, TurnID: state.turnID, Done: true, Execution: execution})
 	default:
 		// Keep internal tool and lifecycle method names out of user-facing status.
 	}
 }
 
 func (c *Codex) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	id, response, err := c.beginCall(method, params)
+	if err != nil {
+		return nil, err
+	}
+	return c.awaitCall(ctx, method, id, response)
+}
+
+func (c *Codex) beginCall(method string, params any) (int, chan rpcResponse, error) {
 	c.mu.Lock()
 	if c.closed || c.stdin == nil {
 		c.mu.Unlock()
-		return nil, errors.New("codex app-server is not running")
+		return 0, nil, errors.New("codex app-server is not running")
 	}
 	id := c.nextID
 	c.nextID++
@@ -551,12 +657,16 @@ func (c *Codex) call(ctx context.Context, method string, params any) (json.RawMe
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
-		return nil, err
+		return 0, nil, err
 	}
+	return id, response, nil
+}
+
+func (c *Codex) awaitCall(ctx context.Context, method string, id int, response chan rpcResponse) (json.RawMessage, error) {
 	select {
 	case result := <-response:
 		if result.Error != nil {
-			return nil, fmt.Errorf("%s (%d)", result.Error.Message, result.Error.Code)
+			return nil, &rpcCallError{Method: method, Code: result.Error.Code, Message: result.Error.Message}
 		}
 		return result.Result, nil
 	case <-ctx.Done():
@@ -652,7 +762,8 @@ func (c *Codex) failAll(err error) {
 		waiter <- rpcResponse{Error: &rpcError{Code: -1, Message: err.Error()}}
 	}
 	for _, state := range active {
-		state.emitEvent(core.Event{Kind: core.EventError, Text: err.Error(), ThreadID: state.threadID, TurnID: state.turnID, Done: true})
+		state.emitEvent(core.Event{Kind: core.EventError, Text: err.Error(), ThreadID: state.threadID, TurnID: state.turnID, Done: true,
+			Execution: &core.ExecutionStatus{State: "error", Detail: err.Error()}})
 	}
 }
 

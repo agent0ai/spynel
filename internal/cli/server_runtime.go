@@ -51,7 +51,7 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 		if term != nil {
 			select {
 			case err := <-term.apiError:
-				term.service.Runtime.Log("workspace API stopped: " + errorText(err))
+				term.service.Runtime.LogEvent("error", "localapi", "stopped", "Workspace API stopped: "+errorText(err))
 				term.stop()
 				term = nil
 				return nil
@@ -62,7 +62,7 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 			}
 			_, owned, err := election.Renew(term.token)
 			if err != nil {
-				term.service.Runtime.Log("renew primary lease: " + err.Error())
+				term.service.Runtime.LogEvent("error", "instance", "lease_renew_failed", "Renew primary lease: "+err.Error())
 			}
 			if err != nil || !owned {
 				term.stop()
@@ -116,9 +116,9 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 		case <-ctx.Done():
 			return nil
 		case targetID := <-primaryRequests:
-			term.service.Runtime.Log("Handing primary ownership to instance " + targetID)
+			term.service.Runtime.LogEvent("info", "instance", "handoff", "Handing primary ownership to instance "+targetID)
 			if err := term.handoff(targetID); err != nil {
-				term.service.Runtime.Log("primary handoff: " + err.Error())
+				term.service.Runtime.LogEvent("error", "instance", "handoff_failed", "Primary handoff: "+err.Error())
 			}
 			term = nil
 		case <-ticker.C:
@@ -134,6 +134,9 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 	// it never resurrects the snapshot from its own startup.
 	cfg, err := config.Load(original.Path)
 	if err != nil {
+		runtimeState := app.NewRuntimeAt(original.StatePath("runtime", "logs"), election.ID()+"-reload")
+		runtimeState.LogEvent("error", "config", "reload_failed", "Configuration reload before primary startup failed")
+		runtimeState.Close()
 		return nil, err
 	}
 	if filepath.Clean(cfg.Resolve(cfg.Workspace.StateDir)) != filepath.Clean(original.Resolve(original.Workspace.StateDir)) {
@@ -145,34 +148,45 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 		cancel()
 		return nil, err
 	}
+	service.Runtime.LogEvent("info", "config", "reloaded", "Configuration loaded for primary startup")
 	service.SetPrimaryInstanceID(election.ID())
 	if err := service.Start(ctx); err != nil {
-		service.Runtime.Log("Harness unavailable: " + err.Error())
+		service.Runtime.LogEvent("error", "harness", "unavailable", "Harness unavailable: "+err.Error())
 	}
 	if _, owned, renewErr := election.Renew(token); renewErr != nil || !owned {
-		_ = service.Harness.Close()
+		_ = service.Close()
 		cancel()
 		if renewErr != nil {
 			return nil, renewErr
 		}
 		return nil, errOwnershipLost
 	}
-	service.Runtime.Log("Spynel primary server started")
+	service.Runtime.LogEvent("info", "runtime", "primary_started", "Spynel primary server started")
 	term := &primaryTerm{
 		election: election, token: token, cancel: cancel, listener: listener, service: service,
 		apiDone: make(chan struct{}), apiError: make(chan error, 1), orchestratorDone: make(chan error, 1),
 	}
+	reportConnection := func(status channel.ConnectionStatus) { service.SetConnectionStatus(status) }
+	term.channelsDone, err = startChannels(ctx, service, reportConnection)
+	if err != nil {
+		_ = service.Close()
+		cancel()
+		return nil, err
+	}
 	apiServer := &localapi.Server{Service: service, Token: token}
 	go func() {
+		defer service.Runtime.RecoverPanic("localapi", "server_panic")
 		err := apiServer.Serve(ctx, listener)
 		term.apiError <- err
 		close(term.apiDone)
 	}()
 
-	reportConnection := func(status channel.ConnectionStatus) { service.SetConnectionStatus(status) }
-	term.channelsDone = startChannels(ctx, service, reportConnection)
-	go func() { term.orchestratorDone <- runPrimaryOrchestrator(ctx, service) }()
 	go func() {
+		defer service.Runtime.RecoverPanic("orchestrator", "worker_panic")
+		term.orchestratorDone <- runPrimaryOrchestrator(ctx, service)
+	}()
+	go func() {
+		defer service.Runtime.RecoverPanic("runtime", "request_panic")
 		select {
 		case <-ctx.Done():
 		case <-service.RestartRequests():
@@ -209,7 +223,9 @@ func (term *primaryTerm) stopFor(targetID string) error {
 	var stopErr error
 	stopped := false
 	term.stopOnce.Do(func() {
+		defer term.service.Runtime.Close()
 		stopped = true
+		term.service.SetPrimaryInstanceID("")
 		term.cancel()
 		_ = term.listener.Close()
 		_ = term.service.Harness.Close()
@@ -232,7 +248,7 @@ func (term *primaryTerm) stopFor(targetID string) error {
 			return
 		}
 		if err := term.election.Release(term.token); err != nil {
-			term.service.Runtime.Log("release primary lease: " + err.Error())
+			term.service.Runtime.LogEvent("error", "instance", "lease_release_failed", "Release primary lease: "+err.Error())
 		}
 	})
 	if !stopped && targetID != "" {

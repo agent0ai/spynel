@@ -36,11 +36,19 @@ type Supervisor struct {
 	managed  []Managed
 	report   StatusReporter
 	log      io.Writer
+	logEvent func(level, component, event, message string)
 
 	mu         sync.Mutex
 	running    map[string]*runningChannel
 	generation uint64
 	wait       sync.WaitGroup
+}
+
+// SetEventLogger installs the structured lifecycle boundary used by the
+// application owner. The ordinary writer remains available to adapters for
+// bounded free-form diagnostics.
+func (s *Supervisor) SetEventLogger(logEvent func(level, component, event, message string)) {
+	s.logEvent = logEvent
 }
 
 func NewSupervisor(settings *config.Store, handler Handler, managed []Managed, report StatusReporter, log io.Writer) *Supervisor {
@@ -88,6 +96,7 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 			if current != nil {
 				delete(s.running, managed.Name)
 				current.cancel()
+				s.event("info", managed.Name, "disconnected", "Channel disabled and disconnected")
 			}
 			s.mu.Unlock()
 			s.publish(ConnectionStatus{Name: managed.Name, State: ConnectionUnconfigured})
@@ -100,6 +109,7 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 		if current != nil {
 			delete(s.running, managed.Name)
 			current.cancel()
+			s.event("info", managed.Name, "reconnecting", "Channel configuration changed; reconnecting")
 		}
 		s.generation++
 		generation := s.generation
@@ -114,11 +124,13 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 			cancel()
 			s.publish(ConnectionStatus{Name: managed.Name, State: ConnectionError, Detail: err.Error()})
 			problems = append(problems, fmt.Errorf("%s: %w", managed.Name, err))
+			s.event("error", managed.Name, "build_failed", "Channel construction failed: "+err.Error())
 			continue
 		}
 		if reporter, ok := instance.(ConnectionReporter); ok {
 			reporter.SetStatusReporter(func(status ConnectionStatus) {
 				if s.isCurrent(managed.Name, running) {
+					s.eventForStatus(status)
 					s.publish(status)
 				}
 			})
@@ -132,6 +144,7 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 		}
 		s.mu.Unlock()
 		s.publish(ConnectionStatus{Name: managed.Name, State: ConnectionConnecting})
+		s.event("info", managed.Name, "connecting", "Channel connection starting")
 		s.wait.Add(1)
 		go func() {
 			defer s.wait.Done()
@@ -178,7 +191,7 @@ func (s *Supervisor) PairPhone(ctx context.Context, name, phone string) (string,
 	return controller.PairPhone(ctx, phone)
 }
 
-func (s *Supervisor) Deliver(ctx context.Context, name, conversation, eventID, text string) error {
+func (s *Supervisor) Deliver(ctx context.Context, name, conversation, eventID, text string) (DeliveryReceipt, error) {
 	s.mu.Lock()
 	running := s.running[name]
 	var instance Channel
@@ -187,11 +200,11 @@ func (s *Supervisor) Deliver(ctx context.Context, name, conversation, eventID, t
 	}
 	s.mu.Unlock()
 	if instance == nil {
-		return fmt.Errorf("%s is disconnected", name)
+		return DeliveryReceipt{}, fmt.Errorf("%s is disconnected", name)
 	}
 	deliverer, ok := instance.(ProactiveDeliverer)
 	if !ok {
-		return fmt.Errorf("%s does not support proactive delivery", name)
+		return DeliveryReceipt{}, fmt.Errorf("%s does not support proactive delivery", name)
 	}
 	return deliverer.Deliver(ctx, conversation, eventID, text)
 }
@@ -204,6 +217,9 @@ func (s *Supervisor) runOne(ctx context.Context, name string, running *runningCh
 	if err != nil && !errors.Is(err, context.Canceled) && ctx.Err() == nil {
 		s.logf("%s: %v", name, err)
 		s.publish(ConnectionStatus{Name: name, State: ConnectionError, Detail: err.Error()})
+		s.event("error", name, "disconnected", "Channel stopped unexpectedly: "+err.Error())
+	} else {
+		s.event("info", name, "disconnected", "Channel stopped")
 	}
 }
 
@@ -242,5 +258,22 @@ func (s *Supervisor) publish(status ConnectionStatus) {
 func (s *Supervisor) logf(format string, values ...any) {
 	if s.log != nil {
 		_, _ = fmt.Fprintf(s.log, format+"\n", values...)
+	}
+}
+
+func (s *Supervisor) event(level, name, event, message string) {
+	if s.logEvent != nil {
+		s.logEvent(level, "channel."+name, event, message)
+	}
+}
+
+func (s *Supervisor) eventForStatus(status ConnectionStatus) {
+	switch status.State {
+	case ConnectionConnected:
+		s.event("info", status.Name, "connected", "Channel connected")
+	case ConnectionConnecting:
+		s.event("info", status.Name, "connecting", "Channel connecting")
+	case ConnectionError:
+		s.event("error", status.Name, "connection_error", "Channel connection failed: "+status.Detail)
 	}
 }

@@ -16,6 +16,7 @@ type supervisedFixture struct {
 	name    string
 	started chan string
 	stopped chan string
+	report  StatusReporter
 }
 
 type pairingFixture struct {
@@ -44,10 +45,15 @@ func (c *supervisedFixture) Name() string { return "telegram" }
 
 func (c *supervisedFixture) Run(ctx context.Context, _ Handler) error {
 	c.started <- c.name
+	if c.report != nil {
+		c.report(ConnectionStatus{Name: "telegram", State: ConnectionConnected})
+	}
 	<-ctx.Done()
 	c.stopped <- c.name
 	return ctx.Err()
 }
+
+func (c *supervisedFixture) SetStatusReporter(report StatusReporter) { c.report = report }
 
 func TestSupervisorHotReloadsAndDisablesChannels(t *testing.T) {
 	root := t.TempDir()
@@ -72,6 +78,8 @@ func TestSupervisorHotReloadsAndDisablesChannels(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	supervisor := NewSupervisor(settings, nil, managed, nil, nil)
+	events := make(chan string, 16)
+	supervisor.SetEventLogger(func(_, component, event, _ string) { events <- component + "/" + event })
 	done := make(chan error, 1)
 	go func() { done <- supervisor.Run(ctx) }()
 
@@ -110,6 +118,17 @@ func TestSupervisorHotReloadsAndDisablesChannels(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("supervisor did not stop")
+	}
+	close(events)
+	var lifecycle []string
+	for event := range events {
+		lifecycle = append(lifecycle, event)
+	}
+	joined := strings.Join(lifecycle, " ")
+	for _, want := range []string{"channel.telegram/connecting", "channel.telegram/connected", "channel.telegram/reconnecting", "channel.telegram/disconnected"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("channel lifecycle lacks %q: %v", want, lifecycle)
+		}
 	}
 }
 

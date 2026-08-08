@@ -1,10 +1,10 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -13,30 +13,102 @@ import (
 	"github.com/agent0ai/spynel/internal/core"
 )
 
-func TestClaudeStreamsAndResumesSessions(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell Claude Code fixture")
-	}
-	root := t.TempDir()
-	script := filepath.Join(root, "fake-claude")
-	argsPath := filepath.Join(root, "args")
-	inputPath := filepath.Join(root, "input")
-	fixture := `#!/bin/sh
-printf '%s\n' "$*" >> "` + argsPath + `"
-IFS= read -r input
-printf '%s\n' "$input" >> "` + inputPath + `"
-printf '%s\n' '{"type":"system","subtype":"init","session_id":"claude-session"}'
-printf '%s\n' '{"type":"stream_event","session_id":"claude-session","event":{"type":"message_start"}}'
-printf '%s\n' '{"type":"stream_event","session_id":"claude-session","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"progress"}}}'
-printf '%s\n' '{"type":"stream_event","session_id":"claude-session","event":{"type":"message_start"}}'
-printf '%s\n' '{"type":"stream_event","session_id":"claude-session","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}}'
-printf '%s\n' '{"type":"result","subtype":"success","session_id":"claude-session","is_error":false,"result":"progress\nhello"}'
-cat >/dev/null
-`
-	if err := os.WriteFile(script, []byte(fixture), 0o700); err != nil {
+func TestClaudeRecordsNonzeroProcessExitAfterResult(t *testing.T) {
+	command, root, _ := portableHarnessFixture(t, "claude-result-nonzero")
+	var diagnostics bytes.Buffer
+	claude, err := NewClaude(HarnessConfig{Command: command, Cwd: root, ApprovalPolicy: "plan", Stderr: &diagnostics})
+	if err != nil {
 		t.Fatal(err)
 	}
-	claude, err := NewClaude(HarnessConfig{Command: script, Cwd: root, Model: "sonnet", Effort: "high", ApprovalPolicy: "never", SessionsFile: filepath.Join(root, "sessions.json")})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := claude.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer claude.Close()
+	done := make(chan core.Event, 1)
+	if _, _, err := claude.Send(ctx, "chat", "test", func(event core.Event) {
+		if event.Done {
+			done <- event
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-done:
+		if event.Kind != core.EventFinal {
+			t.Fatalf("terminal event = %#v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for Claude result")
+	}
+	got := diagnostics.String()
+	if !strings.Contains(got, "post-result process failure") || !strings.Contains(got, "returned a result but its process failed: exit status 7") {
+		t.Fatalf("post-result exit evidence = %q", got)
+	}
+}
+
+func TestClaudeLifecycleDiagnosticMappingIsNarrowAndSupportsUnknownTotals(t *testing.T) {
+	tests := []struct {
+		line    string
+		state   string
+		attempt int
+		total   int
+	}{
+		{"Attempting to reconnect... (attempt 2/5)", "reconnecting", 2, 5},
+		{"Attempting to reconnect… (attempt 3)", "reconnecting", 3, 0},
+		{"Attempting to reconnect", "reconnecting", 0, 0},
+		{"Connection restored", "running", 0, 0},
+		{"error: reconnecting to unrelated tool", "", 0, 0},
+		{"Attempting to reconnect... attempt 2/5", "", 0, 0},
+	}
+	for _, test := range tests {
+		got := parseClaudeLifecycleDiagnostic(test.line)
+		if test.state == "" {
+			if got != nil {
+				t.Fatalf("%q unexpectedly mapped to %#v", test.line, got)
+			}
+			continue
+		}
+		if got == nil || got.State != test.state || got.ReconnectAttempt != test.attempt || got.ReconnectTotal != test.total {
+			t.Fatalf("%q = %#v", test.line, got)
+		}
+	}
+}
+
+func TestClaudeLifecycleWriterMapsOnlyCompleteReconnectDiagnostics(t *testing.T) {
+	events := make(chan core.Event, 2)
+	turn := &claudeTurn{emit: func(event core.Event) { events <- event }}
+	var output bytes.Buffer
+	writer := &claudeLifecycleWriter{dst: &output, turn: turn}
+	for _, chunk := range []string{"Attempting to re", "connect... (attempt 2/5)\nordinary reconnect prose\n"} {
+		if _, err := writer.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case event := <-events:
+		if event.Execution == nil || event.Execution.State != "reconnecting" || event.Execution.ReconnectAttempt != 2 || event.Execution.ReconnectTotal != 5 {
+			t.Fatalf("mapped event = %#v", event)
+		}
+	default:
+		t.Fatal("complete reconnect diagnostic was not mapped")
+	}
+	select {
+	case event := <-events:
+		t.Fatalf("fallback prose unexpectedly mapped: %#v", event)
+	default:
+	}
+	if output.String() != "Attempting to reconnect... (attempt 2/5)\nordinary reconnect prose\n" {
+		t.Fatalf("diagnostic output changed: %q", output.String())
+	}
+}
+
+func TestClaudeStreamsAndResumesSessions(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "claude-stream")
+	sessionsPath := filepath.Join(root, "sessions.json")
+	config := HarnessConfig{Command: command, Cwd: root, Model: "sonnet", Effort: "high", ApprovalPolicy: "never", SessionsFile: sessionsPath}
+	claude, err := NewClaude(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,10 +119,11 @@ cat >/dev/null
 	}
 	defer claude.Close()
 
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 1; attempt++ {
 		var mu sync.Mutex
 		var streamed strings.Builder
 		var final core.Event
+		foundRunning := false
 		done := make(chan struct{})
 		threadID, steered, err := claude.Send(ctx, "chat:tui:local", "test prompt", func(event core.Event) {
 			mu.Lock()
@@ -60,6 +133,7 @@ cat >/dev/null
 			if event.Kind == core.EventFinal {
 				final = event
 			}
+			foundRunning = foundRunning || event.Execution != nil && event.Execution.State == "running"
 			mu.Unlock()
 			if event.Done {
 				close(done)
@@ -80,54 +154,59 @@ cat >/dev/null
 		if final.FinalText == nil || *final.FinalText != "hello" {
 			t.Fatalf("last assistant item = %#v, want hello", final.FinalText)
 		}
+		if !foundRunning || final.Execution == nil || final.Execution.State != "finishing" {
+			t.Fatalf("structured lifecycle missing: running=%t final=%#v", foundRunning, final.Execution)
+		}
 		mu.Unlock()
 	}
-	args, err := os.ReadFile(argsPath)
-	if err != nil {
+	if err := claude.Close(); err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimSpace(string(args)), "\n")
-	if len(lines) != 2 || !strings.Contains(lines[0], "--input-format stream-json") || !strings.Contains(lines[0], "--model sonnet") || !strings.Contains(lines[0], "--effort high") || !strings.Contains(lines[0], "--permission-mode dontAsk") || !strings.Contains(lines[1], "--resume claude-session") {
-		t.Fatalf("Claude arguments = %q", string(args))
-	}
-	input, err := os.ReadFile(inputPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Count(strings.TrimSpace(string(input)), "\n") != 1 || !strings.Contains(string(input), `"type":"user"`) || !strings.Contains(string(input), `"text":"test prompt"`) {
-		t.Fatalf("Claude streaming input = %q", input)
-	}
-	reloaded, err := NewClaude(HarnessConfig{Command: script, Cwd: root, SessionsFile: filepath.Join(root, "sessions.json")})
+	reloaded, err := NewClaude(config)
 	if err != nil || reloaded.ThreadID("chat:tui:local") != "claude-session" {
 		t.Fatalf("persisted session = %q, %v", reloaded.ThreadID("chat:tui:local"), err)
+	}
+	if err := reloaded.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	if thread, steered, err := reloaded.Send(ctx, "chat:tui:local", "test prompt", func(event core.Event) {
+		if event.Done {
+			close(done)
+		}
+	}); err != nil || steered || thread != "claude-session" {
+		t.Fatalf("resumed Send() = %q, %t, %v", thread, steered, err)
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for resumed Claude result")
+	}
+	if err := reloaded.Close(); err != nil {
+		t.Fatal(err)
+	}
+	invocations, inputs, resumed := 0, 0, false
+	for _, record := range readFixtureRecords(t, logPath) {
+		if record.Kind == "invocation" && !containsArgument(record.Args, "--help") {
+			invocations++
+			args := strings.Join(record.Args, " ")
+			if !strings.Contains(args, "--input-format stream-json") || !strings.Contains(args, "--model sonnet") || !strings.Contains(args, "--effort high") || !strings.Contains(args, "--permission-mode dontAsk") || record.Cwd != root || record.Executable != command {
+				t.Fatalf("portable Claude invocation = %#v", record)
+			}
+			resumed = resumed || strings.Contains(args, "--resume claude-session")
+		}
+		if record.Kind == "input" && strings.Contains(record.Text, `"text":"test prompt"`) {
+			inputs++
+		}
+	}
+	if invocations != 2 || inputs != 2 || !resumed {
+		t.Fatalf("portable Claude fixture counts = invocations %d, inputs %d, resumed %t", invocations, inputs, resumed)
 	}
 }
 
 func TestClaudeSteersFollowUpThroughActiveStreamingInput(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell Claude Code fixture")
-	}
-	root := t.TempDir()
-	script := filepath.Join(root, "fake-claude")
-	inputPath := filepath.Join(root, "input")
-	invocationsPath := filepath.Join(root, "invocations")
-	fixture := `#!/bin/sh
-printf 'run\n' >> "` + invocationsPath + `"
-IFS= read -r first
-printf '%s\n' "$first" >> "` + inputPath + `"
-printf '%s\n' '{"type":"system","subtype":"init","session_id":"steered-session"}'
-printf '%s\n' '{"type":"stream_event","session_id":"steered-session","event":{"type":"message_start"}}'
-printf '%s\n' '{"type":"stream_event","session_id":"steered-session","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}}}'
-IFS= read -r second
-printf '%s\n' "$second" >> "` + inputPath + `"
-printf '%s\n' '{"type":"stream_event","session_id":"steered-session","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":" second"}}}'
-printf '%s\n' '{"type":"result","subtype":"success","session_id":"steered-session","is_error":false,"result":"first second"}'
-cat >/dev/null
-`
-	if err := os.WriteFile(script, []byte(fixture), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	claude, err := NewClaude(HarnessConfig{Command: script, Cwd: root, ApprovalPolicy: "never"})
+	command, root, logPath := portableHarnessFixture(t, "claude-steer")
+	claude, err := NewClaude(HarnessConfig{Command: command, Cwd: root, ApprovalPolicy: "never"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,17 +263,26 @@ firstDeltaSeen:
 	if !foundReleased {
 		t.Fatal("previous emitter was not released after Claude steering")
 	}
-	invocations, err := os.ReadFile(invocationsPath)
-	if err != nil || strings.Count(string(invocations), "run\n") != 1 {
-		t.Fatalf("Claude process invocations = %q, %v", invocations, err)
+	invocations, first, followUp := 0, false, false
+	for _, record := range readFixtureRecords(t, logPath) {
+		if record.Kind == "invocation" && !containsArgument(record.Args, "--help") {
+			invocations++
+		}
+		first = first || strings.Contains(record.Text, `"text":"first prompt"`)
+		followUp = followUp || strings.Contains(record.Text, `"text":"follow-up prompt"`)
 	}
-	input, err := os.ReadFile(inputPath)
-	if err != nil {
-		t.Fatal(err)
+	if invocations != 1 || !first || !followUp {
+		t.Fatalf("steered fixture evidence = invocations %d, first %t, follow-up %t", invocations, first, followUp)
 	}
-	if !strings.Contains(string(input), `"text":"first prompt"`) || !strings.Contains(string(input), `"text":"follow-up prompt"`) {
-		t.Fatalf("steered input = %q", input)
+}
+
+func containsArgument(arguments []string, wanted string) bool {
+	for _, argument := range arguments {
+		if argument == wanted {
+			return true
+		}
 	}
+	return false
 }
 
 func TestClaudePermissionModesRespectSandboxAndPrivilegedFallback(t *testing.T) {
@@ -241,24 +329,9 @@ func TestClaudeInputModeMatchesPermissionCapabilities(t *testing.T) {
 }
 
 func TestClaudeTextInputSupportsToolCapablePermissionModes(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell Claude Code fixture")
-	}
-	root := t.TempDir()
-	script := filepath.Join(root, "fake-claude")
-	argsPath := filepath.Join(root, "args")
-	inputPath := filepath.Join(root, "input")
-	fixture := `#!/bin/sh
-printf '%s\n' "$*" > "` + argsPath + `"
-cat > "` + inputPath + `"
-printf '%s\n' '{"type":"system","subtype":"init","session_id":"text-session"}'
-printf '%s\n' '{"type":"result","subtype":"success","session_id":"text-session","is_error":false,"result":"tool done"}'
-`
-	if err := os.WriteFile(script, []byte(fixture), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	command, root, logPath := portableHarnessFixture(t, "claude-text")
 	claude, err := NewClaude(HarnessConfig{
-		Command: script, Cwd: root, ApprovalPolicy: "never", Sandbox: "workspace-write",
+		Command: command, Cwd: root, ApprovalPolicy: "never", Sandbox: "workspace-write",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -285,16 +358,54 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"text-session",
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for text-mode result")
 	}
-	args, err := os.ReadFile(argsPath)
+	var args, input string
+	for _, record := range readFixtureRecords(t, logPath) {
+		if record.Kind == "invocation" {
+			args = strings.Join(record.Args, " ")
+		}
+		if record.Kind == "input" {
+			input = record.Text
+		}
+	}
+	if strings.Contains(args, "--input-format") || !strings.Contains(args, "--allowedTools Bash(*)") || input != "run the tools" {
+		t.Fatalf("text-mode args/input = %q/%q", args, input)
+	}
+}
+
+func TestClaudeInterruptsActiveTurn(t *testing.T) {
+	command, root, _ := portableHarnessFixture(t, "claude-interrupt")
+	claude, err := NewClaude(HarnessConfig{Command: command, Cwd: root, ApprovalPolicy: "never"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(args), "--input-format") || !strings.Contains(string(args), "--allowedTools Bash(*)") {
-		t.Fatalf("text-mode args = %q", args)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := claude.Start(ctx); err != nil {
+		t.Fatal(err)
 	}
-	input, err := os.ReadFile(inputPath)
-	if err != nil || string(input) != "run the tools" {
-		t.Fatalf("text-mode input = %q, %v", input, err)
+	defer claude.Close()
+	done := make(chan core.Event, 1)
+	if thread, steered, err := claude.Send(ctx, "chat", "long task", func(event core.Event) {
+		if event.Done {
+			done <- event
+		}
+	}); err != nil || steered || thread != "interrupt-session" {
+		t.Fatalf("Send() = %q, %t, %v", thread, steered, err)
+	}
+	interrupted, err := claude.Interrupt(ctx, "chat")
+	if err != nil || !interrupted {
+		t.Fatalf("Interrupt() = %t, %v", interrupted, err)
+	}
+	select {
+	case event := <-done:
+		if event.Kind != core.EventError {
+			t.Fatalf("interrupted terminal event = %#v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for interrupted Claude process")
+	}
+	if claude.IsActive("chat") {
+		t.Fatal("Claude turn remained active after interruption")
 	}
 }
 

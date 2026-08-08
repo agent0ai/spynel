@@ -2,20 +2,27 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"runtime/pprof"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/agent0ai/spynel/internal/channel/tui/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
+	"github.com/rivo/uniseg"
 
 	"github.com/agent0ai/spynel/internal/channel"
 	"github.com/agent0ai/spynel/internal/core"
@@ -157,6 +164,34 @@ func TestMarkdownChatDoesNotOrphanBoundaryLettersBesideScrollbar(t *testing.T) {
 	}
 }
 
+func TestJobsMarkdownRendersEachEntryAsTwoAdjacentRows(t *testing.T) {
+	const jobs = "# Jobs\n\n- **Job 1** task \\[x\\] (1).md  \n  3h27m 2▶ 4↻ · running · orchestrator/markdown\n- **Job 2** Unicode 雪 job  \n  2m 1▶ · reconnecting 2/5 · telegram/42\n\nUse `/job info <number>` to inspect a job.\nUse `/job kill <number>` to stop a job."
+	for _, width := range []int{80, 32} {
+		m := testModel()
+		next, _ := m.Update(tea.WindowSizeMsg{Width: width, Height: 18})
+		m = next.(model)
+		rendered := ansi.Strip(m.renderTranscriptEntry(transcriptEntry{role: "assistant", text: jobs}))
+		lines := strings.Split(rendered, "\n")
+		for _, pair := range []struct{ job, state string }{{"Job 1", "running"}, {"Job 2", "reconnecting"}} {
+			jobRow, stateRow := -1, -1
+			for index, line := range lines {
+				if strings.Contains(line, pair.job) {
+					jobRow = index
+				}
+				if strings.Contains(line, pair.state) {
+					stateRow = index
+				}
+				if lipgloss.Width(line) > m.viewport.Width {
+					t.Fatalf("width %d overflow: %q", width, line)
+				}
+			}
+			if jobRow < 0 || stateRow != jobRow+1 {
+				t.Fatalf("width %d %s rows are not adjacent:\n%s", width, pair.job, rendered)
+			}
+		}
+	}
+}
+
 func TestRenderedMarkdownUsesOneBlankLineBetweenParagraphs(t *testing.T) {
 	m := testModel()
 	result := ansi.Strip(m.renderTranscriptEntry(transcriptEntry{role: "assistant", text: "first paragraph\n\nsecond paragraph"}))
@@ -173,6 +208,235 @@ func TestRenderedMarkdownUsesOneBlankLineBetweenParagraphs(t *testing.T) {
 	if maxBlankRun != 1 {
 		t.Fatalf("rendered paragraph spacing has %d consecutive blank rows, want 1: %q", maxBlankRun, result)
 	}
+}
+
+func TestInlineCodeEndPaddingSurvivesTUILayoutAndCaches(t *testing.T) {
+	profile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(profile) })
+	m := testModel()
+	m.viewport.Width = 18
+	message := "Middle `15m` value\nEnd `/log`"
+	inlineBackground := termenv.RGBColor(m.activeTheme.Colors.SurfaceElevated).Sequence(true)
+
+	finalized := m.renderTranscriptEntry(transcriptEntry{role: "assistant", text: message})
+	assertTUIInlineCodePadding(t, finalized, "15m", inlineBackground)
+	assertTUIInlineCodePadding(t, finalized, "/log", inlineBackground)
+
+	m.streaming = message
+	m.streamVersion++
+	command := m.requestStreamRender()
+	if command == nil {
+		t.Fatal("streaming Markdown render was not scheduled")
+	}
+	next, refresh := m.Update(command())
+	m = next.(model)
+	if m.streamRendered != m.renderAgentMarkdown(message) {
+		t.Fatalf("streaming and finalized Markdown differ:\nstream=%q\nfinal=%q", m.streamRendered, m.renderAgentMarkdown(message))
+	}
+	if refresh == nil || !m.streamRefreshPending {
+		t.Fatal("completed streaming Markdown render did not queue a viewport refresh")
+	}
+	next, _ = m.Update(streamRefreshMsg{})
+	m = next.(model)
+	assertTUIInlineCodePadding(t, m.viewport.View(), "/log", inlineBackground)
+}
+
+func TestHyphenatedCompoundMatchesStreamingAndFinalCaches(t *testing.T) {
+	m := testModel()
+	m.viewport.Width = 25 // 20 Markdown cells after the label and edge reserve.
+	message := "Use the familiar editor-style Up/Down controls."
+	want := m.renderAgentMarkdown(message)
+	plain := ansi.Strip(want)
+	if !strings.Contains(plain, "\neditor-style Up/Down\n") || strings.Contains(plain, "editor-\nstyle") {
+		t.Fatalf("final render orphaned the fitting compound: %q", plain)
+	}
+
+	m.streaming = message
+	m.streamVersion++
+	command := m.requestStreamRender()
+	if command == nil {
+		t.Fatal("stream render was not scheduled")
+	}
+	next, _ := m.Update(command())
+	m = next.(model)
+	if m.streamRendered != want {
+		t.Fatalf("streaming and final compound renders differ:\nstream=%q\nfinal=%q", m.streamRendered, want)
+	}
+}
+
+func TestSanitizedReportedTranscriptWrapsWithoutChangingProse(t *testing.T) {
+	data, err := os.ReadFile("testdata/composer-transcript.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture []struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	for _, viewportWidth := range []int{24, 39, 72} {
+		for _, entry := range fixture {
+			name := fmt.Sprintf("%s-width-%d", entry.Role, viewportWidth)
+			t.Run(name, func(t *testing.T) {
+				m := testModel()
+				m.viewport.Width = viewportWidth
+				rendered := ansi.Strip(m.renderTranscriptEntry(transcriptEntry{role: entry.Role, text: entry.Content}))
+				lines := strings.Split(rendered, "\n")
+				for row, line := range lines {
+					if got := lipgloss.Width(line); got > viewportWidth {
+						t.Fatalf("row %d has %d cells, exceeds %d: %q", row, got, viewportWidth, rendered)
+					}
+					if len([]rune(line)) > chatContentColumn && strings.HasPrefix(line, strings.Repeat(" ", chatContentColumn+1)) {
+						t.Fatalf("row %d has renderer-generated leading content space: %q", row, line)
+					}
+				}
+				if strings.Contains(rendered, "1\n    5") || strings.Contains(rendered, "conf-ig") {
+					t.Fatalf("reported token corruption remains: %q", rendered)
+				}
+				plain := strings.ReplaceAll(strings.ReplaceAll(entry.Content, "`", ""), "\n", " ")
+				if got, want := strings.Join(strings.Fields(stripChatStructure(rendered)), " "), strings.Join(strings.Fields(plain), " "); got != want {
+					t.Fatalf("rendered prose changed: got %q, want %q; rendered=%q", got, want, rendered)
+				}
+
+				if entry.Role == "assistant" {
+					m.streaming = entry.Content
+					m.streamVersion++
+					command := m.requestStreamRender()
+					if command == nil {
+						t.Fatal("stream render was not scheduled")
+					}
+					next, _ := m.Update(command())
+					streamed := next.(model)
+					if streamed.streamRendered != m.renderAgentMarkdown(entry.Content) {
+						t.Fatalf("stream/final render mismatch:\nstream=%q\nfinal=%q", streamed.streamRendered, m.renderAgentMarkdown(entry.Content))
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestUserTranscriptPreservesAuthoredWhitespace(t *testing.T) {
+	m := testModel()
+	m.viewport.Width = 72
+	for _, source := range []string{
+		"two  authored   spaces",
+		"    intentional indentation",
+		"first\n  indented continuation",
+	} {
+		rendered := ansi.Strip(m.renderTranscriptEntry(transcriptEntry{role: "user", text: source}))
+		lines := strings.Split(rendered, "\n")
+		for index := range lines {
+			runes := []rune(lines[index])
+			if len(runes) >= chatContentColumn {
+				lines[index] = string(runes[chatContentColumn:])
+			}
+		}
+		if got := strings.Join(lines, "\n"); got != source {
+			t.Fatalf("authored whitespace changed:\ngot  %q\nwant %q", got, source)
+		}
+	}
+}
+
+func TestSourceWrapperPreservesSpacesAndGraphemes(t *testing.T) {
+	for _, test := range []struct {
+		name, source string
+		width        int
+		want         string
+	}{
+		{name: "repeated spaces", source: "two  authored   spaces", width: 40, want: "two  authored   spaces"},
+		{name: "intentional indentation", source: "   config", width: 20, want: "   config"},
+		{name: "fitting number moves intact", source: "take 15 minutes", width: 8, want: "take 15 \nminutes"},
+		{name: "overwide token uses graphemes", source: "e\u0301e\u0301e\u0301", width: 2, want: "e\u0301e\u0301\ne\u0301"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := wordWrapPreservingSpaces(test.source, test.width); got != test.want {
+				t.Fatalf("wrapped source = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func stripChatStructure(rendered string) string {
+	lines := strings.Split(rendered, "\n")
+	for index, line := range lines {
+		runes := []rune(line)
+		if len(runes) >= chatContentColumn {
+			lines[index] = string(runes[chatContentColumn:])
+		}
+	}
+	return strings.Join(lines, " ")
+}
+
+func assertTUIInlineCodePadding(t *testing.T, rendered, code, expectedBackground string) {
+	t.Helper()
+	original := rendered
+	type cell struct {
+		text       string
+		background string
+	}
+	for _, row := range strings.Split(rendered, "\n") {
+		parser := ansi.NewParser()
+		state := byte(ansi.NormalState)
+		background := ""
+		var cells []cell
+		for len(row) > 0 {
+			sequence, width, consumed, nextState := ansi.DecodeSequence(row, state, parser)
+			if consumed <= 0 {
+				break
+			}
+			state = nextState
+			row = row[consumed:]
+			if width > 0 {
+				cells = append(cells, cell{text: string(sequence), background: background})
+				continue
+			}
+			if byte(parser.Command()) != 'm' {
+				continue
+			}
+			parameters := parser.Params()
+			if len(parameters) == 0 {
+				background = ""
+			}
+			for index := 0; index < len(parameters); index++ {
+				parameter, _ := parser.Param(index, 0)
+				switch {
+				case parameter == 0 || parameter == 49:
+					background = ""
+				case parameter == 48 && index+4 < len(parameters):
+					mode, _ := parser.Param(index+1, 0)
+					if mode == 2 {
+						red, _ := parser.Param(index+2, 0)
+						green, _ := parser.Param(index+3, 0)
+						blue, _ := parser.Param(index+4, 0)
+						background = fmt.Sprintf("48;2;%d;%d;%d", red, green, blue)
+					}
+				}
+			}
+		}
+		for start := range cells {
+			if cells[start].text != " " || !strings.EqualFold(cells[start].background, expectedBackground) {
+				continue
+			}
+			var content strings.Builder
+			for end := start + 1; end < len(cells); end++ {
+				if cells[end].text == " " {
+					if content.String() == code && strings.EqualFold(cells[end].background, expectedBackground) {
+						return
+					}
+					break
+				}
+				if !strings.EqualFold(cells[end].background, expectedBackground) {
+					break
+				}
+				content.WriteString(cells[end].text)
+			}
+		}
+	}
+	t.Fatalf("inline code %q lacks symmetric %s padding in one TUI row: %q", code, expectedBackground, original)
 }
 
 func TestUserLabelUsesBlueAccent(t *testing.T) {
@@ -255,23 +519,444 @@ func TestDeletingTrailingNewlinesKeepsCursorOnBottomComposerRow(t *testing.T) {
 	}
 }
 
-func TestTypingDoesNotMoveChatHistoryOffset(t *testing.T) {
+func TestTypingCompensatesDetachedChatHistoryOffset(t *testing.T) {
 	m := testModel()
 	m.height = 24
 	m.inputWidth = 4
 	m.input.SetWidth(4)
+	m.resizeComposer()
 	m.viewport.SetContent(strings.Repeat("history line\n", 100))
 	m.viewport.SetYOffset(27)
 	wantOffset := m.viewport.YOffset
+	wantHeight := m.viewport.Height - 1
 
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1234")})
 	got := next.(model)
 	if got.composerRows != 2 {
 		t.Fatalf("composer rows = %d, want 2", got.composerRows)
 	}
-	if got.viewport.YOffset != wantOffset {
-		t.Fatalf("history offset moved from %d to %d while typing", wantOffset, got.viewport.YOffset)
+	if got.viewport.Height != wantHeight || got.viewport.YOffset != wantOffset+1 {
+		t.Fatalf("composer growth did not compensate history by one row: height=%d offset=%d, want height=%d offset=%d", got.viewport.Height, got.viewport.YOffset, wantHeight, wantOffset+1)
 	}
+}
+
+func TestComposerGrowthAndShrinkCompensateDetachedHistory(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		startOffset int
+		wantGrowth  int
+		wantShrink  int
+	}{
+		{name: "top clamps", startOffset: 0, wantGrowth: 1, wantShrink: 0},
+		{name: "middle", startOffset: 35, wantGrowth: 36, wantShrink: 35},
+		{name: "near tail detached", startOffset: 70, wantGrowth: 71, wantShrink: 70},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := testModel()
+			m.height = 24
+			m.inputWidth = 4
+			m.input.SetWidth(4)
+			m.resizeComposer()
+			m.viewport.SetContent(strings.Repeat("history line\n", 100))
+			m.viewport.SetYOffset(test.startOffset)
+			// A recent upward gesture suppresses the near-tail follow policy.
+			m.now = func() time.Time { return time.Unix(100, 0) }
+			m.manualScrollUpUntil = time.Unix(102, 0)
+
+			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("1234")})
+			grown := next.(model)
+			if grown.viewport.YOffset != test.wantGrowth {
+				t.Fatalf("growth offset = %d, want %d", grown.viewport.YOffset, test.wantGrowth)
+			}
+			next, _ = grown.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+			shrunk := next.(model)
+			if shrunk.viewport.YOffset != test.wantShrink {
+				t.Fatalf("shrink offset = %d, want %d", shrunk.viewport.YOffset, test.wantShrink)
+			}
+		})
+	}
+}
+
+func TestComposerRowsMatchTextareaGeometryAtEveryBoundary(t *testing.T) {
+	inputs := []string{
+		"123456789",
+		"15 minutes config should move intact",
+		"one two three four five",
+		"🙂🙂🙂🙂🙂",
+		"e\u0301e\u0301e\u0301e\u0301e\u0301",
+		"界界界界界",
+		"👨‍👩‍👧‍👦",
+		"🇺🇸",
+		"1️⃣",
+		"👩🏽‍💻",
+	}
+	for _, width := range []int{4, 5, 8, 12} {
+		for _, input := range inputs {
+			name := fmt.Sprintf("width-%d-%x", width, []byte(input))
+			t.Run(name, func(t *testing.T) {
+				m := testModel()
+				m.inputWidth = width
+				m.input.SetWidth(width)
+				for _, grapheme := range splitTestGraphemes(input) {
+					next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(grapheme)})
+					m = next.(model)
+					want := min(maxComposerHeight, max(1, m.input.LineInfo().Height))
+					if m.composerRows != want {
+						t.Fatalf("after %q rows=%d, textarea height=%d, value=%q", grapheme, m.composerRows, want, m.input.Value())
+					}
+					offset, total := m.inputScrollMetrics()
+					cursorRow := m.input.LineInfo().RowOffset
+					if cursorRow < offset || cursorRow >= offset+m.composerRows || total < m.composerRows {
+						t.Fatalf("cursor row %d is outside visible [%d,%d), total=%d", cursorRow, offset, offset+m.composerRows, total)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestExactFitTokenFollowedBySpaceKeepsItsVisualRow(t *testing.T) {
+	grapheme := "👨‍👩‍👧‍👦"
+	for _, test := range []struct {
+		terminalWidth int
+		tokens        []string
+	}{
+		{terminalWidth: 6, tokens: []string{"ab", grapheme}},
+		{terminalWidth: 7, tokens: []string{"abc", grapheme + "x"}},
+		{terminalWidth: 8, tokens: []string{"abcd", grapheme + "xx"}},
+	} {
+		for _, token := range test.tokens {
+			for delivery, messages := range map[string][]tea.KeyMsg{
+				"atomic": {
+					{Type: tea.KeyRunes, Runes: []rune(token)},
+					{Type: tea.KeyRunes, Runes: []rune(" ")},
+				},
+				"single update": {
+					{Type: tea.KeyRunes, Runes: []rune(token + " ")},
+				},
+				"incremental": append(runeKeyMessages(token), tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")}),
+			} {
+				t.Run(fmt.Sprintf("width-%d/%x/%s", test.terminalWidth, []byte(token), delivery), func(t *testing.T) {
+					m := testModel()
+					next, _ := m.Update(tea.WindowSizeMsg{Width: test.terminalWidth, Height: 14})
+					m = next.(model)
+					for _, message := range messages {
+						next, _ = m.Update(message)
+						m = next.(model)
+						if want := min(m.composerCapacity(), max(minComposerHeight, m.input.LineInfo().Height)); m.composerRows != want {
+							t.Fatalf("after %q composer rows = %d, textarea rows = %d", message.String(), m.composerRows, want)
+						}
+					}
+
+					if m.composerRows != 2 {
+						t.Fatalf("exact-fit token plus space uses %d rows, want 2; input=%q", m.composerRows, ansi.Strip(m.input.View()))
+					}
+					inputRows := strings.Split(ansi.Strip(m.input.View()), "\n")
+					if len(inputRows) == 0 || !strings.Contains(inputRows[0], token) {
+						t.Fatalf("exact-fit token moved after a blank row: %q", ansi.Strip(m.input.View()))
+					}
+					view := ansi.Strip(m.View())
+					if !strings.Contains(view, token) {
+						t.Fatalf("exact-fit token is missing from composer: %q", view)
+					}
+					for row, line := range strings.Split(view, "\n") {
+						if width := lipgloss.Width(line); width != m.width {
+							t.Fatalf("row %d width = %d, want %d: %q", row, width, m.width, line)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestExtendedGraphemeComposerGeometryMatchesTextareaView(t *testing.T) {
+	for name, grapheme := range map[string]string{
+		"family ZWJ":     "👨‍👩‍👧‍👦",
+		"combining":      "e\u0301",
+		"regional flag":  "🇺🇸",
+		"keycap":         "1️⃣",
+		"emoji modifier": "👩🏽‍💻",
+	} {
+		for delivery, messages := range map[string][]tea.KeyMsg{
+			"atomic":      {{Type: tea.KeyRunes, Runes: []rune(grapheme)}},
+			"incremental": runeKeyMessages(grapheme),
+		} {
+			for _, terminalWidth := range []int{6, 7, 8} {
+				t.Run(fmt.Sprintf("%s/%s/width-%d", name, delivery, terminalWidth), func(t *testing.T) {
+					m := testModel()
+					next, _ := m.Update(tea.WindowSizeMsg{Width: terminalWidth, Height: 14})
+					m = next.(model)
+					for _, message := range messages {
+						next, _ = m.Update(message)
+						m = next.(model)
+						wantRows := min(m.composerCapacity(), max(minComposerHeight, m.input.LineInfo().Height))
+						if m.composerRows != wantRows {
+							t.Fatalf("after %q composer rows = %d, textarea rows = %d for %q", string(message.Runes), m.composerRows, wantRows, grapheme)
+						}
+					}
+
+					offset, total := m.inputScrollMetrics()
+					cursorRow := m.input.LineInfo().RowOffset
+					if cursorRow < offset || cursorRow >= offset+m.composerRows {
+						t.Fatalf("cursor row %d is outside visible [%d,%d), total=%d", cursorRow, offset, offset+m.composerRows, total)
+					}
+					view := ansi.Strip(m.View())
+					if !strings.Contains(view, grapheme) {
+						t.Fatalf("fitting grapheme was split or lost at content width %d:\n%s", m.inputWidth, view)
+					}
+					rows := strings.Split(view, "\n")
+					if len(rows) > m.height {
+						t.Fatalf("view has %d rows in a %d-row terminal:\n%s", len(rows), m.height, view)
+					}
+					for row, line := range rows {
+						if width := lipgloss.Width(line); width != m.width {
+							t.Fatalf("row %d width = %d, want %d: %q", row, width, m.width, line)
+						}
+					}
+					if !strings.Contains(view, "╭") || !strings.Contains(view, "╯") {
+						t.Fatalf("composer border is corrupt:\n%s", view)
+					}
+
+					m.input.CursorStart()
+					next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRight})
+					m = next.(model)
+					if info := m.input.LineInfo(); info.StartColumn+info.ColumnOffset != len([]rune(grapheme)) {
+						t.Fatalf("right navigation stopped inside grapheme: %#v", info)
+					}
+					next, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+					m = next.(model)
+					if info := m.input.LineInfo(); info.StartColumn+info.ColumnOffset != 0 {
+						t.Fatalf("left navigation stopped inside grapheme: %#v", info)
+					}
+					next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDelete})
+					m = next.(model)
+					if m.input.Value() != "" || m.composerRows != minComposerHeight {
+						t.Fatalf("forward deletion split grapheme: value=%q rows=%d", m.input.Value(), m.composerRows)
+					}
+					next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(grapheme)})
+					m = next.(model)
+					next, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+					m = next.(model)
+					if m.input.Value() != "" || m.composerRows != minComposerHeight {
+						t.Fatalf("backward deletion split grapheme: value=%q rows=%d", m.input.Value(), m.composerRows)
+					}
+					m.input.InsertString(grapheme)
+					m.resizeComposer()
+					if view := ansi.Strip(m.View()); !strings.Contains(view, grapheme) {
+						t.Fatalf("pasted grapheme was split or lost at content width %d:\n%s", m.inputWidth, view)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestExtendedGraphemeTransposePreservesClustersAndGeometry(t *testing.T) {
+	for name, grapheme := range map[string]string{
+		"family ZWJ":     "👨‍👩‍👧‍👦",
+		"combining":      "e\u0301",
+		"regional flag":  "🇺🇸",
+		"keycap":         "1️⃣",
+		"emoji modifier": "👩🏽‍💻",
+	} {
+		for _, terminalWidth := range []int{6, 7, 8} {
+			t.Run(fmt.Sprintf("%s/width-%d", name, terminalWidth), func(t *testing.T) {
+				m := testModel()
+				next, _ := m.Update(tea.WindowSizeMsg{Width: terminalWidth, Height: 24})
+				m = next.(model)
+				for _, message := range []tea.KeyMsg{
+					{Type: tea.KeyRunes, Runes: []rune(grapheme)},
+					{Type: tea.KeyRunes, Runes: []rune("X")},
+					{Type: tea.KeyCtrlT},
+				} {
+					next, _ = m.Update(message)
+					m = next.(model)
+					wantRows := min(m.composerCapacity(), max(minComposerHeight, m.input.LineInfo().Height))
+					if m.composerRows != wantRows {
+						t.Fatalf("after %s composer rows = %d, textarea rows = %d", message.String(), m.composerRows, wantRows)
+					}
+				}
+
+				want := "X" + grapheme
+				if got := m.input.Value(); got != want {
+					t.Fatalf("transpose value = %q, want %q", got, want)
+				}
+				info := m.input.LineInfo()
+				if cursor := info.StartColumn + info.ColumnOffset; cursor != len([]rune(want)) {
+					t.Fatalf("cursor stopped inside transposed grapheme at rune %d of %d: %#v", cursor, len([]rune(want)), info)
+				}
+				offset, _ := m.inputScrollMetrics()
+				if info.RowOffset < offset || info.RowOffset >= offset+m.composerRows {
+					t.Fatalf("cursor row %d is outside visible [%d,%d)", info.RowOffset, offset, offset+m.composerRows)
+				}
+
+				view := ansi.Strip(m.View())
+				if !strings.Contains(view, grapheme) {
+					t.Fatalf("transposed grapheme was split or lost at content width %d:\n%s", m.inputWidth, view)
+				}
+				rows := strings.Split(view, "\n")
+				if len(rows) > m.height {
+					t.Fatalf("view has %d rows in a %d-row terminal:\n%s", len(rows), m.height, view)
+				}
+				for row, line := range rows {
+					if width := lipgloss.Width(line); width != m.width {
+						t.Fatalf("row %d width = %d, want %d: %q", row, width, m.width, line)
+					}
+				}
+			})
+		}
+	}
+}
+
+func runeKeyMessages(value string) []tea.KeyMsg {
+	messages := make([]tea.KeyMsg, 0, len([]rune(value)))
+	for _, value := range []rune(value) {
+		messages = append(messages, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{value}})
+	}
+	return messages
+}
+
+func TestTinyTerminalKeepsComposerCursorInsidePhysicalFrame(t *testing.T) {
+	for _, height := range []int{5, 6, 7} {
+		t.Run(fmt.Sprintf("height-%d", height), func(t *testing.T) {
+			m := testModel()
+			m.input.SetValue(strings.Repeat("hidden\n", 10) + "cursor")
+			next, _ := m.Update(tea.WindowSizeMsg{Width: 24, Height: height})
+			got := next.(model)
+			view := ansi.Strip(got.View())
+			rows := strings.Split(view, "\n")
+			if len(rows) > height {
+				t.Fatalf("view has %d rows in a %d-row terminal:\n%s", len(rows), height, view)
+			}
+			if got.composerRows != max(1, height-4) {
+				t.Fatalf("composer rows = %d, want %d", got.composerRows, max(1, height-4))
+			}
+			if !strings.Contains(view, "cursor") {
+				t.Fatalf("final composer line/cursor is unreachable:\n%s", view)
+			}
+			if !strings.Contains(view, "╭") || !strings.Contains(view, "╰") {
+				t.Fatalf("composer border is corrupt:\n%s", view)
+			}
+		})
+	}
+}
+
+func TestNarrowTerminalUsesPhysicalWidthAndKeepsComposerCursorVisible(t *testing.T) {
+	for _, terminalWidth := range []int{4, 5, 6, 8, 12, 19} {
+		t.Run(fmt.Sprintf("width-%d", terminalWidth), func(t *testing.T) {
+			m := testModel()
+			m.input.SetValue(strings.Repeat("hidden\n", 10) + "Z")
+			next, _ := m.Update(tea.WindowSizeMsg{Width: terminalWidth, Height: 5})
+			got := next.(model)
+			view := ansi.Strip(got.View())
+			rows := strings.Split(view, "\n")
+			if len(rows) > got.height {
+				t.Fatalf("view has %d rows in a %d-row terminal:\n%s", len(rows), got.height, view)
+			}
+			for row, line := range rows {
+				if width := lipgloss.Width(line); width != terminalWidth {
+					t.Fatalf("row %d width = %d, want physical width %d: %q", row, width, terminalWidth, line)
+				}
+			}
+			if got.viewport.Width != max(1, terminalWidth-3) {
+				t.Fatalf("viewport width = %d, want %d", got.viewport.Width, max(1, terminalWidth-3))
+			}
+			wantInputWidth, _ := borderedContentGeometry(terminalWidth)
+			if got.inputWidth != wantInputWidth {
+				t.Fatalf("input width = %d, want %d", got.inputWidth, wantInputWidth)
+			}
+			if !strings.Contains(view, "Z") {
+				t.Fatalf("cursor-bearing final composer cell is unreachable:\n%s", view)
+			}
+			if !strings.Contains(view, "╭") || !strings.Contains(view, "╰") {
+				t.Fatalf("composer border is corrupt:\n%s", view)
+			}
+		})
+	}
+}
+
+func TestPaddingYieldComposerUsesActualPanelWidth(t *testing.T) {
+	for name, grapheme := range map[string]string{
+		"wide CJK":   "界",
+		"family ZWJ": "👨‍👩‍👧‍👦",
+	} {
+		for delivery, messages := range map[string][]tea.KeyMsg{
+			"atomic":      {{Type: tea.KeyRunes, Runes: []rune(grapheme)}},
+			"incremental": runeKeyMessages(grapheme),
+		} {
+			for _, terminalWidth := range []int{4, 5} {
+				t.Run(fmt.Sprintf("%s/%s/width-%d", name, delivery, terminalWidth), func(t *testing.T) {
+					m := testModel()
+					next, _ := m.Update(tea.WindowSizeMsg{Width: terminalWidth, Height: 14})
+					m = next.(model)
+					wantInputWidth, wantInset := borderedContentGeometry(terminalWidth)
+					if m.inputWidth != wantInputWidth || wantInset != 0 {
+						t.Fatalf("narrow composer geometry = width %d inset %d, want yielded inset and width %d", m.inputWidth, wantInset, wantInputWidth)
+					}
+					for _, message := range messages {
+						next, _ = m.Update(message)
+						m = next.(model)
+						wantRows := min(m.composerCapacity(), max(minComposerHeight, m.input.LineInfo().Height))
+						if m.composerRows != wantRows {
+							t.Fatalf("after %q composer rows = %d, textarea rows = %d", string(message.Runes), m.composerRows, wantRows)
+						}
+					}
+
+					view := ansi.Strip(m.View())
+					if !strings.Contains(view, grapheme) {
+						t.Fatalf("fitting grapheme is unreachable at panel width %d; input=%q info=%#v:\n%s", terminalWidth, ansi.Strip(m.input.View()), m.input.LineInfo(), view)
+					}
+					for row, line := range strings.Split(view, "\n") {
+						if width := lipgloss.Width(line); width != terminalWidth {
+							t.Fatalf("row %d width = %d, want %d: %q", row, width, terminalWidth, line)
+						}
+					}
+					if !strings.Contains(view, "╭") || !strings.Contains(view, "╯") {
+						t.Fatalf("composer border is corrupt:\n%s", view)
+					}
+					offset, _ := m.inputScrollMetrics()
+					cursorRow := m.input.LineInfo().RowOffset
+					if cursorRow < offset || cursorRow >= offset+m.composerRows {
+						t.Fatalf("cursor row %d is outside visible [%d,%d)", cursorRow, offset, offset+m.composerRows)
+					}
+
+					m.input.Reset()
+					m.input.InsertString(grapheme)
+					m.resizeComposer()
+					if pastedView := ansi.Strip(m.View()); !strings.Contains(pastedView, grapheme) {
+						t.Fatalf("pasted grapheme is unreachable at panel width %d:\n%s", terminalWidth, pastedView)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestShortTerminalSuppressesPickerBeforeOverflow(t *testing.T) {
+	m := testModel()
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 24, Height: 8})
+	m = next.(model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m = next.(model)
+	if !m.commandMenu {
+		t.Fatal("command menu state did not open")
+	}
+	if picker := m.inlineMenuView(); picker != "" {
+		t.Fatalf("picker should yield to the minimum physical layout, got %q", ansi.Strip(picker))
+	}
+	if rows := len(strings.Split(ansi.Strip(m.View()), "\n")); rows > m.height {
+		t.Fatalf("view has %d rows in a %d-row terminal", rows, m.height)
+	}
+}
+
+func splitTestGraphemes(value string) []string {
+	var result []string
+	graphemes := uniseg.NewGraphemes(value)
+	for graphemes.Next() {
+		result = append(result, graphemes.Str())
+	}
+	return result
 }
 
 func TestGrowingComposerKeepsNewestHistoryVisibleAtBottom(t *testing.T) {
@@ -437,6 +1122,101 @@ func TestInputArrowsDoNotScrollHistory(t *testing.T) {
 	}
 	if got.viewport.YOffset != historyOffset {
 		t.Fatalf("history offset = %d, want unchanged %d", got.viewport.YOffset, historyOffset)
+	}
+}
+
+func TestComposerArrowsJumpAtLogicalBoundariesAndPreserveInteriorColumns(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		position   []tea.KeyType
+		arrow      tea.KeyType
+		wantLine   int
+		wantColumn int
+	}{
+		{name: "empty up", arrow: tea.KeyUp, wantLine: 0, wantColumn: 0},
+		{name: "empty down", arrow: tea.KeyDown, wantLine: 0, wantColumn: 0},
+		{name: "single line up", value: "hello", position: []tea.KeyType{tea.KeyCtrlHome, tea.KeyRight, tea.KeyRight}, arrow: tea.KeyUp, wantLine: 0, wantColumn: 0},
+		{name: "single line down", value: "hello", position: []tea.KeyType{tea.KeyCtrlHome, tea.KeyRight, tea.KeyRight}, arrow: tea.KeyDown, wantLine: 0, wantColumn: 5},
+		{name: "first logical line up", value: "first\nsecond\nthird", position: []tea.KeyType{tea.KeyCtrlHome, tea.KeyRight, tea.KeyRight}, arrow: tea.KeyUp, wantLine: 0, wantColumn: 0},
+		{name: "last logical line down", value: "first\nsecond\nthird", position: []tea.KeyType{tea.KeyCtrlEnd, tea.KeyLeft, tea.KeyLeft}, arrow: tea.KeyDown, wantLine: 2, wantColumn: 5},
+		{name: "middle line up", value: "abcdef\nxy\n123456", position: []tea.KeyType{tea.KeyCtrlHome, tea.KeyDown, tea.KeyRight}, arrow: tea.KeyUp, wantLine: 0, wantColumn: 1},
+		{name: "middle uneven line down restores column", value: "abcdef\nxy\n123456", position: []tea.KeyType{tea.KeyCtrlHome, tea.KeyRight, tea.KeyRight, tea.KeyRight, tea.KeyDown}, arrow: tea.KeyDown, wantLine: 2, wantColumn: 3},
+		{name: "trailing newline down", value: "first\n", arrow: tea.KeyDown, wantLine: 1, wantColumn: 0},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := testModel()
+			m.input.SetValue(test.value)
+			for _, keyType := range test.position {
+				m.input, _ = m.input.Update(tea.KeyMsg{Type: keyType})
+			}
+
+			next, _ := m.Update(tea.KeyMsg{Type: test.arrow})
+			got := next.(model)
+			line, column := got.inputCursorPosition()
+			if line != test.wantLine || column != test.wantColumn {
+				t.Fatalf("cursor = (%d, %d), want (%d, %d)", line, column, test.wantLine, test.wantColumn)
+			}
+		})
+	}
+}
+
+func TestComposerArrowsUseVisualBoundariesWhenTextWraps(t *testing.T) {
+	m := testModel()
+	m.inputWidth = 4
+	m.input.SetWidth(4)
+	m.input.SetValue("abcdefghij")
+	m.input, _ = m.input.Update(tea.KeyMsg{Type: tea.KeyCtrlHome})
+
+	// Down traverses the two interior visual rows before the boundary press
+	// moves to the complete input's final insertion position.
+	for _, wantColumn := range []int{4, 8, 10} {
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = next.(model)
+		if line, column := m.inputCursorPosition(); line != 0 || column != wantColumn {
+			t.Fatalf("Down cursor = (%d, %d), want (0, %d)", line, column, wantColumn)
+		}
+	}
+
+	// Up likewise traverses interior visual rows and jumps to input start only
+	// after the cursor is already on the first visual row.
+	for _, wantColumn := range []int{6, 2, 0} {
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+		m = next.(model)
+		if line, column := m.inputCursorPosition(); line != 0 || column != wantColumn {
+			t.Fatalf("Up cursor = (%d, %d), want (0, %d)", line, column, wantColumn)
+		}
+	}
+}
+
+func TestComposerBoundaryArrowsPreserveUnicodeAndAttachmentTokens(t *testing.T) {
+	m := testModel()
+	label := "[Attachment résumé-界.txt]"
+	m.tokens = []composerToken{{label: label, expansion: "private attachment"}}
+	m.input.SetValue("🙂e\u0301界\n" + label)
+	m.input, _ = m.input.Update(tea.KeyMsg{Type: tea.KeyCtrlHome})
+	m.input, _ = m.input.Update(tea.KeyMsg{Type: tea.KeyRight})
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = next.(model)
+	if line, column := m.inputCursorPosition(); line != 0 || column != 0 {
+		t.Fatalf("Unicode first-line Up cursor = (%d, %d), want (0, 0)", line, column)
+	}
+	if m.input.Value() != "🙂e\u0301界\n"+label || len(m.tokens) != 1 {
+		t.Fatalf("Up changed composer content or tokens: value=%q tokens=%#v", m.input.Value(), m.tokens)
+	}
+
+	m.input, _ = m.input.Update(tea.KeyMsg{Type: tea.KeyCtrlEnd})
+	m.input, _ = m.input.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = next.(model)
+	if line, column := m.inputCursorPosition(); line != 1 || column != len([]rune(label)) {
+		t.Fatalf("attachment last-line Down cursor = (%d, %d), want (1, %d)", line, column, len([]rune(label)))
+	}
+	if m.input.Value() != "🙂e\u0301界\n"+label || len(m.tokens) != 1 {
+		t.Fatalf("Down changed composer content or tokens: value=%q tokens=%#v", m.input.Value(), m.tokens)
 	}
 }
 
@@ -797,8 +1577,8 @@ func TestHistoryRenderCacheInvalidatesWhenTranscriptChanges(t *testing.T) {
 		t.Fatalf("history cache was not populated: valid=%t entries=%d", m.historyValid, len(m.historyCache))
 	}
 	m.appendTranscript(transcriptEntry{role: "assistant", text: "second"})
-	if m.historyValid {
-		t.Fatal("appending a transcript entry did not invalidate the render cache")
+	if !m.historyValid || len(m.historyCache) != 2 {
+		t.Fatalf("small append did not extend the valid render cache: valid=%t entries=%d", m.historyValid, len(m.historyCache))
 	}
 	m.renderHistory()
 	if len(m.historyCache) != 2 {
@@ -947,6 +1727,26 @@ func TestJobsStatusIsPlainTextWithoutSpinner(t *testing.T) {
 	}
 }
 
+func TestCompactRuntimeCountsAreSharedAcrossLogsAndJobs(t *testing.T) {
+	tests := []struct {
+		count int
+		want  string
+	}{
+		{-1, "0"}, {0, "0"}, {999, "999"}, {1000, "1k"},
+		{1540, "1.5k"}, {999499, "999k"}, {999500, "1m"},
+		{14700000, "15m"}, {999500000, "1b"},
+		{int(^uint(0) >> 1), "9.2e"},
+	}
+	for _, test := range tests {
+		if got := core.CompactCount(test.count); got != test.want {
+			t.Errorf("CompactCount(%d) = %q, want %q", test.count, got, test.want)
+		}
+		if jobs, logs := runtimeCount(test.count, "jobs"), runtimeCount(test.count, "logs"); !strings.HasPrefix(jobs, test.want+" ") || !strings.HasPrefix(logs, test.want+" ") {
+			t.Errorf("shared count mismatch for %d: jobs=%q logs=%q", test.count, jobs, logs)
+		}
+	}
+}
+
 func TestTitleEventRenamesWindow(t *testing.T) {
 	m := testModel()
 	m.title = "Spynel"
@@ -1065,6 +1865,544 @@ func TestPastedFileIsCopiedIntoAttachments(t *testing.T) {
 	if expanded := m.expandTokens(m.input.Value()); !strings.Contains(expanded, filepath.ToSlash(copied)) {
 		t.Fatalf("expanded token %q does not link to copied attachment", expanded)
 	}
+}
+
+func TestBlockedPastePreparationLeavesInputAndCancellationResponsive(t *testing.T) {
+	m := testModel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	m.preparePaste = func(context.Context, string, string) ([]composerToken, bool, error) {
+		close(started)
+		<-release
+		return nil, false, nil
+	}
+
+	next, command := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("slow-path.txt"), Paste: true})
+	got := next.(model)
+	if command == nil || !got.pasteBusy || !strings.Contains(got.input.Value(), "Preparing paste") {
+		t.Fatalf("paste was not delegated: busy=%t input=%q command=%v", got.pasteBusy, got.input.Value(), command)
+	}
+	result := make(chan tea.Msg, 1)
+	go func() { result <- runCommandAt(command, 0) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("paste worker did not start")
+	}
+
+	responsive := make(chan model, 1)
+	go func() {
+		typed, _ := got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+		responsive <- typed.(model)
+	}()
+	var cleared model
+	select {
+	case typed := <-responsive:
+		if !strings.Contains(typed.input.Value(), "x") {
+			t.Fatalf("typing was not processed while paste I/O was blocked: %q", typed.input.Value())
+		}
+		next, _ = typed.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+		cleared = next.(model)
+		if cleared.input.Value() != "" || !cleared.pasteCancelled || len(cleared.pasteQueue) != 0 {
+			t.Fatalf("cancellation did not clear composer: %q", cleared.input.Value())
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Update blocked behind paste preparation; stressed target is under 100ms")
+	}
+	close(release)
+	select {
+	case late := <-result:
+		next, _ = cleared.Update(late)
+		cleared = next.(model)
+		if cleared.input.Value() != "" || len(cleared.tokens) != 0 || cleared.pasteBusy || cleared.pasteCancelled {
+			t.Fatalf("late cancelled paste mutated UI: input=%q tokens=%#v busy=%t cancelled=%t", cleared.input.Value(), cleared.tokens, cleared.pasteBusy, cleared.pasteCancelled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("paste worker did not finish")
+	}
+}
+
+func TestBlockedMarkdownRenderCoalescesAndLeavesInputResponsive(t *testing.T) {
+	m := testModel()
+	m.working = true
+	started := make(chan struct{})
+	release := make(chan struct{})
+	m.renderStream = func(text string, width int, active theme.Theme) string {
+		close(started)
+		<-release
+		return renderAgentMarkdownText(text, width, active)
+	}
+
+	next, command := m.Update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: strings.Repeat("stream ", 2000)}})
+	got := next.(model)
+	if command == nil || !got.streamRenderBusy {
+		t.Fatalf("Markdown render was not delegated: busy=%t command=%v", got.streamRenderBusy, command)
+	}
+	rendered := make(chan tea.Msg, 1)
+	go func() { rendered <- runCommandAt(command, 0) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("Markdown worker did not start")
+	}
+
+	responsive := make(chan model, 1)
+	go func() {
+		typed, _ := got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+		responsive <- typed.(model)
+	}()
+	select {
+	case typed := <-responsive:
+		if typed.input.Value() != "x" {
+			t.Fatalf("typing was not processed while Markdown was blocked: %q", typed.input.Value())
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Update blocked behind Markdown rendering; stressed target is under 100ms")
+	}
+
+	second, _ := got.Update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: "newest"}})
+	if coalesced := second.(model); !coalesced.streamRenderBusy || coalesced.streamVersion != 2 {
+		t.Fatalf("new delta was not coalesced behind the owned worker: busy=%t version=%d", coalesced.streamRenderBusy, coalesced.streamVersion)
+	}
+	close(release)
+	select {
+	case <-rendered:
+	case <-time.After(time.Second):
+		t.Fatal("Markdown worker did not finish")
+	}
+}
+
+func TestCurrentMarkdownRenderDoesNotScheduleDuplicateWork(t *testing.T) {
+	m := testModel()
+	m.streaming = "complete stream"
+	m.streamVersion = 1
+	command := m.requestStreamRender()
+	if command == nil {
+		t.Fatal("initial Markdown render was not scheduled")
+	}
+
+	next, _ := m.Update(runCommandAt(command, 0))
+	got := next.(model)
+	if got.streamRenderBusy || got.streamRenderCooling || got.requestStreamRender() != nil {
+		t.Fatalf("current result scheduled duplicate work: busy=%t cooling=%t", got.streamRenderBusy, got.streamRenderCooling)
+	}
+	if got.streamRenderText != got.streaming {
+		t.Fatalf("accepted source = %q, want %q", got.streamRenderText, got.streaming)
+	}
+}
+
+func TestSupersededMarkdownRenderDefersReplacementWhileUIWorkContinues(t *testing.T) {
+	m := testModel()
+	m.working = true
+	m.streaming = "first"
+	m.streamVersion = 1
+	command := m.requestStreamRender()
+	if command == nil {
+		t.Fatal("initial Markdown render was not scheduled")
+	}
+
+	next, _ := m.Update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: " second"}})
+	m = next.(model)
+	next, cooldown := m.Update(runCommandAt(command, 0))
+	m = next.(model)
+	if cooldown == nil || !m.streamRenderCooling || m.streamRenderBusy {
+		t.Fatalf("superseded render was not cooled down: command=%v cooling=%t busy=%t", cooldown, m.streamRenderCooling, m.streamRenderBusy)
+	}
+
+	for index := 0; index < 200; index++ {
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+		m = next.(model)
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+		m = next.(model)
+		next, _ = m.Update(tea.WindowSizeMsg{Width: 90 + index%2, Height: 30})
+		m = next.(model)
+		next, _ = m.Update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: "x"}})
+		m = next.(model)
+		if !m.streamRenderCooling || m.streamRenderBusy {
+			t.Fatalf("iteration %d bypassed cooldown: cooling=%t busy=%t", index, m.streamRenderCooling, m.streamRenderBusy)
+		}
+	}
+	if got := len([]rune(m.input.Value())); got != 200 {
+		t.Fatalf("typed runes = %d, want 200", got)
+	}
+	if got := len(m.streaming); got != len("first second")+200 {
+		t.Fatalf("stream bytes = %d, want %d", got, len("first second")+200)
+	}
+
+	next, replacement := m.Update(runCommandAt(cooldown, -1))
+	m = next.(model)
+	if replacement == nil || !m.streamRenderBusy || m.streamRenderCooling {
+		t.Fatalf("latest render did not resume after cooldown: command=%v busy=%t cooling=%t", replacement, m.streamRenderBusy, m.streamRenderCooling)
+	}
+}
+
+func TestBlockedAndCPUHeavyMarkdownRenderKeepsContinuousInteractiveWorkResponsive(t *testing.T) {
+	for _, dependency := range []struct {
+		name string
+		wait func(<-chan struct{})
+	}{
+		{name: "blocked", wait: func(release <-chan struct{}) { <-release }},
+		{name: "cpu-heavy", wait: func(release <-chan struct{}) {
+			var value uint64 = 1
+			for {
+				for index := 0; index < 4096; index++ {
+					value = value*6364136223846793005 + 1442695040888963407
+				}
+				select {
+				case <-release:
+					if value == 0 {
+						runtime.Gosched()
+					}
+					return
+				default:
+				}
+			}
+		}},
+	} {
+		t.Run(dependency.name, func(t *testing.T) {
+			m := testModel()
+			m.working = true
+			started := make(chan struct{})
+			release := make(chan struct{})
+			var released atomic.Bool
+			t.Cleanup(func() {
+				if released.CompareAndSwap(false, true) {
+					close(release)
+				}
+			})
+			m.renderStream = func(text string, width int, active theme.Theme) string {
+				close(started)
+				dependency.wait(release)
+				return renderAgentMarkdownText(text, width, active)
+			}
+
+			next, command := m.Update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: strings.Repeat("stream ", 2000)}})
+			m = next.(model)
+			if command == nil || !m.streamRenderBusy {
+				t.Fatalf("Markdown render was not delegated: busy=%t command=%v", m.streamRenderBusy, command)
+			}
+			rendered := make(chan tea.Msg, 1)
+			go func() { rendered <- runCommandAt(command, 0) }()
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("Markdown dependency did not start")
+			}
+
+			maxUpdate := time.Duration(0)
+			update := func(message tea.Msg) {
+				started := time.Now()
+				next, _ = m.Update(message)
+				m = next.(model)
+				if elapsed := time.Since(started); elapsed > maxUpdate {
+					maxUpdate = elapsed
+				}
+			}
+			for index := 0; index < 200; index++ {
+				update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+				update(tea.KeyMsg{Type: tea.KeyShiftUp})
+				update(tea.WindowSizeMsg{Width: 90 + index%2, Height: 30 + index%2})
+				update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: "x"}})
+				if !m.streamRenderBusy {
+					t.Fatalf("iteration %d lost the single owned render while dependency was active", index)
+				}
+			}
+			if got := len([]rune(m.input.Value())); got != 200 {
+				t.Fatalf("typed runes = %d, want 200", got)
+			}
+			if got := len(m.streaming); got != len(strings.Repeat("stream ", 2000))+200 {
+				t.Fatalf("stream bytes = %d, want %d", got, len(strings.Repeat("stream ", 2000))+200)
+			}
+			if maxUpdate >= 100*time.Millisecond {
+				t.Fatalf("slowest combined-sequence Update took %s while formatter was active; stressed target is under 100ms", maxUpdate)
+			}
+
+			if released.CompareAndSwap(false, true) {
+				close(release)
+			}
+			select {
+			case <-rendered:
+			case <-time.After(time.Second):
+				t.Fatal("Markdown worker did not finish")
+			}
+		})
+	}
+}
+
+func TestBlockedHistoryRenderLeavesResizeScrollAndInputResponsive(t *testing.T) {
+	m := testModel()
+	for index := 0; index < asyncHistoryEntries+1; index++ {
+		m.transcript = append(m.transcript, transcriptEntry{role: "assistant", text: fmt.Sprintf("entry %d", index)})
+	}
+	m.invalidateHistoryRender()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	m.renderHistoryEntries = func(snapshot model) []string {
+		close(started)
+		<-release
+		return renderHistoryEntries(snapshot)
+	}
+
+	next, command := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	got := next.(model)
+	if command == nil || !got.historyRenderBusy {
+		t.Fatalf("history render was not delegated: busy=%t command=%v", got.historyRenderBusy, command)
+	}
+	done := make(chan tea.Msg, 1)
+	go func() { done <- runCommandAt(command, -1) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("history worker did not start")
+	}
+
+	responsive := make(chan model, 1)
+	go func() {
+		typed, _ := got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+		scrolled, _ := typed.(model).Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+		resized, _ := scrolled.(model).Update(tea.WindowSizeMsg{Width: 101, Height: 31})
+		responsive <- resized.(model)
+	}()
+	var updated model
+	select {
+	case updated = <-responsive:
+		if updated.input.Value() != "x" || updated.width != 101 || updated.height != 31 {
+			t.Fatalf("blocked history render delayed UI state: input=%q size=%dx%d", updated.input.Value(), updated.width, updated.height)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("input/scroll/resize blocked behind history rendering; stressed target is under 100ms")
+	}
+	close(release)
+	select {
+	case stale := <-done:
+		next, command = updated.Update(stale)
+		updated = next.(model)
+		if updated.historyValid || !updated.historyRenderBusy || command == nil {
+			t.Fatalf("stale resize render was accepted or not replaced: valid=%t busy=%t command=%v", updated.historyValid, updated.historyRenderBusy, command)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("history worker did not finish")
+	}
+}
+
+func TestBlockedThemeDiscoveryLeavesInputResponsive(t *testing.T) {
+	m := testModel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	m.loadThemes = func() ([]theme.Theme, error) {
+		close(started)
+		<-release
+		return theme.Builtins(), nil
+	}
+	next, command := m.Update(uiEvent{event: core.Event{Kind: core.EventThemePicker}})
+	got := next.(model)
+	if command == nil || !got.themeLoading || got.themeMenu {
+		t.Fatalf("theme discovery was not delegated: loading=%t menu=%t command=%v", got.themeLoading, got.themeMenu, command)
+	}
+	done := make(chan tea.Msg, 1)
+	go func() { done <- runCommandAt(command, 0) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("theme discovery worker did not start")
+	}
+	responsive := make(chan model, 1)
+	go func() {
+		typed, _ := got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+		responsive <- typed.(model)
+	}()
+	select {
+	case typed := <-responsive:
+		if typed.input.Value() != "x" {
+			t.Fatalf("typing was not processed during theme discovery: %q", typed.input.Value())
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("input blocked behind theme discovery; stressed target is under 100ms")
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("theme discovery worker did not finish")
+	}
+}
+
+func TestDeltaBurstCoalescesViewportRefreshWithLargeHistory(t *testing.T) {
+	m := testModel()
+	m.historyValid = true
+	m.historyWidth = m.viewport.Width
+	m.historyTheme = m.activeTheme
+	m.historyCache = []string{strings.Repeat("history\n", 60_000)}
+	for index := 0; index <= asyncHistoryEntries; index++ {
+		m.transcript = append(m.transcript, transcriptEntry{role: "assistant", text: "cached"})
+	}
+	m.viewport.SetContent("stable viewport")
+	m.streamRenderBusy = true
+	m.resizeComposer()
+	next, _ := m.Update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: "x"}})
+	m = next.(model)
+	before := m.viewport.View()
+	for index := 1; index < 500; index++ {
+		next, _ = m.Update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: "x"}})
+		m = next.(model)
+	}
+	if !m.streamRefreshPending || m.viewport.View() != before || m.streaming != strings.Repeat("x", 500) {
+		t.Fatalf("delta burst was not coalesced: pending=%t viewportChanged=%t stream=%d", m.streamRefreshPending, m.viewport.View() != before, len(m.streaming))
+	}
+	next, _ = m.Update(streamRefreshMsg{})
+	m = next.(model)
+	if m.streamRefreshPending || !strings.Contains(ansi.Strip(m.viewport.View()), "xxx") {
+		t.Fatalf("coalesced refresh did not publish the latest stream: pending=%t view=%q", m.streamRefreshPending, ansi.Strip(m.viewport.View()))
+	}
+}
+
+func TestStreamingFollowUsesOneViewportTailThreshold(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		distance   int
+		wantFollow bool
+	}{
+		{name: "within one visible page", distance: 5, wantFollow: true},
+		{name: "farther than one visible page", distance: 6, wantFollow: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m, _ := streamingScrollTestModel()
+			maximumOffset := max(0, m.viewport.TotalLineCount()-m.viewport.Height)
+			m.viewport.SetYOffset(maximumOffset - test.distance)
+			oldOffset := m.viewport.YOffset
+			m.streaming += strings.Repeat("\n\nnew streamed paragraph", 12)
+			m.refreshStreaming()
+			if test.wantFollow {
+				if !m.viewport.AtBottom() {
+					t.Fatalf("tail-adjacent viewport did not follow: offset=%d lines=%d", m.viewport.YOffset, m.viewport.TotalLineCount())
+				}
+			} else if m.viewport.YOffset != oldOffset {
+				t.Fatalf("far viewport moved from %d to %d", oldOffset, m.viewport.YOffset)
+			}
+		})
+	}
+}
+
+func TestManualUpwardScrollSuppressesFollowUntilGraceExpires(t *testing.T) {
+	m, clock := streamingScrollTestModel()
+	m.viewport.GotoBottom()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+	m = next.(model)
+	manualOffset := m.viewport.YOffset
+	m.streaming += "\n\nnew streamed paragraph"
+	next, _ = m.Update(streamRefreshMsg{})
+	m = next.(model)
+	if m.viewport.YOffset != manualOffset || m.viewport.AtBottom() {
+		t.Fatalf("recent upward scroll was not preserved: offset=%d want=%d bottom=%t", m.viewport.YOffset, manualOffset, m.viewport.AtBottom())
+	}
+
+	*clock = clock.Add(manualScrollGrace)
+	m.refreshStreaming()
+	if !m.viewport.AtBottom() {
+		t.Fatalf("follow did not resume after %s grace period", manualScrollGrace)
+	}
+}
+
+func TestManualDownwardReturnToTailResumesFollowImmediately(t *testing.T) {
+	m, _ := streamingScrollTestModel()
+	m.viewport.GotoBottom()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+	m = next.(model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftDown})
+	m = next.(model)
+	if !m.viewport.AtBottom() || !m.manualScrollUpUntil.IsZero() {
+		t.Fatalf("explicit tail return did not resume follow: bottom=%t suppressed-until=%v", m.viewport.AtBottom(), m.manualScrollUpUntil)
+	}
+	m.streaming += strings.Repeat("\n\nnew streamed paragraph", 8)
+	m.refreshStreaming()
+	if !m.viewport.AtBottom() {
+		t.Fatal("viewport detached after explicit return to tail")
+	}
+}
+
+func TestStreamingFollowSurvivesResizeAsyncRenderAndFinalization(t *testing.T) {
+	m, _ := streamingScrollTestModel()
+	m.viewport.SetYOffset(max(0, m.viewport.YOffset-2))
+
+	next, _ := m.Update(tea.WindowSizeMsg{Width: m.width + 7, Height: m.height + 2})
+	m = next.(model)
+	if !m.viewport.AtBottom() {
+		t.Fatal("tail-adjacent resize disengaged follow mode")
+	}
+
+	m.historyRenderBusy = true
+	m.historyVersion++
+	version := m.historyVersion
+	next, _ = m.Update(historyRenderResult{
+		version: version,
+		width:   m.viewport.Width,
+		theme:   m.activeTheme,
+		entries: append(append([]string(nil), m.historyCache...), strings.Repeat("async row\n", 12)),
+	})
+	m = next.(model)
+	if !m.viewport.AtBottom() {
+		t.Fatal("accepted asynchronous render disengaged follow mode")
+	}
+
+	next, _ = m.Update(uiEvent{event: core.Event{Kind: core.EventFinal, Text: m.streaming, Done: true}})
+	m = next.(model)
+	if !m.viewport.AtBottom() || m.streaming != "" {
+		t.Fatalf("stream finalization lost tail anchor: bottom=%t streaming=%q", m.viewport.AtBottom(), m.streaming)
+	}
+}
+
+func TestRapidDeltaBurstKeepsTailAdjacentViewportAttached(t *testing.T) {
+	m, _ := streamingScrollTestModel()
+	m.streamRenderBusy = true
+	m.viewport.SetYOffset(max(0, m.viewport.YOffset-m.viewport.Height))
+	for index := 0; index < 100; index++ {
+		next, _ := m.Update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: "\n\nburst"}})
+		m = next.(model)
+	}
+	next, _ := m.Update(streamRefreshMsg{})
+	m = next.(model)
+	if !m.viewport.AtBottom() {
+		t.Fatalf("coalesced delta burst disengaged tail follow: offset=%d lines=%d", m.viewport.YOffset, m.viewport.TotalLineCount())
+	}
+}
+
+func TestRecentManualScrollPreservesOffsetAcrossFinalAndNotification(t *testing.T) {
+	m, _ := streamingScrollTestModel()
+	m.viewport.GotoBottom()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+	m = next.(model)
+	wantOffset := m.viewport.YOffset
+	next, _ = m.Update(uiEvent{event: core.Event{Kind: core.EventFinal, Text: m.streaming, Done: true}})
+	m = next.(model)
+	if m.viewport.YOffset != wantOffset {
+		t.Fatalf("finalization moved recent manual offset from %d to %d", wantOffset, m.viewport.YOffset)
+	}
+	m.pendingNotifications = append(m.pendingNotifications, channel.Notification{Text: "Task notification"})
+	m.flushNotifications()
+	m.refresh()
+	if m.viewport.YOffset != wantOffset {
+		t.Fatalf("notification insertion moved recent manual offset from %d to %d", wantOffset, m.viewport.YOffset)
+	}
+}
+
+func streamingScrollTestModel() (model, *time.Time) {
+	m := testModel()
+	clock := time.Date(2026, time.August, 8, 8, 0, 0, 0, time.UTC)
+	m.now = func() time.Time { return clock }
+	m.viewport.Width = 36
+	m.viewport.Height = 5
+	m.width = 39
+	m.height = layoutOverhead + m.composerRows + m.viewport.Height
+	m.historyCache = []string{strings.Repeat("history row\n", 40)}
+	m.historyValid = true
+	m.historyWidth = m.viewport.Width
+	m.historyTheme = m.activeTheme
+	m.streaming = "current streamed response"
+	m.responseText = m.streaming
+	m.working = true
+	m.renderHistory()
+	m.viewport.GotoBottom()
+	return m, &clock
 }
 
 func TestScrollbarTracksTopAndBottom(t *testing.T) {
@@ -1221,11 +2559,16 @@ func TestWorkingSpinnerTrailsStreamingResponseUntilFinal(t *testing.T) {
 		t.Fatalf("header logo did not advance independently: logo=%q first=%q", got.spynelLogo(), firstLogoFrame)
 	}
 
+	got.viewport.GotoBottom()
 	next, _ = got.Update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: "Confirmation received."}})
 	got = next.(model)
+	if got.streamRefreshPending {
+		next, _ = got.Update(streamRefreshMsg{})
+		got = next.(model)
+	}
 	streamingFrame := got.workingSpinner.View()
 	view = ansi.Strip(got.viewport.View())
-	if !strings.Contains(view, "received."+streamingFrame) || strings.Contains(view, "Working") {
+	if !strings.Contains(view, "Confirmation") || !strings.Contains(view, "ceived.") || !strings.Contains(view, streamingFrame) || strings.Contains(view, "Working") {
 		t.Fatalf("spinner does not trail the streamed response: %q", view)
 	}
 	got.viewport.SetYOffset(7)
@@ -1236,10 +2579,15 @@ func TestWorkingSpinnerTrailsStreamingResponseUntilFinal(t *testing.T) {
 		t.Fatalf("trailing spinner did not animate in place: frame=%q offset=%d want-offset=%d", got.workingSpinner.View(), got.viewport.YOffset, wantOffset)
 	}
 
+	got.viewport.GotoBottom()
 	next, _ = got.Update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: " Next response"}})
 	got = next.(model)
+	if got.streamRefreshPending {
+		next, _ = got.Update(streamRefreshMsg{})
+		got = next.(model)
+	}
 	view = ansi.Strip(got.viewport.View())
-	if !strings.Contains(view, "response"+got.workingSpinner.View()) || strings.Contains(view, "Working") {
+	if !strings.Contains(view, "sponse"+got.workingSpinner.View()) || strings.Contains(view, "Working") {
 		t.Fatalf("spinner did not follow the newest streamed character: %q", view)
 	}
 
@@ -2112,12 +3460,15 @@ func TestWhatsAppFullscreenQRCodeRefreshesAndTimeoutReturnsToWizard(t *testing.T
 func TestChatScreenResultSwitchesToBranchedConversation(t *testing.T) {
 	m := testModel()
 	m.transcript = []transcriptEntry{{role: "user", text: "old chat"}}
-	m.openScreen(core.Screen{ID: "chat", Conversation: "resume-ab12cd34", Transcript: []core.ChatEntry{{Role: "user", Text: "remote"}, {Role: "assistant", Text: "answer"}}})
-	if m.screen != nil || m.conversation != "resume-ab12cd34" || len(m.transcript) != 2 || m.transcript[1].text != "answer" {
+	m.openScreen(core.Screen{ID: "chat", Conversation: "resume-ab12cd34", Transcript: []core.ChatEntry{{Role: "user", Text: "remote"}, {Role: "assistant", Text: strings.Repeat("answer\n", 30) + "newest answer"}}})
+	if m.screen != nil || m.conversation != "resume-ab12cd34" || len(m.transcript) != 2 || !strings.HasSuffix(m.transcript[1].text, "newest answer") {
 		t.Fatalf("branched TUI state = conversation %q, screen %#v, transcript %#v", m.conversation, m.screen, m.transcript)
 	}
 	if !strings.Contains(m.status, "resume-ab12cd34") {
 		t.Fatalf("resume status = %q", m.status)
+	}
+	if m.initialHistoryScroll || !m.viewport.AtBottom() || !strings.Contains(ansi.Strip(m.viewport.View()), "newest answer") {
+		t.Fatalf("resumed chat did not start at newest row: pending=%t bottom=%t view=%q", m.initialHistoryScroll, m.viewport.AtBottom(), ansi.Strip(m.viewport.View()))
 	}
 }
 
@@ -2236,6 +3587,103 @@ func TestPersistedHistoryBuildsInitialTranscript(t *testing.T) {
 	}
 }
 
+func TestStartupHistoryScrollsToNewestRowAfterRealViewportSize(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []transcriptEntry
+	}{
+		{name: "longer than viewport", entries: []transcriptEntry{{role: "assistant", text: strings.Repeat("history row\n", 30) + "newest row"}}},
+		{name: "short", entries: []transcriptEntry{{role: "assistant", text: "only row"}}},
+		{name: "empty"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := testModel()
+			m.width, m.height = 0, 0
+			m.transcript = test.entries
+			m.initialHistoryScroll = len(test.entries) > 0
+			m.invalidateHistoryRender()
+			m.viewport.SetContent(strings.Repeat("provisional row\n", 20))
+			m.viewport.SetYOffset(3)
+			provisionalOffset := m.viewport.YOffset
+
+			// A refresh before Bubble Tea reports the terminal size must not
+			// consume the one-shot or reposition provisional content.
+			m.refresh()
+			if len(test.entries) > 0 && !m.initialHistoryScroll {
+				t.Fatal("startup scroll completed before real viewport dimensions")
+			}
+			if test.name == "longer than viewport" && m.viewport.YOffset != provisionalOffset {
+				t.Fatalf("startup refresh moved provisional offset from %d to %d", provisionalOffset, m.viewport.YOffset)
+			}
+
+			next, _ := m.Update(tea.WindowSizeMsg{Width: 40, Height: 14})
+			got := next.(model)
+			if got.initialHistoryScroll {
+				t.Fatal("startup scroll remained pending after synchronous render")
+			}
+			if len(test.entries) == 0 {
+				if got.viewport.YOffset != 0 || !strings.Contains(ansi.Strip(got.viewport.View()), emptyConversation) {
+					t.Fatalf("empty history view = offset %d, %q", got.viewport.YOffset, ansi.Strip(got.viewport.View()))
+				}
+				return
+			}
+			if !got.viewport.AtBottom() {
+				t.Fatalf("loaded history did not start at bottom: offset=%d total=%d height=%d", got.viewport.YOffset, got.viewport.TotalLineCount(), got.viewport.Height)
+			}
+			if test.name == "longer than viewport" && !strings.Contains(ansi.Strip(got.viewport.View()), "newest row") {
+				t.Fatalf("newest row is not visible: %q", ansi.Strip(got.viewport.View()))
+			}
+		})
+	}
+}
+
+func TestAsyncStartupHistoryWaitsThroughResizeThenScrollsExactlyOnce(t *testing.T) {
+	m := testModel()
+	m.width, m.height = 0, 0
+	for index := 0; index <= asyncHistoryEntries; index++ {
+		m.transcript = append(m.transcript, transcriptEntry{role: "assistant", text: fmt.Sprintf("history-%02d", index)})
+	}
+	m.initialHistoryScroll = true
+	m.invalidateHistoryRender()
+	m.historyCache = []string{strings.Repeat("provisional row\n", 80)}
+	m.viewport.SetContent(m.historyCache[0])
+	m.viewport.SetYOffset(5)
+	provisionalOffset := m.viewport.YOffset
+
+	next, firstRender := m.Update(tea.WindowSizeMsg{Width: 70, Height: 16})
+	m = next.(model)
+	if firstRender == nil || !m.historyRenderBusy || !m.initialHistoryScroll || m.viewport.YOffset != provisionalOffset {
+		t.Fatalf("initial asynchronous render state = command %v, busy %t, pending %t, offset %d want %d", firstRender, m.historyRenderBusy, m.initialHistoryScroll, m.viewport.YOffset, provisionalOffset)
+	}
+
+	// Resize while the first render is outstanding. Its result is stale and
+	// must schedule another render without consuming the startup scroll.
+	next, _ = m.Update(tea.WindowSizeMsg{Width: 54, Height: 13})
+	m = next.(model)
+	if m.viewport.YOffset != provisionalOffset {
+		t.Fatalf("startup resize moved provisional offset from %d to %d", provisionalOffset, m.viewport.YOffset)
+	}
+	next, replacementRender := m.Update(runCommandAt(firstRender, -1))
+	m = next.(model)
+	if replacementRender == nil || !m.historyRenderBusy || !m.initialHistoryScroll || m.historyValid {
+		t.Fatalf("stale render state = command %v, busy %t, pending %t, valid %t", replacementRender, m.historyRenderBusy, m.initialHistoryScroll, m.historyValid)
+	}
+
+	next, _ = m.Update(runCommandAt(replacementRender, -1))
+	m = next.(model)
+	if m.initialHistoryScroll || !m.historyValid || !m.viewport.AtBottom() || !strings.Contains(ansi.Strip(m.viewport.View()), "history-50") {
+		t.Fatalf("completed startup render = pending %t, valid %t, bottom %t, view %q", m.initialHistoryScroll, m.historyValid, m.viewport.AtBottom(), ansi.Strip(m.viewport.View()))
+	}
+
+	m.viewport.ScrollUp(2)
+	wantOffset := m.viewport.YOffset
+	m.refreshPreservingHistory()
+	if m.viewport.YOffset != wantOffset {
+		t.Fatalf("later render forced history from offset %d to %d", wantOffset, m.viewport.YOffset)
+	}
+}
+
 func TestClearEventRemovesVisibleTranscript(t *testing.T) {
 	m := testModel()
 	m.transcript = []transcriptEntry{{role: "user", text: "old message"}, {role: "assistant", text: "old response"}}
@@ -2279,6 +3727,282 @@ func TestWelcomeRendersInlineAboveChatWithoutTakingComposerFocus(t *testing.T) {
 	if !m.input.Focused() || m.viewport.YOffset != 0 {
 		t.Fatalf("inline welcome stole composer focus or did not start at top: focused=%v offset=%d", m.input.Focused(), m.viewport.YOffset)
 	}
+}
+
+func BenchmarkStreamingDeltaUpdate(b *testing.B) {
+	m := testModel()
+	m.streamRenderBusy = true // model one deliberately slow formatter
+	delta := uiEvent{event: core.Event{Kind: core.EventDelta, Text: strings.Repeat("delta ", 32)}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		next, _ := m.Update(delta)
+		m = next.(model)
+	}
+}
+
+func BenchmarkLargeHistoryDeltaAdmission(b *testing.B) {
+	m := largeHistoryBenchmarkModel()
+	m.streamRenderBusy = true
+	delta := uiEvent{event: core.Event{Kind: core.EventDelta, Text: "x"}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		next, _ := m.Update(delta)
+		m = next.(model)
+	}
+}
+
+// BenchmarkLargeHistoryViewportRefresh measures the full refresh that every
+// delta triggered before publication was coalesced. Keep it beside admission
+// so performance evidence compares the same retained-history fixture.
+func BenchmarkLargeHistoryViewportRefresh(b *testing.B) {
+	m := largeHistoryBenchmarkModel()
+	m.streaming = "latest delta"
+	m.working = true
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		m.refreshStreaming()
+	}
+}
+
+func BenchmarkRealisticConcurrentLoad(b *testing.B) {
+	b.ReportAllocs()
+	metrics := runRealisticConcurrentLoad(b, b.N)
+	b.ReportMetric(float64(metrics.p95Update.Nanoseconds()), "ui_p95_ns")
+	b.ReportMetric(float64(metrics.maxUIQueue), "ui_queue_max")
+	b.ReportMetric(float64(metrics.maxBackgroundQueue), "background_queue_max")
+	b.ReportMetric(float64(metrics.peakGoroutines), "goroutines_peak")
+	b.ReportMetric(float64(metrics.finalGoroutines), "goroutines_final")
+}
+
+func TestRealisticConcurrentLoadUsesBoundedQueuesAndResponsiveUpdates(t *testing.T) {
+	metrics := runRealisticConcurrentLoad(t, 256)
+	if metrics.maxUIQueue > 64 || metrics.maxBackgroundQueue > 8 {
+		t.Fatalf("queue bounds exceeded: ui=%d background=%d", metrics.maxUIQueue, metrics.maxBackgroundQueue)
+	}
+	if metrics.peakGoroutines < metrics.finalGoroutines+4 {
+		t.Fatalf("fixture did not observe all owned workers: peak=%d final=%d", metrics.peakGoroutines, metrics.finalGoroutines)
+	}
+	if metrics.p95Update >= streamRefreshInterval {
+		t.Fatalf("mixed-load event-loop p95 = %s, target is under %s", metrics.p95Update, streamRefreshInterval)
+	}
+}
+
+type concurrentLoadMetrics struct {
+	p95Update          time.Duration
+	maxUIQueue         int
+	maxBackgroundQueue int
+	peakGoroutines     int
+	finalGoroutines    int
+}
+
+// runRealisticConcurrentLoad keeps the real TUI update path active while
+// bounded owned workers perform the subsystem work seen during an orchestrated
+// streaming turn: Markdown/layout, runtime logging, durable history appends,
+// task-file transitions, notifications, and channel status activity.
+func runRealisticConcurrentLoad(tb testing.TB, iterations int) concurrentLoadMetrics {
+	tb.Helper()
+	root := tb.TempDir()
+	logFile, err := os.OpenFile(filepath.Join(root, "runtime.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer logFile.Close()
+	histories := history.New(filepath.Join(root, "history"))
+	todoDir, workingDir := filepath.Join(root, "tasks", "todo"), filepath.Join(root, "tasks", "working")
+	if err := os.MkdirAll(todoDir, 0o700); err != nil {
+		tb.Fatal(err)
+	}
+	if err := os.MkdirAll(workingDir, 0o700); err != nil {
+		tb.Fatal(err)
+	}
+	todoTask, workingTask := filepath.Join(todoDir, "load.md"), filepath.Join(workingDir, "load.md")
+	if err := os.WriteFile(todoTask, []byte("---\nstatus: todo\n---\n"), 0o600); err != nil {
+		tb.Fatal(err)
+	}
+
+	uiQueue := make(chan tea.Msg, 64)
+	markdownJobs := make(chan string, 1)
+	logJobs := make(chan int, 8)
+	historyJobs := make(chan int, 8)
+	orchestratorJobs := make(chan int, 1)
+	errCh := make(chan error, 4)
+	var maxUIQueue atomic.Int64
+	var maxBackgroundQueue atomic.Int64
+	recordDepth := func(target *atomic.Int64, depth int) {
+		for current := target.Load(); int64(depth) > current && !target.CompareAndSwap(current, int64(depth)); current = target.Load() {
+		}
+	}
+
+	baselineGoroutines := runtime.NumGoroutine()
+	var workers sync.WaitGroup
+	workers.Add(4)
+	go func() {
+		defer workers.Done()
+		for text := range markdownJobs {
+			_ = renderAgentMarkdownText(text, 72, theme.Default())
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		for index := range logJobs {
+			if _, err := fmt.Fprintf(logFile, "{\"level\":\"info\",\"event\":\"load\",\"sequence\":%d}\n", index); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		for index := range historyJobs {
+			_, err := histories.Append("tui", "load", history.Entry{Role: "assistant", Content: fmt.Sprintf("streamed response %d", index)})
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		inWorking := false
+		for range orchestratorJobs {
+			from, to := todoTask, workingTask
+			if inWorking {
+				from, to = workingTask, todoTask
+			}
+			if err := os.Rename(from, to); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+			inWorking = !inWorking
+		}
+	}()
+
+	producerDone := make(chan struct{})
+	go func() {
+		defer close(producerDone)
+		defer close(uiQueue)
+		defer close(markdownJobs)
+		defer close(logJobs)
+		defer close(historyJobs)
+		defer close(orchestratorJobs)
+		for index := 0; index < iterations; index++ {
+			var message tea.Msg
+			switch index % 8 {
+			case 0:
+				text := fmt.Sprintf("**stream-%d** with [link](https://example.com)\n\n", index)
+				message = uiEvent{event: core.Event{Kind: core.EventDelta, Text: text}}
+				markdownJobs <- text
+				recordDepth(&maxBackgroundQueue, len(markdownJobs))
+			case 1:
+				message = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")}
+			case 2:
+				message = tea.KeyMsg{Type: tea.KeyShiftUp}
+			case 3:
+				message = tea.WindowSizeMsg{Width: 90 + index%3, Height: 30 + index%2}
+			case 4:
+				message = taskNotificationEvent{notification: channel.Notification{ID: fmt.Sprintf("task-%d", index), Text: "Task moved to review"}}
+			case 5:
+				message = noticeEvent{notice: channel.Notice{Channel: "telegram", Sender: "operator", Text: "channel activity"}}
+			case 6:
+				message = runtimeEvent{status: core.RuntimeStatus{Jobs: index%4 + 1, Logs: index}}
+			case 7:
+				message = connectionEvent{status: channel.ConnectionStatus{Name: "telegram", State: channel.ConnectionConnected}}
+			}
+			uiQueue <- message
+			recordDepth(&maxUIQueue, len(uiQueue))
+			if index%4 == 0 {
+				logJobs <- index
+				recordDepth(&maxBackgroundQueue, len(logJobs))
+			}
+			if index%16 == 0 {
+				historyJobs <- index
+				recordDepth(&maxBackgroundQueue, len(historyJobs))
+			}
+			if index%32 == 0 {
+				orchestratorJobs <- index
+				recordDepth(&maxBackgroundQueue, len(orchestratorJobs))
+			}
+		}
+	}()
+
+	m := largeHistoryBenchmarkModel()
+	m.working = true
+	m.streamRenderBusy = true
+	latencies := make([]time.Duration, 0, iterations)
+	peakGoroutines := runtime.NumGoroutine()
+	profileWritten := false
+	for message := range uiQueue {
+		started := time.Now()
+		next, _ := m.Update(message)
+		m = next.(model)
+		latencies = append(latencies, time.Since(started))
+		if count := runtime.NumGoroutine(); count > peakGoroutines {
+			peakGoroutines = count
+		}
+		if !profileWritten && len(uiQueue) > 0 {
+			if path := os.Getenv("SPYNEL_TUI_GOROUTINE_PROFILE"); path != "" {
+				file, err := os.Create(path)
+				if err != nil {
+					tb.Fatal(err)
+				}
+				if err := pprof.Lookup("goroutine").WriteTo(file, 0); err != nil {
+					file.Close()
+					tb.Fatal(err)
+				}
+				if err := file.Close(); err != nil {
+					tb.Fatal(err)
+				}
+				profileWritten = true
+			}
+		}
+	}
+	<-producerDone
+	workers.Wait()
+	select {
+	case err := <-errCh:
+		tb.Fatal(err)
+	default:
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	p95 := time.Duration(0)
+	if len(latencies) > 0 {
+		p95 = latencies[(len(latencies)-1)*95/100]
+	}
+	finalGoroutines := runtime.NumGoroutine()
+	if finalGoroutines > baselineGoroutines+1 {
+		tb.Fatalf("concurrent load leaked goroutines: baseline=%d final=%d", baselineGoroutines, finalGoroutines)
+	}
+	return concurrentLoadMetrics{
+		p95Update:          p95,
+		maxUIQueue:         int(maxUIQueue.Load()),
+		maxBackgroundQueue: int(maxBackgroundQueue.Load()),
+		peakGoroutines:     peakGoroutines,
+		finalGoroutines:    finalGoroutines,
+	}
+}
+
+func largeHistoryBenchmarkModel() model {
+	m := testModel()
+	m.historyValid = true
+	m.historyWidth = m.viewport.Width
+	m.historyTheme = m.activeTheme
+	m.historyCache = []string{strings.Repeat("history\n", 60_000)}
+	for index := 0; index <= asyncHistoryEntries; index++ {
+		m.transcript = append(m.transcript, transcriptEntry{role: "assistant", text: "cached"})
+	}
+	return m
 }
 
 func TestPersistedWelcomeLogoUsesThemePrimaryStyle(t *testing.T) {
@@ -2335,6 +4059,22 @@ func testModel() model {
 		width:  24,
 		height: 20,
 		status: "Ready",
+	}
+}
+
+func runCommandAt(command tea.Cmd, index int) tea.Msg {
+	message := command()
+	for {
+		batch, ok := message.(tea.BatchMsg)
+		if !ok || len(batch) == 0 {
+			return message
+		}
+		selected := index
+		if selected < 0 {
+			selected = len(batch) - 1
+		}
+		message = batch[selected]()
+		index = 0
 	}
 }
 

@@ -9,9 +9,17 @@ binary="$project_dir/bin/spynel"
 smoke_dir=$(mktemp -d "${TMPDIR:-/tmp}/spynel-smoke.XXXXXX")
 trap 'rm -rf "$smoke_dir"' EXIT HUP INT TERM
 
+docs_index=$(cd "$smoke_dir" && "$binary" docs)
+printf '%s\n' "$docs_index" | grep -q '`goals`'
+docs_json=$(cd "$smoke_dir" && "$binary" docs search review --format json)
+printf '%s\n' "$docs_json" | grep -q '"schema_version": "spynel.docs/v1"'
+
 "$binary" init --no-start --dir "$smoke_dir"
 (cd "$smoke_dir" && "$binary" config)
-(cd "$smoke_dir" && "$binary" task "smoke test task creation")
+reviewed_task=$(cd "$smoke_dir" && "$binary" task "smoke test task creation")
+direct_task=$(cd "$smoke_dir" && "$binary" task --no-review "collect smoke status")
+"$binary" task inspect "$reviewed_task" | grep -q 'Review required: true'
+"$binary" task inspect "$direct_task" | grep -q 'Review required: false'
 (cd "$smoke_dir" && "$binary" goal "smoke test goal creation")
 
 status_json=$("$binary" status --config "$smoke_dir/spynel.yaml" --conversation smoke --json)
@@ -40,7 +48,7 @@ test -f "$smoke_dir/.spynel/AGENTS.md"
 test -f "$smoke_dir/.spynel/prompts/create-task.md"
 test -f "$smoke_dir/.spynel/prompts/create-goal.md"
 test -f "$smoke_dir/.spynel/prompts/goal-review.md"
-test "$(find "$smoke_dir/.spynel/tasks/todo" -type f -name '*.md' | wc -l)" -eq 1
+test "$(find "$smoke_dir/.spynel/tasks/todo" -type f -name '*.md' | wc -l)" -eq 2
 test "$(find "$smoke_dir/.spynel/goals/proposed" -type f -name '*.md' | wc -l)" -eq 1
 
 for status in todo working review reviewing waiting done failed cancelled; do

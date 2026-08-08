@@ -36,8 +36,9 @@ func Settings(cfg Config) []Setting {
 		{Key: "channels.tui.enabled", Section: "config", Description: "Launch the TUI by default on the next start", Value: formatBool(cfg.Channels.TUI.Enabled), Choices: []string{"on", "off"}, Restart: true, Advanced: true},
 		{Key: "channels.tui.title", Section: "config", Description: "Default TUI title", Value: cfg.Channels.TUI.Title, Advanced: true},
 		{Key: "channels.tui.theme", Section: "config", Description: "Active color theme from .spynel/themes", Value: cfg.Channels.TUI.Theme, Advanced: true},
-		{Key: "orchestrator.enabled", Section: "config", Description: "Run Markdown task and goal routes after restart", Value: formatBool(cfg.Orchestrator.Enabled), Choices: []string{"on", "off"}, Restart: true, Advanced: true},
+		{Key: "orchestrator.enabled", Section: "config", Description: "Run Markdown task and goal routes", Value: formatBool(cfg.Orchestrator.Enabled), Choices: []string{"on", "off"}, Advanced: true},
 		{Key: "orchestrator.interval_seconds", Section: "config", Description: "Route scan interval after restart", Value: strconv.Itoa(cfg.Orchestrator.IntervalSec), Restart: true, Advanced: true},
+		{Key: "orchestrator.semantic_heartbeat_minutes", Section: "config", Description: "Fixed delay after each agent workflow audit completes; 0 disables it", Value: strconv.Itoa(cfg.Orchestrator.SemanticHeartbeatMinutes), Advanced: true},
 		{Key: "orchestrator.max_parallel", Section: "config", Description: "Maximum concurrent Markdown jobs after restart", Value: strconv.Itoa(cfg.Orchestrator.MaxParallel), Restart: true, Advanced: true},
 		{Key: "extensions.enabled", Section: "config", Description: "Run trusted extension hooks after restart", Value: formatBool(cfg.Extensions.Enabled), Choices: []string{"on", "off"}, Restart: true, Advanced: true},
 		{Key: "extensions.directory", Section: "config", Description: "Installed extension directory after restart", Value: cfg.Extensions.Directory, Restart: true, Advanced: true},
@@ -65,7 +66,7 @@ func Settings(cfg Config) []Setting {
 		{Key: "channels.whatsapp.poll_interval_seconds", Section: "whatsapp", Description: "Connection health-check interval", Value: strconv.Itoa(cfg.Channels.WhatsApp.PollIntervalSec), Advanced: true},
 		{Key: "speech.enabled", Section: "config", Description: "Transcribe incoming voice messages", Value: formatBool(cfg.Speech.Enabled), Choices: []string{"on", "off"}, Advanced: true},
 		{Key: "speech.language", Section: "config", Description: "Parakeet transcription language; English uses the English model and other values use multilingual auto-detection", Value: cfg.Speech.Language, Choices: SpeechLanguages(), Advanced: true},
-		{Key: "speech.model_dir", Section: "config", Description: "Optional local directory containing Parakeet encoder, decoder, joiner, and tokens files", Value: cfg.Speech.ModelDir, Advanced: true},
+		{Key: "speech.model_dir", Section: "config", Description: "Optional explicit Parakeet model directory; otherwise use the shared OS user cache", Value: cfg.Speech.ModelDir, Advanced: true},
 		{Key: "speech.num_threads", Section: "config", Description: "CPU threads used for local transcription", Value: strconv.Itoa(cfg.Speech.NumThreads), Advanced: true},
 		{Key: "speech.max_file_mb", Section: "config", Description: "Maximum accepted voice file size", Value: strconv.Itoa(cfg.Speech.MaxFileMB), Advanced: true},
 		{Key: "speech.max_duration_seconds", Section: "config", Description: "Maximum voice duration processed", Value: strconv.Itoa(cfg.Speech.MaxDurationSec), Advanced: true},
@@ -161,6 +162,8 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Orchestrator.Enabled, err = parseBoolean()
 	case "orchestrator.interval_seconds":
 		cfg.Orchestrator.IntervalSec, err = parseInteger(1)
+	case "orchestrator.semantic_heartbeat_minutes":
+		cfg.Orchestrator.SemanticHeartbeatMinutes, err = parseInteger(0)
 	case "orchestrator.max_parallel":
 		cfg.Orchestrator.MaxParallel, err = parseInteger(1)
 	case "extensions.enabled":

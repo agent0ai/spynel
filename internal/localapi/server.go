@@ -61,6 +61,10 @@ type notificationAckRequest struct {
 	ID         string `json:"id"`
 	AfterChars int    `json:"after_chars"`
 }
+type diagnosticRequest struct {
+	Event   string `json:"event"`
+	Message string `json:"message"`
+}
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if s.Service == nil || s.Token == "" {
@@ -77,6 +81,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	mux.HandleFunc("POST /v1/run-once", s.authorize(s.runOnce))
 	mux.HandleFunc("POST /v1/notify", s.authorize(s.notify))
 	mux.HandleFunc("POST /v1/notification-ack", s.authorize(s.notificationAck))
+	mux.HandleFunc("POST /v1/diagnostic", s.authorize(s.diagnostic))
 	serverContext, cancelServer := context.WithCancel(ctx)
 	defer cancelServer()
 	server := &http.Server{
@@ -104,6 +109,20 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) diagnostic(response http.ResponseWriter, request *http.Request) {
+	var input diagnosticRequest
+	if err := decodeJSON(request.Body, &input); err != nil {
+		http.Error(response, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(input.Event) > 64 || len(input.Message) > 1024 {
+		http.Error(response, "diagnostic exceeds bounds", http.StatusBadRequest)
+		return
+	}
+	s.Service.Runtime.LogEvent("warning", "tui", input.Event, input.Message)
+	response.WriteHeader(http.StatusNoContent)
 }
 
 func shutdownServer(parent context.Context, server *http.Server) {

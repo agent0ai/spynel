@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -29,28 +30,40 @@ func TestVisualCapture(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.TrueColor)
 
 	captures := map[string]model{
-		"chat":              visualChatModel(),
-		"history-boundary":  visualHistoryBoundaryModel(),
-		"fresh":             visualFreshModel(),
-		"chat-scrolled":     visualScrolledChatModel(),
-		"composer-expanded": visualExpandedComposerModel(),
-		"help":              visualHelpModel(),
-		"help-narrow":       visualNarrowHelpModel(),
-		"theme-applied":     visualAppliedThemeModel(),
-		"theme-dark":        visualThemedChatModel("nord"),
-		"theme-cb-dark":     visualThemedChatModel("github-colorblind-dark"),
-		"theme-cb-light":    visualThemedChatModel("okabe-ito-light"),
-		"theme-picker":      visualThemeModel(),
-		"welcome":           visualWelcomeModel(),
-		"welcome-manual":    visualManualWelcomeModel(),
-		"config":            visualConfigModel(),
-		"config-advanced":   visualAdvancedConfigModel(),
-		"telegram-config":   visualTelegramConfigModel(),
-		"whatsapp-config":   visualWhatsAppConfigModel(),
-		"wizard":            visualWizardModel(),
-		"whatsapp-wizard":   visualWhatsAppWizardModel(),
-		"whatsapp-qr":       visualWhatsAppQRModel(),
-		"resume":            visualResumeModel(),
+		"chat":                  visualChatModel(),
+		"history-boundary":      visualHistoryBoundaryModel(),
+		"fresh":                 visualFreshModel(),
+		"chat-scrolled":         visualScrolledChatModel(),
+		"composer-expanded":     visualExpandedComposerModel(),
+		"help":                  visualHelpModel(),
+		"help-narrow":           visualNarrowHelpModel(),
+		"theme-applied":         visualAppliedThemeModel(),
+		"theme-dark":            visualThemedChatModel("nord"),
+		"theme-cb-dark":         visualThemedChatModel("github-colorblind-dark"),
+		"theme-cb-light":        visualThemedChatModel("okabe-ito-light"),
+		"inline-code-dark":      visualInlineCodeModel("spynel"),
+		"inline-code-light":     visualInlineCodeModel("catppuccin-latte"),
+		"hyphen-wrap-dark":      visualHyphenWrapModel("spynel"),
+		"hyphen-wrap-light":     visualHyphenWrapModel("catppuccin-latte"),
+		"geometry-wrap-dark":    visualGeometryWrapModel("spynel"),
+		"geometry-wrap-light":   visualGeometryWrapModel("catppuccin-latte"),
+		"geometry-wrap-tiny":    visualTinyGeometryModel(),
+		"geometry-wrap-narrow":  visualNarrowGeometryModel(),
+		"geometry-wrap-emoji":   visualExtendedGraphemeGeometryModel(),
+		"geometry-wrap-space":   visualExactFitSpaceGeometryModel(),
+		"geometry-wrap-padding": visualPaddingYieldGeometryModel(),
+		"theme-picker":          visualThemeModel(),
+		"welcome":               visualWelcomeModel(),
+		"welcome-manual":        visualManualWelcomeModel(),
+		"config":                visualConfigModel(),
+		"config-advanced":       visualAdvancedConfigModel(),
+		"telegram-config":       visualTelegramConfigModel(),
+		"whatsapp-config":       visualWhatsAppConfigModel(),
+		"wizard":                visualWizardModel(),
+		"whatsapp-wizard":       visualWhatsAppWizardModel(),
+		"whatsapp-qr":           visualWhatsAppQRModel(),
+		"resume":                visualResumeModel(),
+		"jobs":                  visualJobsModel(),
 	}
 	for _, palette := range theme.Builtins() {
 		captures["theme-"+palette.Name] = visualThemedChatModel(palette.Name)
@@ -60,6 +73,17 @@ func TestVisualCapture(t *testing.T) {
 			t.Fatalf("write %s capture: %v", name, err)
 		}
 	}
+}
+
+func visualJobsModel() model {
+	value := visualBaseModel()
+	value.transcript = []transcriptEntry{
+		{role: "user", text: "/jobs"},
+		{role: "assistant", text: "# Jobs\n\n- **Job 1** 20260808-release-check.md  \n  1m24s 13▶ 4↻ · running · orchestrator/markdown\n- **Job 2** Check the Unicode 雪 output  \n  18s 1▶ · reconnecting 2/5 · telegram/42\n\nUse `/job info <number>` to inspect a job.\nUse `/job kill <number>` to stop a job."},
+	}
+	value.renderHistory()
+	value.viewport.GotoBottom()
+	return value
 }
 
 func visualFreshModel() model {
@@ -152,6 +176,110 @@ func visualThemedChatModel(name string) model {
 	value.applyTheme(selected)
 	value.status = "Theme changed to " + name
 	return value
+}
+
+func visualInlineCodeModel(name string) model {
+	value := visualBaseModel()
+	selected, _ := theme.Find(theme.Builtins(), name)
+	value.applyTheme(selected)
+	value.transcript = []transcriptEntry{{
+		role: "assistant",
+		text: "Inline code uses identical padding in the middle: `/log` followed by text.\nThe same command ends this line: `/log`\nMultiple values stay distinct: `15m`, `999`, and Unicode 界`15m`界.",
+	}}
+	value.invalidateHistoryRender()
+	value.renderHistory()
+	return value
+}
+
+func visualHyphenWrapModel(name string) model {
+	value := visualBaseModel()
+	selected, _ := theme.Find(theme.Builtins(), name)
+	value.applyTheme(selected)
+	value.width = 28
+	value.height = 16
+	value.viewport.Width = 25
+	value.viewport.Height = 9
+	value.inputWidth = 24
+	value.input.SetWidth(value.inputWidth)
+	value.transcript = []transcriptEntry{{
+		role: "assistant",
+		text: "Use the familiar editor-style Up/Down controls.\nThen choose scroll-to-bottom or Ctrl-C-safe mode.",
+	}}
+	value.invalidateHistoryRender()
+	value.renderHistory()
+	return value
+}
+
+func visualGeometryWrapModel(name string) model {
+	value := visualBaseModel()
+	selected, _ := theme.Find(theme.Builtins(), name)
+	value.applyTheme(selected)
+	value.width = 42
+	value.height = 22
+	value.viewport.Width = 39
+	value.viewport.Height = 10
+	value.inputWidth = 38
+	value.input.SetWidth(value.inputWidth)
+	value.transcript = []transcriptEntry{
+		{role: "user", text: "Run every 15 minutes by default, configurable from the config screen. Ordinary fitting words should move intact."},
+		{role: "assistant", text: "The semantic workflow heartbeat checks tasks and jobs. It should preserve `config` and avoid anomalously short rows."},
+	}
+	value.input.SetValue("A wrapped composer keeps this final cursor visible while history remains anchored.")
+	value.resizeComposer()
+	value.invalidateHistoryRender()
+	value.renderHistory()
+	value.viewport.SetYOffset(max(0, value.viewport.TotalLineCount()-value.viewport.Height-2))
+	return value
+}
+
+func visualTinyGeometryModel() model {
+	value := visualBaseModel()
+	value.input.SetValue(strings.Repeat("hidden line\n", 10) + "Final cursor row")
+	next, _ := value.Update(tea.WindowSizeMsg{Width: 24, Height: 5})
+	return next.(model)
+}
+
+func visualNarrowGeometryModel() model {
+	value := visualBaseModel()
+	value.input.SetValue(strings.Repeat("hidden\n", 10) + "Z")
+	next, _ := value.Update(tea.WindowSizeMsg{Width: 12, Height: 5})
+	return next.(model)
+}
+
+func visualExtendedGraphemeGeometryModel() model {
+	value := visualBaseModel()
+	// Six terminal cells leave the exact two-cell composer content width that
+	// previously split this fitting family cluster into rune fragments.
+	next, _ := value.Update(tea.WindowSizeMsg{Width: 6, Height: 14})
+	value = next.(model)
+	for _, r := range []rune("👨‍👩‍👧‍👦") {
+		next, _ = value.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		value = next.(model)
+	}
+	return value
+}
+
+func visualExactFitSpaceGeometryModel() model {
+	value := visualBaseModel()
+	// Eight terminal cells leave a four-cell composer content width. The token
+	// fills it exactly; its following space and cursor belong on the next row.
+	next, _ := value.Update(tea.WindowSizeMsg{Width: 8, Height: 14})
+	value = next.(model)
+	next, _ = value.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("abcd")})
+	value = next.(model)
+	next, _ = value.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	return next.(model)
+}
+
+func visualPaddingYieldGeometryModel() model {
+	value := visualBaseModel()
+	// Four terminal cells leave only the two border cells and two content
+	// cells. Cosmetic padding yields so this fitting wide grapheme remains
+	// intact while its exact-fit cursor occupies the following visual row.
+	next, _ := value.Update(tea.WindowSizeMsg{Width: 4, Height: 14})
+	value = next.(model)
+	next, _ = value.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("界")})
+	return next.(model)
 }
 
 func visualBaseModel() model {

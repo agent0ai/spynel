@@ -46,12 +46,12 @@ func TestOutboxDeduplicatesAndRecoversRetryState(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "outbox")
 	now := time.Date(2026, 8, 7, 20, 0, 0, 0, time.UTC)
 	attempts := 0
-	outbox := &Outbox{Directory: directory, Now: func() time.Time { return now }, Deliver: func(context.Context, Origin, string, string) error {
+	outbox := &Outbox{Directory: directory, Now: func() time.Time { return now }, Deliver: func(context.Context, Origin, string, string) ([]string, error) {
 		attempts++
 		if attempts == 1 {
-			return errors.New("offline")
+			return nil, errors.New("offline")
 		}
-		return nil
+		return []string{"native-1"}, nil
 	}}
 	first, err := outbox.Enqueue("task-1", "done", "cli/local", "complete")
 	if err != nil {

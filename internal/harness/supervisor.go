@@ -5,8 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
+)
+
+const (
+	maxPendingControls  = 8
+	controlDedupeWindow = time.Minute
 )
 
 // Supervisor keeps the rest of Spynel provider-neutral while allowing the
@@ -15,26 +21,46 @@ import (
 type Supervisor struct {
 	registry *Registry
 
-	operationMu sync.Mutex
-	mu          sync.RWMutex
-	ctx         context.Context
-	config      HarnessConfig
-	current     Harness
-	startErr    error
-	active      map[string]int
-	pending     map[string][]pendingSend
-	ready       chan struct{}
-	closed      bool
+	operationMu       sync.Mutex
+	mu                sync.RWMutex
+	ctx               context.Context
+	config            HarnessConfig
+	current           Harness
+	startErr          error
+	active            map[string]int
+	pending           map[string][]pendingSend
+	controlEmit       map[string]core.Emit
+	controls          map[string]*controlState
+	seenControl       map[string]map[string]time.Time
+	controlGeneration map[string]uint64
+	controlOpsMu      sync.Mutex
+	controlOps        map[string]*sync.Mutex
+	ready             chan struct{}
+	closed            bool
 }
 
 type pendingSend struct {
-	prompt string
-	emit   core.Emit
+	prompt          string
+	emit            core.Emit
+	control         *controlState
+	preserveEmitter bool
+	generation      uint64
+}
+
+type controlState struct {
+	id                  string
+	continuationPrompt  string
+	validate            func() bool
+	prepareContinuation func() bool
+	reserveProviderTurn func() bool
+	continued           bool
 }
 
 func NewSupervisor(registry *Registry, cfg HarnessConfig) *Supervisor {
 	return &Supervisor{
 		registry: registry, config: cfg, active: map[string]int{}, pending: map[string][]pendingSend{},
+		controlEmit: map[string]core.Emit{}, controls: map[string]*controlState{}, seenControl: map[string]map[string]time.Time{},
+		controlGeneration: map[string]uint64{}, controlOps: map[string]*sync.Mutex{},
 		ready: make(chan struct{}, 1),
 	}
 }
@@ -207,6 +233,8 @@ func (s *Supervisor) targetLocked() (Harness, error) {
 }
 
 func (s *Supervisor) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	operation := s.controlOperation(key)
+	operation.Lock()
 	// Selecting the target and marking a new turn active must be atomic with
 	// respect to Reconfigure. Otherwise a swap could close the old harness in
 	// the narrow window after target selection but before active bookkeeping.
@@ -214,6 +242,7 @@ func (s *Supervisor) Send(ctx context.Context, key, prompt string, emit core.Emi
 	target, err := s.targetLocked()
 	if err != nil {
 		s.mu.Unlock()
+		operation.Unlock()
 		return "", false, err
 	}
 	wasActive := target.IsActive(key)
@@ -221,6 +250,7 @@ func (s *Supervisor) Send(ctx context.Context, key, prompt string, emit core.Emi
 		threadID := target.ThreadID(key)
 		s.pending[key] = append(s.pending[key], pendingSend{prompt: prompt, emit: emit})
 		s.mu.Unlock()
+		operation.Unlock()
 		if emit != nil {
 			emit(core.Event{Kind: core.EventStatus, Text: "Follow-up queued behind the active harness turn", ThreadID: threadID})
 		}
@@ -229,24 +259,128 @@ func (s *Supervisor) Send(ctx context.Context, key, prompt string, emit core.Emi
 	if !wasActive {
 		s.active[key] = 1
 	}
+	wrapper := s.executionEmit(key, target, emit)
+	s.controlEmit[key] = wrapper
 	s.mu.Unlock()
-	threadID, steered, err := target.Send(ctx, key, prompt, s.executionEmit(key, target, emit))
+	threadID, steered, err := target.Send(ctx, key, prompt, wrapper)
 	if err != nil {
 		if wasActive && steered {
 			// The active turn finished during the failed steering attempt. Retry
 			// as the next ordinary turn instead of losing the follow-up.
 			if !target.IsActive(key) {
+				operation.Unlock()
 				return s.Send(ctx, key, prompt, emit)
 			}
+			operation.Unlock()
 			return threadID, steered, err
 		}
 		if !wasActive {
 			s.mu.Lock()
 			delete(s.active, key)
+			delete(s.controlEmit, key)
 			s.mu.Unlock()
 		}
 	}
+	operation.Unlock()
 	return threadID, steered, err
+}
+
+// SendControl delivers guidance to an existing execution without changing its
+// emitter. Queueing and retry deduplication are bounded per session.
+func (s *Supervisor) SendControl(ctx context.Context, key string, request ControlRequest) (ControlResult, error) {
+	if request.ID == "" || request.Prompt == "" {
+		return ControlResult{}, errors.New("invalid empty control request")
+	}
+	s.mu.Lock()
+	target, err := s.targetLocked()
+	if err != nil {
+		s.mu.Unlock()
+		return ControlResult{}, err
+	}
+	if s.active[key] == 0 || !target.IsActive(key) {
+		s.mu.Unlock()
+		return ControlResult{}, errors.New("job provider turn is no longer active or steerable")
+	}
+	now := time.Now()
+	seen := s.seenControl[key]
+	if seen == nil {
+		seen = map[string]time.Time{}
+		s.seenControl[key] = seen
+	}
+	for id, at := range seen {
+		if now.Sub(at) > controlDedupeWindow {
+			delete(seen, id)
+		}
+	}
+	if _, exists := seen[request.ID]; exists {
+		s.mu.Unlock()
+		return ControlResult{Duplicate: true}, nil
+	}
+	state := &controlState{id: request.ID, continuationPrompt: request.ContinuationPrompt, validate: request.Validate, prepareContinuation: request.PrepareContinuation, reserveProviderTurn: request.ReserveProviderTurn}
+	owner := s.controlEmit[key]
+	if owner == nil {
+		s.mu.Unlock()
+		return ControlResult{}, errors.New("job execution emitter is unavailable")
+	}
+	seen[request.ID] = now
+	if followUpMode(target) == FollowUpQueue {
+		if len(s.pending[key]) >= maxPendingControls {
+			delete(seen, request.ID)
+			s.mu.Unlock()
+			return ControlResult{}, fmt.Errorf("job control queue is full (maximum %d messages)", maxPendingControls)
+		}
+		s.pending[key] = append(s.pending[key], pendingSend{prompt: request.Prompt, emit: owner, control: state, preserveEmitter: true})
+		s.mu.Unlock()
+		return ControlResult{Queued: true}, nil
+	}
+	previousControl := s.controls[key]
+	s.controls[key] = state
+	generation := s.controlGeneration[key]
+	s.mu.Unlock()
+	operation := s.controlOperation(key)
+	operation.Lock()
+	defer operation.Unlock()
+	if state.validate != nil && !state.validate() {
+		s.mu.Lock()
+		if s.controls[key] == state {
+			s.controls[key] = previousControl
+		}
+		delete(seen, request.ID)
+		s.mu.Unlock()
+		return ControlResult{}, errors.New("job ownership or durable state changed before control delivery")
+	}
+	s.mu.RLock()
+	validDelivery := !s.closed && s.active[key] > 0 && s.controlGeneration[key] == generation
+	s.mu.RUnlock()
+	if !validDelivery {
+		return ControlResult{}, errors.New("job was cancelled or completed before control delivery")
+	}
+	steerer, ok := target.(NativeSteerer)
+	if !ok {
+		s.mu.Lock()
+		if s.controls[key] == state {
+			s.controls[key] = previousControl
+		}
+		delete(seen, request.ID)
+		s.mu.Unlock()
+		return ControlResult{}, errors.New("active harness declares native steering but has no steer-only control operation")
+	}
+	_, err = steerer.Steer(ctx, key, request.Prompt, owner, state.reserveProviderTurn)
+	if err != nil {
+		s.mu.Lock()
+		if s.controls[key] == state {
+			s.controls[key] = previousControl
+		}
+		if errors.Is(err, errNativeTurnInactive) || errors.Is(err, errNativeDeliveryUnreserved) {
+			delete(seen, request.ID)
+		}
+		s.mu.Unlock()
+		if errors.Is(err, errNativeDeliveryUnreserved) {
+			return ControlResult{}, errors.New("durable provider-turn reservation failed before control delivery")
+		}
+		return ControlResult{}, err
+	}
+	return ControlResult{}, nil
 }
 
 func followUpMode(target Harness) FollowUpMode {
@@ -272,8 +406,44 @@ func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) c
 					s.pending[key] = queue[1:]
 				}
 				event.Continues = true
+				if next.control != nil && next.control.validate != nil {
+					s.mu.Unlock()
+					if emit != nil {
+						emit(event)
+					}
+					s.scheduleQueued(key, target, *next)
+					return
+				}
+			} else if control := s.controls[key]; control != nil && !control.continued && control.continuationPrompt != "" {
+				// Let the owning orchestrator emitter first persist the provider's
+				// terminal event as awaiting_transition. The continuation gate then
+				// revalidates and returns that exact lease to processing.
+				s.mu.Unlock()
+				event.Continues = true
+				if emit != nil {
+					emit(event)
+				}
+				s.mu.Lock()
+				if s.controls[key] == control {
+					control.continued = true
+					value := pendingSend{prompt: control.continuationPrompt, emit: s.controlEmit[key], control: control, preserveEmitter: true}
+					next = &value
+					event.Continues = true
+				} else {
+					delete(s.active, key)
+					delete(s.controls, key)
+					delete(s.controlEmit, key)
+				}
+				s.mu.Unlock()
+				if next != nil {
+					s.scheduleQueued(key, target, *next)
+				}
+				return
 			} else {
 				delete(s.active, key)
+				delete(s.controls, key)
+				delete(s.controlEmit, key)
+				delete(s.seenControl, key)
 			}
 			s.mu.Unlock()
 		}
@@ -281,13 +451,89 @@ func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) c
 			emit(event)
 		}
 		if next != nil {
-			s.startQueued(key, target, *next)
+			s.scheduleQueued(key, target, *next)
 		}
 	}
 }
 
+func (s *Supervisor) scheduleQueued(key string, target Harness, next pendingSend) {
+	s.mu.Lock()
+	next.generation = s.controlGeneration[key]
+	s.mu.Unlock()
+	go s.startQueued(key, target, next)
+}
+
+func (s *Supervisor) controlOperation(key string) *sync.Mutex {
+	s.controlOpsMu.Lock()
+	defer s.controlOpsMu.Unlock()
+	lock := s.controlOps[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.controlOps[key] = lock
+	}
+	return lock
+}
+
 func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
-	wrapper := s.executionEmit(key, target, next.emit)
+	operation := s.controlOperation(key)
+	operation.Lock()
+	defer operation.Unlock()
+	s.mu.RLock()
+	validStart := !s.closed && s.active[key] > 0 && s.controlGeneration[key] == next.generation
+	s.mu.RUnlock()
+	if !validStart {
+		return
+	}
+	if next.control != nil {
+		valid := true
+		if next.control.prepareContinuation != nil {
+			valid = next.control.prepareContinuation()
+		} else if next.control.validate != nil {
+			valid = next.control.validate()
+		}
+		if !valid {
+			s.mu.Lock()
+			if s.controlGeneration[key] == next.generation {
+				delete(s.pending, key)
+				delete(s.active, key)
+				delete(s.controls, key)
+				delete(s.controlEmit, key)
+				delete(s.seenControl, key)
+			}
+			s.mu.Unlock()
+			return
+		}
+	}
+	s.mu.RLock()
+	validStart = !s.closed && s.active[key] > 0 && s.controlGeneration[key] == next.generation
+	s.mu.RUnlock()
+	if !validStart {
+		return
+	}
+	if next.control != nil && next.control.reserveProviderTurn != nil && !next.control.reserveProviderTurn() {
+		s.mu.Lock()
+		if s.controlGeneration[key] == next.generation {
+			delete(s.pending, key)
+			delete(s.active, key)
+			delete(s.controls, key)
+			delete(s.controlEmit, key)
+			delete(s.seenControl, key)
+		}
+		s.mu.Unlock()
+		return
+	}
+	wrapper := next.emit
+	if !next.preserveEmitter {
+		wrapper = s.executionEmit(key, target, next.emit)
+	}
+	s.mu.Lock()
+	if !next.preserveEmitter {
+		s.controlEmit[key] = wrapper
+	}
+	if next.control != nil {
+		s.controls[key] = next.control
+	}
+	s.mu.Unlock()
 	s.mu.RLock()
 	ctx := s.ctx
 	closed := s.closed
@@ -307,11 +553,41 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 }
 
 func (s *Supervisor) Interrupt(ctx context.Context, key string) (bool, error) {
+	operation := s.controlOperation(key)
+	operation.Lock()
+	defer operation.Unlock()
 	target, err := s.target()
 	if err != nil {
 		return false, err
 	}
-	return target.Interrupt(ctx, key)
+	s.mu.Lock()
+	logicalActive := s.active[key] > 0
+	generation := s.controlGeneration[key] + 1
+	s.controlGeneration[key] = generation
+	delete(s.pending, key)
+	delete(s.controls, key)
+	delete(s.seenControl, key)
+	delete(s.controlEmit, key)
+	s.mu.Unlock()
+	stopped, err := target.Interrupt(ctx, key)
+	if err != nil {
+		if !target.IsActive(key) {
+			s.mu.Lock()
+			if s.controlGeneration[key] == generation {
+				delete(s.active, key)
+			}
+			s.mu.Unlock()
+		}
+		return false, err
+	}
+	if !stopped || !target.IsActive(key) {
+		s.mu.Lock()
+		if s.controlGeneration[key] == generation {
+			delete(s.active, key)
+		}
+		s.mu.Unlock()
+	}
+	return stopped || logicalActive, err
 }
 
 func (s *Supervisor) ResetSession(key string) error {

@@ -573,7 +573,7 @@ func validWhatsAppPairingPhone(value string) bool {
 }
 
 func (s *Service) SetNotice(notice channel.Notice) {
-	s.Runtime.Log(notice.Channel + " message from " + notice.Sender + ": " + notice.Text)
+	s.Runtime.LogEvent("info", "channel."+notice.Channel, "notice", "Channel notice received")
 	s.noticeMu.Lock()
 	s.noticeSequence++
 	s.lastNotice = notice
@@ -891,6 +891,7 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	next := previous
 	changed, err := config.SetSettings(&next, values)
 	if err != nil {
+		s.Runtime.LogEvent("error", "config", "validation_failed", "Configuration change was rejected")
 		return nil, err
 	}
 	var selectedTheme theme.Theme
@@ -934,6 +935,7 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		if harnessChanged {
 			rollback = s.reconfigureHarness(previous)
 		}
+		s.Runtime.LogEvent("error", "config", "persist_failed", "Configuration persistence failed")
 		return nil, errors.Join(err, wrapRollback("harness", rollback))
 	}
 	if startupChanged && s.Startup != nil {
@@ -948,6 +950,7 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 				rollbacks = append(rollbacks, wrapRollback("harness", s.reconfigureHarness(previous)))
 			}
 			rollbacks = append(rollbacks, wrapRollback("startup registration", s.Startup.Sync(previous, previous.Startup.Enabled)))
+			s.Runtime.LogEvent("error", "config", "side_effect_failed", "Configuration side effect failed and rollback was requested")
 			return nil, errors.Join(fmt.Errorf("configure run at startup: %w", err), errors.Join(rollbacks...))
 		}
 	}
@@ -959,6 +962,10 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	if themeChanged {
 		s.publishTheme(selectedTheme)
 	}
+	if previous.Orchestrator.Enabled != next.Orchestrator.Enabled || previous.Orchestrator.SemanticHeartbeatMinutes != next.Orchestrator.SemanticHeartbeatMinutes {
+		s.Orchestrator.ApplyRuntimeConfig(next)
+	}
+	s.Runtime.LogEvent("info", "config", "persisted", fmt.Sprintf("Configuration persisted (%d settings changed)", len(changed)))
 	return changed, nil
 }
 

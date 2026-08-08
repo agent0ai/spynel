@@ -3,9 +3,8 @@ package harness
 import (
 	"context"
 	"encoding/json"
-	"os"
+	"errors"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -100,35 +99,9 @@ func TestCodexNormalizesSandboxPoliciesForAppServer(t *testing.T) {
 }
 
 func TestCodexAppServerStartsThreadsStreamsAndSteers(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell app-server fixture")
-	}
-	root := t.TempDir()
-	script := filepath.Join(root, "fake-codex")
-	fixture := `#!/bin/sh
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
-    *'"method":"initialized"'*) ;;
-    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"thr_test"}}}\n' "$id" ;;
-    *'"method":"thread/resume"'*) printf '{"id":%s,"result":{"thread":{"id":"thr_test"}}}\n' "$id" ;;
-    *'"method":"turn/start"'*)
-      printf '{"id":%s,"result":{"turn":{"id":"turn_test","status":"inProgress"}}}\n' "$id"
-      (sleep 0.05
-       printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"hello "}}\n'
-       sleep 0.05
-       printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_test","turnId":"turn_test","delta":"world"}}\n'
-       printf '{"method":"turn/completed","params":{"threadId":"thr_test","turn":{"id":"turn_test","status":"completed"}}}\n') &
-      ;;
-    *'"method":"turn/steer"'*) printf '{"id":%s,"result":{"turnId":"turn_test"}}\n' "$id" ;;
-  esac
-done
-`
-	if err := os.WriteFile(script, []byte(fixture), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	codex, err := NewCodex(CodexConfig{Command: script, Cwd: root, SessionsFile: filepath.Join(root, "sessions.json")})
+	command, root, logPath := portableHarnessFixture(t, "codex-lifecycle")
+	sessionsPath := filepath.Join(root, "sessions.json")
+	codex, err := NewCodex(CodexConfig{Command: command, Cwd: root, SessionsFile: sessionsPath})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,51 +159,79 @@ done
 		t.Fatal("timed out waiting for streamed completion")
 	}
 	mu.Lock()
-	defer mu.Unlock()
 	for _, event := range firstEvents {
 		if event.Kind == core.EventFinal {
 			t.Fatalf("previous emitter received the steered final: %#v", firstEvents)
 		}
 	}
-	foundFinal := false
+	foundStart, foundFinal := false, false
+	for _, event := range firstEvents {
+		foundStart = foundStart || event.Execution != nil && event.Execution.State == "running"
+	}
 	for _, event := range secondEvents {
 		if event.Kind == core.EventFinal && strings.Contains(event.Text, "hello world") {
-			foundFinal = true
+			foundFinal = event.Execution != nil && event.Execution.State == "finishing"
 		}
 	}
-	if !foundFinal {
+	if !foundStart || !foundFinal {
 		t.Fatalf("unexpected latest-emitter events: %#v", secondEvents)
 	}
 	if codex.ThreadID("chat:tui:local") != "thr_test" {
 		t.Fatal("thread session was not persisted")
 	}
+	mu.Unlock()
+	if err := codex.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewCodex(CodexConfig{Command: command, Cwd: root, SessionsFile: sessionsPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	restartDone := make(chan struct{})
+	if thread, steered, err := restarted.Send(ctx, "chat:tui:local", "after restart", func(event core.Event) {
+		if event.Done {
+			close(restartDone)
+		}
+	}); err != nil || steered || thread != "thr_test" {
+		t.Fatalf("restart Send() = %q, %t, %v", thread, steered, err)
+	}
+	select {
+	case <-restartDone:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for resumed Codex turn")
+	}
+	if err := restarted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	started, resumed, portable := false, false, false
+	for _, record := range readFixtureRecords(t, logPath) {
+		started = started || record.Method == "thread/start"
+		resumed = resumed || record.Method == "thread/resume"
+		portable = portable || record.Kind == "invocation" && record.Cwd == root && record.Executable == command
+	}
+	if !started || !resumed || !portable {
+		t.Fatalf("portable Codex fixture evidence = start %t, resume %t, paths %t", started, resumed, portable)
+	}
+}
+
+func TestCodexTransportLossEmitsStructuredFatalFailure(t *testing.T) {
+	events := make(chan core.Event, 1)
+	codex := &Codex{pending: map[int]chan rpcResponse{}, active: map[string]*turnState{
+		"thread": {threadID: "thread", turnID: "turn", emit: func(event core.Event) { events <- event }},
+	}}
+	codex.failAll(errors.New("connection lost"))
+	event := <-events
+	if !event.Done || event.Kind != core.EventError || event.Execution == nil || event.Execution.State != "error" || !strings.Contains(event.Execution.Detail, "connection lost") {
+		t.Fatalf("transport loss event = %#v", event)
+	}
 }
 
 func TestCodexInterruptsActiveTurn(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell app-server fixture")
-	}
-	root := t.TempDir()
-	script := filepath.Join(root, "fake-codex")
-	fixture := `#!/bin/sh
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
-    *'"method":"initialized"'*) ;;
-    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"thread":{"id":"thr_stop"}}}\n' "$id" ;;
-    *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"turn_stop","status":"inProgress"}}}\n' "$id" ;;
-    *'"method":"turn/interrupt"'*'"threadId":"thr_stop"'*'"turnId":"turn_stop"'*)
-      printf '{"id":%s,"result":{}}\n' "$id"
-      printf '{"method":"turn/completed","params":{"threadId":"thr_stop","turn":{"id":"turn_stop","status":"interrupted"}}}\n'
-      ;;
-  esac
-done
-`
-	if err := os.WriteFile(script, []byte(fixture), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	codex, err := NewCodex(CodexConfig{Command: script, Cwd: root, SessionsFile: filepath.Join(root, "sessions.json")})
+	command, root, _ := portableHarnessFixture(t, "codex-interrupt")
+	codex, err := NewCodex(CodexConfig{Command: command, Cwd: root, SessionsFile: filepath.Join(root, "sessions.json")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,27 +276,8 @@ done
 }
 
 func TestCodexDiscoversPickerVisibleModels(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell app-server fixture")
-	}
-	root := t.TempDir()
-	script := filepath.Join(root, "fake-codex")
-	fixture := `#!/bin/sh
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
-    *'"method":"initialized"'*) ;;
-    *'"method":"model/list"'*)
-      printf '{"id":%s,"result":{"data":[{"id":"model-a","model":"model-a","displayName":"Model A","defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"medium"}],"isDefault":true}],"nextCursor":null}}\n' "$id"
-      ;;
-  esac
-done
-`
-	if err := os.WriteFile(script, []byte(fixture), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	codex, err := NewCodex(CodexConfig{Command: script, Cwd: root})
+	command, root, _ := portableHarnessFixture(t, "codex-models")
+	codex, err := NewCodex(CodexConfig{Command: command, Cwd: root})
 	if err != nil {
 		t.Fatal(err)
 	}
