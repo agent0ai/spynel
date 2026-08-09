@@ -1,6 +1,6 @@
 # Agent-readable documentation
 
-`spynel docs` is the stable offline interface for product behavior. It is compiled into the binary, never invokes Codex or Claude Code, and does not require an initialized workspace, primary server, local API, or network connection.
+`spynel docs` is the stable offline interface for product behavior. It is compiled into the binary, never invokes a coding harness, and does not require an initialized workspace, primary server, local API, or network connection.
 
 ## Interface and schema
 
@@ -18,7 +18,7 @@ Static content is classified as `user-command`, `workflow-contract`, `implementa
 
 ## Ownership and safe content
 
-The canonical catalog and schema live in `internal/agentdocs`. Content is curated Go data rather than a runtime scan of repository Markdown. Never add histories, recipient/session identifiers, notification origins, leases containing private identifiers, tokens, credentials, arbitrary environment values, or unreviewed workspace files. Link readers to typed `status`, `jobs`, `logs`, or durable task/goal files when current state is required.
+The canonical catalog and schema live in `internal/agentdocs`. Content is curated Go data rather than a runtime scan of repository Markdown. Never add histories, recipient/session identifiers, notification origins, leases containing private identifiers, tokens, credentials, arbitrary environment values, or unreviewed workspace files. Link readers to typed `status`, `jobs`, `tasks`, `goals`, `logs`, or durable task/goal files when current state is required.
 
 To add or change a topic:
 

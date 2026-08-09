@@ -54,7 +54,11 @@ type notificationBoundaryMsg struct {
 	after    int
 }
 type redrawTickMsg struct{}
-type screenSaveResult struct{ err error }
+type screenSaveResult struct {
+	screenID       string
+	closeOnSuccess bool
+	err            error
+}
 type themeSaveResult struct {
 	theme theme.Theme
 	err   error
@@ -158,6 +162,7 @@ type model struct {
 	responseText             string
 	responseCommit           int
 	working                  bool
+	mainAgentActivity        int
 	logoSpinner              bubblespinner.Model
 	workingSpinner           bubblespinner.Model
 	commands                 []core.SlashCommand
@@ -209,6 +214,7 @@ type model struct {
 	screenManual             bool
 	screenSaving             bool
 	screenStack              []screenFrame
+	dialog                   *dialogModel
 	saveSettings             func(map[string]string) error
 	screenAction             func(context.Context, string, string, map[string]string) (*core.Screen, error)
 	screenResult             string
@@ -247,6 +253,7 @@ const (
 	maxComposerHeight = 10
 	userChatLabel     = "You"
 	agentChatLabel    = "Spy"
+	errorChatLabel    = "Err"
 	chatContentColumn = 4
 	maxCommandRows    = 7
 	compactPasteChars = 1000
@@ -628,6 +635,22 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		value = filtered
 		message = filtered
+		if value.Type == tea.KeyCtrlC && (m.screen != nil || m.dialog != nil) {
+			updateInput = false
+			updateViewport = false
+			if m.screen != nil && m.screen.Required {
+				m.screenResult = "exit"
+				return m, tea.Quit
+			}
+			m.clearScreen()
+			m.status = "Ready"
+			return m, nil
+		}
+		if m.dialog != nil {
+			updateInput = false
+			updateViewport = false
+			return m, m.handleDialogKey(value)
+		}
 		if m.screen != nil && m.screen.ID == core.ScreenWhatsAppQR {
 			updateInput = false
 			updateViewport = false
@@ -827,15 +850,15 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.finishRecipientResponse(event.Text)
 			m.flushNotifications()
-			m.working = event.Continues
-			if event.Continues {
+			m.working = event.Continues || m.mainAgentActivity > 0
+			if m.working {
 				m.status = "Harness working"
 			} else {
 				m.status = "Ready"
 			}
 		case core.EventError:
 			if !event.Local {
-				m.working = event.Continues
+				m.working = event.Continues || m.mainAgentActivity > 0
 				if m.streaming != "" {
 					m.commitStreamingResponse()
 				} else {
@@ -853,6 +876,20 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case core.EventStatus:
 			m.status = event.Text
+		case core.EventActivity:
+			wasWorking := m.working
+			if event.Active {
+				m.mainAgentActivity++
+			} else if m.mainAgentActivity > 0 {
+				m.mainAgentActivity--
+			}
+			m.working = m.mainAgentActivity > 0
+			if event.Active {
+				m.status = "Harness working"
+				if !wasWorking {
+					commands = append(commands, m.logoSpinner.Tick, m.workingSpinner.Tick)
+				}
+			}
 		case core.EventScreen:
 			if event.Screen != nil {
 				m.openScreen(*event.Screen)
@@ -1006,11 +1043,18 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.runtimeStatus = value.status
 		commands = append(commands, m.waitEvent())
 	case screenSaveResult:
+		if m.screen == nil || m.screen.ID != value.screenID {
+			break
+		}
 		m.screenSaving = false
 		if value.err != nil {
 			m.status = "Save failed: " + value.err.Error()
 		} else {
-			m.captureScreenOriginal()
+			if value.closeOnSuccess {
+				m.clearScreen()
+			} else {
+				m.captureScreenOriginal()
+			}
 			m.status = "Configuration saved"
 		}
 	case screenActionResult:
@@ -1018,6 +1062,17 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if value.err != nil {
 			m.status = "Action failed: " + value.err.Error()
 			break
+		}
+		actionMessage := ""
+		if value.screen != nil {
+			actionMessage = strings.TrimSpace(value.screen.ActionMessage)
+			value.screen.ActionMessage = ""
+			if value.screen.ID == "" {
+				value.screen = nil
+			}
+		}
+		if actionMessage != "" {
+			m.appendTranscript(transcriptEntry{role: "assistant", text: actionMessage})
 		}
 		m.screenResult = value.action
 		if value.screen == nil && value.action == "cancel" && len(m.screenStack) > 0 {
@@ -1031,11 +1086,13 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		selectionScreen := m.screen != nil && (m.screen.ID == "harness" || m.screen.ID == "model")
 		if selectionScreen && len(m.screenStack) > 0 && (value.screen == nil || value.screen.ID != m.screen.ID) {
+			selectionScreenID := m.screen.ID
 			m.restoreParentScreen()
 			selection := strings.TrimPrefix(value.action, "select:")
 			if selection == "" {
 				selection = "harness default"
 			}
+			m.refreshRestoredSelection(selectionScreenID, selection)
 			m.status = "Selected " + selection
 			break
 		}
@@ -2639,7 +2696,7 @@ func (m model) renderTranscriptEntry(entry transcriptEntry) string {
 	case "assistant":
 		return m.renderMarkdownChatMessage(agentChatLabel, m.styles.agent, m.renderAgentMarkdown(entry.text))
 	case "error":
-		return m.renderChatMessage("Error", m.styles.error, entry.text)
+		return m.renderChatMessage(errorChatLabel, m.styles.error, entry.text)
 	default:
 		return m.renderChatMessage(entry.role, m.styles.status, entry.text)
 	}
@@ -2814,6 +2871,10 @@ func trimRenderedPadding(content string) string {
 }
 
 func (m model) View() string {
+	return m.overlayDialog(m.viewWithoutDialog())
+}
+
+func (m model) viewWithoutDialog() string {
 	if m.screen != nil && m.screen.ID == core.ScreenWhatsAppQR {
 		return m.fullscreenWhatsAppQR()
 	}
@@ -3096,6 +3157,7 @@ func trueColorBackgroundSGR(background lipgloss.TerminalColor) string {
 }
 
 func (m *model) openScreen(screen core.Screen) {
+	m.dialog = nil
 	if screen.ID == "welcome" {
 		copyScreen := screen
 		copyScreen.Controls = nil
@@ -3201,7 +3263,10 @@ func (m *model) handleScreenKey(key tea.KeyMsg) tea.Cmd {
 	if key.Type == tea.KeyCtrlL {
 		return m.repaint()
 	}
-	if key.Type == tea.KeyEsc || key.Type == tea.KeyCtrlC {
+	if m.screenSaving {
+		return nil
+	}
+	if key.Type == tea.KeyEsc {
 		if m.screen.Required {
 			m.screenResult = "exit"
 			return tea.Quit
@@ -3210,12 +3275,16 @@ func (m *model) handleScreenKey(key tea.KeyMsg) tea.Cmd {
 			m.status = "Editing " + m.screen.Title
 			return nil
 		}
+		if m.isSettingsScreen() && m.screenDirty() {
+			m.confirmDiscardScreenChanges()
+			return nil
+		}
 		m.clearScreen()
 		m.status = "Ready"
 		return nil
 	}
 	visible := m.visibleScreenControlIndices()
-	if len(visible) == 0 || m.screenSaving {
+	if len(visible) == 0 {
 		return nil
 	}
 	switch key.Type {
@@ -3298,6 +3367,24 @@ func (m *model) restoreParentScreen() bool {
 	return true
 }
 
+func (m *model) refreshRestoredSelection(key, selection string) {
+	if m.screen == nil || m.screen.ID != "config" {
+		return
+	}
+	for index := range m.screen.Controls {
+		control := &m.screen.Controls[index]
+		if control.Key != key {
+			continue
+		}
+		label, _, found := strings.Cut(control.Value, " · ")
+		if !found {
+			label = control.Value
+		}
+		control.Value = strings.TrimSpace(label) + " · " + selection
+		return
+	}
+}
+
 func (m *model) clearScreen() {
 	m.screen = nil
 	m.screenOriginal = nil
@@ -3308,6 +3395,7 @@ func (m *model) clearScreen() {
 	m.screenManual = false
 	m.screenSaving = false
 	m.screenStack = nil
+	m.dialog = nil
 }
 
 func cloneScreen(screen *core.Screen) *core.Screen {
@@ -3486,7 +3574,28 @@ func (m *model) saveScreen() tea.Cmd {
 		m.status = "Configuration saving is unavailable"
 		return nil
 	}
+	changes := m.screenChanges()
+	if len(changes) == 0 {
+		if m.isSettingsScreen() {
+			m.clearScreen()
+		}
+		m.status = "No configuration changes"
+		return nil
+	}
+	m.screenSaving = true
+	screenID := m.screen.ID
+	closeOnSuccess := m.isSettingsScreen()
+	save := m.saveSettings
+	return func() tea.Msg {
+		return screenSaveResult{screenID: screenID, closeOnSuccess: closeOnSuccess, err: save(changes)}
+	}
+}
+
+func (m model) screenChanges() map[string]string {
 	changes := map[string]string{}
+	if m.screen == nil {
+		return changes
+	}
 	for _, control := range m.screen.Controls {
 		if control.Kind == "action" || control.Kind == "disclosure" || control.Kind == "hidden" {
 			continue
@@ -3495,13 +3604,43 @@ func (m *model) saveScreen() tea.Cmd {
 			changes[control.Key] = control.Value
 		}
 	}
-	if len(changes) == 0 {
-		m.status = "No configuration changes"
-		return nil
-	}
-	m.screenSaving = true
-	save := m.saveSettings
-	return func() tea.Msg { return screenSaveResult{err: save(changes)} }
+	return changes
+}
+
+func (m model) screenDirty() bool {
+	return len(m.screenChanges()) > 0
+}
+
+func (m *model) confirmDiscardScreenChanges() {
+	m.openDialog(dialogModel{
+		title:       "Unsaved changes",
+		message:     "You have unsaved changes. What do you want to do?",
+		selected:    2,
+		cancelValue: "keep",
+		options: []dialogOption{
+			{label: "Save", value: "save"},
+			{label: "Discard", value: "discard"},
+			{label: "Keep editing", value: "keep"},
+		},
+		resolve: func(m *model, value string) tea.Cmd {
+			if value == "save" {
+				return m.saveScreen()
+			}
+			if value == "discard" {
+				m.clearScreen()
+				m.status = "Changes discarded"
+				return nil
+			}
+			if m.screen != nil {
+				title := strings.TrimSpace(m.screen.Title)
+				if title == "" {
+					title = strings.Title(m.screen.ID) //nolint:staticcheck
+				}
+				m.status = "Editing " + title
+			}
+			return nil
+		},
+	})
 }
 
 func (m model) screenContent(height, width int) (string, int, int) {

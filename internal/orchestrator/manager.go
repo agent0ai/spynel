@@ -22,6 +22,7 @@ import (
 	"github.com/agent0ai/spynel/internal/extensions"
 	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/instructions"
 	"github.com/agent0ai/spynel/internal/shortid"
 )
 
@@ -68,10 +69,9 @@ type Manager struct {
 	JobExecutionUpdated         func(id int, status core.ExecutionStatus)
 	JobFinished                 func(id int)
 	AuthorizeNotificationOrigin func(Origin) error
-	notificationActivityMu      sync.Mutex
-	notificationRequestMu       sync.Mutex
-	notificationTriageTimeout   time.Duration
-	notificationTriageRunning   atomic.Bool
+	notificationDecisionTimeout time.Duration
+	notificationMu              sync.Mutex
+	notificationRunning         map[string]bool
 
 	mu                          sync.Mutex
 	scanMu                      sync.Mutex
@@ -100,6 +100,7 @@ type Manager struct {
 	heartbeatConfigAcceptedAt   atomic.Int64
 	heartbeatConfigGeneration   atomic.Uint64
 	heartbeatAppliedGeneration  atomic.Uint64
+	harnessPolicy               atomic.Value
 	heartbeatTimerMu            sync.Mutex
 	heartbeatTimer              *time.Timer
 	heartbeatStatusMu           sync.RWMutex
@@ -120,6 +121,7 @@ func (m *Manager) SetPrimaryOwned(owned bool) {
 // semantics are live. Structural routes, scan cadence, and parallelism remain
 // fixed for the manager lifetime and continue to require a restart.
 func (m *Manager) ApplyRuntimeConfig(cfg config.Config) {
+	m.harnessPolicy.Store(cfg.Harness)
 	wasEnabled := m.orchestratorEnabled.Load()
 	acceptedAt := m.semanticHeartbeatNow()
 	m.heartbeatCommit.Lock()
@@ -144,6 +146,13 @@ func (m *Manager) ApplyRuntimeConfig(cfg config.Config) {
 	if cfg.Orchestrator.Enabled && !wasEnabled {
 		m.requestScan()
 	}
+}
+
+// ApplyHarnessConfig publishes prompt prefixes and task-review policy without
+// perturbing the semantic-heartbeat timer. Runtime adapter settings are still
+// applied separately by the application harness supervisor.
+func (m *Manager) ApplyHarnessConfig(settings config.Harness) {
+	m.harnessPolicy.Store(settings)
 }
 
 // stopSemanticHeartbeatTimer stops the registered production timer. Callers
@@ -179,14 +188,15 @@ func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Ma
 		scanNow:                make(chan struct{}, 1),
 		heartbeatConfigChanged: make(chan struct{}, 1),
 		heartbeatNow:           time.Now, heartbeatTimeout: 5 * time.Minute,
+		notificationRunning: map[string]bool{},
 	}
 	manager.orchestratorEnabled.Store(cfg.Orchestrator.Enabled)
 	manager.heartbeatMinutes.Store(int64(cfg.Orchestrator.SemanticHeartbeatMinutes))
-	manager.Outbox.OnDelivered = manager.markActionDelivered
+	manager.harnessPolicy.Store(cfg.Harness)
 	return manager
 }
 
-func (m *Manager) SetNotificationDelivery(deliver func(context.Context, Origin, string, string) ([]string, error)) {
+func (m *Manager) SetNotificationDelivery(deliver func(context.Context, Origin, string, string) error) {
 	m.Outbox.Deliver = deliver
 }
 
@@ -228,6 +238,9 @@ func (m *Manager) requestScan() {
 func (m *Manager) ScanOnce(ctx context.Context) error {
 	m.scanMu.Lock()
 	defer m.scanMu.Unlock()
+	if err := m.removeLegacyNotificationWorkflowState(); err != nil {
+		m.log("legacy notification state cleanup deferred: " + err.Error())
+	}
 	if !m.orchestratorEnabled.Load() {
 		return nil
 	}
@@ -258,10 +271,6 @@ func (m *Manager) ScanOnce(ctx context.Context) error {
 	if err := m.advanceActiveGoals(); err != nil {
 		return err
 	}
-	if err := m.reconcileActionRequests(); err != nil {
-		m.log("action request reconciliation deferred: " + err.Error())
-	}
-	m.startNotificationTriage(ctx)
 	for _, route := range m.Config.Orchestrator.Routes {
 		var err error
 		switch route.Name {
@@ -293,6 +302,9 @@ func (m *Manager) ScanOnce(ctx context.Context) error {
 	}
 	if err := m.Outbox.Process(ctx); err != nil {
 		m.log("notification delivery deferred: " + err.Error())
+	}
+	if err := m.startPendingNotificationAgents(ctx); err != nil {
+		m.log("notification agent recovery deferred: " + err.Error())
 	}
 	return nil
 }
@@ -401,6 +413,14 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route config.Route, source
 			return leaseErr
 		}
 		if m.isInflight(key) || m.leaseExists(key) || documentLeased {
+			continue
+		}
+		if phase == phaseTaskReview && m.harnessSettings().Reviews == config.TaskReviewsNever {
+			target := filepath.Join(filepath.Dir(sourceDir), "todo", entry.Name())
+			note := "Independent task review is disabled by harness.reviews=never; Spynel returned this task to todo so an implementation session can record the required direct-completion evidence."
+			if err := moveDocumentWithProgress(source, target, "todo", time.Now().UTC(), note); err != nil {
+				m.log("bypass disabled task review " + source + ": " + err.Error())
+			}
 			continue
 		}
 		target := filepath.Join(claimedDir, entry.Name())
@@ -567,11 +587,21 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 		} else if lease.Phase == phaseTaskReview || lease.Phase == phaseGoalReview || lease.Phase == "review" {
 			promptPath = route.ReviewPrompt
 		}
+		if recovery {
+			recoveryAttempt := lease.RecoveryCount + 1
+			note := fmt.Sprintf("Spynel started recovery attempt %d for %s after its durable execution ownership required reconciliation; the recovery agent must record its findings and outcome here.", recoveryAttempt, strings.ReplaceAll(normalizeLeasePhase(route.Name, lease.Phase), "_", " "))
+			if err := updateDocumentProgress(lease.File, time.Now().UTC(), note); err != nil {
+				m.recordError(lease, fmt.Errorf("record recovery progress: %w", err))
+				return
+			}
+		}
 		prompt, err := m.renderPrompt(route, lease.File, promptPath)
 		if err != nil {
 			m.recordError(lease, err)
 			return
 		}
+		harnessSettings := m.harnessSettings()
+		prompt = config.PrependAgentPrefix(m.agentPrefix(lease.Phase, harnessSettings), prompt)
 		firstAssignedAt, providerIterations, err := ReserveProviderTurn(lease.File, time.Now().UTC())
 		if err != nil {
 			m.recordError(lease, err)
@@ -768,7 +798,16 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route config.Rout
 			}
 			return status, path, nil
 		}
-		if status == "reviewing" || (status == "done" && policy.ReviewRequired) {
+		harnessSettings := m.harnessSettings()
+		reviewRequired := harnessSettings.EffectiveTaskReviewRequired(policy.ReviewRequired)
+		if harnessSettings.Reviews == config.TaskReviewsNever && (status == "review" || status == "reviewing") {
+			var err error
+			status, path, err = m.redirectTransition(path, statusPath(base, "todo", name), "todo", "Independent task review is disabled; Spynel returned this task to todo to record direct-completion evidence.")
+			if err != nil {
+				return status, path, err
+			}
+		}
+		if status == "reviewing" || (status == "done" && reviewRequired) {
 			var err error
 			status, path, err = m.redirectTransition(path, statusPath(base, "review", name), "review", "Implementation cannot bypass independent review; Spynel redirected this task to review.")
 			if err != nil {
@@ -793,7 +832,7 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route config.Rout
 				return status, path, err
 			}
 		}
-		if status == "done" && !policy.ReviewRequired {
+		if status == "done" && !reviewRequired {
 			if evidenceErr := validateDirectCompletionEvidence(document); evidenceErr != nil {
 				var err error
 				status, path, err = m.redirectTransition(path, statusPath(base, "todo", name), "todo", "Direct completion rejected: "+evidenceErr.Error())
@@ -866,23 +905,8 @@ func (m *Manager) reconcileGoalTransition(_ context.Context, route config.Route,
 }
 
 func (m *Manager) redirectTransition(path, target, status, note string) (string, string, error) {
-	lock, lockErr := lockProviderTurn(path)
-	if lockErr != nil {
-		return status, path, lockErr
-	}
-	defer unlockProviderTurn(lock)
-	document, err := ReadDocument(path)
-	if err != nil {
-		return status, path, err
-	}
 	now := time.Now().UTC()
-	document.FrontMatter["status"] = status
-	document.FrontMatter["updated_at"] = now.Format(time.RFC3339)
-	document.Body += "\n- " + now.Format(time.RFC3339) + " — " + note + "\n"
-	if err := WriteDocument(path, document); err != nil {
-		return status, path, err
-	}
-	if err := os.Rename(path, target); err != nil {
+	if err := moveDocumentWithProgress(path, target, status, now, note); err != nil {
 		return status, path, err
 	}
 	m.log(note + " " + target)
@@ -899,13 +923,14 @@ func (m *Manager) completeTransition(ctx context.Context, route config.Route, le
 		m.log("invalid notification metadata in " + path + ": " + err.Error())
 		policy = NotificationPolicy{}
 	}
-	if policy.Enabled && policy.Outcomes[status] {
+	if policy.Enabled && policy.Outcomes[status] && m.Config.Orchestrator.TaskNotifications != config.TaskNotificationsOff {
 		id, _ := document.FrontMatter["id"].(string)
 		if id == "" {
 			id = lease.ID
 		}
-		if err = m.enqueueTriage(document, lease, status, path, policy); err != nil {
-			return err
+		if err := m.scheduleTaskNotification(id, status, notificationTransitionID(lease), path, policy); err != nil {
+			m.log("notification agent schedule failed: " + err.Error())
+			return fmt.Errorf("persist task notification event: %w", err)
 		}
 	}
 	if m.Config.Extensions.Enabled {
@@ -1141,7 +1166,8 @@ func (m *Manager) wakeWaitingDocuments(ctx context.Context) error {
 				}
 			}
 			target := filepath.Join(base, targetStatus, entry.Name())
-			if err := moveDocument(path, target, targetStatus, now); err != nil {
+			note := fmt.Sprintf("Spynel resumed this %s from waiting because its scheduled wake condition became due; it returned to %s for a fresh agent decision.", strings.TrimSuffix(route.Name, "s"), targetStatus)
+			if err := moveDocumentWithProgress(path, target, targetStatus, now, note); err != nil {
 				return err
 			}
 			if route.Name == "goals" && targetStatus == "planning" {
@@ -1216,7 +1242,12 @@ func (m *Manager) advanceActiveGoals() error {
 			continue
 		}
 		target := filepath.Join(base, "review", entry.Name())
-		if err := moveDocument(path, target, "review", now); err != nil {
+		reason := "all current-round tasks settled"
+		if checkpoint && !settled {
+			reason = "the configured evidence checkpoint became due"
+		}
+		note := "Spynel queued this goal for independent review because " + reason + "."
+		if err := moveDocumentWithProgress(path, target, "review", now, note); err != nil {
 			return err
 		}
 		m.log("goal round ready for review: " + target)
@@ -1333,7 +1364,8 @@ func (m *Manager) migrateLegacyGoals() error {
 		if _, err := os.Stat(target); err == nil {
 			continue
 		}
-		if err := moveDocument(source, target, "planning", time.Now()); err != nil {
+		now := time.Now().UTC()
+		if err := moveDocumentWithProgress(source, target, "planning", now, "Spynel migrated this legacy claimed goal into the current planning workflow and preserved its recovery ownership."); err != nil {
 			return err
 		}
 		leases, _ := m.loadLeases()
@@ -1411,7 +1443,29 @@ func (m *Manager) renderPrompt(route config.Route, file, promptPath string) (str
 	for from, to := range replacements {
 		prompt = strings.ReplaceAll(prompt, from, to)
 	}
-	return prompt, nil
+	prompt = appendTaskReviewModeInstruction(prompt, m.harnessSettings().Reviews)
+	role := instructions.Developer
+	phase := normalizeLeasePhase(route.Name, phaseForFile(route.Name, file))
+	if phase == phaseTaskReview || phase == phaseGoalReview {
+		role = instructions.Reviewer
+	}
+	return instructions.Append(prompt, m.Config.StatePath(), role)
+}
+
+func (m *Manager) harnessSettings() config.Harness {
+	if value := m.harnessPolicy.Load(); value != nil {
+		return value.(config.Harness)
+	}
+	return m.Config.Harness
+}
+
+func (m *Manager) agentPrefix(phase string, settings config.Harness) string {
+	switch normalizeLeasePhase("", phase) {
+	case phaseTaskReview, phaseGoalReview:
+		return settings.ReviewerAgentPrefix
+	default:
+		return settings.DeveloperAgentPrefix
+	}
 }
 
 func (m *Manager) routeSource(name string) string {

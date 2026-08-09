@@ -3,9 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -138,9 +136,6 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 		runtimeState.LogEvent("error", "config", "reload_failed", "Configuration reload before primary startup failed")
 		runtimeState.Close()
 		return nil, err
-	}
-	if filepath.Clean(cfg.Resolve(cfg.Workspace.StateDir)) != filepath.Clean(original.Resolve(original.Workspace.StateDir)) {
-		return nil, fmt.Errorf("workspace state directory changed from %s to %s; restart this Spynel process to join the new server election", original.Resolve(original.Workspace.StateDir), cfg.Resolve(cfg.Workspace.StateDir))
 	}
 	ctx, cancel := context.WithCancel(parent)
 	service, err := buildService(cfg, version)

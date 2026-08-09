@@ -2,6 +2,7 @@ package history
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +48,55 @@ func TestRecentBoundedUsesNewestMessageAndCharacterWindow(t *testing.T) {
 	short, _, err := store.RecentBounded("telegram", "person", 20, 35)
 	if err != nil || len([]rune(short)) > 35 || !strings.Contains(short, "message-100") {
 		t.Fatalf("unexpected bounded character window: %q, %v", short, err)
+	}
+}
+
+func TestReplyContextSerializesAndRendersWithinBounds(t *testing.T) {
+	store := New(t.TempDir())
+	_, err := store.Append("telegram", "person", Entry{Role: "user", ReplyTo: "123 referenced text", Content: strings.Repeat("界", 200)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(store.Path("telegram", "person"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"reply_to":"123 referenced text"`) {
+		t.Fatalf("serialized history missing reply_to: %s", data)
+	}
+	recent, _, err := store.RecentBounded("telegram", "person", 20, 70)
+	if err != nil || len([]rune(recent)) > 70 || !strings.Contains(recent, "[reply_to: 123 referenced text]") || !strings.Contains(recent, "…") {
+		t.Fatalf("bounded reply history = %q (%v)", recent, err)
+	}
+	legacy := []byte(`{"at":"2026-08-09T00:00:00Z","role":"user","content":"legacy"}` + "\n")
+	if err := os.WriteFile(store.Path("telegram", "legacy"), legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := store.Entries("telegram", "legacy")
+	if err != nil || len(entries) != 1 || entries[0].ReplyTo != "" || entries[0].Content != "legacy" {
+		t.Fatalf("legacy history = %#v, %v", entries, err)
+	}
+}
+
+func TestReplyContextHandlesMaximumPreviewAndTinyLimitsSafely(t *testing.T) {
+	store := New(t.TempDir())
+	id := "ABCDEFGHIJKLMNOPQRST"
+	reply := id + " " + strings.Repeat("🙂", 100) + "…"
+	_, _ = store.Append("whatsapp", "person", Entry{Role: "user", ReplyTo: reply, Content: strings.Repeat("界", 100)})
+	for _, limit := range []int{31, 32, 35} {
+		recent, _, err := store.RecentBounded("whatsapp", "person", 20, limit)
+		if err != nil || len([]rune(recent)) > limit || recent != "" {
+			t.Fatalf("limit %d produced damaged identity %q (%v)", limit, recent, err)
+		}
+	}
+	recent, _, err := store.RecentBounded("whatsapp", "person", 20, 64)
+	if err != nil || len([]rune(recent)) > 64 || !strings.Contains(recent, "[reply_to: "+id) || !strings.Contains(recent, "…") {
+		t.Fatalf("compact reply history = %q (%v)", recent, err)
+	}
+	_, _ = store.Append("whatsapp", "ordinary", Entry{Role: "user", Content: "ordinary"})
+	data, _ := os.ReadFile(store.Path("whatsapp", "ordinary"))
+	if strings.Contains(string(data), "reply_to") {
+		t.Fatalf("ordinary history emitted reply_to: %s", data)
 	}
 }
 

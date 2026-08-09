@@ -1,7 +1,6 @@
 package orchestrator
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -31,10 +30,6 @@ type WorkStatus struct {
 	CountDiagnostics []string  `json:"count_diagnostics,omitempty"`
 	HeartbeatState   string    `json:"heartbeat_state"`
 	NextHeartbeatAt  time.Time `json:"next_heartbeat_at,omitempty"`
-	TriagePending    int       `json:"triage_pending"`
-	TriageRunning    int       `json:"triage_running"`
-	TriageFailed     int       `json:"triage_failed"`
-	AwaitingResponse int       `json:"awaiting_response"`
 }
 
 // AddCountDiagnostic appends one diagnostic using the same count, control,
@@ -61,59 +56,7 @@ func (m *Manager) WorkStatus() WorkStatus {
 	}
 	status.CountDiagnostics = diagnostics
 	status.HeartbeatState, status.NextHeartbeatAt = m.semanticHeartbeatSchedule()
-	status.TriagePending, status.TriageRunning, status.TriageFailed, status.AwaitingResponse = m.notificationStatus(&status.CountDiagnostics)
 	return status
-}
-
-func (m *Manager) notificationStatus(diagnostics *[]string) (pending, running, failed, awaiting int) {
-	count := func(directory string, visit func(string, bool)) {
-		entries, truncated, err := readDirectoryEntries(directory, 4096)
-		if os.IsNotExist(err) {
-			return
-		}
-		if err != nil {
-			addStatusDiagnostic(diagnostics, "notification state is partially unavailable")
-			return
-		}
-		if truncated {
-			addStatusDiagnostic(diagnostics, "notification count is a lower bound: entry limit reached")
-		}
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-				continue
-			}
-			data, err := readStatusDocument(filepath.Join(directory, entry.Name()))
-			if err != nil {
-				continue
-			}
-			var state struct {
-				State     string `json:"state"`
-				LastError string `json:"last_error"`
-			}
-			if json.Unmarshal(data, &state) == nil {
-				visit(state.State, state.LastError != "")
-			}
-		}
-	}
-	count(m.Config.StatePath("runtime", "notification-triage"), func(state string, hasError bool) {
-		switch state {
-		case "pending":
-			pending++
-			if hasError {
-				failed++
-			}
-		case "running":
-			running++
-		case "failed":
-			failed++
-		}
-	})
-	count(m.Config.StatePath("runtime", "action-requests"), func(state string, _ bool) {
-		if state == "awaiting_response" {
-			awaiting++
-		}
-	})
-	return
 }
 
 func (m *Manager) semanticHeartbeatSchedule() (string, time.Time) {

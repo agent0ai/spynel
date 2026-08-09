@@ -160,21 +160,6 @@ func (s *Service) formatJobInfo(job Job, lease orchestrator.Lease, hasLease bool
 			lines = append(lines, "- "+field.label+": "+safeJobText(value, maxJobMetadataRunes))
 		}
 	}
-	if taskID, ok := safeFrontMatterValue(document.FrontMatter["id"]); ok {
-		if request, exists := s.Orchestrator.ActionRequestStatusForTask(taskID); exists {
-			lines = append(lines, "", "## Action request", "", "- State: "+safeJobText(request.State, maxJobMetadataRunes))
-			if request.SentChannel != "" {
-				lines = append(lines, "- Delivery channel: "+safeJobText(request.SentChannel, maxJobMetadataRunes))
-			}
-			if !request.ReminderDueAt.IsZero() {
-				lines = append(lines, "- Reminder due: "+request.ReminderDueAt.UTC().Format(time.RFC3339))
-			}
-			lines = append(lines, fmt.Sprintf("- Reminders: %d/%d", request.ReminderCount, request.MaxReminders))
-			if request.Acknowledged {
-				lines = append(lines, "- Acknowledged: yes")
-			}
-		}
-	}
 	progress := newestProgressEntries(document.Body)
 	if len(progress) > 0 {
 		lines = append(lines, "", fmt.Sprintf("## Recent progress (newest %d)", len(progress)), "")

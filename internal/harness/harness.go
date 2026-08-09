@@ -16,6 +16,8 @@ import (
 type HarnessConfig struct {
 	Name           string
 	Command        string
+	Args           []string
+	Env            []string
 	Cwd            string
 	Model          string
 	Effort         string
@@ -103,6 +105,15 @@ type ControlResult struct {
 // adapters continue to expose only their declared native-steer/queue behavior.
 type ControlSender interface {
 	SendControl(context.Context, string, ControlRequest) (ControlResult, error)
+}
+
+// ConversationSender preserves the exact user message separately from the
+// rendered harness prompt. Supervisors use it to collapse several queued chat
+// follow-ups into one provider turn without concatenating repeated framework
+// instructions and history snapshots. Basic harness implementations may omit
+// it and continue to receive ordinary Send calls.
+type ConversationSender interface {
+	SendConversation(context.Context, string, string, string, core.Emit) (threadID string, steered bool, err error)
 }
 
 type Harness interface {

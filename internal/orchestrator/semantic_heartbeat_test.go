@@ -26,6 +26,7 @@ type heartbeatHarness struct {
 	release            chan struct{}
 	ignoreCancellation bool
 	err                error
+	prompt             string
 }
 
 func (h *heartbeatHarness) Start(context.Context) error                     { return nil }
@@ -37,6 +38,7 @@ func (h *heartbeatHarness) IsActive(string) bool                            { re
 func (h *heartbeatHarness) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
 	h.mu.Lock()
 	h.calls++
+	h.prompt = prompt
 	h.mu.Unlock()
 	if h.entered != nil {
 		select {
@@ -71,7 +73,7 @@ func newHeartbeatManager(t *testing.T, target *heartbeatHarness) *Manager {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,6 +624,46 @@ func TestSemanticHeartbeatBoundsCancellationIgnoringProviderWithoutOverlap(t *te
 	close(target.release)
 }
 
+func TestSemanticHeartbeatJobRemainsInspectableUntilProviderRelease(t *testing.T) {
+	target := &heartbeatHarness{entered: make(chan struct{}, 1), release: make(chan struct{}), ignoreCancellation: true}
+	manager := newHeartbeatManager(t, target)
+	manager.heartbeatTimeout = 10 * time.Millisecond
+	started := make(chan Lease, 1)
+	finished := make(chan int, 1)
+	manager.JobStarted = func(lease Lease, description string, _ time.Time, _, _ int) int {
+		if description != "semantic workflow heartbeat" {
+			t.Errorf("heartbeat job description = %q", description)
+		}
+		started <- lease
+		return 17
+	}
+	manager.JobFinished = func(id int) { finished <- id }
+
+	manager.runSemanticHeartbeatOnce(context.Background())
+	select {
+	case lease := <-started:
+		if lease.DocumentType != "heartbeat" || lease.Route != "semantic-heartbeat" || lease.SessionKey != semanticHeartbeatSession || lease.State != "audit" || lease.Phase != "semantic_audit" {
+			t.Fatalf("heartbeat job lease = %#v", lease)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat job was not registered")
+	}
+	select {
+	case id := <-finished:
+		t.Fatalf("cancellation-ignoring heartbeat job %d disappeared before provider release", id)
+	default:
+	}
+	close(target.release)
+	select {
+	case id := <-finished:
+		if id != 17 {
+			t.Fatalf("finished heartbeat job = %d", id)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat job remained registered after provider release")
+	}
+}
+
 func TestSemanticHeartbeatRejectsLateResultAfterPrimaryCancellation(t *testing.T) {
 	target := &heartbeatHarness{entered: make(chan struct{}, 1), release: make(chan struct{}), ignoreCancellation: true}
 	manager := newHeartbeatManager(t, target)
@@ -726,6 +768,62 @@ func TestSemanticHeartbeatRepairRequiresInScopeWorkflow(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("in-scope repair did not request serialized scan")
 	}
+	journaled, err := ReadDocument(path)
+	if err != nil || !strings.Contains(journaled.Body, "Semantic heartbeat recorded stale or orphaned claim and requested recover") {
+		t.Fatalf("heartbeat repair request was not journaled: body=%q err=%v", journaled.Body, err)
+	}
+}
+
+func TestSemanticHeartbeatRequeuesOnlyValidatedDueWaitingCondition(t *testing.T) {
+	manager := newHeartbeatManager(t, &heartbeatHarness{})
+	now := time.Date(2026, 8, 8, 20, 0, 0, 0, time.UTC)
+	path, err := Create(manager.Config, "tasks", "waiting fallback", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := ReadDocument(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document.FrontMatter["status"] = "waiting"
+	document.FrontMatter["wake_at"] = now.Add(-time.Minute).Format(time.RFC3339)
+	if err := WriteDocument(path, document); err != nil {
+		t.Fatal(err)
+	}
+	waitingPath := filepath.Join(filepath.Dir(filepath.Dir(path)), "waiting", filepath.Base(path))
+	if err := os.Rename(path, waitingPath); err != nil {
+		t.Fatal(err)
+	}
+	result := semanticHeartbeatResult{Schema: semanticHeartbeatSchema, ExecutionID: "run", ObservedAt: now, Status: "findings", Findings: []semanticHeartbeatFinding{{
+		Category: "due_waiting_condition", WorkflowID: documentID(document), Evidence: "documented fallback is due", Action: "request_requeue",
+	}}}
+	if err := manager.recordSemanticHeartbeatResult(context.Background(), result); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-manager.scanNow:
+	case <-time.After(time.Second):
+		t.Fatal("validated due wait did not request a serialized scan")
+	}
+	journaled, err := ReadDocument(waitingPath)
+	if err != nil || !strings.Contains(journaled.Body, "requested requeue") {
+		t.Fatalf("due waiting requeue was not journaled: body=%q err=%v", journaled.Body, err)
+	}
+
+	delete(journaled.FrontMatter, "wake_at")
+	if err := WriteDocument(waitingPath, journaled); err != nil {
+		t.Fatal(err)
+	}
+	result.ObservedAt = now.Add(time.Minute)
+	result.Findings[0].Evidence = "changed but unsupported waiting evidence"
+	if err := manager.recordSemanticHeartbeatResult(context.Background(), result); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-manager.scanNow:
+		t.Fatal("waiting task without a due condition requested requeue")
+	default:
+	}
 }
 
 func TestSemanticHeartbeatAcceptsRealClockPrecisionAndPersistsDiagnostic(t *testing.T) {
@@ -747,7 +845,7 @@ func TestSemanticHeartbeatAcceptsRealClockPrecisionAndPersistsDiagnostic(t *test
 	}
 }
 
-func TestSemanticHeartbeatNotificationIsDeduplicatedPersistently(t *testing.T) {
+func TestSemanticHeartbeatNotificationDecisionUsesProgressInsteadOfResponseState(t *testing.T) {
 	manager := newHeartbeatManager(t, &heartbeatHarness{})
 	manager.AuthorizeNotificationOrigin = func(Origin) error { return nil }
 	path, err := Create(manager.Config, "tasks", "needs a user decision", "")
@@ -759,14 +857,19 @@ func TestSemanticHeartbeatNotificationIsDeduplicatedPersistently(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflowID := documentID(document)
+	document.FrontMatter["status"] = "waiting"
 	document.FrontMatter["notify"] = map[string]any{"enabled": true, "origin": "tui/local", "on": []any{"waiting"}}
 	if err := WriteDocument(path, document); err != nil {
 		t.Fatal(err)
 	}
+	waitingPath := filepath.Join(filepath.Dir(filepath.Dir(path)), "waiting", filepath.Base(path))
+	if err := os.Rename(path, waitingPath); err != nil {
+		t.Fatal(err)
+	}
 	deliveries := 0
-	manager.Outbox.Deliver = func(context.Context, Origin, string, string) ([]string, error) {
+	manager.Outbox.Deliver = func(context.Context, Origin, string, string) error {
 		deliveries++
-		return nil, nil
+		return nil
 	}
 	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
 	result := semanticHeartbeatResult{Schema: semanticHeartbeatSchema, ExecutionID: "run", ObservedAt: now, Status: "findings", Findings: []semanticHeartbeatFinding{{
@@ -784,23 +887,18 @@ func TestSemanticHeartbeatNotificationIsDeduplicatedPersistently(t *testing.T) {
 	if deliveries != 1 {
 		t.Fatalf("restart redelivered identical finding: %d", deliveries)
 	}
+	result.ExecutionID = "run-2"
 	result.ObservedAt = now.Add(30 * time.Minute)
-	result.Findings[0].Evidence = "waiting condition changed materially"
-	recordAndDeliverHeartbeat(t, manager, result)
-	if deliveries != 1 {
-		t.Fatalf("material change ignored cooldown: deliveries = %d", deliveries)
-	}
-	result.ObservedAt = now.Add(75 * time.Minute)
 	recordAndDeliverHeartbeat(t, manager, result)
 	if deliveries != 2 {
-		t.Fatalf("pending material change was not delivered after cooldown: %d", deliveries)
+		t.Fatalf("new agent decision was suppressed by old response state: %d", deliveries)
 	}
-	healthy := semanticHeartbeatResult{Schema: semanticHeartbeatSchema, ExecutionID: "healthy", ObservedAt: now.Add(80 * time.Minute), Status: "healthy", Findings: []semanticHeartbeatFinding{}}
-	recordAndDeliverHeartbeat(t, manager, healthy)
-	result.ObservedAt = now.Add(90 * time.Minute)
-	recordAndDeliverHeartbeat(t, manager, result)
-	if deliveries != 3 {
-		t.Fatalf("resolved finding recurrence was not treated as a new incident: %d", deliveries)
+	journaled, err := ReadDocument(waitingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(journaled.Body, "Semantic heartbeat queued this proactive notification: A task needs your decision.") != 2 {
+		t.Fatalf("notification messages were not recorded in Progress:\n%s", journaled.Body)
 	}
 }
 
@@ -821,9 +919,9 @@ func TestSemanticHeartbeatRejectsOriginNotBoundToWorkflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	deliveries := 0
-	manager.Outbox.Deliver = func(context.Context, Origin, string, string) ([]string, error) {
+	manager.Outbox.Deliver = func(context.Context, Origin, string, string) error {
 		deliveries++
-		return nil, nil
+		return nil
 	}
 	result := semanticHeartbeatResult{Schema: semanticHeartbeatSchema, ExecutionID: "run", ObservedAt: time.Now().UTC(), Status: "findings", Findings: []semanticHeartbeatFinding{{
 		Category: "external_input_required", WorkflowID: workflowID, Evidence: "needs a private decision", Action: "notify", NotificationOrigin: "tui/unrelated", Notification: "Private workflow details.",
@@ -852,7 +950,7 @@ func TestSemanticHeartbeatRequiresWaitingNotificationOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	deliveries := 0
-	manager.Outbox.Deliver = func(context.Context, Origin, string, string) ([]string, error) { deliveries++; return nil, nil }
+	manager.Outbox.Deliver = func(context.Context, Origin, string, string) error { deliveries++; return nil }
 	result := semanticHeartbeatResult{Schema: semanticHeartbeatSchema, ExecutionID: "run", ObservedAt: time.Now().UTC(), Status: "findings", Findings: []semanticHeartbeatFinding{{
 		Category: "external_input_required", WorkflowID: documentID(document), Evidence: "decision required", Action: "notify", NotificationOrigin: "tui/local", Notification: "A decision is required.",
 	}}}
@@ -874,8 +972,13 @@ func TestSemanticHeartbeatCancellationDuringAuthorizationCannotCommit(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	document.FrontMatter["status"] = "waiting"
 	document.FrontMatter["notify"] = map[string]any{"enabled": true, "origin": "tui/local", "on": []any{"waiting"}}
 	if err := WriteDocument(path, document); err != nil {
+		t.Fatal(err)
+	}
+	waitingPath := filepath.Join(filepath.Dir(filepath.Dir(path)), "waiting", filepath.Base(path))
+	if err := os.Rename(path, waitingPath); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -883,9 +986,9 @@ func TestSemanticHeartbeatCancellationDuringAuthorizationCannotCommit(t *testing
 		cancel()
 		return nil
 	}
-	manager.Outbox.Deliver = func(context.Context, Origin, string, string) ([]string, error) {
+	manager.Outbox.Deliver = func(context.Context, Origin, string, string) error {
 		t.Fatal("cancelled result reached delivery")
-		return nil, nil
+		return nil
 	}
 	result := semanticHeartbeatResult{Schema: semanticHeartbeatSchema, ExecutionID: "run", ObservedAt: time.Now().UTC(), Status: "findings", Findings: []semanticHeartbeatFinding{{
 		Category: "external_input_required", WorkflowID: documentID(document), Evidence: "decision required", Action: "notify", NotificationOrigin: "tui/local", Notification: "A decision is required.",
@@ -931,5 +1034,44 @@ func TestSemanticHeartbeatBoundsRenderedPromptAndPersistedState(t *testing.T) {
 	}
 	if _, exists := findings["0000"]; exists {
 		t.Fatal("oldest finding was not pruned")
+	}
+}
+
+func TestSemanticHeartbeatUsesWorkspacePromptOverride(t *testing.T) {
+	manager := newHeartbeatManager(t, &heartbeatHarness{})
+	path := manager.Config.StatePath("prompts", "heartbeat.md")
+	override := "WORKSPACE HEARTBEAT {{EXECUTION_ID}} {{NOW_UTC}} {{ROUTES}}"
+	if err := os.WriteFile(path, []byte(override), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manager.Config.StatePath("instructions", "agent-heartbeat.md"), []byte("heartbeat-only-rule"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := manager.semanticHeartbeatPrompt("audit-7", time.Date(2026, 8, 8, 20, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"WORKSPACE HEARTBEAT", "audit-7", "2026-08-08T20:00:00Z", "tasks:", "Configured task review mode: skip-trivial"} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("workspace heartbeat prompt omitted %q: %q", want, prompt)
+		}
+	}
+	if !strings.Contains(prompt, "\nheartbeat-only-rule\n</workspace_owner_persistent_instructions>") || !strings.HasSuffix(prompt, "The precedence stated above still applies to every imported rule.") {
+		t.Fatalf("heartbeat instructions were not the final prompt section: %q", prompt)
+	}
+}
+
+func TestSemanticHeartbeatMessageUsesHeartbeatAgentPrefix(t *testing.T) {
+	target := &heartbeatHarness{}
+	manager := newHeartbeatManager(t, target)
+	settings := manager.harnessSettings()
+	settings.HeartbeatAgentPrefix = "/audit"
+	manager.ApplyHarnessConfig(settings)
+	manager.runSemanticHeartbeatOnce(context.Background())
+	target.mu.Lock()
+	prompt := target.prompt
+	target.mu.Unlock()
+	if !strings.HasPrefix(prompt, "/audit ") {
+		t.Fatalf("heartbeat prompt = %q", prompt)
 	}
 }

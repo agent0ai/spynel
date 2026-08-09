@@ -18,6 +18,7 @@ assert.throws(() => resolve("win32", "arm64"), /does not publish/);
 assert.throws(() => resolve("freebsd", "x64"), /does not publish/);
 
 assert.strictEqual(pkg.name, "spynel");
+assert.strictEqual(pkg.description, "A non-AI orchestration layer connecting one human to many coding agents");
 assert.strictEqual(pkg.bin.spynel, "npm/bin/spynel.js");
 assert.strictEqual(pkg.publishConfig.registry, "https://registry.npmjs.org");
 assert.strictEqual(pkg.repository.url, "git+https://github.com/agent0ai/spynel.git");

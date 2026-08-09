@@ -28,6 +28,7 @@ import (
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
+	"github.com/agent0ai/spynel/internal/instructions"
 	"github.com/agent0ai/spynel/internal/localapi"
 	"github.com/agent0ai/spynel/internal/media"
 	"github.com/agent0ai/spynel/internal/orchestrator"
@@ -96,6 +97,8 @@ func run(args []string, version string) error {
 		return nil
 	case "docs":
 		return runDocsCommand(args[1:], os.Stdout)
+	case "instructions":
+		return runInstructionsCommand(args[1:], os.Stdout)
 	case "version", "--version", "-v":
 		fmt.Println("spynel " + version)
 		return nil
@@ -113,13 +116,13 @@ func run(args []string, version string) error {
 		absolute, _ := filepath.Abs(*root)
 		fmt.Println("Initialized Spynel in " + absolute)
 		if !*noStart && interactiveTerminal() {
-			configPath := filepath.Join(absolute, config.FileName)
+			configPath := config.PathForRoot(absolute)
 			return runServer(configPath, true, version, []string{"serve", "--tui", "--config", configPath})
 		}
 		return nil
 	case "serve":
 		flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-		configPath := flags.String("config", "", "path to spynel.yaml")
+		configPath := flags.String("config", "", "path to .spynel/config.yaml")
 		withTUI := flags.Bool("tui", false, "also launch the terminal UI")
 		flags.Bool("automatic-startup", false, "identify a non-interactive operating-system startup")
 		if err := flags.Parse(args[1:]); err != nil {
@@ -128,7 +131,7 @@ func run(args []string, version string) error {
 		return runServer(*configPath, *withTUI, version, append([]string(nil), args...))
 	case "run":
 		flags := flag.NewFlagSet("run", flag.ContinueOnError)
-		configPath := flags.String("config", "", "path to spynel.yaml")
+		configPath := flags.String("config", "", "path to .spynel/config.yaml")
 		once := flags.Bool("once", false, "run one scan and wait for dispatched turns")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
@@ -147,7 +150,7 @@ func run(args []string, version string) error {
 		return runFrameworkCLICommand("", args[1:], version)
 	case "status":
 		return runStatusCLICommand(args[1:], version, os.Stdout)
-	case "jobs", "job", "log", "logs", "stop", "new", "clear", "history", "harness", "model", "telegram", "restart", "update":
+	case "jobs", "tasks", "goals", "job", "log", "logs", "stop", "new", "clear", "history", "harness", "model", "telegram", "restart", "update":
 		return runFrameworkCLICommand(args[0], args[1:], version)
 	case "conversation", "conversations":
 		return runConversationCommand(args[1:], os.Stdout)
@@ -219,9 +222,47 @@ func inspectTaskPolicy(path string, output io.Writer) error {
 		return err
 	}
 	policy, policyErr := orchestrator.TaskPolicyFromDocument(document)
-	_, _ = fmt.Fprintf(output, "Review required: %t\n", policy.ReviewRequired)
+	effective := policy.ReviewRequired
+	if configPath, findErr := config.Find(filepath.Dir(path)); findErr == nil {
+		if cfg, loadErr := config.Load(configPath); loadErr == nil {
+			effective = cfg.Harness.EffectiveTaskReviewRequired(policy.ReviewRequired)
+			_, _ = fmt.Fprintln(output, "Configured task review mode: "+cfg.Harness.Reviews)
+		}
+	}
+	_, _ = fmt.Fprintf(output, "Review required: %t\n", effective)
 	if policyErr != nil {
 		_, _ = fmt.Fprintln(output, "Policy warning: "+policyErr.Error()+"; treated as review required")
+	}
+	return nil
+}
+
+func runInstructionsCommand(args []string, output io.Writer) error {
+	flags := flag.NewFlagSet("instructions", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	configPath := flags.String("config", "", "path to .spynel/config.yaml")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: spynel instructions [--config PATH]")
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	invalid := false
+	for _, status := range instructions.Inspect(cfg.StatePath()) {
+		state := "missing (valid empty fallback)"
+		if status.Present && status.Valid {
+			state = fmt.Sprintf("valid (%d bytes)", status.Bytes)
+		} else if status.Error != "" {
+			state = "invalid (" + status.Error + ")"
+			invalid = true
+		}
+		_, _ = fmt.Fprintf(output, "%s: %s — %s\n", status.Role, status.RelativePath, state)
+	}
+	if invalid {
+		return errors.New("one or more persistent instruction files are unsafe or invalid")
 	}
 	return nil
 }
@@ -285,13 +326,13 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 			if setupErr != nil || !initialized {
 				return setupErr
 			}
-			return runServer(filepath.Join(root, config.FileName), true, version, restartArgs)
+			return runServer(config.PathForRoot(root), true, version, restartArgs)
 		}
 		return err
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	election, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	election, err := instance.New(cfg.StatePath())
 	if err != nil {
 		return err
 	}
@@ -569,7 +610,7 @@ func addCLIAttachments(ctx context.Context, cfg config.Config, text string, sour
 }
 
 func activeWorkspaceClient(ctx context.Context, cfg config.Config) (*localapi.Client, bool, error) {
-	election, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	election, err := instance.New(cfg.StatePath())
 	if err != nil {
 		return nil, false, err
 	}
@@ -707,14 +748,14 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 	}
 	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d", os.Getpid()))
 	registry := harness.NewBuiltinRegistry()
-	command, commandErr := harness.ResolveCommand(cfg.Harness.Name, nil)
+	command, commandErr := harness.ResolveConfiguredCommand(cfg.Harness.Name, cfg.Harness.ACPCommand, nil)
 	if commandErr != nil {
 		if definition, ok := harness.Lookup(cfg.Harness.Name); ok {
 			command = definition.Command
 		}
 	}
 	target := harness.NewSupervisor(registry, harness.HarnessConfig{
-		Name: cfg.Harness.Name, Command: command, Cwd: cfg.Root,
+		Name: cfg.Harness.Name, Command: command, Args: cfg.HarnessArgs(), Cwd: cfg.Root,
 		Model: cfg.Harness.Model, Effort: "medium",
 		ApprovalPolicy: "never", Sandbox: cfg.Harness.Sandbox,
 		Network: false, SessionsFile: cfg.HarnessSessionsPath(cfg.Harness.Name),
@@ -759,6 +800,7 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 			},
 			Build: func(cfg config.Config) (channel.Channel, error) {
 				bot := telegram.NewWithIdentityStore(cfg.Channels.Telegram, cfg.TelegramToken(), cfg.StatePath("runtime", "telegram-identities.json"))
+				bot.SetAllowedUsersSource(func() []string { return service.Settings.Snapshot().Channels.Telegram.AllowedUsers })
 				bot.SetNoticeReporter(service.SetNotice)
 				store := &media.Store{Directory: cfg.StatePath("attachments", "telegram"), MaxBytes: int64(cfg.Workspace.AttachmentMaxMB) * 1024 * 1024}
 				var transcriber media.Transcriber
@@ -781,6 +823,7 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 			},
 			Build: func(cfg config.Config) (channel.Channel, error) {
 				client := whatsapp.New(cfg.Channels.WhatsApp, cfg.Resolve(cfg.Channels.WhatsApp.Database))
+				client.SetAllowedNumbersSource(func() []string { return service.Settings.Snapshot().Channels.WhatsApp.AllowedNumbers })
 				client.SetPairingReporter(service.SetPairing)
 				store := &media.Store{Directory: cfg.StatePath("attachments", "whatsapp"), MaxBytes: int64(cfg.Workspace.AttachmentMaxMB) * 1024 * 1024}
 				var transcriber media.Transcriber
@@ -900,7 +943,7 @@ func doctor() error {
 		return err
 	}
 	fmt.Println("config: ok (" + cfg.Path + ")")
-	command, err := harness.ResolveCommand(cfg.Harness.Name, nil)
+	command, err := harness.ResolveConfiguredCommand(cfg.Harness.Name, cfg.Harness.ACPCommand, nil)
 	if err != nil {
 		return err
 	}
@@ -913,7 +956,7 @@ func doctor() error {
 		return fmt.Errorf("state directory is not writable: %w", err)
 	}
 	_ = os.Remove(testPath)
-	fmt.Println("state directory: writable (" + cfg.Resolve(cfg.Workspace.StateDir) + ")")
+	fmt.Println("state directory: writable (" + cfg.StatePath() + ")")
 	if cfg.Channels.Telegram.Enabled && cfg.TelegramToken() == "" {
 		return errors.New("Telegram is enabled but its token is empty")
 	}
@@ -930,7 +973,7 @@ func enabled(value bool) string {
 	return "disabled"
 }
 
-const helpText = `Spynel - extensible chat and markdown orchestration
+const helpText = `Spynel - non-AI orchestration for one human and many coding agents
 
 Usage:
   spynel                         Launch TUI and enabled background services
@@ -952,13 +995,23 @@ Usage:
   spynel conversations resume   Branch any saved conversation into CLI
   spynel status [flags]          Show workspace and current conversation status
   spynel command [flags] NAME    Run any non-visual framework slash command
-	spynel job message N TEXT      Guide a live orchestrator job in place
-	spynel job ping N              Request durable progress from a live job
+  spynel tasks [flags] [VIEW]   List durable tasks (open by default)
+  spynel goals [flags] [VIEW]   List durable goals (open by default)
+    VIEW                        open|recent|active|review|waiting|done|failed|all
+    --config PATH               Load an explicit workspace configuration
+    --conversation NAME         Use a durable CLI command conversation
+    --days N                    Restrict updated_at to the last N days
+    --limit N                   Render 1 through 100 matching items
+    --detail                    Add allowlisted durable details
+    --json                      Emit the shared response event as NDJSON
+  spynel job message N TEXT     Guide a live orchestrator job in place
+  spynel job ping N             Request durable progress from a live job
   spynel docs [TOPIC]            Read curated offline documentation
     search QUERY [page NUMBER]   Search bounded topic sections
     --format text|json           Select plain Markdown or versioned JSON
-  spynel jobs|log|stop|clear...  Concise aliases for common framework commands
-	spynel update                  Check npm for an update (/update install applies it)
+  spynel instructions            Validate role instruction files without showing contents
+  spynel jobs|log...             Other concise framework-command aliases
+  spynel update                 Check npm for an update (/update install applies it)
   spynel run --once              Dispatch one orchestration scan and wait
   spynel task [--no-review] REQUEST
                                 Create a task (reviewed by default)

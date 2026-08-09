@@ -27,8 +27,9 @@ func TestInitCreatesDocumentedWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, path := range []string{
-		"spynel.yaml", ".spynel/AGENTS.md", ".spynel/tasks/AGENTS.md",
+		".spynel/config.yaml", ".spynel/AGENTS.md", ".spynel/tasks/AGENTS.md",
 		".spynel/prompts/create-task.md", ".spynel/prompts/create-goal.md", ".spynel/prompts/task.md", ".spynel/prompts/review.md", ".spynel/prompts/goal-review.md", ".spynel/prompts/heartbeat.md", ".spynel/prompts/notification.md",
+		".spynel/instructions/agent-chat.md", ".spynel/instructions/agent-developer.md", ".spynel/instructions/agent-reviewer.md", ".spynel/instructions/agent-notification.md", ".spynel/instructions/agent-heartbeat.md",
 		".spynel/tasks/todo", ".spynel/tasks/working", ".spynel/tasks/review", ".spynel/tasks/reviewing", ".spynel/tasks/cancelled",
 		".spynel/goals/proposed", ".spynel/goals/planning", ".spynel/goals/active", ".spynel/goals/review", ".spynel/goals/reviewing", ".spynel/goals/abandoned",
 		".spynel/attachments", ".spynel/runtime/leases",
@@ -42,7 +43,20 @@ func TestInitCreatesDocumentedWorkspace(t *testing.T) {
 			t.Fatalf("missing initialized path %s: %v", path, err)
 		}
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	instructionEntries, err := os.ReadDir(filepath.Join(root, ".spynel", "instructions"))
+	if err != nil || len(instructionEntries) != 5 {
+		t.Fatalf("initialized instruction files = %d, %v", len(instructionEntries), err)
+	}
+	for _, entry := range instructionEntries {
+		info, statErr := entry.Info()
+		if statErr != nil {
+			t.Fatalf("instruction file %s metadata: %v", entry.Name(), statErr)
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			t.Fatalf("instruction file %s mode = %v", entry.Name(), info.Mode())
+		}
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +90,147 @@ func TestInitCreatesDocumentedWorkspace(t *testing.T) {
 	}
 	if err := Init(root, false); err == nil {
 		t.Fatal("second init should require --force")
+	}
+}
+
+func TestInitAndUpgradeRejectSymlinkedInstructionBoundaries(t *testing.T) {
+	previousDetection := detectCodingHarness
+	detectCodingHarness = func(func(string) (string, error)) (harness.Definition, string, bool) {
+		return harness.Definition{}, "", false
+	}
+	t.Cleanup(func() { detectCodingHarness = previousDetection })
+
+	for _, operation := range []struct {
+		name string
+		run  func(string) error
+	}{
+		{name: "init", run: func(root string) error { return Init(root, false) }},
+		{name: "upgrade", run: Upgrade},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			root := t.TempDir()
+			stateRoot := filepath.Join(root, ".spynel")
+			if err := os.Mkdir(stateRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			outside := t.TempDir()
+			if err := os.Symlink(outside, filepath.Join(stateRoot, "instructions")); err != nil {
+				t.Skipf("symlinks unavailable: %v", err)
+			}
+			if err := operation.run(root); err == nil || !strings.Contains(err.Error(), "must not be a symbolic link") {
+				t.Fatalf("%s error = %v", operation.name, err)
+			}
+			entries, err := os.ReadDir(outside)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("%s wrote through symlinked instructions directory: %#v, %v", operation.name, entries, err)
+			}
+		})
+	}
+}
+
+func TestUpgradeMigratesLegacyPersistentInstructionsSafely(t *testing.T) {
+	const custom = "Keep this exact workspace rule. ✓\n"
+	for _, test := range []struct {
+		name             string
+		legacy           *string
+		canonical        *string
+		wantErr          string
+		wantLegacy       bool
+		wantCanonical    string
+		legacyPermission os.FileMode
+	}{
+		{name: "legacy only", legacy: stringPointer(custom), wantCanonical: custom, legacyPermission: 0o400},
+		{name: "canonical only", canonical: stringPointer(custom), wantCanonical: custom},
+		{name: "identical dual", legacy: stringPointer(custom), canonical: stringPointer(custom), wantCanonical: custom},
+		{name: "conflicting dual", legacy: stringPointer("legacy rule\n"), canonical: stringPointer("canonical rule\n"), wantErr: "different content", wantLegacy: true, wantCanonical: "canonical rule\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, ".spynel", "instructions")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			legacyPath := filepath.Join(dir, "chat.md")
+			canonicalPath := filepath.Join(dir, "agent-chat.md")
+			if test.legacy != nil {
+				mode := test.legacyPermission
+				if mode == 0 {
+					mode = 0o600
+				}
+				if err := os.WriteFile(legacyPath, []byte(*test.legacy), mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.canonical != nil {
+				if err := os.WriteFile(canonicalPath, []byte(*test.canonical), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			err := Upgrade(root)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("Upgrade() error = %v, want %q", err, test.wantErr)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			got, readErr := os.ReadFile(canonicalPath)
+			if readErr != nil || string(got) != test.wantCanonical {
+				t.Fatalf("canonical content = %q, %v", got, readErr)
+			}
+			_, legacyErr := os.Stat(legacyPath)
+			if test.wantLegacy && legacyErr != nil {
+				t.Fatalf("conflicting legacy file was not preserved: %v", legacyErr)
+			}
+			if !test.wantLegacy && !os.IsNotExist(legacyErr) {
+				t.Fatalf("legacy file remains after migration: %v", legacyErr)
+			}
+			if test.legacyPermission != 0 && test.wantErr == "" {
+				info, statErr := os.Stat(canonicalPath)
+				if statErr != nil {
+					t.Fatal(statErr)
+				}
+				if info.Mode().Perm() != test.legacyPermission {
+					t.Fatalf("canonical mode = %v; want %v", info.Mode().Perm(), test.legacyPermission)
+				}
+			}
+			if test.wantErr == "" {
+				if err := Upgrade(root); err != nil {
+					t.Fatalf("repeated upgrade was not idempotent: %v", err)
+				}
+				if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+					t.Fatalf("repeated upgrade recreated legacy file: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func stringPointer(value string) *string { return &value }
+
+func TestUpgradeRejectsUnsafeLegacyPersistentInstruction(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".spynel", "instructions")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyPath := filepath.Join(dir, "chat.md")
+	if err := os.WriteFile(legacyPath, []byte("unsafe rule\n"), 0o622); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(legacyPath, 0o622); err != nil {
+		t.Fatal(err)
+	}
+	err := Upgrade(root)
+	if err == nil || !strings.Contains(err.Error(), "must not be group- or world-writable") {
+		t.Fatalf("Upgrade() error = %v", err)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("unsafe legacy file was not preserved: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "agent-chat.md")); !os.IsNotExist(err) {
+		t.Fatalf("unsafe legacy file was migrated: %v", err)
 	}
 }
 
@@ -151,6 +306,38 @@ func TestGoVerificationCacheContracts(t *testing.T) {
 	}
 	if !strings.Contains(string(ignored), "/bin/") || (!strings.Contains(string(ignored), "/.spynel-dev/") && !strings.Contains(string(ignored), ".spynel-dev/")) {
 		t.Fatal("verification binary and retained-evidence locations must be ignored")
+	}
+}
+
+func TestFrameworkPromptsEncodeRiskProportionateReview(t *testing.T) {
+	chat, err := Template("chat.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"expected value", "minor, localized, easily reversible changes", "explicit request for speed or no review", "Goal derivation alone never decides"} {
+		if !strings.Contains(string(chat), required) {
+			t.Errorf("communication prompt is missing review policy %q", required)
+		}
+	}
+
+	goal, err := Template("goal.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"Follow the injected configured task-review mode", "`always` forces `review_required: true`", "allow direct completion", "mandatory goal outcome review"} {
+		if !strings.Contains(string(goal), required) {
+			t.Errorf("goal prompt is missing review policy %q", required)
+		}
+	}
+
+	review, err := Template("review.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"If the workspace uses Git", "trivial, localized, low-risk corrections", "rerun the relevant verification", "requires design judgment"} {
+		if !strings.Contains(string(review), required) {
+			t.Errorf("review prompt is missing correction boundary %q", required)
+		}
 	}
 }
 
@@ -325,6 +512,15 @@ func TestUpgradeAddsReviewAssetsWithoutOverwritingPrompts(t *testing.T) {
 	if err := os.WriteFile(notificationPrompt, notificationCustom, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	instructionPath := filepath.Join(root, ".spynel", "instructions", "agent-developer.md")
+	instructionCustom := []byte("Keep this developer preference.\n")
+	if err := os.WriteFile(instructionPath, instructionCustom, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missingInstruction := filepath.Join(root, ".spynel", "instructions", "agent-reviewer.md")
+	if err := os.Remove(missingInstruction); err != nil {
+		t.Fatal(err)
+	}
 	reviewPrompt := filepath.Join(root, ".spynel", "prompts", "review.md")
 	if err := os.Remove(reviewPrompt); err != nil {
 		t.Fatal(err)
@@ -354,6 +550,12 @@ func TestUpgradeAddsReviewAssetsWithoutOverwritingPrompts(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(notificationPrompt); string(got) != string(notificationCustom) {
 		t.Fatal("upgrade overwrote a user notification prompt")
+	}
+	if got, _ := os.ReadFile(instructionPath); string(got) != string(instructionCustom) {
+		t.Fatal("upgrade overwrote user persistent instructions")
+	}
+	if _, err := os.Stat(missingInstruction); err != nil {
+		t.Fatalf("upgrade did not restore missing persistent instructions: %v", err)
 	}
 	if _, err := os.Stat(reviewPrompt); err != nil {
 		t.Fatal(err)
@@ -450,7 +652,7 @@ func TestCommunicationPromptDispatchesWorkAndStaysResponsive(t *testing.T) {
 		"Understood—this is being worked on.",
 		"Do not expose task or goal filenames",
 		"explicitly asks for technical details",
-		"/status`, `/jobs`, `/job info`, `/log`",
+		"/status`, `/jobs`, `/tasks`, `/goals`, `/job info`, `/log`",
 		"Telegram and WhatsApp, never include a local-path Markdown link",
 		"security implication, destructive effect, or failure",
 		"obtain the environment's current UTC time",
@@ -521,7 +723,7 @@ func TestInitLeavesHarnessSelectionOpenWhenNothingIsDetected(t *testing.T) {
 	if err := Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}

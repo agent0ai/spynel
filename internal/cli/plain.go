@@ -51,7 +51,7 @@ func (values *stringListFlag) Set(value string) error {
 
 func runSendCommand(name string, args []string, version string, followupOnly bool) error {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
-	configPath := flags.String("config", "", "path to spynel.yaml")
+	configPath := flags.String("config", "", "path to .spynel/config.yaml")
 	conversation := flags.String("conversation", "local", "durable CLI conversation name")
 	stream := flags.Bool("stream", false, "print response deltas as they arrive")
 	jsonOutput := flags.Bool("json", false, "emit response events as NDJSON")
@@ -83,15 +83,26 @@ func runSendCommand(name string, args []string, version string, followupOnly boo
 
 func runNotifyCommand(args []string, version string) error {
 	flags := flag.NewFlagSet("notify", flag.ContinueOnError)
-	configPath := flags.String("config", "", "path to spynel.yaml")
+	configPath := flags.String("config", "", "path to .spynel/config.yaml")
 	origin := flags.String("origin", "", "stable channel/conversation origin")
 	stdin := flags.Bool("stdin", false, "read the notification from standard input")
+	eventKey := flags.String("event-key", "", "stable internal notification identity")
+	outcome := flags.String("outcome", "", "task transition outcome for the stable identity")
+	decline := flags.Bool("decline", false, "record an authorized decide-mode no-send action")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	text, err := cliMessageText(flags.Args(), *stdin, os.Stdin)
-	if err != nil {
-		return fmt.Errorf("usage: spynel notify [--config PATH] --origin CHANNEL/CONVERSATION [--stdin] <message>: %w", err)
+	text := ""
+	var err error
+	if *decline {
+		if *stdin || len(flags.Args()) != 0 {
+			return errors.New("--decline cannot be combined with notification text or --stdin")
+		}
+	} else {
+		text, err = cliMessageText(flags.Args(), *stdin, os.Stdin)
+		if err != nil {
+			return fmt.Errorf("usage: spynel notify [--config PATH] --origin CHANNEL/CONVERSATION [--stdin] <message>: %w", err)
+		}
 	}
 	if strings.TrimSpace(*origin) == "" {
 		return errors.New("--origin is required")
@@ -106,19 +117,31 @@ func runNotifyCommand(args []string, version string) error {
 	if client, active, clientErr := activeWorkspaceClient(ctx, cfg); clientErr != nil {
 		return clientErr
 	} else if active {
-		id, err = client.Notify(ctx, *origin, text)
+		if *decline {
+			err = client.DeclineNotification(ctx, *origin, *eventKey, *outcome)
+		} else {
+			id, err = client.NotifyWithIdentity(ctx, *origin, text, *eventKey, *outcome)
+		}
 	} else {
 		service, buildErr := buildService(cfg, version)
 		if buildErr != nil {
 			return buildErr
 		}
 		defer service.Close()
-		id, err = service.Notify(ctx, *origin, text)
+		if *decline {
+			err = service.DeclineNotification(*origin, *eventKey, *outcome)
+		} else {
+			id, err = service.NotifyWithIdentity(ctx, *origin, text, *eventKey, *outcome)
+		}
 	}
 	if err != nil {
 		return err
 	}
-	fmt.Println("queued notification " + id)
+	if *decline {
+		fmt.Println("notification declined")
+	} else {
+		fmt.Println("queued notification " + id)
+	}
 	return nil
 }
 
@@ -152,8 +175,11 @@ func runFrameworkCLICommand(command string, args []string, version string) error
 	if name == "" {
 		name = "command"
 	}
+	if command == "tasks" || command == "goals" {
+		args = workflowListAliasArgs(args)
+	}
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
-	configPath := flags.String("config", "", "path to spynel.yaml")
+	configPath := flags.String("config", "", "path to .spynel/config.yaml")
 	conversation := flags.String("conversation", "local", "durable CLI conversation name")
 	jsonOutput := flags.Bool("json", false, "emit response events as NDJSON")
 	if err := flags.Parse(args); err != nil {
@@ -181,6 +207,33 @@ func runFrameworkCLICommand(command string, args []string, version string) error
 		text += " " + strings.Join(arguments, " ")
 	}
 	return runFrameworkMessageMode(*configPath, *conversation, text, version, messageRunOptions{JSON: *jsonOutput, Output: os.Stdout})
+}
+
+// workflowListAliasArgs keeps list-specific options in the slash-command
+// payload while still allowing the plain CLI's shared flags before them. Go's
+// flag parser stops at the inserted view token and leaves the rest untouched.
+func workflowListAliasArgs(args []string) []string {
+	for index := 0; index < len(args); index++ {
+		argument := args[index]
+		switch {
+		case argument == "--config" || argument == "--conversation":
+			if index+1 >= len(args) {
+				return args
+			}
+			index++
+		case argument == "--json" || strings.HasPrefix(argument, "--config=") || strings.HasPrefix(argument, "--conversation=") || strings.HasPrefix(argument, "--json="):
+			continue
+		case strings.HasPrefix(argument, "-"):
+			result := make([]string, 0, len(args)+1)
+			result = append(result, args[:index]...)
+			result = append(result, "open")
+			result = append(result, args[index:]...)
+			return result
+		default:
+			return args
+		}
+	}
+	return args
 }
 
 // runFrameworkMessageMode routes shared slash commands through the owner when
@@ -217,7 +270,7 @@ func runFrameworkMessageMode(configPath, conversation, text, version string, opt
 
 func runStatusCLICommand(args []string, version string, output io.Writer) error {
 	flags := flag.NewFlagSet("status", flag.ContinueOnError)
-	configPath := flags.String("config", "", "path to spynel.yaml")
+	configPath := flags.String("config", "", "path to .spynel/config.yaml")
 	conversation := flags.String("conversation", "local", "durable CLI conversation name")
 	jsonOutput := flags.Bool("json", false, "emit structured JSON")
 	if err := flags.Parse(args); err != nil {
@@ -297,7 +350,7 @@ func runConversationCommand(args []string, output io.Writer) error {
 
 func listCLIConversations(args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("conversations list", flag.ContinueOnError)
-	configPath := flags.String("config", "", "path to spynel.yaml")
+	configPath := flags.String("config", "", "path to .spynel/config.yaml")
 	limit := flags.Int("limit", defaultConversationLimit, "maximum conversations")
 	jsonOutput := flags.Bool("json", false, "emit a JSON array")
 	if err := flags.Parse(args); err != nil {
@@ -343,7 +396,7 @@ func listCLIConversations(args []string, output io.Writer) error {
 
 func showCLIConversation(args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("conversations show", flag.ContinueOnError)
-	configPath := flags.String("config", "", "path to spynel.yaml")
+	configPath := flags.String("config", "", "path to .spynel/config.yaml")
 	tail := flags.Int("tail", 50, "maximum newest entries")
 	characters := flags.Int("chars", 500000, "maximum formatted characters")
 	jsonOutput := flags.Bool("json", false, "emit structured JSON")
@@ -389,7 +442,7 @@ func showCLIConversation(args []string, output io.Writer) error {
 
 func resumeCLIConversation(args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("conversations resume", flag.ContinueOnError)
-	configPath := flags.String("config", "", "path to spynel.yaml")
+	configPath := flags.String("config", "", "path to .spynel/config.yaml")
 	jsonOutput := flags.Bool("json", false, "emit structured JSON")
 	if err := flags.Parse(args); err != nil {
 		return err

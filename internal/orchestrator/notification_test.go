@@ -46,12 +46,12 @@ func TestOutboxDeduplicatesAndRecoversRetryState(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "outbox")
 	now := time.Date(2026, 8, 7, 20, 0, 0, 0, time.UTC)
 	attempts := 0
-	outbox := &Outbox{Directory: directory, Now: func() time.Time { return now }, Deliver: func(context.Context, Origin, string, string) ([]string, error) {
+	outbox := &Outbox{Directory: directory, Now: func() time.Time { return now }, Deliver: func(context.Context, Origin, string, string) error {
 		attempts++
 		if attempts == 1 {
-			return nil, errors.New("offline")
+			return errors.New("offline")
 		}
-		return []string{"native-1"}, nil
+		return nil
 	}}
 	first, err := outbox.Enqueue("task-1", "done", "cli/local", "complete")
 	if err != nil {
@@ -95,7 +95,7 @@ func TestTaskCreationPolicyAllowsExplicitChildOverrideAndValidatesOutcomes(t *te
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	path, err := CreateWithOptions(cfg, "tasks", "child", "", CreateOptions{Notify: true, Origin: "cli/local", ParentTaskID: "parent", Outcomes: []string{"done"}})
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +118,7 @@ func TestGoalLinkedTaskCreationRequiresRoundAndPersistsStableReference(t *testin
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	if _, err := CreateWithOptions(cfg, "tasks", "bad link", "", CreateOptions{GoalID: "goal-1"}); err == nil {
 		t.Fatal("goal-linked task without a round was accepted")
 	}

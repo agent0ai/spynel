@@ -97,7 +97,7 @@ func New(executable string) (*Manager, error) {
 
 func (m *Manager) Sync(cfg config.Config, enabled bool) error {
 	if cfg.Path == "" {
-		return errors.New("cannot configure startup without a loaded spynel.yaml")
+		return errors.New("cannot configure startup without a loaded .spynel/config.yaml")
 	}
 	switch m.GOOS {
 	case "linux":
@@ -118,7 +118,11 @@ func (m *Manager) Sync(cfg config.Config, enabled bool) error {
 }
 
 func workspaceID(cfg config.Config) string {
-	hash := sha256.Sum256([]byte(filepath.Clean(cfg.Path)))
+	// Preserve the identifier used by pre-migration default workspaces so an
+	// existing service is replaced or removed instead of being orphaned when
+	// its command moves from root spynel.yaml to .spynel/config.yaml.
+	identityPath := filepath.Join(cfg.Root, config.LegacyFileName)
+	hash := sha256.Sum256([]byte(filepath.Clean(identityPath)))
 	return hex.EncodeToString(hash[:4])
 }
 

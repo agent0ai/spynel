@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/agent0ai/spynel/internal/config"
-	"github.com/agent0ai/spynel/internal/core"
 )
 
 func TestProactiveDeliveryReappliesTelegramAuthorization(t *testing.T) {
@@ -18,33 +17,23 @@ func TestProactiveDeliveryReappliesTelegramAuthorization(t *testing.T) {
 	}))
 	defer server.Close()
 	bot := New(config.Telegram{AllowedUsers: []string{"7"}, PollTimeoutSec: 30}, "token")
+	allowed := []string{"7"}
+	bot.SetAllowedUsersSource(func() []string { return allowed })
 	bot.baseURL = server.URL
-	receipt, err := bot.Deliver(context.Background(), "TG-7", "event-1", "complete")
-	if err != nil {
+	if err := bot.Deliver(context.Background(), "TG-7", "event-1", "complete"); err != nil {
 		t.Fatal(err)
-	}
-	if len(receipt.MessageIDs) != 1 || receipt.MessageIDs[0] != "91" {
-		t.Fatalf("receipt = %#v", receipt)
 	}
 	if requests != 1 {
 		t.Fatalf("requests = %d", requests)
 	}
-	if _, err := bot.Deliver(context.Background(), "TG-8", "event-2", "blocked"); err == nil {
+	if err := bot.Deliver(context.Background(), "TG-8", "event-2", "blocked"); err == nil {
 		t.Fatal("unauthorized Telegram origin delivered")
 	}
-}
-
-func TestTelegramInboundCarriesNativeReplyIdentity(t *testing.T) {
-	bot := New(config.Telegram{AllowedUsers: []string{"7"}}, "token")
-	var received core.Message
-	bot.processUpdate(context.Background(), func(_ context.Context, message core.Message, _ core.Emit) error {
-		received = message
-		return nil
-	}, telegramUpdate{Message: &telegramMessage{
-		MessageID: 303, From: telegramUser{ID: 7}, Chat: telegramChat{ID: 7, Type: "private"}, Date: 1, Text: "answer",
-		ReplyToMessage: &telegramMessage{MessageID: 91, From: telegramUser{ID: 99}},
-	}})
-	if received.NativeMessageID != "303" || received.NativeReplyToID != "91" {
-		t.Fatalf("native identity = %#v", received)
+	allowed = nil
+	if err := bot.Deliver(context.Background(), "TG-group-9", "event-3", "revoked"); err == nil {
+		t.Fatal("revoked Telegram group origin delivered")
+	}
+	if requests != 1 {
+		t.Fatalf("revoked delivery contacted Telegram: requests=%d", requests)
 	}
 }

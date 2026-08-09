@@ -112,18 +112,19 @@ func TestFreshConversationUsesConciseCopy(t *testing.T) {
 	}
 }
 
-func TestYouAndSpyPrefixesAlign(t *testing.T) {
+func TestYouSpyAndErrPrefixesAlign(t *testing.T) {
 	m := testModel()
 	user := ansi.Strip(m.renderTranscriptEntry(transcriptEntry{role: "user", text: "hello"}))
 	agent := ansi.Strip(m.renderTranscriptEntry(transcriptEntry{role: "assistant", text: "hello"}))
-	if strings.Contains(user, "›") || strings.Contains(agent, "›") {
-		t.Fatalf("sender separator remains: user=%q agent=%q", user, agent)
+	failure := ansi.Strip(m.renderTranscriptEntry(transcriptEntry{role: "error", text: "hello"}))
+	if strings.Contains(user, "›") || strings.Contains(agent, "›") || strings.Contains(failure, "›") {
+		t.Fatalf("sender separator remains: user=%q agent=%q error=%q", user, agent, failure)
 	}
-	if user != "You hello" || agent != "Spy hello" {
-		t.Fatalf("chat rows = %q and %q, want aligned sender prefixes", user, agent)
+	if user != "You hello" || agent != "Spy hello" || failure != "Err hello" {
+		t.Fatalf("chat rows = %q, %q, and %q; want aligned sender prefixes", user, agent, failure)
 	}
-	if userContent, agentContent := strings.Index(user, "hello"), strings.Index(agent, "hello"); userContent != chatContentColumn || agentContent != chatContentColumn {
-		t.Fatalf("message content is not aligned at column %d: user=%q agent=%q", chatContentColumn, user, agent)
+	if userContent, agentContent, errorContent := strings.Index(user, "hello"), strings.Index(agent, "hello"), strings.Index(failure, "hello"); userContent != chatContentColumn || agentContent != chatContentColumn || errorContent != chatContentColumn {
+		t.Fatalf("message content is not aligned at column %d: user=%q agent=%q error=%q", chatContentColumn, user, agent, failure)
 	}
 }
 
@@ -133,6 +134,7 @@ func TestMultilineChatMessagesKeepContentIndentation(t *testing.T) {
 		{role: "user", text: "first line\nsecond line"},
 		{role: "user", text: strings.Repeat("wrapped", 5)},
 		{role: "assistant", text: "first line\nsecond line"},
+		{role: "error", text: "first line\nsecond line"},
 	} {
 		lines := strings.Split(ansi.Strip(m.renderTranscriptEntry(entry)), "\n")
 		if len(lines) < 2 || !strings.HasPrefix(lines[1], strings.Repeat(" ", chatContentColumn)) {
@@ -1462,6 +1464,68 @@ func TestCtrlCStopsActiveHarnessWhenComposerIsEmpty(t *testing.T) {
 	}
 }
 
+func TestCtrlCLeavesEveryNonRequiredUISurfaceForMainChat(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*model)
+	}{
+		{name: "standalone dialog", setup: func(m *model) {
+			m.openDialog(dialogModel{
+				title:       "Notice",
+				cancelValue: "cancel",
+				options:     []dialogOption{{label: "Cancel", value: "cancel"}},
+			})
+		}},
+		{name: "dirty settings", setup: func(m *model) {
+			m.openScreen(core.Screen{ID: "config", Controls: []core.ScreenControl{{Key: "setting", Kind: "text", Value: "old"}}})
+			m.screen.Controls[0].Value = "new"
+		}},
+		{name: "confirmation dialog", setup: func(m *model) {
+			m.openScreen(core.Screen{ID: "telegram", Controls: []core.ScreenControl{{Key: "setting", Kind: "text", Value: "old"}}})
+			m.screen.Controls[0].Value = "new"
+			m.confirmDiscardScreenChanges()
+		}},
+		{name: "saving settings", setup: func(m *model) {
+			m.openScreen(core.Screen{ID: "whatsapp", Controls: []core.ScreenControl{{Key: "setting", Kind: "text", Value: "old"}}})
+			m.screenSaving = true
+		}},
+		{name: "fullscreen QR", setup: func(m *model) {
+			m.openScreen(core.Screen{ID: "wizard:whatsapp:pair", Controls: []core.ScreenControl{{Key: "show_qr", Kind: "action", Value: "Show QR"}}})
+			m.openScreen(core.Screen{ID: core.ScreenWhatsAppQR, ParentID: "wizard:whatsapp:pair", Banner: "QR", SaveDisabled: true})
+		}},
+		{name: "nested screen", setup: func(m *model) {
+			m.openScreen(core.Screen{ID: "config", Controls: []core.ScreenControl{{Key: "harness", Kind: "action", Value: "Harness"}}})
+			m.openScreen(core.Screen{ID: "harness", ParentID: "config", SaveDisabled: true, Controls: []core.ScreenControl{{Key: "select:codex", Kind: "action", Value: "Codex"}}})
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			m := testModel()
+			m.transcript = []transcriptEntry{{role: "assistant", text: "preserved chat"}}
+			test.setup(&m)
+			next, command := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+			m = next.(model)
+			if command != nil {
+				t.Fatalf("Ctrl+C returned command %#v instead of returning to chat", command)
+			}
+			if m.screen != nil || m.dialog != nil || len(m.screenStack) != 0 || m.status != "Ready" {
+				t.Fatalf("Ctrl+C did not return directly to chat: screen=%#v dialog=%#v stack=%d status=%q", m.screen, m.dialog, len(m.screenStack), m.status)
+			}
+			if len(m.transcript) != 1 || m.transcript[0] != (transcriptEntry{role: "assistant", text: "preserved chat"}) {
+				t.Fatalf("returning to chat changed transcript: %#v", m.transcript)
+			}
+
+			_, command = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+			if command == nil {
+				t.Fatal("Ctrl+C on the restored idle chat did not request exit")
+			}
+			if _, ok := command().(tea.QuitMsg); !ok {
+				t.Fatalf("Ctrl+C on the restored idle chat returned %T, want tea.QuitMsg", command())
+			}
+		})
+	}
+}
+
 func TestCommandMenuSurfaceHasConciseTitle(t *testing.T) {
 	m := testModel()
 	m.width = 80
@@ -2718,17 +2782,183 @@ func TestConfigurationScreenReplacesChatAndSupportsFormNavigation(t *testing.T) 
 	}
 	next, _ = m.Update(cmd())
 	m = next.(model)
-	if m.screenSaving || saved["channels.telegram.enabled"] != "on" || saved["channels.telegram.name"] != "spynel" {
-		t.Fatalf("unexpected saved form values: saving=%t values=%#v", m.screenSaving, saved)
+	if m.screenSaving || m.screen != nil || m.status != "Configuration saved" || saved["channels.telegram.enabled"] != "on" || saved["channels.telegram.name"] != "spynel" {
+		t.Fatalf("unexpected saved form result: screen=%#v saving=%t status=%q values=%#v", m.screen, m.screenSaving, m.status, saved)
 	}
 	if _, exists := saved["channels.telegram.token"]; exists {
 		t.Fatalf("unchanged configured secret was overwritten: %#v", saved)
 	}
+	if len(m.transcript) != 1 || m.transcript[0].text != "preserve chat" {
+		t.Fatalf("save did not restore preserved chat state: transcript=%#v", m.transcript)
+	}
+}
 
-	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+func TestSettingsSaveExitsConfigTelegramAndWhatsApp(t *testing.T) {
+	for _, screenID := range []string{"config", "telegram", "whatsapp"} {
+		t.Run(screenID, func(t *testing.T) {
+			m := testModel()
+			m.transcript = []transcriptEntry{{role: "assistant", text: "preserved chat"}}
+			var saved map[string]string
+			m.saveSettings = func(changes map[string]string) error {
+				saved = changes
+				return nil
+			}
+			m.openScreen(core.Screen{ID: screenID, Controls: []core.ScreenControl{{Key: "setting", Label: "setting", Kind: "text", Value: "old"}}})
+			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" value")})
+			m = next.(model)
+			next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+			m = next.(model)
+			if cmd == nil || !m.screenSaving {
+				t.Fatal("Ctrl+S did not start the save")
+			}
+			next, _ = m.Update(cmd())
+			m = next.(model)
+			if m.screen != nil || m.dialog != nil || m.status != "Configuration saved" || saved["setting"] != "old value" {
+				t.Fatalf("save result: screen=%#v dialog=%#v status=%q saved=%#v", m.screen, m.dialog, m.status, saved)
+			}
+			if len(m.transcript) != 1 || m.transcript[0].text != "preserved chat" {
+				t.Fatalf("preserved chat = %#v", m.transcript)
+			}
+		})
+	}
+}
+
+func TestSettingsSaveWithoutChangesExitsImmediately(t *testing.T) {
+	m := testModel()
+	m.saveSettings = func(map[string]string) error { t.Fatal("unchanged form called persistence"); return nil }
+	m.openScreen(core.Screen{ID: "config", Controls: []core.ScreenControl{{Key: "setting", Kind: "text", Value: "same"}}})
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	m = next.(model)
-	if m.screen != nil || len(m.transcript) != 1 || m.transcript[0].text != "preserve chat" {
-		t.Fatalf("Esc did not restore preserved chat state: screen=%#v transcript=%#v", m.screen, m.transcript)
+	if cmd != nil || m.screen != nil || m.status != "No configuration changes" {
+		t.Fatalf("unchanged save result: cmd=%#v screen=%#v status=%q", cmd, m.screen, m.status)
+	}
+}
+
+func TestSettingsSaveFailureKeepsEditedFormOpen(t *testing.T) {
+	m := testModel()
+	m.saveSettings = func(map[string]string) error { return fmt.Errorf("disk unavailable") }
+	m.openScreen(core.Screen{ID: "whatsapp", Controls: []core.ScreenControl{{Key: "setting", Kind: "text", Value: "old"}}})
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" value")})
+	m = next.(model)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m = next.(model)
+	next, _ = m.Update(cmd())
+	m = next.(model)
+	if m.screen == nil || m.screen.Controls[0].Value != "old value" || !m.screenDirty() || m.status != "Save failed: disk unavailable" {
+		t.Fatalf("failed save result: screen=%#v dirty=%t status=%q", m.screen, m.screenDirty(), m.status)
+	}
+}
+
+func TestSettingsEscapeConfirmsUnsavedChangesInModal(t *testing.T) {
+	for _, screenID := range []string{"config", "telegram", "whatsapp"} {
+		t.Run(screenID, func(t *testing.T) {
+			m := testModel()
+			m.width = 80
+			m.height = 24
+			m.transcript = []transcriptEntry{{role: "assistant", text: "preserved chat"}}
+			m.openScreen(core.Screen{ID: screenID, Controls: []core.ScreenControl{{Key: "setting", Label: "setting", Kind: "text", Value: "old"}}})
+			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" value")})
+			m = next.(model)
+
+			next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			m = next.(model)
+			view := ansi.Strip(m.View())
+			if m.screen == nil || m.dialog == nil || m.dialog.selected != 2 || !strings.Contains(view, "Unsaved changes") || !strings.Contains(view, "You have unsaved changes. What do you want to do?") || !strings.Contains(view, "Save") || !strings.Contains(view, "Discard") || !strings.Contains(view, "Keep editing") {
+				t.Fatalf("confirmation dialog: screen=%#v dialog=%#v view=%q", m.screen, m.dialog, view)
+			}
+			viewLines := strings.Split(view, "\n")
+			rawPopupLines := strings.Split(m.dialogView(m.width), "\n")
+			popupLines := strings.Split(ansi.Strip(strings.Join(rawPopupLines, "\n")), "\n")
+			popupTop := (m.height - len(popupLines)) / 2
+			popupLeft := (m.width - lipgloss.Width(popupLines[0])) / 2
+			if popupTop < 0 || popupTop >= len(viewLines) || strings.Index(viewLines[popupTop], "╭") != popupLeft {
+				t.Fatalf("dialog is not centered: top=%d left=%d view=%q", popupTop, popupLeft, view)
+			}
+			bottom := popupLines[len(popupLines)-1]
+			aboveBottom := popupLines[len(popupLines)-2]
+			hintIndex := strings.Index(bottom, "←→ nav")
+			if hintIndex < 0 || lipgloss.Width(bottom[:hintIndex]) != 3 || strings.Contains(bottom, "·") || !strings.Contains(bottom, "nav ─ ␠/↵ choose ─ ␛ cancel") || strings.Trim(aboveBottom, "│ ") != "" {
+				t.Fatalf("dialog hint border or bottom spacing = %q above %q", bottom, aboveBottom)
+			}
+			mutedHint := m.styles.footer.Background(m.styles.elevated.GetBackground()).Render("←→ nav")
+			if !strings.Contains(rawPopupLines[len(rawPopupLines)-1], mutedHint) {
+				t.Fatalf("dialog hints do not use the footer's muted semantic style: %q", rawPopupLines[len(rawPopupLines)-1])
+			}
+			for _, line := range viewLines {
+				if lipgloss.Width(line) > m.width {
+					t.Fatalf("dialog row exceeds terminal width %d: %q", m.width, line)
+				}
+			}
+
+			// Modal input must not leak into the form beneath it. Escape resolves
+			// to the safe default and keeps the unsaved value in memory.
+			next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ignored")})
+			m = next.(model)
+			if m.screen.Controls[0].Value != "old value" {
+				t.Fatalf("modal input changed underlying form: %q", m.screen.Controls[0].Value)
+			}
+			next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			m = next.(model)
+			if m.dialog != nil || m.screen == nil || m.screen.Controls[0].Value != "old value" {
+				t.Fatalf("safe cancel result: screen=%#v dialog=%#v", m.screen, m.dialog)
+			}
+
+			// Reopen, select Discard, and resolve the modal. Chat is restored only
+			// after that explicit destructive choice.
+			next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			m = next.(model)
+			next, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+			m = next.(model)
+			next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			m = next.(model)
+			if m.screen != nil || m.dialog != nil || m.status != "Changes discarded" || len(m.transcript) != 1 || m.transcript[0].text != "preserved chat" {
+				t.Fatalf("discard result: screen=%#v dialog=%#v status=%q transcript=%#v", m.screen, m.dialog, m.status, m.transcript)
+			}
+		})
+	}
+}
+
+func TestSettingsDialogSaveUsesValidatedSaveAndExits(t *testing.T) {
+	for _, screenID := range []string{"config", "telegram", "whatsapp"} {
+		t.Run(screenID, func(t *testing.T) {
+			m := testModel()
+			var saved map[string]string
+			m.saveSettings = func(changes map[string]string) error {
+				saved = changes
+				return nil
+			}
+			m.openScreen(core.Screen{ID: screenID, Controls: []core.ScreenControl{{Key: "setting", Kind: "text", Value: "old"}}})
+			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" value")})
+			m = next.(model)
+			next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			m = next.(model)
+
+			// Keep editing is the safe default at the right. Moving right wraps to
+			// the first visible action, Save.
+			next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRight})
+			m = next.(model)
+			next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			m = next.(model)
+			if cmd == nil || m.dialog != nil || !m.screenSaving {
+				t.Fatalf("dialog Save did not start persistence: cmd=%#v dialog=%#v saving=%t", cmd, m.dialog, m.screenSaving)
+			}
+			next, _ = m.Update(cmd())
+			m = next.(model)
+			if m.screen != nil || m.status != "Configuration saved" || saved["setting"] != "old value" {
+				t.Fatalf("dialog Save result: screen=%#v status=%q saved=%#v", m.screen, m.status, saved)
+			}
+		})
+	}
+}
+
+func TestCleanSettingsEscapeDoesNotPrompt(t *testing.T) {
+	m := testModel()
+	m.openScreen(core.Screen{ID: "telegram", Controls: []core.ScreenControl{{Key: "setting", Kind: "text", Value: "same"}}})
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(model)
+	if m.screen != nil || m.dialog != nil || m.status != "Ready" {
+		t.Fatalf("clean Escape result: screen=%#v dialog=%#v status=%q", m.screen, m.dialog, m.status)
 	}
 }
 
@@ -2774,6 +3004,28 @@ func TestSelectionScreenFocusesCurrentChoiceAndAppliesWithNavigation(t *testing.
 	m = next.(model)
 	if selected != "select:third" || m.screen != nil || m.status != "Selected third" {
 		t.Fatalf("selection result = %q, screen %#v, status %q", selected, m.screen, m.status)
+	}
+}
+
+func TestHarnessSelectionDisplaysApplicationConfirmation(t *testing.T) {
+	m := testModel()
+	m.screenAction = func(_ context.Context, screenID, action string, _ map[string]string) (*core.Screen, error) {
+		if screenID != "harness" || action != "select:codex" {
+			t.Fatalf("harness selection action = %q %q", screenID, action)
+		}
+		return &core.Screen{ActionMessage: "Saved `harness.name` = `codex` and connected the coding harness."}, nil
+	}
+	m.openScreen(core.Screen{ID: "harness", Controls: []core.ScreenControl{{Key: "select:codex", Kind: "action", Value: "Codex"}}})
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(model)
+	if cmd == nil {
+		t.Fatal("Enter did not apply harness selection")
+	}
+	next, _ = m.Update(cmd())
+	m = next.(model)
+	if m.screen != nil || len(m.transcript) != 1 || m.transcript[0].role != "assistant" || m.transcript[0].text != "Saved `harness.name` = `codex` and connected the coding harness." {
+		t.Fatalf("harness confirmation result: screen=%#v transcript=%#v", m.screen, m.transcript)
 	}
 }
 
@@ -2884,9 +3136,11 @@ func TestScreenFooterNeverAdvertisesTypingAsAControl(t *testing.T) {
 func TestNestedHarnessSelectionReturnsToPreservedConfigOnEscapeAndEnter(t *testing.T) {
 	m := testModel()
 	m.openScreen(core.Screen{ID: "config", Title: "Spynel configuration", Controls: []core.ScreenControl{
-		{Key: "harness", Kind: "action", Value: "Coding harness"},
-		{Key: "notes", Kind: "text", Value: "unsaved edit"},
+		{Key: "harness", Kind: "action", Value: "Coding harness · claude-code"},
+		{Key: "notes", Kind: "text", Value: "original"},
 	}})
+	m.screen.Controls[1].Value = "unsaved edit"
+	m.screenCursors[1] = len([]rune("unsaved edit"))
 	m.screenIndex = 1
 	m.screenAdvanced = true
 	m.screenScroll = 3
@@ -2906,7 +3160,7 @@ func TestNestedHarnessSelectionReturnsToPreservedConfigOnEscapeAndEnter(t *testi
 		if screenID != "harness" || action != "select:codex" {
 			t.Fatalf("selection action = %q %q", screenID, action)
 		}
-		return nil, nil
+		return &core.Screen{ActionMessage: "Saved `harness.name` = `codex` and connected the coding harness."}, nil
 	}
 	m.openScreen(core.Screen{ID: "harness", ParentID: "config", Title: "Coding harness", SaveDisabled: true, Controls: []core.ScreenControl{
 		{Key: "select:codex", Kind: "action", Value: "Codex"},
@@ -2918,7 +3172,7 @@ func TestNestedHarnessSelectionReturnsToPreservedConfigOnEscapeAndEnter(t *testi
 	}
 	next, _ = m.Update(cmd())
 	m = next.(model)
-	if m.screen == nil || m.screen.ID != "config" || m.screen.Controls[1].Value != "unsaved edit" || m.status != "Selected codex" {
+	if m.screen == nil || m.screen.ID != "config" || m.screen.Controls[0].Value != "Coding harness · codex" || m.screen.Controls[1].Value != "unsaved edit" || m.status != "Selected codex" || len(m.transcript) != 1 || m.transcript[0].text != "Saved `harness.name` = `codex` and connected the coding harness." {
 		t.Fatalf("Enter did not return to config: screen=%#v status=%q", m.screen, m.status)
 	}
 }
@@ -3509,6 +3763,17 @@ func TestRequiredInitializationScreenActionsAndCannotFallIntoChat(t *testing.T) 
 	if m.screen == nil || m.screenResult != "exit" || quit == nil {
 		t.Fatalf("required setup escaped into chat: screen=%#v result=%q", m.screen, m.screenResult)
 	}
+
+	m = testModel()
+	m.openScreen(InitializationScreen("/workspace/new"))
+	next, quit = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = next.(model)
+	if m.screen == nil || m.screenResult != "exit" || quit == nil {
+		t.Fatalf("required setup handled Ctrl+C as a return to chat: screen=%#v result=%q", m.screen, m.screenResult)
+	}
+	if _, ok := quit().(tea.QuitMsg); !ok {
+		t.Fatalf("required setup Ctrl+C returned %T, want tea.QuitMsg", quit())
+	}
 }
 
 func TestSpynelLogoIsBlankBeforeFirstMessageAndUsesRequestedFrames(t *testing.T) {
@@ -3523,6 +3788,43 @@ func TestSpynelLogoIsBlankBeforeFirstMessageAndUsesRequestedFrames(t *testing.T)
 	workingFrames := []string{"⠋", "⠙", "⠸", "⠴", "⠦", "⠇"}
 	if got := m.workingSpinner.Spinner.Frames; strings.Join(got, "") != strings.Join(workingFrames, "") {
 		t.Fatalf("Working spinner frames = %q, want %q", got, workingFrames)
+	}
+}
+
+func TestMainAgentActivityEventDrivesWorkingAnimationBeforeOutput(t *testing.T) {
+	m := testModel()
+	next, _ := m.Update(uiEvent{event: core.Event{Kind: core.EventActivity, Active: true}})
+	got := next.(model)
+	if !got.working || got.status != "Harness working" {
+		t.Fatalf("active main-agent state = working %t, status %q", got.working, got.status)
+	}
+	next, _ = got.Update(uiEvent{event: core.Event{Kind: core.EventActivity}})
+	got = next.(model)
+	if got.working {
+		t.Fatal("inactive main-agent event left the TUI animation running")
+	}
+}
+
+func TestMainAgentActivityReplacementDoesNotClearNewerTurn(t *testing.T) {
+	m := testModel()
+	for _, event := range []core.Event{
+		{Kind: core.EventActivity, Active: true},
+		{Kind: core.EventActivity, Active: true},
+		{Kind: core.EventActivity},
+		{Kind: core.EventStatus, Done: true},
+		{Kind: core.EventFinal, Text: "replaced response", Done: true},
+	} {
+		next, _ := m.Update(uiEvent{event: event})
+		m = next.(model)
+	}
+	if !m.working || m.mainAgentActivity != 1 || m.status != "Harness working" {
+		t.Fatalf("replacement handoff state = working %t, activity %d, status %q", m.working, m.mainAgentActivity, m.status)
+	}
+
+	next, _ := m.Update(uiEvent{event: core.Event{Kind: core.EventActivity}})
+	m = next.(model)
+	if m.working || m.mainAgentActivity != 0 {
+		t.Fatalf("replacement completion state = working %t, activity %d", m.working, m.mainAgentActivity)
 	}
 }
 

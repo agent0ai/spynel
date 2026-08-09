@@ -17,13 +17,55 @@ import (
 const (
 	codexFixtureProvenance  = "codex-app-server-public-schema-retrieved-2026-08-07"
 	claudeFixtureProvenance = "claude-code-stream-json-docs-retrieved-2026-08-07"
+	piFixtureProvenance     = "pi-jsonl-rpc-docs-retrieved-2026-08-08"
+	acpFixtureProvenance    = "acp-stable-v1-schema-retrieved-2026-08-08"
 )
 
 func TestCompatibilityFixtureProvenanceIsVersionLabeled(t *testing.T) {
-	for _, label := range []string{codexFixtureProvenance, claudeFixtureProvenance} {
-		if !strings.Contains(label, "2026-08-07") {
+	for _, label := range []string{codexFixtureProvenance, claudeFixtureProvenance, piFixtureProvenance, acpFixtureProvenance} {
+		if !strings.Contains(label, "retrieved-2026-08-") {
 			t.Fatalf("fixture provenance is not retrieval-version labeled: %q", label)
 		}
+	}
+}
+
+func TestPiRejectsStateWithoutSessionIdentity(t *testing.T) {
+	command, root, _ := portableHarnessFixture(t, "pi-state-missing-session")
+	sessions := filepath.Join(root, "sessions.json")
+	pi, err := NewPi(HarnessConfig{Command: command, Cwd: root, SessionsFile: sessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := pi.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer pi.Close()
+	_, _, err = pi.Send(ctx, "chat", "test", nil)
+	if err == nil || !strings.Contains(err.Error(), "missing sessionId or sessionFile") {
+		t.Fatalf("Pi state compatibility error = %v", err)
+	}
+	if _, statErr := os.Stat(sessions); !os.IsNotExist(statErr) || pi.ThreadID("chat") != "" {
+		t.Fatalf("incompatible Pi session was persisted: id %q, stat %v", pi.ThreadID("chat"), statErr)
+	}
+}
+
+func TestACPRejectsNonV1InitializeWithoutPersistence(t *testing.T) {
+	command, root, _ := portableHarnessFixture(t, "acp-version-mismatch")
+	sessions := filepath.Join(root, "sessions.json")
+	adapter, err := NewACP(HarnessConfig{Command: command, Cwd: root, SessionsFile: sessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = adapter.Start(ctx)
+	if err == nil || !strings.Contains(err.Error(), "protocol version 2") || !strings.Contains(err.Error(), "stable v1") {
+		t.Fatalf("ACP version compatibility error = %v", err)
+	}
+	if _, statErr := os.Stat(sessions); !os.IsNotExist(statErr) {
+		t.Fatalf("ACP version mismatch created a session map: %v", statErr)
 	}
 }
 

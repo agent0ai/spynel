@@ -216,7 +216,7 @@ func TestClientStatusIdentifiesCallerAndPrimaryInstances(t *testing.T) {
 		lease, _ := primary.Current()
 		_ = primary.Release(lease.Token)
 	}()
-	secondary, err := instance.New(state)
+	secondary, err := instance.New(filepath.Join(state, config.StateDirectoryName))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,19 +250,18 @@ func startTestServer(t *testing.T, state string) (*instance.Election, *Server, *
 	t.Helper()
 	cfg := config.Default()
 	cfg.Root = state
-	cfg.Path = filepath.Join(state, config.FileName)
-	cfg.Workspace.StateDir = "."
+	cfg.Path = config.PathForRoot(state)
 	cfg.Extensions.Enabled = false
 	cfg.Orchestrator.Enabled = false
-	if err := os.MkdirAll(filepath.Join(state, "prompts"), 0o700); err != nil {
+	if err := os.MkdirAll(cfg.StatePath("prompts"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(state, "prompts", "chat.md"), []byte("{{RECENT_HISTORY}}\n"), 0o600); err != nil {
+	if err := os.WriteFile(cfg.StatePath("prompts", "chat.md"), []byte("{{RECENT_HISTORY}}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	target := newAPIHarness()
 	service := app.New(cfg, target)
-	election, err := instance.New(state)
+	election, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)
 	}

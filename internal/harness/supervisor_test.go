@@ -358,6 +358,96 @@ func TestSupervisorQueuesFollowUpWhenHarnessCannotSteer(t *testing.T) {
 	}
 }
 
+func TestSupervisorBatchesAccumulatedConversationFollowUps(t *testing.T) {
+	target := &supervisorHarness{
+		name: "acp", followUp: FollowUpQueue, active: map[string]bool{}, emits: map[string]core.Emit{},
+	}
+	registry := NewRegistry()
+	registry.Register("acp", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "acp"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.SendConversation(context.Background(), "chat", "initial prompt", "initial", nil); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var events [3][]core.Event
+	for index, message := range []string{"first queued", "second queued", "third queued"} {
+		index, message := index, message
+		if _, queued, err := supervisor.SendConversation(context.Background(), "chat", "snapshot "+message, message, func(event core.Event) {
+			mu.Lock()
+			events[index] = append(events[index], event)
+			mu.Unlock()
+		}); err != nil || !queued {
+			t.Fatalf("queue %d = steered %t, error %v", index, queued, err)
+		}
+	}
+	target.finish("chat")
+	waitSupervisorState(t, func() bool { return target.IsActive("chat") })
+	target.mu.Lock()
+	prompts := append([]string(nil), target.prompts["chat"]...)
+	target.mu.Unlock()
+	if len(prompts) != 2 {
+		t.Fatalf("provider turns = %d, want initial plus one batch: %#v", len(prompts), prompts)
+	}
+	batch := prompts[1]
+	if !strings.HasPrefix(batch, "snapshot third queued") {
+		t.Fatalf("batch did not reuse newest conversation snapshot: %q", batch)
+	}
+	for index, message := range []string{"first queued", "second queued", "third queued"} {
+		if !strings.Contains(batch, fmt.Sprintf("<queued_followup index=\"%d\">\n%s\n", index+1, message)) {
+			t.Fatalf("batch lost ordered message %d: %q", index, batch)
+		}
+	}
+	mu.Lock()
+	for index := 0; index < 2; index++ {
+		foundRelease := false
+		for _, event := range events[index] {
+			foundRelease = foundRelease || event.Kind == core.EventStatus && event.Done
+		}
+		if !foundRelease {
+			mu.Unlock()
+			t.Fatalf("queued emitter %d was not released: %#v", index, events[index])
+		}
+	}
+	mu.Unlock()
+	target.finish("chat")
+	mu.Lock()
+	latest := append([]core.Event(nil), events[2]...)
+	mu.Unlock()
+	foundFinal := false
+	for _, event := range latest {
+		foundFinal = foundFinal || event.Kind == core.EventFinal && event.Done && !event.Continues
+	}
+	if !foundFinal || supervisor.IsActive("chat") {
+		t.Fatalf("batched final = %#v, active %t", latest, supervisor.IsActive("chat"))
+	}
+}
+
+func TestQueuedConversationBatchCanAbsorbMessagesArrivingDuringHandoff(t *testing.T) {
+	emit := func(core.Event) {}
+	first, consumed := mergeQueuedConversationPrompts([]pendingSend{
+		{prompt: "snapshot two", message: "one", emit: emit},
+		{prompt: "snapshot two", message: "two", emit: emit},
+	})
+	if consumed != 2 || len(first.messages) != 2 || len(first.release) != 1 {
+		t.Fatalf("initial queued batch = %#v, consumed %d", first, consumed)
+	}
+	combined, consumed := mergeQueuedConversationPrompts([]pendingSend{
+		first,
+		{prompt: "snapshot three", message: "three", emit: emit},
+	})
+	if consumed != 2 || len(combined.messages) != 3 || len(combined.release) != 2 {
+		t.Fatalf("handoff batch = messages %#v releases %d consumed %d", combined.messages, len(combined.release), consumed)
+	}
+	for index, message := range []string{"one", "two", "three"} {
+		if !strings.Contains(combined.prompt, fmt.Sprintf("<queued_followup index=\"%d\">\n%s\n", index+1, message)) {
+			t.Fatalf("handoff batch lost message %d: %q", index, combined.prompt)
+		}
+	}
+}
+
 func TestSupervisorControlRetainsEmitterAndContinuesOnlyOnce(t *testing.T) {
 	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}}
 	registry := NewRegistry()

@@ -20,6 +20,7 @@ type fakeHarness struct {
 	mu         sync.Mutex
 	calls      int
 	keys       []string
+	prompts    []string
 	threads    map[string]string
 	active     map[string]bool
 	beforeEmit func()
@@ -45,10 +46,11 @@ func (f *fakeHarness) Interrupt(_ context.Context, key string) (bool, error) {
 	f.active[key] = false
 	return true, nil
 }
-func (f *fakeHarness) Send(_ context.Context, key, _ string, emit core.Emit) (string, bool, error) {
+func (f *fakeHarness) Send(_ context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
 	f.mu.Lock()
 	f.calls++
 	f.keys = append(f.keys, key)
+	f.prompts = append(f.prompts, prompt)
 	thread := f.threads[key]
 	if thread == "" {
 		thread = "thread-" + key
@@ -74,7 +76,7 @@ func TestImplementationDoneMoveIsReconciledIntoIndependentReview(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	task, err := Create(cfg, "tasks", "move and release", "")
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +153,7 @@ func TestProviderCompletionRemainsAwaitingTransitionUntilDurableMove(t *testing.
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	task, err := Create(cfg, "tasks", "await durable move", "")
 	if err != nil {
 		t.Fatal(err)
@@ -201,7 +203,7 @@ func TestClaimLeasePreventsDuplicatesAndStaleLeaseRecovers(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +283,7 @@ func TestFutureDispatchTimeDefersGoalPlanning(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	goal, err := Create(cfg, "goals", "review this later", "")
 	if err != nil {
 		t.Fatal(err)
@@ -315,7 +317,7 @@ func TestFutureCheckpointDoesNotDeferImplementationOrPlanning(t *testing.T) {
 			if err := workspace.Init(root, false); err != nil {
 				t.Fatal(err)
 			}
-			cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+			cfg, _ := config.Load(config.PathForRoot(root))
 			path, err := Create(cfg, route, "checkpoint belongs to active goals", "")
 			if err != nil {
 				t.Fatal(err)
@@ -351,7 +353,7 @@ func TestReviewTransitionAcceptRejectAndSelfReviewGuard(t *testing.T) {
 			if err := workspace.Init(root, false); err != nil {
 				t.Fatal(err)
 			}
-			cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+			cfg, _ := config.Load(config.PathForRoot(root))
 			route := cfg.Orchestrator.Routes[0]
 			reviewDir := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "review")
 			path := filepath.Join(filepath.Dir(reviewDir), "reviewing", "review.md")
@@ -392,7 +394,7 @@ func TestReviewDispatchUsesFreshAttemptSessionAcrossRestart(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	route := cfg.Orchestrator.Routes[0]
 	path := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "review", "retry.md")
 	if err := WriteDocument(path, Document{FrontMatter: map[string]any{"id": "retry", "title": "retry", "status": "review", "created_at": time.Now().UTC().Format(time.RFC3339), "updated_at": time.Now().UTC().Format(time.RFC3339)}, Body: "# retry\n"}); err != nil {
@@ -423,7 +425,7 @@ func TestControlReservationsPersistAndRefreshRegisteredDurableJob(t *testing.T) 
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +469,7 @@ func TestPrepareControlContinuationRevalidatesLeaseOwnerAndDurableState(t *testi
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	target := newFakeRecipient()
 	manager := New(cfg, target, extensions.Runner{})
 	path := filepath.Join(cfg.StatePath("tasks", "working"), "control.md")
@@ -527,7 +529,7 @@ func TestTransportOnlyDoneStatusDoesNotEndOrchestratorProviderTurn(t *testing.T)
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	if _, err := Create(cfg, "tasks", "retain native control emitter", ""); err != nil {
 		t.Fatal(err)
 	}

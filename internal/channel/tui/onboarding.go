@@ -26,7 +26,7 @@ func InitializationScreen(root string) core.Screen {
 			{Key: "␛", Action: "exit"},
 		},
 		Controls: []core.ScreenControl{
-			{Key: "initialize", Kind: "action", Value: "Initialize Spynel in " + root, Description: "Create spynel.yaml and the private .spynel workspace"},
+			{Key: "initialize", Kind: "action", Value: "Initialize Spynel in " + root, Description: "Create the private .spynel workspace and its config.yaml"},
 			{Key: "exit", Kind: "action", Value: "Exit", Description: "Leave this directory unchanged"},
 		},
 	}

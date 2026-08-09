@@ -3,7 +3,8 @@
 This document is the compatibility baseline for Spynel's built-in coding
 harnesses. It separates provider documentation, behavior exercised by Spynel's
 deterministic tests, and behavior that still needs a real-provider or native-OS
-canary. Provider documentation was retrieved on **2026-08-07**.
+canary. Codex and Claude documentation was retrieved on **2026-08-07**; Pi and
+ACP documentation and registry manifests were retrieved on **2026-08-08**.
 
 Any future authenticated or native-provider run must follow the separately
 reviewed [provider-canary threat model and authorization plan](provider-canary-threat-model.md).
@@ -19,11 +20,11 @@ That plan is a gate, not evidence that a canary has run.
   the behavior on the claimed provider version and operating system.
 - **Unsupported** means Spynel deliberately has no integration for the surface.
 
-Spynel integrates with the `codex` executable's documented app-server protocol
-over stdio and with the `claude` executable's documented non-interactive print
-mode. The provider-neutral contract is `Harness`, with optional model and
-follow-up capabilities ([implementation](../internal/harness/harness.go)); the
-built-in registration and executable discovery boundary is centralized in the
+Spynel integrates with Codex app-server, Claude Code non-interactive print
+mode, Pi JSONL RPC, and stable ACP v1 JSON-RPC over stdio. The
+provider-neutral contract is `Harness`, with optional model and follow-up
+capabilities ([implementation](../internal/harness/harness.go)); registration,
+aliases, fixed arguments, and executable discovery are centralized in the
 [catalog](../internal/harness/catalog.go).
 
 The native desktop surface that OpenAI currently documents as the **ChatGPT
@@ -44,6 +45,8 @@ interchangeable.
 | --- | --- | --- | --- | --- |
 | Codex CLI/app-server | `codex app-server --stdio`; documented JSONL request/response and notification methods | **Not established.** No primary evidence establishes one numeric lower bound. Spynel instead requires the documented initialize result and validates each consumed method/result/terminal shape at its earliest safe use. | `codex-cli 0.147.0` was found at `/usr/bin/codex` on Linux arm64; `codex app-server --help` exposed stdio and schema tooling. Synthetic current and incompatible schema variants pass; no authenticated request was sent. | Supported implementation boundary with fail-closed capability diagnostics; provider-version compatibility remains provisional until versioned canaries exist. See [Codex adapter](../internal/harness/codex.go), [variant tests](../internal/harness/compatibility_test.go), and the official [app-server protocol](https://developers.openai.com/codex/app-server/). |
 | Claude Code CLI | `claude -p` with `stream-json` output and either text or `stream-json` input | **Not established.** No primary evidence establishes one numeric lower bound. At startup Spynel requires every CLI flag needed by the configured mode from `claude --help`; the first turn must negotiate the documented `system/init` event with `session_id`. | Claude Code `2.1.224` was found at `/root/.local/bin/claude` on Linux arm64; `claude --help` exposed every flag Spynel uses. Synthetic current and incompatible help/stream variants pass; no authenticated request was sent. | Supported implementation boundary with fail-closed flag and stream-initialization diagnostics; provider-version compatibility remains provisional until versioned canaries exist. See [Claude adapter](../internal/harness/claude.go), [variant tests](../internal/harness/compatibility_test.go), and Anthropic's [programmatic-use documentation](https://code.claude.com/docs/en/headless). |
+| Pi coding agent | `pi --mode rpc`; documented JSONL commands and events | **Not established.** Spynel requires a non-empty `--version`, successful `get_state`, and both queue-mode configuration commands. | `@earendil-works/pi-coding-agent` `0.84.1` was installed on Linux arm64. Keyless `PI_OFFLINE=1` RPC negotiation succeeded; synthetic lifecycle, steering, cancellation, model, and resume tests pass. No model request was sent. | Supported native RPC boundary; authenticated model/tool behavior remains unverified. See the [Pi adapter](../internal/harness/pi.go), [tests](../internal/harness/pi_test.go), and official [RPC documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md). |
+| ACP v1 agents | Newline-delimited JSON-RPC 2.0 over a launched command's stdin/stdout | Protocol version **1**, negotiated by `initialize`; there is no numeric minimum agent release. | Synthetic initialize, session setup/resume, config-option, streaming, permission, cancellation, persistence, and shell-free argument tests pass. Alias commands were checked against official ACP registry manifests; no alias executable or authenticated provider was run. | Supported shared adapter for catalog aliases and custom commands. Stable v1 stdio is supported; draft HTTP transport is deliberately unsupported. See the [ACP adapter](../internal/harness/acp.go), [tests](../internal/harness/acp_test.go), official [transport](https://agentclientprotocol.com/protocol/v1/transports), and [initialization](https://agentclientprotocol.com/protocol/v1/initialization) specifications. |
 | ChatGPT desktop app / Codex workspace | None | Not applicable | The app was not available on the Linux audit host. Official app documentation was reviewed; it does not document an app-local automation interface usable by Spynel. | **Unsupported as an integration surface.** Users need a separately discoverable `codex` CLI. See the [catalog](../internal/harness/catalog.go) and official [desktop app page](https://developers.openai.com/codex/app/). |
 
 “Current audit evidence” is deliberately narrower than “certified provider
@@ -52,16 +55,30 @@ prove authentication, tool execution, or provider-side session recovery. An
 incompatible executable now fails at startup or the earliest documented
 negotiation point, before a new or resumed session identifier is overwritten.
 
+## Pi and ACP lifecycle coverage
+
+The older matrix below remains the detailed Codex/Claude/desktop comparison.
+The newer adapters have this narrower evidence:
+
+| Capability | Pi RPC | ACP v1 and aliases |
+| --- | --- | --- |
+| Startup and transport | **Tested:** exact executable/cwd launch, bounded `--version`, strict JSONL, `get_state`, and queue modes. Non-JSON stdout fails closed. | **Tested:** exact command plus argument vector, absolute cwd, JSON-RPC 2.0 framing, and protocol-version-1 initialize. ACP stable transport is stdio; custom URL configuration is intentionally absent. |
+| Streaming and completion | **Tested:** text deltas and authoritative assistant-message endings are aggregated; only `agent_settled` is terminal because `agent_end` may precede retry or continuation. | **Tested:** `session/update` agent chunks and tool status stream until the `session/prompt` response supplies a stop reason. |
+| Follow-up and interruption | **Tested native steer:** `steer` transfers output to the newest emitter; `abort` interrupts. | **Tested queue/cancel:** ACP v1 has no prompt-steer method. Accumulated adjacent chat messages form one ordered next prompt; `/stop` sends `session/cancel`. |
+| Resume and settings | **Tested:** session-file path and policy fingerprint persist; model/thought/tool choices become RPC CLI flags. | **Tested:** opaque session IDs persist; advertised `session/resume` is preferred over `session/load`; model/thought overrides use category-matched config options. |
+| Permissions | **Tested mapping:** read-only enables only Pi read/search tools. Pi provides no OS sandbox through RPC. | **Tested mapping:** Spynel advertises no filesystem/terminal client callbacks. Read-only auto-rejects unsafe permission requests; broader modes choose one-time allowance. Agents that skip permission requests remain trusted local processes. |
+
 ## Synthetic protocol variants
 
 The portable fixture process and compatibility suite are labelled
-`codex-app-server-public-schema-retrieved-2026-08-07` and
-`claude-code-stream-json-docs-retrieved-2026-08-07`. They exercise the supported
-current initialization, method, result-field, stream-event, and terminal-error
-shapes plus representative missing-method, missing-flag, renamed-field,
-changed-init-event, and changed-terminal-status variants. The incompatible
-resume and initialization cases assert that existing session mappings remain
-byte-for-byte unchanged and that no new mapping is written.
+`codex-app-server-public-schema-retrieved-2026-08-07`,
+`claude-code-stream-json-docs-retrieved-2026-08-07`,
+`pi-jsonl-rpc-docs-retrieved-2026-08-08`, and
+`acp-stable-v1-schema-retrieved-2026-08-08`. They exercise supported lifecycle
+shapes plus representative missing methods/flags/identity fields, renamed
+fields, changed initialization events/versions, and changed terminal statuses.
+Incompatible session and initialization cases assert that no invalid mapping
+is persisted.
 
 These are synthetic public-interface snapshots, not captured authenticated
 transcripts. Update both labels and affected variants whenever the retrieval

@@ -62,7 +62,7 @@ func (s *Service) channelNeedsSetup(section string) bool {
 	cfg := s.Settings.Snapshot()
 	switch section {
 	case "telegram":
-		return strings.TrimSpace(cfg.TelegramToken()) == "" || !hasCommaSeparatedValue(strings.Join(cfg.Channels.Telegram.AllowedUsers, ","))
+		return strings.TrimSpace(cfg.TelegramToken()) == "" || !config.HasAllowedTelegramUser(cfg.Channels.Telegram.AllowedUsers)
 	case "whatsapp":
 		return !config.HasAllowedWhatsAppNumber(cfg.Channels.WhatsApp.AllowedNumbers)
 	default:
@@ -80,8 +80,8 @@ func (s *Service) WelcomeScreen() core.Screen {
 func (s *Service) welcomeText(channelName string) string {
 	lines := []string{
 		"👋 Hey, I'm **Spynel** — you can call me **Spy**.", "",
-		"I handle tasks and orchestrate agents. Just tell me your objectives and leave the rest to me.",
-		"Feel free to ask me for updates anytime or have me get things done. 👍",
+		"My classic, non-AI core organizes work for external coding agents through one assistant relationship.",
+		"Share an objective from your desk or phone; I'll coordinate the work and ask when your input is needed. 👍",
 		"", "- type `/help` if you ever feel lost",
 	}
 	if channelName == "tui" {
@@ -376,7 +376,7 @@ func (s *Service) telegramWizardScreen(step string, values map[string]string) co
 		screen.Controls = wizardActions("I have the token", true)
 		state = telegramWizardState(token, allowed, enabled)
 	case "token":
-		screen.Subtitle = "Paste the complete token from BotFather below. It is stored in the private `spynel.yaml` file and never shown in configuration replies or history. Leave it blank only if a token is already configured through the file or environment."
+		screen.Subtitle = "Paste the complete token from BotFather below. It is stored in the private `.spynel/config.yaml` file and never shown in configuration replies or history. Leave it blank only if a token is already configured through the file or environment."
 		screen.Controls = []core.ScreenControl{
 			{Key: telegramTokenKey, Label: "bot token", Kind: "password", Value: token, Secret: true, Configured: cfg.TelegramToken() != "", Description: "Paste the token exactly as BotFather supplied it"},
 			{Key: "next", Kind: "action", Value: "Continue", Description: "Keep this token in memory and choose who may use the bot"},
@@ -629,16 +629,19 @@ func (s *Service) harnessCommand(message core.Message, remainder string, emit co
 	if strings.TrimSpace(remainder) != "" {
 		name := harness.NormalizeName(remainder)
 		if _, ok := harness.Lookup(name); !ok {
-			return s.localReply(message, "Unknown coding harness `"+name+"`. Choose `codex` or `claude-code`.", emit)
+			return s.localReply(message, "Unknown coding harness `"+name+"`. Choose one of: `"+strings.Join(harness.Names(), "`, `")+"`.", emit)
 		}
 		if _, err := s.ApplySettings(map[string]string{"harness.name": name}); err != nil {
 			return s.localReply(message, "Cannot select coding harness: "+err.Error(), emit)
 		}
-		if _, err := harness.ResolveCommand(name, nil); err != nil {
+		if _, err := s.resolveHarnessCommand(name); err != nil {
 			definition, _ := harness.Lookup(name)
+			if definition.Custom {
+				return s.localReply(message, "Saved `harness.name` = `acp`, but the custom ACP command is unavailable. Set `harness.acp_command` and optional JSON-array `harness.acp_args`, then run `/harness acp` again.", emit)
+			}
 			return s.localReply(message, fmt.Sprintf("Saved `harness.name` = `%s`. **%s** is not installed or not on PATH. Install it from %s, then run `/harness %s` again to connect.", name, definition.DisplayName, definition.InstallURL, name), emit)
 		}
-		return s.localReply(message, "Saved `harness.name` = `"+name+"` and connected the coding harness.", emit)
+		return s.localReply(message, harnessSelectionMessage(name), emit)
 	}
 	if message.Channel == "tui" && emit != nil {
 		screen := s.HarnessScreen(false)
@@ -649,13 +652,19 @@ func (s *Service) harnessCommand(message core.Message, remainder string, emit co
 	lines := []string{"# Coding harnesses", "", "Active: `" + current + "`", ""}
 	for _, definition := range harness.Catalog() {
 		status := "not installed"
-		if _, err := harness.ResolveCommand(definition.Name, nil); err == nil {
+		if _, err := s.resolveHarnessCommand(definition.Name); err == nil {
 			status = "detected"
+		} else if definition.Custom {
+			status = "not configured"
 		}
 		lines = append(lines, fmt.Sprintf("- `%s` — %s (%s)", definition.Name, definition.DisplayName, status))
 	}
 	lines = append(lines, "", "Select one with `/harness <name>`.")
 	return s.localReply(message, strings.Join(lines, "\n"), emit)
+}
+
+func harnessSelectionMessage(name string) string {
+	return "Saved `harness.name` = `" + name + "` and connected the coding harness."
 }
 
 // HarnessScreen is shared by onboarding, /config, and /harness so detection
@@ -666,21 +675,25 @@ func (s *Service) HarnessScreen(required bool) core.Screen {
 	screen := core.Screen{
 		ID: "harness", Title: "Coding harness", SaveDisabled: true, Required: required,
 		Hints:    selectionScreenHints(),
-		Subtitle: "Choose the coding CLI Spynel should use. Executables and working directories are detected automatically.",
+		Subtitle: "Choose the coding CLI Spynel should use. Built-in executables are detected; custom ACP uses advanced configuration.",
 	}
 	if required {
 		screen.Hints[len(screen.Hints)-1].Action = "exit"
 	}
 	for _, definition := range harness.Catalog() {
 		description := definition.Description
-		if _, err := harness.ResolveCommand(definition.Name, nil); err == nil {
+		if _, err := s.resolveHarnessCommand(definition.Name); err == nil {
 			description += " · detected"
 			detectedAny = true
 			if screen.InitialControl == "" {
 				screen.InitialControl = "select:" + definition.Name
 			}
 		} else {
-			description += " · not detected · install: " + definition.InstallURL
+			if definition.Custom {
+				description += " · not configured · set harness.acp_command"
+			} else {
+				description += " · not detected · install: " + definition.InstallURL
+			}
 		}
 		if definition.Name == current {
 			description += " · selected"
@@ -846,7 +859,7 @@ func (s *Service) selectionScreenAction(ctx context.Context, screenID, action st
 		return nil, true, err
 	}
 	if screenID == "harness" {
-		if _, resolveErr := harness.ResolveCommand(selected, nil); resolveErr != nil {
+		if _, resolveErr := s.resolveHarnessCommand(selected); resolveErr != nil {
 			screen := s.HarnessScreen(false)
 			screen.Status = resolveErr.Error() + ". Install the CLI, then select it again to retry."
 			return &screen, true, nil
@@ -856,8 +869,10 @@ func (s *Service) selectionScreenAction(ctx context.Context, screenID, action st
 			return nil, true, welcomeErr
 		}
 		if welcome != nil {
+			welcome.ActionMessage = harnessSelectionMessage(selected)
 			return welcome, true, nil
 		}
+		return &core.Screen{ActionMessage: harnessSelectionMessage(selected)}, true, nil
 	}
 	return nil, true, nil
 }
@@ -914,7 +929,7 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		}
 	}
 	unchanged := reflect.DeepEqual(previous, next)
-	harnessChanged := previous.Harness != next.Harness
+	harnessChanged := harnessRuntimeChanged(previous.Harness, next.Harness)
 	startupChanged := previous.Startup.Enabled != next.Startup.Enabled
 	if harnessChanged {
 		if err := s.reconfigureHarness(next); err != nil {
@@ -964,6 +979,8 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	}
 	if previous.Orchestrator.Enabled != next.Orchestrator.Enabled || previous.Orchestrator.SemanticHeartbeatMinutes != next.Orchestrator.SemanticHeartbeatMinutes {
 		s.Orchestrator.ApplyRuntimeConfig(next)
+	} else if harnessAgentPolicyChanged(previous.Harness, next.Harness) {
+		s.Orchestrator.ApplyHarnessConfig(next.Harness)
 	}
 	s.Runtime.LogEvent("info", "config", "persisted", fmt.Sprintf("Configuration persisted (%d settings changed)", len(changed)))
 	return changed, nil
@@ -1022,6 +1039,24 @@ func wrapRollback(component string, err error) error {
 	return fmt.Errorf("roll back %s: %w", component, err)
 }
 
+func harnessRuntimeChanged(previous, next config.Harness) bool {
+	if previous.Name != next.Name || previous.Model != next.Model || previous.Sandbox != next.Sandbox {
+		return true
+	}
+	if previous.Name != "acp" && next.Name != "acp" {
+		return false
+	}
+	return previous.ACPCommand != next.ACPCommand || !reflect.DeepEqual(previous.ACPArgs, next.ACPArgs)
+}
+
+func harnessAgentPolicyChanged(previous, next config.Harness) bool {
+	return previous.ChatAgentPrefix != next.ChatAgentPrefix ||
+		previous.DeveloperAgentPrefix != next.DeveloperAgentPrefix ||
+		previous.ReviewerAgentPrefix != next.ReviewerAgentPrefix ||
+		previous.HeartbeatAgentPrefix != next.HeartbeatAgentPrefix ||
+		previous.Reviews != next.Reviews
+}
+
 func (s *Service) reconfigureHarness(cfg config.Config) error {
 	runtimeHarness, ok := s.Harness.(interface {
 		HarnessConfig() harness.HarnessConfig
@@ -1039,7 +1074,8 @@ func (s *Service) reconfigureHarness(cfg config.Config) error {
 	runtimeConfig.Sandbox = cfg.Harness.Sandbox
 	runtimeConfig.Network = false
 	runtimeConfig.SessionsFile = cfg.HarnessSessionsPath(cfg.Harness.Name)
-	command, err := harness.ResolveCommand(cfg.Harness.Name, nil)
+	runtimeConfig.Args = cfg.HarnessArgs()
+	command, err := harness.ResolveConfiguredCommand(cfg.Harness.Name, cfg.Harness.ACPCommand, nil)
 	if err != nil {
 		if definition, ok := harness.Lookup(cfg.Harness.Name); ok {
 			runtimeConfig.Command = definition.Command
@@ -1053,6 +1089,11 @@ func (s *Service) reconfigureHarness(cfg config.Config) error {
 	}
 	runtimeConfig.Command = command
 	return runtimeHarness.Reconfigure(runtimeConfig)
+}
+
+func (s *Service) resolveHarnessCommand(name string) (string, error) {
+	cfg := s.Settings.Snapshot()
+	return harness.ResolveConfiguredCommand(name, cfg.Harness.ACPCommand, nil)
 }
 
 func formatSettings(cfg config.Config, section string) string {
@@ -1075,7 +1116,10 @@ func formatSettings(cfg config.Config, section string) string {
 	}
 	advanced := false
 	for _, setting := range config.Settings(cfg) {
-		if setting.Section != section {
+		if setting.Section != section && !(section == "config" && setting.Section == "harness") {
+			continue
+		}
+		if section == "config" && (setting.Key == "harness.name" || setting.Key == "harness.model") {
 			continue
 		}
 		if grouped && setting.Advanced && !advanced {
@@ -1110,7 +1154,7 @@ func settingsScreen(cfg config.Config, section string) core.Screen {
 		modelName := emptyAs(cfg.Harness.Model, "Harness default")
 		screen.StartAtTop = true
 		screen.Controls = append(screen.Controls,
-			core.ScreenControl{Key: "harness", Section: "Core settings", Kind: "action", Value: "Coding harness · " + harnessName, Description: "Select Codex or Claude Code; Spynel finds the executable automatically"},
+			core.ScreenControl{Key: "harness", Section: "Core settings", Kind: "action", Value: "Coding harness · " + harnessName, Description: "Select a supported harness; Spynel detects built-in executables automatically"},
 			core.ScreenControl{Key: "model", Kind: "action", Value: "Model · " + modelName, Description: "Choose from the active harness model catalog"},
 		)
 	} else if section == "telegram" || section == "whatsapp" {
@@ -1151,13 +1195,16 @@ func settingsScreen(cfg config.Config, section string) core.Screen {
 		})
 	}
 	for _, setting := range settings {
-		if setting.Section != section {
+		if setting.Section != section && !(section == "config" && setting.Section == "harness") {
+			continue
+		}
+		if section == "config" && (setting.Key == "harness.name" || setting.Key == "harness.model") {
 			continue
 		}
 		if setting.Advanced && !advanced {
 			description := "Show optional connection, group, notification, and storage controls"
 			if section == "config" {
-				description = "Show task-management, channel, speech, extension, and storage controls"
+				description = "Show agent prefixes, custom harness, task-management, channel, speech, extension, and storage controls"
 			}
 			screen.Controls = append(screen.Controls, core.ScreenControl{
 				Key: "advanced", Section: "Advanced settings", Kind: "disclosure", Value: "Advanced settings",
@@ -1173,7 +1220,11 @@ func settingsScreen(cfg config.Config, section string) core.Screen {
 		} else if len(setting.Choices) > 0 {
 			kind = "select"
 		}
-		label := strings.ReplaceAll(strings.TrimPrefix(setting.Key, "channels."+section+"."), "_", " ")
+		labelKey := strings.TrimPrefix(setting.Key, "channels."+section+".")
+		if section == "config" {
+			labelKey = strings.TrimPrefix(labelKey, "harness.")
+		}
+		label := strings.ReplaceAll(labelKey, "_", " ")
 		switch setting.Key {
 		case telegramTokenKey:
 			label = "bot token"
@@ -1181,6 +1232,8 @@ func settingsScreen(cfg config.Config, section string) core.Screen {
 			label = "context messages"
 		case "harness.sandbox":
 			label = "agent filesystem access"
+		case "harness.reviews":
+			label = "task reviews"
 		case "workspace.history_char_limit":
 			label = "context character limit"
 		case "workspace.attachment_max_mb":

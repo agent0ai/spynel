@@ -10,6 +10,7 @@ import (
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/workspace"
 )
 
 func TestFormatTaskNotificationGoldens(t *testing.T) {
@@ -146,27 +147,33 @@ func TestReviewSummaryReworkCountIsCodeManaged(t *testing.T) {
 	}
 }
 
-func TestMalformedSummaryDoesNotBlockTerminalEnqueueOrInvokeHarness(t *testing.T) {
+func TestMalformedSummaryDoesNotBlockNotificationAgentScheduling(t *testing.T) {
 	directory := t.TempDir()
+	if err := workspace.Init(directory, false); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(directory, "done.md")
 	document := Document{FrontMatter: map[string]any{
 		"id": "terminal-id", "title": "Terminal transition", "created_at": "bad", "updated_at": time.Now().UTC().Format(time.RFC3339),
 		"notify":               map[string]any{"enabled": true, "origin": "cli/local", "on": []any{"done"}},
 		"notification_summary": map[string]any{"verdict": "accepted", "outcome": strings.Repeat("x", notificationOutcomeRunes+1)},
-	}, Body: "# Task\n"}
+	}, Body: "# Task\n\n## Progress\n\n- The practical work completed.\n"}
 	if err := WriteDocument(path, document); err != nil {
 		t.Fatal(err)
 	}
 	harness := newFakeRecipient()
-	manager := &Manager{Config: config.Config{Root: directory, Workspace: config.Workspace{StateDir: ".spynel"}}, Harness: harness, Hooks: extensions.Runner{}, Outbox: &Outbox{Directory: filepath.Join(directory, "outbox")}}
+	cfg := config.Default()
+	cfg.Root = directory
+	cfg.Path = filepath.Join(directory, ".spynel", "config.yaml")
+	manager := New(cfg, harness, extensions.Runner{})
 	if err := manager.completeTransition(context.Background(), config.Route{Name: "tasks"}, Lease{ID: "lease"}, "done", path); err != nil {
 		t.Fatal(err)
 	}
 	if harness.calls != 0 {
-		t.Fatalf("notification invoked harness %d times", harness.calls)
+		t.Fatalf("terminal transition synchronously called notification harness %d times", harness.calls)
 	}
-	entries, err := os.ReadDir(manager.Config.StatePath("runtime", "notification-triage"))
+	entries, err := os.ReadDir(manager.notificationAgentDirectory())
 	if err != nil || len(entries) != 1 {
-		t.Fatalf("terminal triage was not durably enqueued: %v, %d", err, len(entries))
+		t.Fatalf("terminal notification agent was not scheduled: %v, %d", err, len(entries))
 	}
 }

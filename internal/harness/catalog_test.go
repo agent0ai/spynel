@@ -37,6 +37,41 @@ func TestResolveCommandRejectsManualOrUnknownHarnesses(t *testing.T) {
 	}
 }
 
+func TestACPProfilesResolveFixedAndCustomCommandsWithoutShellParsing(t *testing.T) {
+	definition, ok := Lookup("qwen")
+	if !ok || definition.Name != "qwen-code" || definition.Command != "qwen" {
+		t.Fatalf("Qwen ACP alias = %#v, %t", definition, ok)
+	}
+	arguments := CommandArgs("qwen-code", nil)
+	if len(arguments) != 2 || arguments[0] != "--acp" || arguments[1] != "--experimental-skills" {
+		t.Fatalf("Qwen ACP arguments = %#v", arguments)
+	}
+	arguments[0] = "changed"
+	if CommandArgs("qwen-code", nil)[0] != "--acp" {
+		t.Fatal("catalog ACP arguments were returned by reference")
+	}
+	droid, ok := Lookup("factory-droid")
+	if !ok || len(droid.Env) != 2 || droid.Env[0] != "DROID_DISABLE_AUTO_UPDATE=true" {
+		t.Fatalf("Factory Droid ACP environment = %#v, %t", droid.Env, ok)
+	}
+	customArgs := []string{"--stdio", "value with spaces"}
+	if got := CommandArgs("acp", customArgs); len(got) != 2 || got[1] != "value with spaces" {
+		t.Fatalf("custom ACP arguments = %#v", got)
+	}
+	resolved, err := ResolveConfiguredCommand("acp", "custom-agent", func(name string) (string, error) {
+		if name != "custom-agent" {
+			t.Fatalf("custom command lookup received %q", name)
+		}
+		return "/tools/custom-agent", nil
+	})
+	if err != nil || resolved != "/tools/custom-agent" {
+		t.Fatalf("custom ACP command = %q, %v", resolved, err)
+	}
+	if _, err := ResolveConfiguredCommand("acp", "", func(string) (string, error) { return "", nil }); err == nil {
+		t.Fatal("empty custom ACP command was accepted")
+	}
+}
+
 func TestResolveDefinitionCommandUsesStandardUserLocalBin(t *testing.T) {
 	definition, ok := Lookup("claude-code")
 	if !ok {

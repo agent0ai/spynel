@@ -200,7 +200,7 @@ func validateDirectCompletionEvidence(document Document) error {
 		return errors.New("a valid completed notification_summary is required")
 	}
 	if summary.Evidence == "" {
-		return errors.New("notification_summary.evidence must record the source boundary")
+		return errors.New("notification_summary.evidence must record verification and the inspected boundary")
 	}
 	if summary.Uncertainty == "" {
 		return errors.New("notification_summary.uncertainty must record remaining uncertainty")
@@ -273,7 +273,7 @@ func FormatTaskNotification(document Document, status, fallbackID string) string
 	} else {
 		policy, policyErr := TaskPolicyFromDocument(document)
 		if status == "done" && policyErr == nil && !policy.ReviewRequired {
-			lines = append(lines, "The recorded read-only result was completed without independent review.")
+			lines = append(lines, "The recorded low-risk result was completed without independent review.")
 		} else {
 			lines = append(lines, fallbackTaskOutcome(status))
 		}

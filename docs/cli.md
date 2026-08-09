@@ -1,6 +1,6 @@
 # Plain CLI and automation
 
-The plain CLI exposes Spynel's non-visual control plane without opening the full-screen TUI. It uses the same application service, durable histories, harness sessions, configuration transactions, jobs, logs, and trusted extension hooks as Telegram, WhatsApp, and the TUI.
+Spynel is a classic, non-AI orchestration program; coding harnesses provide its external intelligence. The plain CLI exposes Spynel's non-visual control plane without opening the full-screen TUI. It uses the same application service, durable histories, harness sessions, configuration transactions, jobs, logs, and trusted extension hooks as Telegram, WhatsApp, and the TUI.
 
 ## Offline documentation
 
@@ -12,17 +12,19 @@ spynel docs search review
 spynel docs search "primary election" page 2 --format json
 ```
 
-`docs` is embedded and deterministic: it does not load `spynel.yaml`, join a primary server, read workspace state, or invoke a harness. The index, topic sections, and search results use stable topic/section references. Ordinary documents render whole. Oversized output is split only between complete records using a conservative estimate of one token per three Unicode runes and a 10,000-token page budget; split pages report that budget and their estimated tokens. A separate 128-entry, 64 KiB, and 48 Ki-rune ceiling prevents pathological output. Plain output is Markdown without ANSI/control sequences, including when redirected. `--format json` emits the versioned `spynel.docs/v1` document with kind, IDs, title, content, related references, and page metadata. Unknown topics, invalid pages, and oversized input return actionable structured errors; close misspellings suggest a valid topic. Flags may appear before or after the topic/query.
+`docs` is embedded and deterministic: it does not load `.spynel/config.yaml`, join a primary server, read workspace state, or invoke a harness. The index, topic sections, and search results use stable topic/section references. Ordinary documents render whole. Oversized output is split only between complete records using a conservative estimate of one token per three Unicode runes and a 10,000-token page budget; split pages report that budget and their estimated tokens. A separate 128-entry, 64 KiB, and 48 Ki-rune ceiling prevents pathological output. Plain output is Markdown without ANSI/control sequences, including when redirected. `--format json` emits the versioned `spynel.docs/v1` document with kind, IDs, title, content, related references, and page metadata. Unknown topics, invalid pages, and oversized input return actionable structured errors; close misspellings suggest a valid topic. Flags may appear before or after the topic/query.
 
-Static topics describe user commands, workflow contracts, and implementation architecture. They label runtime-only subjects such as jobs and logs and never represent live values. Use `spynel status`, `jobs`, `logs`, and the actual task/goal documents for current state.
+`spynel instructions [--config PATH]` is a separate read-only workspace inspection command. It reports the five role names, workspace-relative paths, presence, byte counts, and validation errors without displaying saved instruction contents or starting a server or harness.
+
+Static topics describe user commands, workflow contracts, and implementation architecture. They label runtime-only subjects such as jobs and logs and never represent live values. Use `spynel status`, `jobs`, `tasks`, `goals`, `logs`, and the actual task/goal documents for current state.
 
 `/log`, its page ranges, and case-insensitive search read the same retained newest-4,096-entry view after restart. `/log page <start>-<end>` accepts any positive ascending range and clamps the requested end to the oldest available retained page before rendering. Private JSONL session files live under `.spynel/runtime/logs`, rotate at 2 MiB, and retain at most eight files. `/log clear` removes both the active view and those retained files. Stored entries are attributed and bounded, with terminal controls and common credential forms removed before persistence.
 
 ## Proactive notifications
 
-`spynel notify --origin CHANNEL/CONVERSATION "message"` queues a complete assistant message without invoking a coding harness. Supported origins are `telegram/TG-<id>`, `telegram/TG-group-<chat-id>`, `whatsapp/WA-<number>`, `whatsapp/WA-group-<group-id>`, `tui/<conversation>`, and `cli/<conversation>`. `--stdin` accepts at most 512 KiB and cannot be combined with positional text. The origin must already exist in durable history and remote origins must still satisfy the current allow-list/group policy. Success prints `queued notification <id>`; disconnected remote delivery remains in `.spynel/runtime/outbox/` for retry.
+`spynel notify --origin CHANNEL/CONVERSATION "message"` queues a complete assistant message without invoking a coding harness. Supported origins are `telegram/TG-<id>`, `telegram/TG-group-<chat-id>`, `whatsapp/WA-<number>`, `whatsapp/WA-group-<group-id>`, `tui/<conversation>`, and `cli/<conversation>`. `--stdin` accepts at most 512 KiB and cannot be combined with positional text. The origin must already exist in durable history and remote origins must still satisfy the current allow-list/group policy. Success prints `queued notification <id>`; disconnected remote delivery remains in `.spynel/runtime/outbox/` for retry. Automatic notification agents receive framework-prepared `--event-key` and `--outcome` arguments; those internal arguments are accepted only when they match a persisted pending task transition, its exact origin, and current authorization. In `decide` mode the framework also prepares the same bound command with `--decline`, which accepts no message and records an explicit no-send decision.
 
-Automatic terminal-task notifications lead with what finished and the practical result from a valid bounded summary. Routine notifications omit internal paths, task IDs, and duration/attempt/review/rework metrics; those details remain available through explicit task and diagnostic inspection. Task completion never invokes a harness from notification formatting, enqueue, or retry delivery.
+Automatic task notifications use one bounded, inspectable decision-agent job that reads only the task's newest `## Progress`, then either skips or queues one concise message. Accepted text is recorded exactly in task progress. Routine notifications omit internal paths and task IDs; those details remain available through explicit task and diagnostic inspection. Enqueue and retry delivery do not invoke a harness, and no notification-specific response or reminder state is created.
 
 Pass command flags before positional arguments. For example, use `spynel conversations show --json telegram TG-42`, not flags after `TG-42`. Use `--` before message text that begins with a dash.
 
@@ -59,7 +61,7 @@ spynel send --conversation bot --json "Report current work" | jq -c .
 spynel followup [send flags] TEXT
 ```
 
-`followup` targets the same `cli/<conversation>` key as `send`, but it is strict: the elected service rejects it before writing history unless that conversation currently has an active harness execution. Codex uses native turn steering. Harnesses that declare queue semantics retain the follow-up in arrival order and run it in the same session. This makes a failed shell race visible instead of silently starting unrelated work.
+`followup` targets the same `cli/<conversation>` key as `send`, but it is strict: the elected service rejects it before writing history unless that conversation currently has an active harness execution. Codex and Pi use native turn steering. Harnesses that declare queue semantics retain follow-ups in the same session; adjacent ordinary messages that accumulate before the next turn are combined in arrival order into one provider prompt. This makes a failed shell race visible instead of silently starting unrelated work.
 
 When native steering transfers output ownership, the earlier waiting CLI process receives a terminal transport status and exits successfully; the follow-up process receives subsequent deltas and the final response. This is the same emitter handoff used to keep overlapping remote-channel typing state correct.
 
@@ -97,6 +99,19 @@ spynel command [--config PATH] [--conversation NAME] [--json] NAME [ARGUMENTS...
 
 ```bash
 spynel jobs
+spynel tasks
+spynel tasks --limit 50
+spynel tasks recent --days 14
+spynel tasks review
+spynel tasks waiting --detail
+spynel tasks done
+spynel tasks failed
+spynel tasks --json failed
+spynel goals
+spynel goals active
+spynel goals review
+spynel goals failed
+spynel goals all --days 30
 spynel job info 3
 spynel job message 3 "Prioritize the API regression"
 spynel job ping 3
@@ -117,7 +132,9 @@ spynel command help commands
 
 Options such as `--config`, `--conversation`, and `--json` must precede alias arguments (`spynel log --json search webhook`). Prefer typed `spynel status --json` over `spynel command --json status`, whose NDJSON response follows the generic event contract.
 
-`spynel jobs` renders two logical rows per active execution: emphasized job number plus a bounded message/Markdown filename, then compact lifetime, cumulative provider steps (`N▶`), an optional durable task implementation-attempt count (`M↻`), canonical execution status, and origin. For example, `3h27m 13▶ 4↻` means thirteen provider steps and the fourth implementation attempt. Provider steps survive phase, recovery, control, continuation, owner, and process-local job-number changes. Live conversations show current execution age and `1▶`; goals, legacy work, and other jobs without a real task `attempt` omit `↻`. `spynel job info NUMBER` uses the same process-local snapshot and labels those same two values as `Provider steps (▶)` and, when present, `Implementation attempts (↻)`, while distinguishing current execution age from durable lifetime before adding start time, last-activity age, reconnect attempt, recovery count, bounded detail, and abbreviated execution identity. For orchestrated Markdown work it also reads only allowlisted task/goal metadata, exact lease state/heartbeat, and at most the three newest bounded `## Progress` entries; it never returns arbitrary front matter, full paths, session keys, notification origins, or harness transcripts. Live execution status is distinct from workflow phase and durable document outcome: a task in `waiting`, `done`, or `failed` is not shown as an active worker.
+`spynel tasks` and `spynel goals` are deterministic automation aliases for the shared `/tasks` and `/goals` durable-work inspectors; they never start a harness. They join the elected application service when available or use the same harness-free local service, so an external terminal program observes the same state as the TUI and authorized Telegram/WhatsApp conversations. Bare commands use the newest-first `open` view and show all nonterminal work, with at most 20 rendered entries. `recent` uses `updated_at` from the last three days for tasks or seven days for goals. The remaining semantic views are `active` (pre-review work), `review` (queued or claimed review), `waiting`, `done`, `failed` (failed/cancelled tasks or abandoned goals), and `all`. Every compact entry uses two logical rows for the title and a status/update/counter/current-step summary. `--days N` narrows any view, `--limit N` accepts 1 through 100, and `--detail` adds only the durable ID, Markdown basename, task review policy, and exact created/updated timestamps. Shared `--config`, `--conversation`, and `--json` flags precede the view or list options. JSON mode uses the generic NDJSON response-event contract: the terminal `final` event's `text` field contains the same bounded Markdown listing. Folder status is authoritative; bounded warnings keep invalid or unreadable documents visible without following symlinks or exposing full paths.
+
+`spynel jobs` renders two logical rows per active execution: emphasized job number plus a bounded message/Markdown filename, then compact lifetime, cumulative provider steps (`N▶`), an optional durable task implementation-attempt count (`M↻`), canonical execution status, and origin. For example, `3h27m 13▶ 4↻` means thirteen provider steps and the fourth implementation attempt. Provider steps survive phase, recovery, control, continuation, owner, and process-local job-number changes. The semantic heartbeat appears locally as a `heartbeat` job with `semantic_audit` phase and `audit` state and remains registered until its provider actually releases, even after timeout, cancellation, or primary handoff. Live conversations show current execution age and `1▶`; goals, legacy work, and other jobs without a real task `attempt` omit `↻`. `spynel job info NUMBER` uses the same process-local snapshot and labels those same two values as `Provider steps (▶)` and, when present, `Implementation attempts (↻)`, while distinguishing current execution age from durable lifetime before adding start time, last-activity age, reconnect attempt, recovery count, bounded detail, and abbreviated execution identity. For orchestrated Markdown work it also reads only allowlisted task/goal metadata, exact lease state/heartbeat, and at most the three newest bounded `## Progress` entries; it never returns arbitrary front matter, full paths, session keys, notification origins, or harness transcripts. Live execution status is distinct from workflow phase and durable document outcome: a task in `waiting`, `done`, or `failed` is not shown as an active worker.
 
 `spynel job message NUMBER TEXT` and `/job message NUMBER TEXT` deliver nonterminal operator guidance to an active orchestrator job without changing its objective, session, lease, emitter, review phase, or notification destination. `job ping NUMBER` is the concise progress form: it asks the existing agent to record current progress, blockers, and next action in the durable document at the next safe opportunity, then continue. Acknowledgement is bounded and reports delivered, queued, duplicate, terminal, stale, unauthorized, or backpressure state; it does not wait for provider completion. Native steering and ordered same-session queues remain harness behavior. Queues hold at most eight controls per job and identical recent retries are applied once. If a control causes a provider final while the exact durable owner/session/file is still in a claimed nonterminal phase, Spynel permits one automatic same-session continuation; a second final falls through to ordinary reconciliation/recovery. Remote channels see and control only jobs tied to their currently authorized notification origin, while local TUI and CLI operators may inspect workspace jobs.
 
@@ -131,7 +148,7 @@ Harness-free script helpers create a single task in `todo` or a goal in `propose
 
 ```bash
 spynel task "Fix the failing login test"
-spynel task --no-review "Collect the current service status and report uncertainty"
+spynel task --no-review "Correct the README typo and verify the result"
 spynel task inspect .spynel/tasks/todo/example.md
 spynel goal "Keep dependencies current"
 spynel run --once
@@ -140,9 +157,9 @@ spynel extension install https://github.com/example/spynel-hooks.git
 spynel extension remove spynel-hooks
 ```
 
-The shared slash commands have different, conversation-aware behavior. `spynel command --conversation NAME task "..."` and its `/task` equivalent load `.spynel/prompts/create-task.md`; `/goal` loads `create-goal.md`. Spynel combines that directive and the literal request with the ordinary communication prompt, then the communication agent checks for duplicates and creates or refines the complete document. These slash paths therefore require the selected harness, while the direct `spynel task` and `spynel goal` helpers remain suitable for offline scripts.
+The shared slash commands have different, conversation-aware behavior. `spynel command --conversation NAME task "..."` and its `/task` equivalent combine the user-overridable `.spynel/prompts/create-task.md` directive and the literal request with the ordinary communication prompt; `/goal` uses the matching goal directive. The communication agent checks for duplicates and creates or refines the complete document. These slash paths therefore require the selected harness, while the direct `spynel task` and `spynel goal` helpers remain suitable for offline scripts.
 
-Tasks are finite objectives with `todo`, `working`, `review`, `reviewing`, `waiting`, `done`, `failed`, and `cancelled` statuses. Review is required by default and for every development/change or goal-derived task. `--no-review` is limited to explicit bounded low-risk read-only collection whose report is the deliverable; `task inspect` reports the effective fail-safe policy. Goals have a separate `proposed`, `planning`, `active`, `review`, `reviewing`, `waiting`, `done`, and `abandoned` lifecycle. Goal planners create numbered linked task rounds; independent goal review—not task completion—decides whether the bar has been met or another planning pass is required.
+Tasks are finite objectives with `todo`, `working`, `review`, `reviewing`, `waiting`, `done`, `failed`, and `cancelled` statuses. `harness.reviews` defaults to `skip-trivial`, where review defaults safely to required but creators choose it by expected value: broad, high-risk, hard-to-reverse, or materially uncertain work normally uses review; read-only work and minor localized reversible changes may use `--no-review` with proportionate verification, evidence, and residual uncertainty. `always` overrides `--no-review`; `never` forces direct completion. Goal planners follow the same global mode for derived tasks, while independent goal outcome review—not task completion—still decides whether the goal bar has been met.
 
 Installed extensions are trusted executable integrations. When enabled, their `message.received`, `harness.before`, and `harness.after` hooks run for CLI messages exactly as they do for interactive channels; orchestration hooks likewise run for `run --once` and the server loop. Hooks receive and return bounded JSON over standard streams and execute with Spynel's operating-system authority. Review repositories before installing them. See [Extensions and hooks](extensions.md).
 

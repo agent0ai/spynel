@@ -137,7 +137,7 @@ func TestMainSettingsExposeOnlySimpleHarnessChoicesAndPutAdvancedLast(t *testing
 		}
 		essential = append(essential, setting.Key)
 	}
-	want := []string{"harness.sandbox", "workspace.history_max_messages", "workspace.history_char_limit", "startup.enabled"}
+	want := []string{"workspace.history_max_messages", "workspace.history_char_limit", "startup.enabled"}
 	if len(essential) != len(want) {
 		t.Fatalf("main essentials = %#v, want %#v", essential, want)
 	}
@@ -157,15 +157,71 @@ func TestMainSettingsExposeOnlySimpleHarnessChoicesAndPutAdvancedLast(t *testing
 			t.Fatalf("implementation setting %q is still configurable", key)
 		}
 	}
-	for _, key := range []string{"harness.name", "harness.model"} {
+	for _, key := range []string{
+		"harness.name", "harness.model", "harness.sandbox", "harness.reviews",
+		"harness.chat_agent_prefix", "harness.developer_agent_prefix", "harness.reviewer_agent_prefix", "harness.heartbeat_agent_prefix",
+		"harness.acp_command", "harness.acp_args",
+	} {
 		setting, ok := SettingByKey(cfg, key)
 		if !ok || setting.Section != "harness" {
-			t.Fatalf("simple harness setting %q = %#v, %t", key, setting, ok)
+			t.Fatalf("harness setting %q = %#v, %t", key, setting, ok)
+		}
+	}
+	for _, key := range []string{"harness.acp_command", "harness.acp_args"} {
+		setting, ok := SettingByKey(cfg, key)
+		if !ok || setting.Section != "harness" || !setting.Advanced {
+			t.Fatalf("custom ACP setting %q = %#v, %t", key, setting, ok)
 		}
 	}
 	sandbox, ok := SettingByKey(cfg, "harness.sandbox")
-	if !ok || sandbox.Section != "config" || len(sandbox.Choices) != 3 || sandbox.Value != "danger-full-access" {
+	if !ok || sandbox.Section != "harness" || len(sandbox.Choices) != 3 || sandbox.Value != "danger-full-access" {
 		t.Fatalf("sandbox setting = %#v, %t", sandbox, ok)
+	}
+	reviews, ok := SettingByKey(cfg, "harness.reviews")
+	if !ok || strings.Join(reviews.Choices, ",") != "skip-trivial,always,never" || reviews.Value != "skip-trivial" {
+		t.Fatalf("review-mode setting = %#v, %t", reviews, ok)
+	}
+}
+
+func TestSetHarnessAgentPolicySettings(t *testing.T) {
+	cfg := Default()
+	_, err := SetSettings(&cfg, map[string]string{
+		"harness.chat_agent_prefix":      "/ultrathink",
+		"harness.developer_agent_prefix": "/dev",
+		"harness.reviewer_agent_prefix":  "/review",
+		"harness.heartbeat_agent_prefix": "/audit",
+		"harness.reviews":                "Skip trivial",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Harness.ChatAgentPrefix != "/ultrathink" || cfg.Harness.DeveloperAgentPrefix != "/dev" || cfg.Harness.ReviewerAgentPrefix != "/review" || cfg.Harness.HeartbeatAgentPrefix != "/audit" || cfg.Harness.Reviews != TaskReviewsSkipTrivial {
+		t.Fatalf("agent policy settings = %#v", cfg.Harness)
+	}
+	if _, err := SetSetting(&cfg, "harness.reviews", "sometimes"); err == nil {
+		t.Fatal("invalid review mode was accepted")
+	}
+}
+
+func TestCustomACPSettingsParseArgumentsAtomically(t *testing.T) {
+	cfg := Default()
+	changed, err := SetSettings(&cfg, map[string]string{
+		"harness.name":        "custom-acp",
+		"harness.acp_command": "fixture-agent",
+		"harness.acp_args":    `["--stdio","value with spaces"]`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changed) != 3 || cfg.Harness.Name != "acp" || cfg.Harness.ACPCommand != "fixture-agent" || len(cfg.Harness.ACPArgs) != 2 || cfg.Harness.ACPArgs[1] != "value with spaces" {
+		t.Fatalf("custom ACP settings = %#v, changes %#v", cfg.Harness, changed)
+	}
+	previous := cfg
+	if _, err := SetSetting(&cfg, "harness.acp_args", `["unterminated"`); err == nil {
+		t.Fatal("invalid ACP argument JSON was accepted")
+	}
+	if cfg.Harness.ACPArgs[1] != previous.Harness.ACPArgs[1] {
+		t.Fatal("failed ACP argument update mutated configuration")
 	}
 }
 

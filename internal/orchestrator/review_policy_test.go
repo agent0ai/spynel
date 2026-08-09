@@ -48,7 +48,7 @@ func TestTaskCreationSetsReviewPolicyDeliberately(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	for _, noReview := range []bool{false, true} {
 		path, err := CreateWithOptions(cfg, "tasks", "collect inventory", "", CreateOptions{NoReview: noReview})
 		if err != nil {
@@ -58,7 +58,7 @@ func TestTaskCreationSetsReviewPolicyDeliberately(t *testing.T) {
 		if err != nil || document.FrontMatter["review_required"] != !noReview {
 			t.Fatalf("review_required = %#v, %v", document.FrontMatter["review_required"], err)
 		}
-		if noReview && (!strings.Contains(document.Body, "evidence boundaries") || strings.Contains(document.Body, "independently verified")) {
+		if noReview && (!strings.Contains(document.Body, "proportionate verification") || strings.Contains(document.Body, "independently verified")) {
 			t.Fatalf("direct task acceptance criteria = %q", document.Body)
 		}
 	}
@@ -67,8 +67,185 @@ func TestTaskCreationSetsReviewPolicyDeliberately(t *testing.T) {
 		t.Fatal(err)
 	}
 	document, _ := ReadDocument(path)
-	if document.FrontMatter["review_required"] != true {
-		t.Fatal("goal-derived task did not require review")
+	if document.FrontMatter["review_required"] != false {
+		t.Fatal("goal-derived task did not preserve the planner's no-review choice")
+	}
+}
+
+func TestTaskCreationReviewModeOverridesPerTaskChoice(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	for _, test := range []struct {
+		mode     string
+		noReview bool
+		want     bool
+	}{
+		{mode: config.TaskReviewsAlways, noReview: true, want: true},
+		{mode: config.TaskReviewsNever, noReview: false, want: false},
+	} {
+		cfg.Harness.Reviews = test.mode
+		path, err := CreateWithOptions(cfg, "tasks", "mode "+test.mode, "", CreateOptions{NoReview: test.noReview})
+		if err != nil {
+			t.Fatal(err)
+		}
+		document, err := ReadDocument(path)
+		if err != nil || document.FrontMatter["review_required"] != test.want {
+			t.Fatalf("mode %q review_required = %#v, %v", test.mode, document.FrontMatter["review_required"], err)
+		}
+	}
+}
+
+func TestNeverReviewModeReturnsQueuedReviewToImplementation(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	cfg.Harness.Reviews = config.TaskReviewsNever
+	route := cfg.Orchestrator.Routes[0]
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	task, err := Create(cfg, "tasks", "queued before policy change", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(task)
+	review := filepath.Join(base, "review", name)
+	if err := moveDocument(task, review, "review", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	target := newFakeRecipient()
+	manager := New(cfg, target, extensions.Runner{Directory: filepath.Join(root, "missing")})
+	if err := manager.scanPhaseQueue(context.Background(), route, filepath.Join(base, "review"), filepath.Join(base, "reviewing"), phaseTaskReview); err != nil {
+		t.Fatal(err)
+	}
+	document, err := ReadDocument(filepath.Join(base, "todo", name))
+	if err != nil || !strings.Contains(document.Body, "Independent task review is disabled") {
+		t.Fatalf("disabled review was not returned to todo: %v, %q", err, document.Body)
+	}
+	if target.calls != 0 {
+		t.Fatalf("disabled reviewer was dispatched %d times", target.calls)
+	}
+}
+
+func TestAlwaysReviewModeRedirectsDocumentNoReviewCompletion(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	route := cfg.Orchestrator.Routes[0]
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	task, err := CreateWithOptions(cfg, "tasks", "preexisting direct task", "", CreateOptions{NoReview: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Reviews = config.TaskReviewsAlways
+	name := filepath.Base(task)
+	target := newFakeRecipient()
+	target.beforeEmit = func() {
+		working := filepath.Join(cfg.Resolve(route.Working), name)
+		recordDirectCompletion(t, working, filepath.Join(base, "done", name))
+	}
+	manager := New(cfg, target, extensions.Runner{Directory: filepath.Join(root, "missing")})
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	if err := manager.reconcileTransitions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "review", name)); err != nil {
+		t.Fatalf("always mode did not force review: %v", err)
+	}
+}
+
+func TestNeverReviewModeAllowsExistingReviewRequiredTaskDirectCompletion(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	route := cfg.Orchestrator.Routes[0]
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	task, err := Create(cfg, "tasks", "existing reviewed task", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Reviews = config.TaskReviewsNever
+	name := filepath.Base(task)
+	target := newFakeRecipient()
+	target.beforeEmit = func() {
+		recordDirectCompletion(t, filepath.Join(cfg.Resolve(route.Working), name), filepath.Join(base, "done", name))
+	}
+	manager := New(cfg, target, extensions.Runner{Directory: filepath.Join(root, "missing")})
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	if err := manager.reconcileTransitions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	document, err := ReadDocument(filepath.Join(base, "done", name))
+	if err != nil || document.FrontMatter["review_required"] != true {
+		t.Fatalf("never mode did not complete without rewriting document choice: %#v, %v", document.FrontMatter, err)
+	}
+}
+
+func TestDeveloperAndReviewerPromptsUseRolePrefixes(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	cfg.Harness.DeveloperAgentPrefix = "/develop"
+	cfg.Harness.ReviewerAgentPrefix = "/review"
+	if err := os.WriteFile(cfg.StatePath("instructions", "agent-developer.md"), []byte("developer-only-rule"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg.StatePath("instructions", "agent-reviewer.md"), []byte("reviewer-only-rule"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	route := cfg.Orchestrator.Routes[0]
+	base := filepath.Dir(cfg.Resolve(route.Source))
+	task, err := Create(cfg, "tasks", "prefix phases", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Base(task)
+	target := newFakeRecipient()
+	target.beforeEmit = func() {
+		working := filepath.Join(cfg.Resolve(route.Working), name)
+		if _, err := os.Stat(working); err == nil {
+			_ = moveDocument(working, filepath.Join(base, "review", name), "review", time.Now().UTC())
+		}
+	}
+	manager := New(cfg, target, extensions.Runner{Directory: filepath.Join(root, "missing")})
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	if len(target.prompts) != 2 || !strings.HasPrefix(target.prompts[0], "/develop ") || !strings.HasPrefix(target.prompts[1], "/review ") {
+		t.Fatalf("phase prompts = %#v", target.prompts)
+	}
+	if !strings.Contains(target.prompts[0], "Configured task review mode: skip-trivial") {
+		t.Fatalf("developer prompt omitted review mode: %q", target.prompts[0])
+	}
+	if !strings.Contains(target.prompts[0], "\ndeveloper-only-rule\n</workspace_owner_persistent_instructions>") || strings.Contains(target.prompts[0], "reviewer-only-rule") {
+		t.Fatalf("developer prompt did not receive only its final role instructions: %q", target.prompts[0])
+	}
+	if !strings.Contains(target.prompts[1], "\nreviewer-only-rule\n</workspace_owner_persistent_instructions>") || strings.Contains(target.prompts[1], "developer-only-rule") {
+		t.Fatalf("reviewer prompt did not receive only its final role instructions: %q", target.prompts[1])
+	}
+	settings := manager.harnessSettings()
+	if manager.agentPrefix(phaseGoalPlanning, settings) != "/develop" || manager.agentPrefix(phaseGoalReview, settings) != "/review" {
+		t.Fatalf("goal phase prefixes do not match developer/reviewer roles")
 	}
 }
 
@@ -79,14 +256,14 @@ func TestReviewedAndDirectTaskCompletion(t *testing.T) {
 		wantStatus string
 	}{
 		{name: "review required", wantStatus: "review"},
-		{name: "direct read only", noReview: true, wantStatus: "done"},
+		{name: "direct low risk", noReview: true, wantStatus: "done"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			if err := workspace.Init(root, false); err != nil {
 				t.Fatal(err)
 			}
-			cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+			cfg, _ := config.Load(config.PathForRoot(root))
 			route := cfg.Orchestrator.Routes[0]
 			base := filepath.Dir(cfg.Resolve(route.Source))
 			options := CreateOptions{NoReview: test.noReview}
@@ -101,7 +278,12 @@ func TestReviewedAndDirectTaskCompletion(t *testing.T) {
 			}
 			name := filepath.Base(task)
 			fake := newFakeRecipient()
+			moved := false
 			fake.beforeEmit = func() {
+				if moved {
+					return
+				}
+				moved = true
 				working := filepath.Join(cfg.Resolve(route.Working), name)
 				if test.noReview {
 					recordDirectCompletion(t, working, filepath.Join(base, "done", name))
@@ -130,16 +312,16 @@ func TestReviewedAndDirectTaskCompletion(t *testing.T) {
 				}
 			}
 			if test.noReview {
-				entries, err := os.ReadDir(cfg.StatePath("runtime", "notification-triage"))
+				entries, err := os.ReadDir(manager.notificationAgentDirectory())
 				if err != nil || len(entries) != 1 {
-					t.Fatalf("direct completion triage entries = %d, %v", len(entries), err)
+					t.Fatalf("direct completion notification agent entries = %d, %v", len(entries), err)
 				}
 				if err := manager.reconcileTransitions(context.Background()); err != nil {
 					t.Fatal(err)
 				}
-				again, _ := os.ReadDir(cfg.StatePath("runtime", "notification-triage"))
+				again, _ := os.ReadDir(manager.notificationAgentDirectory())
 				if len(again) != 1 {
-					t.Fatalf("direct completion duplicated triage: %d", len(again))
+					t.Fatalf("direct completion duplicated notification: %d", len(again))
 				}
 			}
 		})
@@ -151,7 +333,7 @@ func TestDirectCompletionWithoutEvidenceReturnsToTodo(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	route := cfg.Orchestrator.Routes[0]
 	task, err := CreateWithOptions(cfg, "tasks", "collect incomplete inventory", "", CreateOptions{NoReview: true, Notify: true, Origin: "cli/local", Outcomes: []string{"done"}})
 	if err != nil {
@@ -186,7 +368,7 @@ func TestMalformedPolicyIsNormalizedAndDirectDoneIsReviewed(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	route := cfg.Orchestrator.Routes[0]
 	task, _ := Create(cfg, "tasks", "malformed", "")
 	document, _ := ReadDocument(task)
@@ -220,7 +402,7 @@ func TestNoReviewTaskManuallyQueuedForReviewIsHonored(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	route := cfg.Orchestrator.Routes[0]
 	task, _ := CreateWithOptions(cfg, "tasks", "manual review", "", CreateOptions{NoReview: true})
 	name := filepath.Base(task)
@@ -251,7 +433,7 @@ func TestReviewQueueWaitsForImplementationLeaseReconciliation(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	route := cfg.Orchestrator.Routes[0]
 	base := filepath.Dir(cfg.Resolve(route.Source))
 	task, err := Create(cfg, "tasks", "review claim race", "")
@@ -309,7 +491,7 @@ func TestImplementationReconciliationPreservesExistingReviewClaim(t *testing.T) 
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	route := cfg.Orchestrator.Routes[0]
 	base := filepath.Dir(cfg.Resolve(route.Source))
 	task, err := Create(cfg, "tasks", "already claimed review", "")
@@ -415,7 +597,7 @@ func TestDirectCompletionHookFiresOnceAcrossRepeatReconciliation(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	route := cfg.Orchestrator.Routes[0]
 	extension := filepath.Join(cfg.Resolve(cfg.Extensions.Directory), "counter")
 	if err := os.MkdirAll(extension, 0o700); err != nil {
@@ -435,7 +617,12 @@ func TestDirectCompletionHookFiresOnceAcrossRepeatReconciliation(t *testing.T) {
 	}
 	name := filepath.Base(task)
 	fake := newFakeRecipient()
+	moved := false
 	fake.beforeEmit = func() {
+		if moved {
+			return
+		}
+		moved = true
 		working := filepath.Join(cfg.Resolve(route.Working), name)
 		recordDirectCompletion(t, working, filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "done", name))
 	}
@@ -444,22 +631,6 @@ func TestDirectCompletionHookFiresOnceAcrossRepeatReconciliation(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager.Wait()
-	blockedTriage := cfg.StatePath("runtime", "notification-triage")
-	if err := os.MkdirAll(filepath.Dir(blockedTriage), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(blockedTriage, []byte("not a directory"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.reconcileTransitions(context.Background()); err == nil {
-		t.Fatal("expected structural triage failure")
-	}
-	if count, err := os.ReadFile(filepath.Join(extension, "completed.count")); !os.IsNotExist(err) || len(count) != 0 {
-		t.Fatalf("hook ran before durable outbox enqueue: %q, %v", count, err)
-	}
-	if err := os.Remove(blockedTriage); err != nil {
-		t.Fatal(err)
-	}
 	if err := manager.reconcileTransitions(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +651,7 @@ func TestDirectCompletionRecoversLegacyPreInvocationFence(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	route := cfg.Orchestrator.Routes[0]
 	extension := filepath.Join(cfg.Resolve(cfg.Extensions.Directory), "counter")
 	if err := os.MkdirAll(extension, 0o700); err != nil {
@@ -545,7 +716,7 @@ func TestDirectCompletionRetriesFailedHookWithStableEventID(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	route := cfg.Orchestrator.Routes[0]
 	extension := filepath.Join(cfg.Resolve(cfg.Extensions.Directory), "retry")
 	if err := os.MkdirAll(extension, 0o700); err != nil {

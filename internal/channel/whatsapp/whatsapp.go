@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mdp/qrterminal/v3"
@@ -33,23 +34,28 @@ import (
 )
 
 type Client struct {
-	config    config.WhatsApp
-	dbPath    string
-	handler   channel.Handler
-	client    *whatsmeow.Client
-	ctx       context.Context
-	report    channel.StatusReporter
-	pairing   channel.PairingReporter
-	log       io.Writer
-	store     *media.Store
-	speech    media.Transcriber
-	incoming  chan incomingMessage
-	download  func(context.Context, whatsmeow.DownloadableMessage, *os.File) error
-	upload    func(context.Context, io.Reader, io.ReadWriteSeeker, whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
-	deliver   func(context.Context, types.JID, *waE2E.Message) (whatsmeow.SendResponse, error)
-	deliverID func(context.Context, types.JID, *waE2E.Message, types.MessageID) (whatsmeow.SendResponse, error)
-	presence  func(context.Context, types.JID, types.ChatPresence, types.ChatPresenceMedia) error
-	activity  *channel.ActivityIndicator[types.JID]
+	config         config.WhatsApp
+	dbPath         string
+	handler        channel.Handler
+	client         *whatsmeow.Client
+	ctx            context.Context
+	report         channel.StatusReporter
+	pairing        channel.PairingReporter
+	log            io.Writer
+	store          *media.Store
+	speech         media.Transcriber
+	incoming       chan incomingMessage
+	download       func(context.Context, whatsmeow.DownloadableMessage, *os.File) error
+	upload         func(context.Context, io.Reader, io.ReadWriteSeeker, whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
+	deliver        func(context.Context, types.JID, *waE2E.Message) (whatsmeow.SendResponse, error)
+	deliverID      func(context.Context, types.JID, *waE2E.Message, types.MessageID) (whatsmeow.SendResponse, error)
+	presence       func(context.Context, types.JID, types.ChatPresence, types.ChatPresenceMedia) error
+	disconnect     func()
+	activity       *channel.ActivityIndicator[types.JID]
+	allowedNumbers func() []string
+	revoked        atomic.Bool
+	authLost       chan struct{}
+	authLostOnce   sync.Once
 
 	mu      sync.Mutex
 	sentIDs map[types.MessageID]time.Time
@@ -73,11 +79,15 @@ type incomingMessage struct {
 
 const whatsAppDeviceName = "Spynel"
 
+var errWhatsAppRuntimeAuthorization = errors.New("WhatsApp runtime authorization is unavailable: allowed_numbers has no valid number")
+
 func New(cfg config.WhatsApp, database string) *Client {
 	client := &Client{
 		config: cfg, dbPath: database, sentIDs: map[types.MessageID]time.Time{}, log: os.Stderr,
 		incoming: make(chan incomingMessage, 64), pairingRetry: make(chan struct{}, 1), pairingDelay: 2 * time.Second,
+		authLost: make(chan struct{}),
 	}
+	client.allowedNumbers = func() []string { return cfg.AllowedNumbers }
 	client.activity = newWhatsAppActivity(client, 4*time.Second)
 	return client
 }
@@ -109,28 +119,67 @@ func (c *Client) SetMedia(store *media.Store, speech media.Transcriber) {
 	c.speech = speech
 }
 
-func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string) (channel.DeliveryReceipt, error) {
+// SetAllowedNumbersSource installs the live configuration resolver used at
+// startup and immediately before every inbound and outbound provider action.
+func (c *Client) SetAllowedNumbersSource(source func() []string) { c.allowedNumbers = source }
+
+func (c *Client) liveAllowedNumbers() []string {
+	if c.allowedNumbers == nil {
+		return nil
+	}
+	return c.allowedNumbers()
+}
+
+func (c *Client) ValidateRuntimeAuthorization() error {
+	if c.revoked.Load() || !config.HasAllowedWhatsAppNumber(c.liveAllowedNumbers()) {
+		return errWhatsAppRuntimeAuthorization
+	}
+	return nil
+}
+
+func (c *Client) RevokeRuntimeAuthorization() {
+	c.revoked.Store(true)
+	c.signalAuthorizationLoss()
+}
+
+func (c *Client) signalAuthorizationLoss() {
+	c.authLostOnce.Do(func() { close(c.authLost) })
+}
+
+func (c *Client) requireRuntimeAuthorization() error {
+	if err := c.ValidateRuntimeAuthorization(); err != nil {
+		c.reportStatus(channel.ConnectionError, err.Error())
+		c.signalAuthorizationLoss()
+		return err
+	}
+	return nil
+}
+
+func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string) error {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	var chat types.JID
 	if strings.HasPrefix(conversation, "WA-group-") {
 		if !c.config.AllowGroups {
-			return channel.DeliveryReceipt{}, errors.New("WhatsApp group delivery is disabled")
+			return errors.New("WhatsApp group delivery is disabled")
 		}
 		chat = types.NewJID(strings.TrimPrefix(conversation, "WA-group-"), types.GroupServer)
 	} else if strings.HasPrefix(conversation, "WA-") {
 		number := config.NormalizeWhatsAppNumber(strings.TrimPrefix(conversation, "WA-"))
 		authorized := false
-		for _, allowed := range c.config.AllowedNumbers {
-			authorized = authorized || config.NormalizeWhatsAppNumber(allowed) == number
+		for _, allowed := range c.liveAllowedNumbers() {
+			authorized = authorized || config.NormalizeAllowedWhatsAppNumber(allowed) == number
 		}
 		if number == "" || !authorized {
-			return channel.DeliveryReceipt{}, errors.New("WhatsApp origin is not in allowed_numbers")
+			return errors.New("WhatsApp origin is not in allowed_numbers")
 		}
 		chat = types.NewJID(number, types.DefaultUserServer)
 	} else {
-		return channel.DeliveryReceipt{}, errors.New("invalid WhatsApp conversation origin")
+		return errors.New("invalid WhatsApp conversation origin")
 	}
-	ids, err := c.sendEvent(ctx, chat, eventID, text)
-	return channel.DeliveryReceipt{MessageIDs: ids}, err
+	_, err := c.sendEvent(ctx, chat, eventID, text)
+	return err
 }
 
 func stableWhatsAppMessageID(eventID string, index int) types.MessageID {
@@ -139,11 +188,17 @@ func stableWhatsAppMessageID(eventID string, index int) types.MessageID {
 }
 
 func (c *Client) sendEvent(ctx context.Context, chat types.JID, eventID, text string) ([]string, error) {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return nil, err
+	}
 	if c.client == nil && c.deliver == nil && c.deliverID == nil {
 		return nil, errors.New("WhatsApp is not connected")
 	}
 	var ids []string
 	for index, chunk := range split(markdownfmt.WhatsApp(text), 60000) {
+		if err := c.requireRuntimeAuthorization(); err != nil {
+			return nil, err
+		}
 		id := stableWhatsAppMessageID(eventID, index)
 		var response whatsmeow.SendResponse
 		var err error
@@ -168,15 +223,18 @@ func (c *Client) sendEvent(ctx context.Context, chat types.JID, eventID, text st
 }
 
 func (c *Client) Run(ctx context.Context, handler channel.Handler) error {
-	if !config.HasAllowedWhatsAppNumber(c.config.AllowedNumbers) {
-		err := errors.New("WhatsApp is enabled but its allowed-numbers whitelist is empty")
-		c.reportStatus(channel.ConnectionError, err.Error())
+	if err := c.requireRuntimeAuthorization(); err != nil {
 		return err
 	}
 	c.handler = handler
 	c.ctx = ctx
-	go c.messageWorker(ctx)
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(c.dbPath), 0o700); err != nil {
+		return err
+	}
+	if err := c.requireRuntimeAuthorization(); err != nil {
 		return err
 	}
 	container, err := sqlstore.New(ctx, "sqlite3", "file:"+filepath.ToSlash(c.dbPath)+"?_foreign_keys=on", nil)
@@ -184,11 +242,17 @@ func (c *Client) Run(ctx context.Context, handler channel.Handler) error {
 		return fmt.Errorf("open WhatsApp session store: %w", err)
 	}
 	defer container.Close()
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	device, err := container.GetFirstDevice(ctx)
 	if err != nil {
 		return err
 	}
 	c.client = whatsmeow.NewClient(device, nil)
+	var disconnectOnce sync.Once
+	c.disconnect = func() { disconnectOnce.Do(c.client.Disconnect) }
+	defer c.disconnect()
 	configurePairingIdentity(c.client)
 	c.pairingMu.Lock()
 	c.pairPhone = func(ctx context.Context, phone string) (string, error) {
@@ -201,18 +265,33 @@ func (c *Client) Run(ctx context.Context, handler channel.Handler) error {
 	c.deliver = func(ctx context.Context, chat types.JID, message *waE2E.Message) (whatsmeow.SendResponse, error) {
 		return c.client.SendMessage(ctx, chat, message)
 	}
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
+	go c.messageWorker(ctx)
 	c.client.AddEventHandler(c.onEvent)
 	if c.client.Store.ID == nil {
 		if err := c.runPairing(ctx); err != nil {
+			c.disconnect()
 			return err
 		}
 	} else {
+		if err := c.requireRuntimeAuthorization(); err != nil {
+			return err
+		}
 		if err := c.client.Connect(); err != nil {
+			c.disconnect()
 			return err
 		}
 		c.reportStatus(channel.ConnectionConnected, "")
 	}
-	defer c.client.Disconnect()
+	return c.waitForRuntime(ctx)
+}
+
+func (c *Client) waitForRuntime(ctx context.Context) error {
+	if c.disconnect != nil {
+		defer c.disconnect()
+	}
 	interval := time.Duration(c.config.PollIntervalSec) * time.Second
 	if interval < 2*time.Second {
 		interval = 3 * time.Second
@@ -223,6 +302,8 @@ func (c *Client) Run(ctx context.Context, handler channel.Handler) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-c.authLost:
+			return errWhatsAppRuntimeAuthorization
 		case <-ticker.C:
 			if c.client.IsConnected() && c.isPaired() {
 				c.reportStatus(channel.ConnectionConnected, "")
@@ -246,6 +327,9 @@ func configurePairingIdentity(client *whatsmeow.Client) {
 // codes. The signal is buffered so a retry pressed while the session is
 // winding down is still observed by the terminal-state wait.
 func (c *Client) RetryPairing() error {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	c.pairingMu.RLock()
 	active := c.pairingActive
 	c.pairingMu.RUnlock()
@@ -262,6 +346,9 @@ func (c *Client) RetryPairing() error {
 // PairPhone generates WhatsApp's official eight-character alternative to QR
 // scanning for the active pairing websocket.
 func (c *Client) PairPhone(ctx context.Context, phone string) (string, error) {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return "", err
+	}
 	c.pairingMu.RLock()
 	active, ready, rendered, pair := c.pairingActive, c.pairingReady, c.pairingQR, c.pairPhone
 	c.pairingMu.RUnlock()
@@ -283,14 +370,23 @@ func (c *Client) runPairing(ctx context.Context) error {
 	c.setPairingState(true, false)
 	defer c.setPairingState(false, false)
 	for c.client.Store.ID == nil {
+		if err := c.requireRuntimeAuthorization(); err != nil {
+			return err
+		}
 		c.reportStatus(channel.ConnectionConnecting, "waiting for pairing")
 		c.reportPairing(channel.PairingEvent{Name: c.Name(), State: "starting", Detail: "Starting a fresh WhatsApp pairing session…"})
+		if err := c.requireRuntimeAuthorization(); err != nil {
+			return err
+		}
 		qrChannel, err := c.client.GetQRChannel(ctx)
 		if err != nil {
 			if waitErr := c.waitForPairingRestart(ctx, "error", "WhatsApp pairing could not start: "+err.Error()); waitErr != nil {
 				return waitErr
 			}
 			continue
+		}
+		if err := c.requireRuntimeAuthorization(); err != nil {
+			return err
 		}
 		if err := c.client.Connect(); err != nil {
 			if waitErr := c.waitForPairingRestart(ctx, "error", "WhatsApp pairing could not connect: "+err.Error()); waitErr != nil {
@@ -304,6 +400,8 @@ func (c *Client) runPairing(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
+			case <-c.authLost:
+				return errWhatsAppRuntimeAuthorization
 			case <-c.pairingRetry:
 				c.setPairingState(true, false)
 				c.client.Disconnect()
@@ -354,6 +452,9 @@ func (c *Client) runPairing(ctx context.Context) error {
 }
 
 func (c *Client) waitForPairingRestart(ctx context.Context, state, detail string) error {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	c.setPairingState(true, false)
 	retryingDetail := detail + " — retrying automatically…"
 	c.reportPairing(channel.PairingEvent{Name: c.Name(), State: state, Detail: retryingDetail})
@@ -367,6 +468,8 @@ func (c *Client) waitForPairingRestart(ctx context.Context, state, detail string
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-c.authLost:
+		return errWhatsAppRuntimeAuthorization
 	case <-c.pairingRetry:
 	case <-timer.C:
 		// Do not carry a simultaneous manual signal into the newly created
@@ -401,6 +504,9 @@ func (c *Client) setPairingQR(rendered string) {
 }
 
 func (c *Client) onEvent(raw any) {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return
+	}
 	switch event := raw.(type) {
 	case *events.Connected:
 		if !c.isPaired() {
@@ -509,6 +615,7 @@ func (c *Client) groupAddressed(message *waE2E.Message) bool {
 }
 
 func messageContext(message *waE2E.Message) *waE2E.ContextInfo {
+	message = unwrapMessage(message)
 	if value := message.GetExtendedTextMessage(); value != nil {
 		return value.GetContextInfo()
 	}
@@ -518,16 +625,95 @@ func messageContext(message *waE2E.Message) *waE2E.ContextInfo {
 	if value := message.GetVideoMessage(); value != nil {
 		return value.GetContextInfo()
 	}
+	if value := message.GetPtvMessage(); value != nil {
+		return value.GetContextInfo()
+	}
 	if value := message.GetAudioMessage(); value != nil {
 		return value.GetContextInfo()
 	}
 	if value := message.GetDocumentMessage(); value != nil {
 		return value.GetContextInfo()
 	}
+	if value := message.GetStickerMessage(); value != nil {
+		return value.GetContextInfo()
+	}
 	return nil
 }
 
+func whatsappReplyTo(message *waE2E.Message) string {
+	contextInfo := messageContext(message)
+	if contextInfo == nil {
+		return ""
+	}
+	return channel.ReplyReference(contextInfo.GetStanzaID(), quotedMessagePreview(contextInfo.GetQuotedMessage()))
+}
+
+func quotedMessagePreview(message *waE2E.Message) string {
+	message = unwrapMessage(message)
+	if message == nil {
+		return ""
+	}
+	if text := message.GetConversation(); text != "" {
+		return text
+	}
+	if value := message.GetExtendedTextMessage(); value != nil {
+		return value.GetText()
+	}
+	if value := message.GetImageMessage(); value != nil {
+		return value.GetCaption()
+	}
+	if value := message.GetVideoMessage(); value != nil {
+		return value.GetCaption()
+	}
+	if value := message.GetPtvMessage(); value != nil {
+		return value.GetCaption()
+	}
+	if value := message.GetDocumentMessage(); value != nil {
+		return value.GetCaption()
+	}
+	return ""
+}
+
+// unwrapMessage mirrors the envelope families whatsmeow unwraps for inbound
+// events and also handles nested quoted payloads, which the library leaves raw.
+func unwrapMessage(message *waE2E.Message) *waE2E.Message {
+	seen := map[*waE2E.Message]bool{}
+	for message != nil && !seen[message] {
+		seen[message] = true
+		var nested *waE2E.Message
+		switch {
+		case message.GetDeviceSentMessage().GetMessage() != nil:
+			nested = message.GetDeviceSentMessage().GetMessage()
+		case message.GetBotInvokeMessage().GetMessage() != nil:
+			nested = message.GetBotInvokeMessage().GetMessage()
+		case message.GetEphemeralMessage().GetMessage() != nil:
+			nested = message.GetEphemeralMessage().GetMessage()
+		case message.GetViewOnceMessage().GetMessage() != nil:
+			nested = message.GetViewOnceMessage().GetMessage()
+		case message.GetViewOnceMessageV2().GetMessage() != nil:
+			nested = message.GetViewOnceMessageV2().GetMessage()
+		case message.GetViewOnceMessageV2Extension().GetMessage() != nil:
+			nested = message.GetViewOnceMessageV2Extension().GetMessage()
+		case message.GetLottieStickerMessage().GetMessage() != nil:
+			nested = message.GetLottieStickerMessage().GetMessage()
+		case message.GetDocumentWithCaptionMessage().GetMessage() != nil:
+			nested = message.GetDocumentWithCaptionMessage().GetMessage()
+		case message.GetEditedMessage().GetMessage() != nil:
+			nested = message.GetEditedMessage().GetMessage()
+		}
+		if nested == nil {
+			break
+		}
+		message = nested
+	}
+	return message
+}
+
 func (c *Client) reportPairing(event channel.PairingEvent) {
+	if err := c.ValidateRuntimeAuthorization(); err != nil {
+		c.reportStatus(channel.ConnectionError, err.Error())
+		return
+	}
 	if c.pairing != nil {
 		c.pairing(event)
 	}
@@ -539,24 +725,29 @@ func (c *Client) messageWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case incoming := <-c.incoming:
+			if err := c.requireRuntimeAuthorization(); err != nil {
+				continue
+			}
 			finishActivity := c.activity.Start(ctx, incoming.chat)
 			text, err := c.prepareMessage(ctx, incoming)
 			if err != nil {
-				_ = c.send(ctx, incoming.chat, "Spynel attachment error: "+err.Error())
+				_ = c.send(ctx, incoming.chat, channel.ErrorResponse("Spynel attachment error: "+err.Error()))
 				finishActivity()
 				continue
 			}
-			contextInfo := messageContext(incoming.message)
-			replyTo := ""
-			if contextInfo != nil {
-				replyTo = contextInfo.GetStanzaID()
+			if err := c.requireRuntimeAuthorization(); err != nil {
+				finishActivity()
+				continue
 			}
-			c.handleWithNativeActivity(incoming.received, incoming.chat, incoming.sender, text, string(incoming.id), replyTo, finishActivity)
+			c.handleWithReply(incoming.received, incoming.chat, incoming.sender, text, whatsappReplyTo(incoming.message), finishActivity)
 		}
 	}
 }
 
 func (c *Client) prepareMessage(ctx context.Context, incoming incomingMessage) (string, error) {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return "", err
+	}
 	parts := []string{messageBody(incoming.message)}
 	downloadable, name, voice, size := downloadableMedia(incoming.message, incoming.id)
 	if downloadable != nil {
@@ -567,6 +758,9 @@ func (c *Client) prepareMessage(ctx context.Context, incoming incomingMessage) (
 			return "", fmt.Errorf("attachment exceeds the %d byte limit", c.store.MaxBytes)
 		}
 		attachment, err := c.store.Create(ctx, name, func(file *os.File) error {
+			if err := c.requireRuntimeAuthorization(); err != nil {
+				return err
+			}
 			if c.download != nil {
 				return c.download(ctx, downloadable, file)
 			}
@@ -593,6 +787,10 @@ func (c *Client) prepareMessage(ctx context.Context, incoming incomingMessage) (
 
 func (c *Client) reportStatus(state channel.ConnectionState, detail string) {
 	if c.report != nil {
+		if (state == channel.ConnectionConnecting || state == channel.ConnectionConnected) && c.ValidateRuntimeAuthorization() != nil {
+			state = channel.ConnectionError
+			detail = errWhatsAppRuntimeAuthorization.Error()
+		}
 		status := channel.ConnectionStatus{Name: c.Name(), State: state, Detail: detail}
 		if state == channel.ConnectionConnected {
 			status.Identity, status.Link = c.pairedAccountIdentity()
@@ -623,17 +821,24 @@ func (c *Client) handle(received time.Time, chat types.JID, sender, text string)
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return
+	}
 	c.handleWithActivity(received, chat, sender, text, c.activity.Start(ctx, chat))
 }
 
 func (c *Client) handleWithActivity(received time.Time, chat types.JID, sender, text string, finishActivity func()) {
-	c.handleWithNativeActivity(received, chat, sender, text, "", "", finishActivity)
+	c.handleWithReply(received, chat, sender, text, "", finishActivity)
 }
 
-func (c *Client) handleWithNativeActivity(received time.Time, chat types.JID, sender, text, nativeMessageID, nativeReplyToID string, finishActivity func()) {
+func (c *Client) handleWithReply(received time.Time, chat types.JID, sender, text, replyTo string, finishActivity func()) {
 	ctx := c.ctx
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		finishActivity()
+		return
 	}
 	emit := func(event core.Event) {
 		if !event.Done || event.Continues || (event.Kind != core.EventFinal && event.Kind != core.EventError) {
@@ -641,30 +846,35 @@ func (c *Client) handleWithNativeActivity(received time.Time, chat types.JID, se
 		}
 		defer finishActivity()
 		text := event.Text
-		if event.FinalText != nil {
+		if event.Kind == core.EventFinal && event.FinalText != nil {
 			text = *event.FinalText
+		}
+		if event.Kind == core.EventError {
+			text = channel.ErrorResponse(text)
 		}
 		if text != "" {
 			_ = c.send(ctx, chat, text)
 		}
 		for _, attachment := range event.Attachments {
 			if err := c.sendAttachment(ctx, chat, attachment); err != nil {
-				_ = c.send(ctx, chat, "Spynel attachment delivery error: "+err.Error())
+				_ = c.send(ctx, chat, channel.ErrorResponse("Spynel attachment delivery error: "+err.Error()))
 			}
 		}
 	}
 	err := c.handler(ctx, core.Message{
 		Channel: c.Name(), Conversation: whatsappConversation(chat, sender), Sender: sender,
-		Text: text, NativeMessageID: nativeMessageID, NativeReplyToID: nativeReplyToID,
-		ReceivedAt: received.UTC(),
+		ReplyTo: replyTo, Text: text, ReceivedAt: received.UTC(),
 	}, emit)
 	if err != nil {
-		_ = c.send(ctx, chat, "Spynel error: "+err.Error())
+		_ = c.send(ctx, chat, channel.ErrorResponse(err.Error()))
 		finishActivity()
 	}
 }
 
 func (c *Client) sendChatPresence(ctx context.Context, chat types.JID, state types.ChatPresence) error {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	if c.presence != nil {
 		return c.presence(ctx, chat, state, types.ChatPresenceMediaText)
 	}
@@ -687,6 +897,9 @@ func whatsappConversation(chat types.JID, sender string) string {
 }
 
 func (c *Client) send(ctx context.Context, chat types.JID, text string) error {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	if c.client == nil && c.deliver == nil {
 		return errors.New("WhatsApp is not connected")
 	}
@@ -701,6 +914,9 @@ func (c *Client) send(ctx context.Context, chat types.JID, text string) error {
 }
 
 func (c *Client) sendAttachment(ctx context.Context, chat types.JID, attachment core.OutboundAttachment) error {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	if (c.client == nil && c.upload == nil) || (c.client == nil && c.deliver == nil) {
 		return errors.New("WhatsApp is not connected")
 	}
@@ -714,6 +930,9 @@ func (c *Client) sendAttachment(ctx context.Context, chat types.JID, attachment 
 		mediaType = whatsmeow.MediaImage
 	}
 	var uploaded whatsmeow.UploadResponse
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	if c.upload != nil {
 		uploaded, err = c.upload(ctx, file, nil, mediaType)
 	} else {
@@ -745,6 +964,9 @@ func (c *Client) sendAttachment(ctx context.Context, chat types.JID, attachment 
 }
 
 func (c *Client) sendMessage(ctx context.Context, chat types.JID, message *waE2E.Message) (whatsmeow.SendResponse, error) {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return whatsmeow.SendResponse{}, err
+	}
 	if c.deliver != nil {
 		return c.deliver(ctx, chat, message)
 	}
@@ -779,13 +1001,14 @@ func (c *Client) cleanupSentLocked() {
 }
 
 func (c *Client) allowed(senders ...string) bool {
-	if !config.HasAllowedWhatsAppNumber(c.config.AllowedNumbers) {
+	allowedNumbers := c.liveAllowedNumbers()
+	if !config.HasAllowedWhatsAppNumber(allowedNumbers) {
 		return false
 	}
 	for _, sender := range senders {
 		number := config.NormalizeWhatsAppNumber(sender)
-		for _, allowed := range c.config.AllowedNumbers {
-			if number != "" && number == config.NormalizeWhatsAppNumber(allowed) {
+		for _, allowed := range allowedNumbers {
+			if number != "" && number == config.NormalizeAllowedWhatsAppNumber(allowed) {
 				return true
 			}
 		}
@@ -798,6 +1021,7 @@ func messageText(event *events.Message) string {
 }
 
 func messageBody(message *waE2E.Message) string {
+	message = unwrapMessage(message)
 	if text := message.GetConversation(); text != "" {
 		return text
 	}
@@ -810,6 +1034,9 @@ func messageBody(message *waE2E.Message) string {
 	if video := message.GetVideoMessage(); video != nil {
 		return video.GetCaption()
 	}
+	if video := message.GetPtvMessage(); video != nil {
+		return video.GetCaption()
+	}
 	if document := message.GetDocumentMessage(); document != nil {
 		if caption := document.GetCaption(); caption != "" {
 			return caption
@@ -820,10 +1047,12 @@ func messageBody(message *waE2E.Message) string {
 }
 
 func hasMedia(message *waE2E.Message) bool {
-	return message.GetImageMessage() != nil || message.GetVideoMessage() != nil || message.GetAudioMessage() != nil || message.GetDocumentMessage() != nil || message.GetStickerMessage() != nil
+	message = unwrapMessage(message)
+	return message.GetImageMessage() != nil || message.GetVideoMessage() != nil || message.GetPtvMessage() != nil || message.GetAudioMessage() != nil || message.GetDocumentMessage() != nil || message.GetStickerMessage() != nil
 }
 
 func downloadableMedia(message *waE2E.Message, id types.MessageID) (whatsmeow.DownloadableMessage, string, bool, uint64) {
+	message = unwrapMessage(message)
 	if document := message.GetDocumentMessage(); document != nil {
 		return document, firstName(document.GetFileName(), "document-"+string(id)+mediaExtension(document.GetMimetype())), false, document.GetFileLength()
 	}
@@ -831,6 +1060,9 @@ func downloadableMedia(message *waE2E.Message, id types.MessageID) (whatsmeow.Do
 		return image, "image-" + string(id) + mediaExtension(image.GetMimetype()), false, image.GetFileLength()
 	}
 	if video := message.GetVideoMessage(); video != nil {
+		return video, "video-" + string(id) + mediaExtension(video.GetMimetype()), false, video.GetFileLength()
+	}
+	if video := message.GetPtvMessage(); video != nil {
 		return video, "video-" + string(id) + mediaExtension(video.GetMimetype()), false, video.GetFileLength()
 	}
 	if audio := message.GetAudioMessage(); audio != nil {

@@ -1,10 +1,13 @@
 # Local configuration, runtime state, and secrets
 .env
 .spynel/
+# Legacy root configuration; current Spynel migrates it into .spynel/config.yaml.
 /spynel.yaml
 
 # Repository-local developer toolchains and build outputs
 .spynel-dev/
+.tmp*/
+/.reviewer-probe/
 /bin/
 /spynel
 /npm/vendor/

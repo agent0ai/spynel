@@ -46,8 +46,18 @@ func TestRunCommandCapturesBoundedAttributedFailureEvidence(t *testing.T) {
 func startupTestConfig(root string) config.Config {
 	cfg := config.Default()
 	cfg.Root = root
-	cfg.Path = filepath.Join(root, config.FileName)
+	cfg.Path = config.PathForRoot(root)
 	return cfg
+}
+
+func TestWorkspaceIDIsStableAcrossConfigurationPathMigration(t *testing.T) {
+	root := t.TempDir()
+	canonical := startupTestConfig(root)
+	legacy := canonical
+	legacy.Path = filepath.Join(root, config.LegacyFileName)
+	if workspaceID(canonical) != workspaceID(legacy) {
+		t.Fatalf("workspace ID changed from %q to %q", workspaceID(legacy), workspaceID(canonical))
+	}
 }
 
 func TestLinuxStartupRegistrationIsWorkspaceSpecificAndReversible(t *testing.T) {

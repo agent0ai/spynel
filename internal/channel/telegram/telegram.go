@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/channel"
@@ -26,19 +28,26 @@ import (
 )
 
 type Bot struct {
-	config   config.Telegram
-	token    string
-	client   *http.Client
-	baseURL  string
-	report   channel.StatusReporter
-	notice   channel.NoticeReporter
-	store    *media.Store
-	speech   media.Transcriber
-	me       telegramUser
-	activity *channel.ActivityIndicator[string]
-	identity *IdentityStore
-	log      io.Writer
+	config       config.Telegram
+	token        string
+	client       *http.Client
+	baseURL      string
+	report       channel.StatusReporter
+	notice       channel.NoticeReporter
+	store        *media.Store
+	speech       media.Transcriber
+	me           telegramUser
+	activity     *channel.ActivityIndicator[string]
+	identity     *IdentityStore
+	log          io.Writer
+	allowedUsers func() []string
+	revoked      atomic.Bool
+	authLost     chan struct{}
+	authLostOnce sync.Once
+	listen       func(string, string) (net.Listener, error)
 }
+
+var errTelegramRuntimeAuthorization = errors.New("Telegram runtime authorization is unavailable: allowed_users has no valid user")
 
 func New(cfg config.Telegram, token string) *Bot {
 	return NewWithIdentityStore(cfg, token, "")
@@ -49,7 +58,8 @@ func NewWithIdentityStore(cfg config.Telegram, token, identityPath string) *Bot 
 	if timeout < 20*time.Second {
 		timeout = 20 * time.Second
 	}
-	bot := &Bot{config: cfg, token: token, client: &http.Client{Timeout: timeout}, baseURL: "https://api.telegram.org", identity: NewIdentityStore(identityPath)}
+	bot := &Bot{config: cfg, token: token, client: &http.Client{Timeout: timeout}, baseURL: "https://api.telegram.org", identity: NewIdentityStore(identityPath), authLost: make(chan struct{}), listen: net.Listen}
+	bot.allowedUsers = func() []string { return cfg.AllowedUsers }
 	bot.activity = newTelegramActivity(bot, 4*time.Second)
 	return bot
 }
@@ -76,26 +86,65 @@ func (b *Bot) SetMedia(store *media.Store, speech media.Transcriber) {
 	b.speech = speech
 }
 
-func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string) (channel.DeliveryReceipt, error) {
+// SetAllowedUsersSource installs the live configuration resolver used at
+// startup and immediately before every inbound and outbound provider action.
+func (b *Bot) SetAllowedUsersSource(source func() []string) { b.allowedUsers = source }
+
+func (b *Bot) liveAllowedUsers() []string {
+	if b.allowedUsers == nil {
+		return nil
+	}
+	return b.allowedUsers()
+}
+
+func (b *Bot) ValidateRuntimeAuthorization() error {
+	if b.revoked.Load() || !config.HasAllowedTelegramUser(b.liveAllowedUsers()) {
+		return errTelegramRuntimeAuthorization
+	}
+	return nil
+}
+
+func (b *Bot) RevokeRuntimeAuthorization() {
+	b.revoked.Store(true)
+	b.signalAuthorizationLoss()
+}
+
+func (b *Bot) signalAuthorizationLoss() {
+	b.authLostOnce.Do(func() { close(b.authLost) })
+}
+
+func (b *Bot) requireRuntimeAuthorization() error {
+	if err := b.ValidateRuntimeAuthorization(); err != nil {
+		b.reportStatus(channel.ConnectionError, err.Error())
+		b.signalAuthorizationLoss()
+		return err
+	}
+	return nil
+}
+
+func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string) error {
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	var chatID string
 	if strings.HasPrefix(conversation, "TG-group-") {
 		if b.config.GroupMode == "off" {
-			return channel.DeliveryReceipt{}, errors.New("Telegram group delivery is disabled")
+			return errors.New("Telegram group delivery is disabled")
 		}
 		chatID = strings.TrimPrefix(conversation, "TG-group-")
 	} else if strings.HasPrefix(conversation, "TG-") {
 		chatID = strings.TrimPrefix(conversation, "TG-")
-		if !b.identity.AuthorizedPrivate(b.config.AllowedUsers, chatID) {
-			return channel.DeliveryReceipt{}, errors.New("Telegram origin is not in allowed_users")
+		if !b.identity.AuthorizedPrivate(b.liveAllowedUsers(), chatID) {
+			return errors.New("Telegram origin is not in allowed_users")
 		}
 	} else {
-		return channel.DeliveryReceipt{}, errors.New("invalid Telegram conversation origin")
+		return errors.New("invalid Telegram conversation origin")
 	}
 	if _, err := strconv.ParseInt(chatID, 10, 64); err != nil {
-		return channel.DeliveryReceipt{}, errors.New("invalid Telegram chat identifier")
+		return errors.New("invalid Telegram chat identifier")
 	}
-	ids, err := b.sendWithIDs(ctx, chatID, text, 0, true)
-	return channel.DeliveryReceipt{MessageIDs: ids}, err
+	_, err := b.sendWithIDs(ctx, chatID, text, 0, false)
+	return err
 }
 
 func (b *Bot) Run(ctx context.Context, handler channel.Handler) error {
@@ -104,9 +153,7 @@ func (b *Bot) Run(ctx context.Context, handler channel.Handler) error {
 		b.reportStatus(channel.ConnectionError, err.Error())
 		return err
 	}
-	if !hasAllowedUser(b.config.AllowedUsers) {
-		err := errors.New("Telegram is enabled but its allowed-users whitelist is empty")
-		b.reportStatus(channel.ConnectionError, err.Error())
+	if err := b.requireRuntimeAuthorization(); err != nil {
 		return err
 	}
 	if b.config.Mode == "webhook" && strings.TrimSpace(b.config.WebhookSecret) == "" {
@@ -133,12 +180,7 @@ func (b *Bot) Run(ctx context.Context, handler channel.Handler) error {
 }
 
 func hasAllowedUser(values []string) bool {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return true
-		}
-	}
-	return false
+	return config.HasAllowedTelegramUser(values)
 }
 
 func (b *Bot) cleanupAttachments(ctx context.Context) {
@@ -167,6 +209,9 @@ func (b *Bot) runPolling(ctx context.Context, handler channel.Handler) error {
 				return ctx.Err()
 			}
 			b.reportStatus(channel.ConnectionError, err.Error())
+			if errors.Is(err, errTelegramRuntimeAuthorization) {
+				return err
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -180,12 +225,20 @@ func (b *Bot) runPolling(ctx context.Context, handler channel.Handler) error {
 				offset = update.UpdateID + 1
 			}
 			b.processUpdate(ctx, handler, update)
+			select {
+			case <-b.authLost:
+				return errTelegramRuntimeAuthorization
+			default:
+			}
 		}
 	}
 }
 
 func (b *Bot) runWebhook(ctx context.Context, handler channel.Handler) error {
-	listener, err := net.Listen("tcp", b.config.WebhookListen)
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
+	listener, err := b.listen("tcp", b.config.WebhookListen)
 	if err != nil {
 		return fmt.Errorf("listen for Telegram webhook on %s: %w", b.config.WebhookListen, err)
 	}
@@ -204,6 +257,10 @@ func (b *Bot) runWebhook(ctx context.Context, handler channel.Handler) error {
 	}()
 	mux := http.NewServeMux()
 	mux.HandleFunc(path, func(writer http.ResponseWriter, request *http.Request) {
+		if err := b.requireRuntimeAuthorization(); err != nil {
+			http.Error(writer, "channel authorization unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		if request.Method != http.MethodPost {
 			http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -237,27 +294,40 @@ func (b *Bot) runWebhook(ctx context.Context, handler channel.Handler) error {
 		return err
 	}
 	b.reportStatus(channel.ConnectionConnected, "webhook connected via "+listener.Addr().String())
+	var runErr error
 	select {
 	case <-ctx.Done():
-		shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = server.Shutdown(shutdownContext)
-		_, _ = b.call(shutdownContext, "deleteWebhook", map[string]any{"drop_pending_updates": false})
-		return ctx.Err()
+		runErr = ctx.Err()
+	case <-b.authLost:
+		runErr = errTelegramRuntimeAuthorization
 	case err := <-serveError:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
 	}
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = server.Shutdown(shutdownContext)
+	// Deleting an already-registered webhook is a teardown-only exception to
+	// the normal provider boundary: revocation must block all useful traffic,
+	// but it must not strand Telegram delivery at a listener that is gone.
+	_, _ = b.callProvider(shutdownContext, "deleteWebhook", map[string]any{"drop_pending_updates": false})
+	return runErr
 }
 
 func (b *Bot) processUpdate(ctx context.Context, handler channel.Handler, update telegramUpdate) {
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return
+	}
 	message := update.Message
 	if message == nil || !message.hasContent() || !b.allowed(message.From) {
 		return
 	}
 	if message.Chat.Type == "private" && message.Chat.ID == message.From.ID {
+		if err := b.requireRuntimeAuthorization(); err != nil {
+			return
+		}
 		if err := b.identity.RecordVerifiedPrivate(message.From.ID, message.From.ID, message.From.Username); err != nil && b.log != nil {
 			_, _ = fmt.Fprintln(b.log, "telegram: persist verified private identity:", err)
 		}
@@ -272,6 +342,10 @@ func (b *Bot) processUpdate(ctx context.Context, handler channel.Handler, update
 
 func (b *Bot) reportStatus(state channel.ConnectionState, detail string) {
 	if b.report != nil {
+		if (state == channel.ConnectionConnecting || state == channel.ConnectionConnected) && b.ValidateRuntimeAuthorization() != nil {
+			state = channel.ConnectionError
+			detail = errTelegramRuntimeAuthorization.Error()
+		}
 		status := channel.ConnectionStatus{Name: b.Name(), State: state, Detail: detail}
 		if username := telegramUsername(b.me.Username); username != "" {
 			status.Identity = "@" + username
@@ -292,15 +366,54 @@ func telegramUsername(value string) string {
 }
 
 func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *telegramMessage) {
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return
+	}
 	chatID := strconv.FormatInt(message.Chat.ID, 10)
-	finishActivity := b.activity.Start(ctx, chatID)
+	var activityMu sync.Mutex
+	var finishActivity func()
+	var agentOwnedActivity bool
+	setActivity := func(active bool) {
+		activityMu.Lock()
+		if active && finishActivity == nil {
+			finishActivity = b.activity.Start(ctx, chatID)
+			activityMu.Unlock()
+			return
+		}
+		finish := finishActivity
+		if !active {
+			finishActivity = nil
+		}
+		activityMu.Unlock()
+		if !active && finish != nil {
+			finish()
+		}
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			setActivity(false)
+			panic(recovered)
+		}
+	}()
+	// Ordinary accepted messages own the visible communication turn from
+	// arrival, including attachment preparation and transcription. Slash
+	// commands wait for the application activity event so framework-only
+	// commands never flash typing while agent-backed commands still activate it.
+	rawText := strings.TrimSpace(firstNonempty(message.Text, message.Caption))
+	if !strings.HasPrefix(rawText, "/") {
+		setActivity(true)
+	}
 	text, err := b.messageText(ctx, message)
 	if err != nil {
-		_ = b.send(context.Background(), chatID, "Spynel attachment error: "+err.Error(), message.MessageID)
-		finishActivity()
+		_ = b.send(context.Background(), chatID, channel.ErrorResponse("Spynel attachment error: "+err.Error()), message.MessageID)
+		setActivity(false)
 		return
 	}
 	if b.config.NotifyMessages && b.notice != nil {
+		if err := b.requireRuntimeAuthorization(); err != nil {
+			setActivity(false)
+			return
+		}
 		preview := strings.ReplaceAll(text, "\n", " ")
 		if runes := []rune(preview); len(runes) > 120 {
 			preview = string(runes[:120]) + "…"
@@ -308,16 +421,27 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 		b.notice(channel.Notice{Channel: b.Name(), Sender: b.sender(message.From), Text: preview})
 	}
 	emit := func(event core.Event) {
+		if event.Kind == core.EventActivity {
+			if event.Active {
+				activityMu.Lock()
+				agentOwnedActivity = true
+				activityMu.Unlock()
+			}
+			setActivity(event.Active)
+			return
+		}
 		if !event.Done || event.Continues || (event.Kind != core.EventFinal && event.Kind != core.EventError) {
 			return
 		}
-		defer finishActivity()
+		// Terminal events are a fallback cleanup boundary for handlers that do
+		// not yet emit the explicit activity-off event. Stop before delivery.
+		setActivity(false)
 		text := event.Text
-		if event.FinalText != nil {
+		if event.Kind == core.EventFinal && event.FinalText != nil {
 			text = *event.FinalText
 		}
-		if text == "" && event.Kind == core.EventError {
-			text = "The harness turn failed."
+		if event.Kind == core.EventError {
+			text = channel.ErrorResponse(text)
 		}
 		if text != "" {
 			_ = b.send(context.Background(), chatID, text, message.MessageID)
@@ -325,20 +449,40 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 		}
 		for _, attachment := range event.Attachments {
 			if err := b.sendAttachment(context.Background(), chatID, attachment, message.MessageID); err != nil {
-				_ = b.send(context.Background(), chatID, "Spynel attachment delivery error: "+err.Error(), message.MessageID)
+				_ = b.send(context.Background(), chatID, channel.ErrorResponse("Spynel attachment delivery error: "+err.Error()), message.MessageID)
 			}
 			message.MessageID = 0
 		}
 	}
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		setActivity(false)
+		return
+	}
 	err = handler(ctx, core.Message{
 		Channel: b.Name(), Conversation: b.conversationID(message), Sender: b.sender(message.From),
-		Text: text, NativeMessageID: strconv.FormatInt(message.MessageID, 10), NativeReplyToID: telegramReplyID(message),
-		ReceivedAt: time.Unix(message.Date, 0).UTC(),
+		ReplyTo: telegramReplyTo(message), Text: text, ReceivedAt: time.Unix(message.Date, 0).UTC(),
 	}, emit)
 	if err != nil {
-		_ = b.send(context.Background(), chatID, "Spynel error: "+err.Error(), message.MessageID)
-		finishActivity()
+		_ = b.send(context.Background(), chatID, channel.ErrorResponse(err.Error()), message.MessageID)
+		setActivity(false)
+		return
 	}
+	activityMu.Lock()
+	owned := agentOwnedActivity
+	activityMu.Unlock()
+	if !owned {
+		// A synchronous handler that neither completed nor transferred activity
+		// to an asynchronous main-agent turn cannot retain arrival activity.
+		setActivity(false)
+	}
+}
+
+func telegramReplyTo(message *telegramMessage) string {
+	if message == nil || message.ReplyToMessage == nil || message.ReplyToMessage.MessageID <= 0 {
+		return ""
+	}
+	replied := message.ReplyToMessage
+	return channel.ReplyReference(strconv.FormatInt(replied.MessageID, 10), firstNonempty(replied.Text, replied.Caption))
 }
 
 func (b *Bot) conversationID(message *telegramMessage) string {
@@ -360,6 +504,9 @@ func (b *Bot) welcome(ctx context.Context, message *telegramMessage) {
 }
 
 func (b *Bot) messageText(ctx context.Context, message *telegramMessage) (string, error) {
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return "", err
+	}
 	parts := []string{firstNonempty(message.Text, message.Caption)}
 	for _, file := range message.files() {
 		attachment, err := b.download(ctx, file)
@@ -383,6 +530,9 @@ func (b *Bot) messageText(ctx context.Context, message *telegramMessage) (string
 }
 
 func (b *Bot) download(ctx context.Context, file telegramFile) (media.Attachment, error) {
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return media.Attachment{}, err
+	}
 	if b.store == nil {
 		return media.Attachment{}, errors.New("attachment storage is not configured")
 	}
@@ -400,6 +550,9 @@ func (b *Bot) download(ctx context.Context, file telegramFile) (media.Attachment
 	if err != nil {
 		return media.Attachment{}, err
 	}
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return media.Attachment{}, err
+	}
 	response, err := b.client.Do(request)
 	if err != nil {
 		return media.Attachment{}, b.redact(err)
@@ -412,12 +565,13 @@ func (b *Bot) download(ctx context.Context, file telegramFile) (media.Attachment
 }
 
 func (b *Bot) allowed(user telegramUser) bool {
-	if len(b.config.AllowedUsers) == 0 {
+	allowedUsers := b.liveAllowedUsers()
+	if !config.HasAllowedTelegramUser(allowedUsers) {
 		return false
 	}
 	id := strconv.FormatInt(user.ID, 10)
 	username := normalizeUsername(user.Username)
-	for _, allowed := range b.config.AllowedUsers {
+	for _, allowed := range allowedUsers {
 		allowed = normalizeAllowedUser(allowed)
 		if allowed == id || (username != "" && allowed == username) {
 			return true
@@ -452,6 +606,9 @@ func (b *Bot) groupAllowed(message *telegramMessage) bool {
 }
 
 func (b *Bot) updates(ctx context.Context, offset int64) ([]telegramUpdate, error) {
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return nil, err
+	}
 	query := url.Values{}
 	query.Set("offset", strconv.FormatInt(offset, 10))
 	timeout := b.config.PollTimeoutSec
@@ -514,14 +671,10 @@ func (b *Bot) sendWithIDs(ctx context.Context, chatID, text string, replyTo int6
 	return ids, nil
 }
 
-func telegramReplyID(message *telegramMessage) string {
-	if message != nil && message.ReplyToMessage != nil && message.ReplyToMessage.MessageID > 0 {
-		return strconv.FormatInt(message.ReplyToMessage.MessageID, 10)
-	}
-	return ""
-}
-
 func (b *Bot) sendAttachment(ctx context.Context, chatID string, attachment core.OutboundAttachment, replyTo int64) error {
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	file, err := media.OpenOutbound(attachment)
 	if err != nil {
 		return err
@@ -556,6 +709,9 @@ func (b *Bot) sendAttachment(ctx context.Context, chatID string, attachment core
 		return err
 	}
 	request.Header.Set("Content-Type", contentType)
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
 	response, err := b.client.Do(request)
 	if err != nil {
 		return b.redact(err)
@@ -605,6 +761,13 @@ func (b *Bot) post(ctx context.Context, method string, payload any) error {
 }
 
 func (b *Bot) call(ctx context.Context, method string, payload any) (json.RawMessage, error) {
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return nil, err
+	}
+	return b.callProvider(ctx, method, payload)
+}
+
+func (b *Bot) callProvider(ctx context.Context, method string, payload any) (json.RawMessage, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err

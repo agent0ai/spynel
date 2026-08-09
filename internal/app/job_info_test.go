@@ -47,7 +47,7 @@ func newJobInfoService(t *testing.T) *Service {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,36 +119,22 @@ func TestJobInfoShowsAllowlistedMarkdownMetadataAndBoundedNewestProgress(t *test
 	service.Runtime.EndJob(id)
 }
 
-func TestJobInfoShowsBodyFreeActionRequestStatus(t *testing.T) {
+func TestJobInfoUsesTaskWaitingStateWithoutNotificationResponseState(t *testing.T) {
 	service := newJobInfoService(t)
 	path := filepath.Join(t.TempDir(), "task.md")
 	document := orchestrator.Document{FrontMatter: map[string]any{"id": "task-action", "title": "Action", "status": "waiting"}, Body: "# Task\n"}
 	if err := orchestrator.WriteDocument(path, document); err != nil {
 		t.Fatal(err)
 	}
-	directory := service.Config.StatePath("runtime", "action-requests")
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	record := map[string]any{
-		"id": "request-1", "task_id": "task-action", "origin": "telegram/TG-secret",
-		"question": "secret question", "sent_channel": "telegram", "state": "awaiting_response",
-		"created_at": "2026-08-08T19:00:00Z", "reminder_due_at": "2026-08-08T20:00:00Z",
-		"reminder_count": 1, "max_reminders": 3,
-	}
-	data, _ := json.Marshal(record)
-	if err := os.WriteFile(filepath.Join(directory, "request-1.json"), data, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	service.Runtime.BeginJobWithDetails("orchestrator:action", "orchestrator", "markdown", "task.md", JobDetails{Kind: "task", Route: "tasks", DurableFile: path})
 	output := runJobCommand(t, service, "/job info 1")
-	for _, want := range []string{"Action request", `State: awaiting\_response`, "Delivery channel: telegram", "Reminder due: 2026-08-08T20:00:00Z", "Reminders: 1/3"} {
+	for _, want := range []string{"Durable work", "Status: waiting"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("missing %q:\n%s", want, output)
 		}
 	}
-	if strings.Contains(output, "secret question") || strings.Contains(output, "TG-secret") {
-		t.Fatalf("job info leaked private action fields:\n%s", output)
+	if strings.Contains(output, "Action request") || strings.Contains(output, "awaiting_response") || strings.Contains(output, "Reminder") {
+		t.Fatalf("job info exposed retired notification response state:\n%s", output)
 	}
 }
 
@@ -326,7 +312,7 @@ func TestJobControlDelimitsGuidanceAndAcknowledgesWithoutTakingEmitter(t *testin
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	target := &jobControlHarness{heldServiceHarness: newHeldServiceHarness()}
 	service := New(cfg, target)
 	path := filepath.Join(root, ".spynel", "tasks", "working", "control.md")
@@ -369,7 +355,7 @@ func TestJobPingAndGuardedContinuationPersistProviderIterations(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,7 +424,7 @@ func TestJobControlAuthorizationAndTerminalRacesFailClosed(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	cfg.Channels.Telegram.AllowedUsers = []string{"7", "8"}
 	target := &jobControlHarness{heldServiceHarness: newHeldServiceHarness()}
 	service := New(cfg, target)

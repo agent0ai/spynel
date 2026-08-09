@@ -1,10 +1,12 @@
 {
   "name": "spynel",
   "version": "0.2.0",
-  "description": "Extensible chat and markdown orchestrator for coding agents",
+  "description": "A non-AI orchestration layer connecting one human to many coding agents",
   "license": "MIT",
   "keywords": [
     "coding-agent",
+    "multi-agent",
+    "orchestration",
     "terminal-ui",
     "telegram",
     "whatsapp",

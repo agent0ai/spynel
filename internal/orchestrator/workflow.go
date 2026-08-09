@@ -212,6 +212,10 @@ func linkedRoundTasks(tasksBase, goalID string, round int) ([]linkedTask, error)
 }
 
 func moveDocument(path, target, status string, now time.Time) error {
+	return moveDocumentWithProgress(path, target, status, now, "")
+}
+
+func moveDocumentWithProgress(path, target, status string, now time.Time, note string) error {
 	lock, err := lockProviderTurn(path)
 	if err != nil {
 		return err
@@ -223,6 +227,9 @@ func moveDocument(path, target, status string, now time.Time) error {
 	}
 	document.FrontMatter["status"] = status
 	document.FrontMatter["updated_at"] = now.UTC().Format(time.RFC3339)
+	if note != "" {
+		appendProgress(&document, now, note)
+	}
 	if err := WriteDocument(path, document); err != nil {
 		return err
 	}
@@ -230,4 +237,62 @@ func moveDocument(path, target, status string, now time.Time) error {
 		return err
 	}
 	return os.Rename(path, target)
+}
+
+func updateDocumentProgress(path string, now time.Time, note string) error {
+	lock, err := lockProviderTurn(path)
+	if err != nil {
+		return err
+	}
+	defer unlockProviderTurn(lock)
+	document, err := ReadDocument(path)
+	if err != nil {
+		return err
+	}
+	document.FrontMatter["updated_at"] = now.UTC().Format(time.RFC3339)
+	appendProgress(&document, now, note)
+	return WriteDocument(path, document)
+}
+
+func appendProgress(document *Document, now time.Time, note string) {
+	note = strings.Join(strings.Fields(note), " ")
+	if runes := []rune(note); len(runes) > 1000 {
+		note = string(runes[:999]) + "…"
+	}
+	entry := "- " + now.UTC().Format(time.RFC3339) + " — " + note
+	body := strings.ReplaceAll(document.Body, "\r\n", "\n")
+	lines := strings.Split(body, "\n")
+	for _, line := range lines {
+		if line == entry {
+			return
+		}
+	}
+	progress := -1
+	end := len(lines)
+	for index, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if progress < 0 {
+			if strings.EqualFold(trimmed, "## Progress") {
+				progress = index
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "## ") {
+			end = index
+			break
+		}
+	}
+	if progress < 0 {
+		document.Body = strings.TrimRight(body, "\n") + "\n\n## Progress\n\n" + entry + "\n"
+		return
+	}
+	prefix := strings.TrimRight(strings.Join(lines[:end], "\n"), "\n")
+	suffix := strings.TrimLeft(strings.Join(lines[end:], "\n"), "\n")
+	document.Body = prefix + "\n\n" + entry + "\n"
+	if suffix != "" {
+		document.Body += "\n" + suffix
+		if !strings.HasSuffix(document.Body, "\n") {
+			document.Body += "\n"
+		}
+	}
 }

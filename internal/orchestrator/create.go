@@ -69,10 +69,7 @@ func CreateWithOptions(cfg config.Config, routeName, title, body string, options
 		}}
 	}
 	if routeName == "tasks" {
-		taskReviewRequired = !options.NoReview
-		if strings.TrimSpace(options.GoalID) != "" {
-			taskReviewRequired = true
-		}
+		taskReviewRequired = cfg.Harness.EffectiveTaskReviewRequired(!options.NoReview)
 		front["review_required"] = taskReviewRequired
 		enabled := options.Notify
 		notify := map[string]any{"enabled": enabled}
@@ -108,9 +105,9 @@ func CreateWithOptions(cfg config.Config, routeName, title, body string, options
 		if routeName == "goals" {
 			body = "# " + title + "\n\n## Objective\n\n" + title + "\n\n## Boundaries\n\n- To be refined during planning.\n\n## Target conditions\n\n- `criterion-1`: " + title + "\n\n## Current evidence\n\n- No evidence recorded yet.\n\n## Planning history\n\n- Awaiting the initial planning pass.\n\n## Review history\n\n- No reviews yet.\n\n## Progress\n\n- Created by Spynel.\n"
 		} else {
-			acceptance := "The requested finite outcome is implemented and independently verified."
+			acceptance := "The requested finite outcome is completed and independently verified."
 			if !taskReviewRequired {
-				acceptance = "The requested information is collected read-only, with sources, evidence boundaries, uncertainty, and an exact UTC completion time recorded."
+				acceptance = "The requested low-risk outcome is completed with proportionate verification, evidence, residual uncertainty, and an exact UTC completion time recorded."
 			}
 			body = "# " + title + "\n\n## Objective\n\n" + title + "\n\n## Acceptance criteria\n\n- " + acceptance + "\n\n## Context\n\n- Created by Spynel.\n\n## Progress\n\n- Not started.\n"
 		}

@@ -1,7 +1,6 @@
 version: 1
 
 workspace:
-  state_dir: .spynel
   history_max_messages: 50
   history_char_limit: 12000
   attachment_max_mb: 100
@@ -10,6 +9,15 @@ harness:
   name: ""
   model: ""
   sandbox: danger-full-access
+  chat_agent_prefix: ""
+  developer_agent_prefix: /goal
+  reviewer_agent_prefix: /goal
+  heartbeat_agent_prefix: /goal
+  # skip-trivial lets each task creator decide; always and never override it.
+  reviews: skip-trivial
+  # Used only when name is acp. Built-in ACP aliases supply these themselves.
+  acp_command: ""
+  acp_args: []
 
 channels:
   tui:
@@ -51,21 +59,13 @@ speech:
 startup:
   enabled: false
 
-# Cross-channel reminders are disabled unless contacts are explicitly bound
-# to the same authenticated principal.
-notifications:
-  contact_bindings: []
-  # Non-urgent actionable reminders are deferred during this daily UTC window.
-  quiet_hours:
-    enabled: false
-    start: "22:00"
-    end: "07:00"
-
 orchestrator:
   enabled: true
   interval_seconds: 10
-  # Higher-level agent audit; 0 disables it. Changes take effect after restart.
+  # Higher-level agent audit; 0 disables it. Changes take effect live.
   semantic_heartbeat_minutes: 15
+  # off, decide (agent must send or explicitly decline), or always (agent must send).
+  task_notifications: decide
   max_parallel: 4
   routes:
     - name: tasks

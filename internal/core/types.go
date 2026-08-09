@@ -20,20 +20,23 @@ type Message struct {
 	Channel      string `json:"channel"`
 	Conversation string `json:"conversation"`
 	Sender       string `json:"sender,omitempty"`
-	// NativeMessageID and NativeReplyToID are opaque transport identifiers from
-	// an accepted inbound event. They are used only for exact reply correlation.
-	NativeMessageID string    `json:"native_message_id,omitempty"`
-	NativeReplyToID string    `json:"native_reply_to_id,omitempty"`
-	InstanceID      string    `json:"instance_id,omitempty"`
-	FollowupOnly    bool      `json:"followup_only,omitempty"`
-	Text            string    `json:"text"`
-	ReceivedAt      time.Time `json:"received_at"`
+	// ReplyTo is a bounded provider-neutral reference derived only from the
+	// accepted inbound event: native message ID followed by an optional preview.
+	ReplyTo      string    `json:"reply_to,omitempty"`
+	InstanceID   string    `json:"instance_id,omitempty"`
+	FollowupOnly bool      `json:"followup_only,omitempty"`
+	Text         string    `json:"text"`
+	ReceivedAt   time.Time `json:"received_at"`
 }
 
 // Event is a streamed harness or application response.
 type Event struct {
 	Kind string `json:"kind"`
 	Text string `json:"text,omitempty"`
+	// Active is meaningful only for EventActivity. The application emits true
+	// exactly when a main communication-agent turn takes ownership of this
+	// response stream and false before its terminal event is delivered.
+	Active bool `json:"active,omitempty"`
 	// FinalText identifies the last assistant-message item when Text contains
 	// the complete streamed turn. Remote chat transports deliver this item.
 	FinalText   *string              `json:"final_text,omitempty"`
@@ -75,10 +78,13 @@ type OutboundAttachment struct {
 
 // Screen is a transport-neutral UI surface. ParentID marks a nested screen so
 // the TUI can restore its exact parent form state after selection or Escape.
-// Text-only channels use the same setting keys as commands.
+// ActionMessage is an optional application-authored assistant reply produced
+// by a screen action; a result-only response may leave ID empty. Text-only
+// channels use the same setting keys as commands.
 type Screen struct {
 	ID             string
 	ParentID       string
+	ActionMessage  string
 	Title          string
 	Hints          []ScreenHint
 	Tabs           []string
@@ -146,7 +152,10 @@ const (
 	EventFinal  = "final"
 	EventError  = "error"
 	EventStatus = "status"
-	EventScreen = "screen"
+	// EventActivity exposes the main communication-agent activity boundary to
+	// presentation channels without coupling them to harness or job internals.
+	EventActivity = "activity"
+	EventScreen   = "screen"
 	// EventThemePicker asks an interactive TUI to open its inline theme list.
 	EventThemePicker = "theme-picker"
 )

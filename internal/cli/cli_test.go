@@ -25,6 +25,7 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/localapi"
+	"github.com/agent0ai/spynel/internal/orchestrator"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
 
@@ -40,7 +41,7 @@ func TestRecordCommandFailurePersistsGenericEvidenceWithoutErrorContent(t *testi
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	configPath := filepath.Join(root, config.FileName)
+	configPath := config.PathForRoot(root)
 	recordCommandFailure([]string{"serve", "--config", configPath}, errors.New("authorization: Bearer must-not-persist"))
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -66,12 +67,91 @@ func TestConfigPathArgument(t *testing.T) {
 		want string
 	}{
 		{args: []string{"status"}, want: ""},
-		{args: []string{"status", "--config", "/tmp/project/spynel.yaml"}, want: "/tmp/project/spynel.yaml"},
+		{args: []string{"status", "--config", "/tmp/project/.spynel/config.yaml"}, want: "/tmp/project/.spynel/config.yaml"},
 		{args: []string{"send", "--config=/tmp/other.yaml", "hello"}, want: "/tmp/other.yaml"},
 	} {
 		if got := configPathArgument(test.args); got != test.want {
 			t.Errorf("configPathArgument(%q) = %q, want %q", test.args, got, test.want)
 		}
+	}
+}
+
+func TestWorkflowListAliasPreservesSharedAndListOptions(t *testing.T) {
+	for _, test := range []struct {
+		input []string
+		want  []string
+	}{
+		{input: []string{"--limit", "50"}, want: []string{"open", "--limit", "50"}},
+		{input: []string{"--config", "workspace.yml", "--days", "14", "--detail"}, want: []string{"--config", "workspace.yml", "open", "--days", "14", "--detail"}},
+		{input: []string{"--json", "waiting", "--limit", "2"}, want: []string{"--json", "waiting", "--limit", "2"}},
+		{input: []string{"review", "--days", "7"}, want: []string{"review", "--days", "7"}},
+		{input: []string{"failed", "--detail"}, want: []string{"failed", "--detail"}},
+	} {
+		if got := workflowListAliasArgs(test.input); strings.Join(got, "\x00") != strings.Join(test.want, "\x00") {
+			t.Errorf("workflowListAliasArgs(%q) = %q, want %q", test.input, got, test.want)
+		}
+	}
+}
+
+func TestWorkflowListAliasesAreDocumentedForExternalPrograms(t *testing.T) {
+	for _, want := range []string{
+		"spynel tasks [flags] [VIEW]",
+		"spynel goals [flags] [VIEW]",
+		"open|recent|active|review|waiting|done|failed|all",
+		"--config PATH",
+		"--conversation NAME",
+		"--days N",
+		"--limit N",
+		"--detail",
+		"shared response event as NDJSON",
+	} {
+		if !strings.Contains(helpText, want) {
+			t.Fatalf("CLI help does not expose %q:\n%s", want, helpText)
+		}
+	}
+}
+
+func TestInstructionsCommandReportsValidationWithoutContents(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := config.PathForRoot(root)
+	cfg, _ := config.Load(cfgPath)
+	secret := "do-not-print-in-status"
+	if err := os.WriteFile(cfg.StatePath("instructions", "agent-chat.md"), []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output strings.Builder
+	if err := runInstructionsCommand([]string{"--config", cfgPath}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), secret) || !strings.Contains(output.String(), "chat: .spynel/instructions/agent-chat.md — valid") {
+		t.Fatalf("instruction inspection output = %q", output.String())
+	}
+}
+
+func TestInstructionsCommandRejectsEscapingInstructionsDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := config.PathForRoot(root)
+	instructionsPath := filepath.Join(root, ".spynel", "instructions")
+	outsidePath := filepath.Join(t.TempDir(), "external-instructions")
+	if err := os.Rename(instructionsPath, outsidePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsidePath, instructionsPath); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	var output strings.Builder
+	err := runInstructionsCommand([]string{"--config", cfgPath}, &output)
+	if err == nil || !strings.Contains(err.Error(), "unsafe or invalid") {
+		t.Fatalf("symlinked instructions command error = %v", err)
+	}
+	if strings.Count(output.String(), "invalid (.spynel/instructions path must not be a symbolic link)") != 5 {
+		t.Fatalf("symlinked instructions command output = %q", output.String())
 	}
 }
 
@@ -103,12 +183,38 @@ func TestTaskInspectShowsEffectiveFailSafeReviewPolicy(t *testing.T) {
 	}
 }
 
+func TestTaskInspectAppliesWorkspaceReviewMode(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Reviews = config.TaskReviewsNever
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(cfg.StatePath("tasks", "todo"), "inspect.md")
+	if err := os.WriteFile(path, []byte("---\nid: task\nreview_required: true\n---\n# Task\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := inspectTaskPolicy(path, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "Configured task review mode: never") || !strings.Contains(output.String(), "Review required: false") {
+		t.Fatalf("inspection = %q", output.String())
+	}
+}
+
 func TestNotifyCommandUsesDurableHistoryWithoutHarness(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	store := history.New(cfg.StatePath("history"))
 	if _, err := store.Append("cli", "alerts", history.Entry{Role: "user", Content: "known"}); err != nil {
 		t.Fatal(err)
@@ -123,6 +229,93 @@ func TestNotifyCommandUsesDurableHistoryWithoutHarness(t *testing.T) {
 	if len(entries) != 2 || entries[1].Sender != "Spy" || entries[1].Content != "complete" {
 		t.Fatalf("history = %#v", entries)
 	}
+}
+
+func TestNotificationAgentPreparedCLIActionsSendOrExplicitlyDecline(t *testing.T) {
+	setup := func(t *testing.T) (config.Config, string) {
+		t.Helper()
+		root := t.TempDir()
+		if err := workspace.Init(root, false); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.Load(config.PathForRoot(root))
+		if err != nil {
+			t.Fatal(err)
+		}
+		store := history.New(cfg.StatePath("history"))
+		if _, err := store.Append("cli", "alerts", history.Entry{Role: "user", Content: "known"}); err != nil {
+			t.Fatal(err)
+		}
+		taskFile := filepath.Join(cfg.StatePath("tasks", "done"), "task.md")
+		document := orchestrator.Document{FrontMatter: map[string]any{
+			"id": "task-1", "title": "Report", "status": "done", "attempt": 1,
+			"notify": map[string]any{"enabled": true, "origin": "cli/alerts", "on": []any{"done"}},
+		}, Body: "# Report\n\n## Progress\n\n- Complete.\n"}
+		if err := orchestrator.WriteDocument(taskFile, document); err != nil {
+			t.Fatal(err)
+		}
+		eventDirectory := cfg.StatePath("runtime", "notification-agents")
+		if err := os.MkdirAll(eventDirectory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		event := map[string]any{
+			"id": "event-1", "task_id": "task-1", "outcome": "done", "task_file": taskFile,
+			"transition": "task_implementation:1", "origin": "cli/alerts", "mode": "decide", "state": "pending",
+		}
+		data, _ := json.Marshal(event)
+		if err := os.WriteFile(filepath.Join(eventDirectory, "event-1.json"), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return cfg, filepath.Join(eventDirectory, "event-1.json")
+	}
+
+	t.Run("send", func(t *testing.T) {
+		cfg, eventPath := setup(t)
+		args := []string{"--config", cfg.Path, "--origin", "cli/alerts", "--event-key", "task-notification:event-1", "--outcome", "done", "report ready"}
+		if err := runNotifyCommand(args, "test"); err != nil {
+			t.Fatal(err)
+		}
+		outboxID := orchestrator.NotificationOutboxID("task-notification:event-1", "done")
+		if _, err := os.Stat(filepath.Join(cfg.StatePath("runtime", "outbox"), outboxID+".json")); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := os.ReadFile(eventPath)
+		if strings.Contains(string(data), `"state":"declined"`) || !strings.Contains(string(data), `"journaled": true`) {
+			t.Fatalf("send did not record its transition-specific journal receipt: %s", data)
+		}
+		document, err := orchestrator.ReadDocument(filepath.Join(cfg.StatePath("tasks", "done"), "task.md"))
+		if err != nil || !strings.Contains(document.Body, "Sent the user a notification: report ready") {
+			t.Fatalf("send journal = %#v, %v", document.Body, err)
+		}
+	})
+
+	t.Run("decline", func(t *testing.T) {
+		cfg, eventPath := setup(t)
+		args := []string{"--config", cfg.Path, "--origin", "cli/alerts", "--event-key", "task-notification:event-1", "--outcome", "done", "--decline"}
+		if err := runNotifyCommand(args, "test"); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(eventPath)
+		if err != nil || !strings.Contains(string(data), `"state": "declined"`) {
+			t.Fatalf("decline event = %s, %v", data, err)
+		}
+		entries, err := os.ReadDir(cfg.StatePath("runtime", "outbox"))
+		if err == nil && len(entries) != 0 {
+			t.Fatalf("decline queued %d outbox entries", len(entries))
+		}
+	})
+
+	t.Run("failed action", func(t *testing.T) {
+		cfg, eventPath := setup(t)
+		args := []string{"--config", cfg.Path, "--origin", "cli/other", "--event-key", "task-notification:event-1", "--outcome", "done", "--decline"}
+		if err := runNotifyCommand(args, "test"); err == nil {
+			t.Fatal("redirected decline unexpectedly succeeded")
+		}
+		data, err := os.ReadFile(eventPath)
+		if err != nil || !strings.Contains(string(data), `"state":"pending"`) {
+			t.Fatalf("failed action event = %s, %v", data, err)
+		}
+	})
 }
 
 func newHeldCLIHarness() *heldCLIHarness {
@@ -194,7 +387,7 @@ func (h *heldCLIHarness) finish(key, text string) {
 }
 
 func TestCompleteRunReplacesProcessForRestartRequest(t *testing.T) {
-	want := []string{"serve", "--tui", "--config", "/tmp/project/spynel.yaml"}
+	want := []string{"serve", "--tui", "--config", "/tmp/project/.spynel/config.yaml"}
 	request := &restartRequest{args: append([]string(nil), want...)}
 	called := false
 	err := completeRun(fmt.Errorf("server stopped: %w", request), func(args []string) error {
@@ -254,7 +447,7 @@ func TestNPMUpdateRequestPublishesInitContinuationArguments(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Remove(statePath) })
 	t.Setenv("SPYNEL_NPM_UPDATE_STATE", statePath)
-	want := []string{"serve", "--tui", "--config", "/tmp/project/spynel.yaml"}
+	want := []string{"serve", "--tui", "--config", "/tmp/project/.spynel/config.yaml"}
 	request := &updateRequest{args: want}
 	if code := request.ExitCode(); code != npmUpdateExitCode {
 		t.Fatalf("update exit code = %d", code)
@@ -294,7 +487,7 @@ func TestOfflineUpdateInstallReturnsControlToNPMLauncher(t *testing.T) {
 	t.Setenv("SPYNEL_NPM_LAUNCHER_MANAGED", "1")
 	t.Setenv("SPYNEL_NPM_REGISTRY_URL", registry.URL)
 	var output bytes.Buffer
-	err := runFrameworkMessageMode(filepath.Join(root, config.FileName), "updates", "/update install", "1.2.0", messageRunOptions{Output: &output})
+	err := runFrameworkMessageMode(config.PathForRoot(root), "updates", "/update install", "1.2.0", messageRunOptions{Output: &output})
 	exit, ok := err.(interface{ ExitCode() int })
 	if !ok || exit.ExitCode() != npmUpdateExitCode || !strings.Contains(output.String(), "Updating Spynel") {
 		t.Fatalf("offline update = %T %v, output %q", err, err, output.String())
@@ -322,7 +515,7 @@ func TestInitNoStartCreatesWorkspaceWithoutEnteringTUI(t *testing.T) {
 	if err := Run([]string{"init", "--no-start", "--dir", root}, "test"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(root, config.FileName)); err != nil {
+	if _, err := os.Stat(config.PathForRoot(root)); err != nil {
 		t.Fatalf("initialized config: %v", err)
 	}
 	if !strings.Contains(helpText, "--no-start") || !strings.Contains(helpText, "continue into the TUI") {
@@ -402,7 +595,7 @@ func TestCLIMessageCopiesRepeatableAttachmentsIntoWorkspace(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +625,7 @@ func TestConversationCLIListsShowsAndBranchesDiskBackedHistory(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -478,7 +671,7 @@ func TestStatusCLIEmitsStructuredNonSecretState(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -526,7 +719,7 @@ func TestOfflineFrameworkCommandDoesNotRequireStartedHarness(t *testing.T) {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	if err := runFrameworkMessageMode(filepath.Join(root, config.FileName), "framework", "/help commands", "test", messageRunOptions{Output: &output}); err != nil {
+	if err := runFrameworkMessageMode(config.PathForRoot(root), "framework", "/help commands", "test", messageRunOptions{Output: &output}); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(output.String(), "/status") || !strings.Contains(output.String(), "/extension list") {
@@ -542,7 +735,7 @@ func TestOfflineCLIExtensionCanHandleMessageWithoutAHarness(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,7 +773,7 @@ func TestCLIJoinsWorkspaceOwnerAndStrictlySteersActiveConversation(t *testing.T)
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -600,7 +793,7 @@ func TestCLIJoinsWorkspaceOwnerAndStrictlySteersActiveConversation(t *testing.T)
 	}
 	target := newHeldCLIHarness()
 	service := app.New(cfg, target)
-	election, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	election, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -735,7 +928,7 @@ func TestBuildServiceUsesConfiguredHarnessSandbox(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -792,7 +985,7 @@ func TestOwnerElectionRunsOneServerAndHandsOffOnExit(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Default()
 	cfg.Root = root
-	cfg.Path = filepath.Join(root, config.FileName)
+	cfg.Path = config.PathForRoot(root)
 	cfg.Harness.Name = ""
 	cfg.Channels.Telegram.Enabled = false
 	cfg.Channels.WhatsApp.Enabled = false
@@ -801,11 +994,11 @@ func TestOwnerElectionRunsOneServerAndHandsOffOnExit(t *testing.T) {
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	first, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	first, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	second, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -879,7 +1072,7 @@ func TestOwnerElectionPromotesAfterObservedPrimaryBecomesStale(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Default()
 	cfg.Root = root
-	cfg.Path = filepath.Join(root, config.FileName)
+	cfg.Path = config.PathForRoot(root)
 	cfg.Harness.Name = ""
 	cfg.Channels.Telegram.Enabled = false
 	cfg.Channels.WhatsApp.Enabled = false
@@ -889,7 +1082,7 @@ func TestOwnerElectionPromotesAfterObservedPrimaryBecomesStale(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stateDirectory := cfg.Resolve(cfg.Workspace.StateDir)
+	stateDirectory := cfg.StatePath()
 	if err := os.MkdirAll(filepath.Join(stateDirectory, "runtime"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -941,7 +1134,7 @@ func TestPrimaryCommandHandsOwnershipToRequestingTUI(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Default()
 	cfg.Root = root
-	cfg.Path = filepath.Join(root, config.FileName)
+	cfg.Path = config.PathForRoot(root)
 	cfg.Harness.Name = ""
 	cfg.Channels.Telegram.Enabled = false
 	cfg.Channels.WhatsApp.Enabled = false
@@ -950,11 +1143,11 @@ func TestPrimaryCommandHandsOwnershipToRequestingTUI(t *testing.T) {
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	first, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	first, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	second, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1008,48 +1201,15 @@ func TestPrimaryCommandHandsOwnershipToRequestingTUI(t *testing.T) {
 	}
 }
 
-func TestPromotionRefusesAChangedStateDirectory(t *testing.T) {
-	root := t.TempDir()
-	cfg := config.Default()
-	cfg.Root = root
-	cfg.Path = filepath.Join(root, config.FileName)
-	if err := config.Save(cfg); err != nil {
-		t.Fatal(err)
-	}
-	election, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	token, _ := election.NewToken()
-	if _, acquired, err := election.TryAcquire(listener.Addr().String(), token); err != nil || !acquired {
-		t.Fatalf("acquire = %t, %v", acquired, err)
-	}
-	defer election.Release(token)
-	updated := cfg
-	updated.Workspace.StateDir = ".spynel-next"
-	if err := config.Save(updated); err != nil {
-		t.Fatal(err)
-	}
-	term, err := startPrimaryTerm(context.Background(), cfg, "test", election, listener, token, func() {}, func() {})
-	if term != nil || err == nil || !strings.Contains(err.Error(), "state directory changed") {
-		t.Fatalf("promotion = %#v, %v", term, err)
-	}
-}
-
 func TestPromotionRecordsConfigurationReloadFailure(t *testing.T) {
 	root := t.TempDir()
 	cfg := config.Default()
 	cfg.Root = root
-	cfg.Path = filepath.Join(root, config.FileName)
+	cfg.Path = config.PathForRoot(root)
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	election, err := instance.New(cfg.Resolve(cfg.Workspace.StateDir))
+	election, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)
 	}

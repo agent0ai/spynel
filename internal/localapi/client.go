@@ -103,7 +103,11 @@ func (c *Client) State(ctx context.Context) (app.SharedState, error) {
 }
 
 func (c *Client) Notify(ctx context.Context, origin, message string) (string, error) {
-	body, err := json.Marshal(notifyRequest{Origin: origin, Message: message})
+	return c.NotifyWithIdentity(ctx, origin, message, "", "")
+}
+
+func (c *Client) NotifyWithIdentity(ctx context.Context, origin, message, eventKey, outcome string) (string, error) {
+	body, err := json.Marshal(notifyRequest{Origin: origin, Message: message, EventKey: eventKey, Outcome: outcome})
 	if err != nil {
 		return "", err
 	}
@@ -120,6 +124,19 @@ func (c *Client) Notify(ctx context.Context, origin, message string) (string, er
 		return "", err
 	}
 	return result.ID, nil
+}
+
+func (c *Client) DeclineNotification(ctx context.Context, origin, eventKey, outcome string) error {
+	body, err := json.Marshal(notifyRequest{Origin: origin, EventKey: eventKey, Outcome: outcome, Decline: true})
+	if err != nil {
+		return err
+	}
+	response, err := c.request(ctx, http.MethodPost, "/v1/notify", body)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	return responseError(response)
 }
 
 func (c *Client) AckNotification(ctx context.Context, origin, id string, afterChars int) error {

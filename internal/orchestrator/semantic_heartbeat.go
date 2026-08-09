@@ -13,8 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/instructions"
 )
 
 const (
@@ -58,12 +60,10 @@ type semanticHeartbeatState struct {
 }
 
 type semanticFindingState struct {
-	FirstSeen            time.Time `json:"first_seen"`
-	LastSeen             time.Time `json:"last_seen"`
-	LastNotified         time.Time `json:"last_notified,omitempty"`
-	EvidenceHash         string    `json:"evidence_hash"`
-	NotifiedEvidenceHash string    `json:"notified_evidence_hash,omitempty"`
-	Occurrences          int       `json:"occurrences"`
+	FirstSeen    time.Time `json:"first_seen"`
+	LastSeen     time.Time `json:"last_seen"`
+	EvidenceHash string    `json:"evidence_hash"`
+	Occurrences  int       `json:"occurrences"`
 }
 
 type semanticAuditDiagnostic struct {
@@ -202,9 +202,6 @@ func (m *Manager) runSemanticHeartbeat(ctx context.Context) {
 			if !armed || auditActive {
 				continue
 			}
-			if err := m.processActionReminders(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				m.log("action reminder scan deferred: " + err.Error())
-			}
 			m.heartbeatCommit.Lock()
 			if m.heartbeatTerm != term || !m.orchestratorEnabled.Load() || m.heartbeatMinutes.Load() <= 0 {
 				m.heartbeatCommit.Unlock()
@@ -318,13 +315,10 @@ func (m *Manager) runSemanticHeartbeatOnceForTerm(parent context.Context, term u
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	lease := Lease{DocumentType: "heartbeat", Route: "semantic-heartbeat", SessionKey: semanticHeartbeatSession, State: "audit", StartedAt: now, HeartbeatAt: now}
+	lease := Lease{DocumentType: "heartbeat", Route: "semantic-heartbeat", SessionKey: semanticHeartbeatSession, State: "audit", Phase: "semantic_audit", StartedAt: now, HeartbeatAt: now}
 	jobID := 0
 	if m.JobStarted != nil {
 		jobID = m.JobStarted(lease, "semantic workflow heartbeat", time.Time{}, 0, 0)
-	}
-	if jobID > 0 && m.JobFinished != nil {
-		defer m.JobFinished(jobID)
 	}
 	type providerResult struct {
 		output string
@@ -333,9 +327,17 @@ func (m *Manager) runSemanticHeartbeatOnceForTerm(parent context.Context, term u
 	providerDone := make(chan providerResult, 1)
 	providerOwnsActive = true
 	go func() {
+		if jobID > 0 && m.JobFinished != nil {
+			defer m.JobFinished(jobID)
+		}
 		defer releaseProvider()
 		var output strings.Builder
 		emit := func(event core.Event) {
+			if jobID > 0 && m.JobUpdated != nil {
+				activity := lease
+				activity.HeartbeatAt = m.semanticHeartbeatNow()
+				m.JobUpdated(jobID, activity)
+			}
 			text := event.Text
 			if event.FinalText != nil {
 				text = *event.FinalText
@@ -351,7 +353,8 @@ func (m *Manager) runSemanticHeartbeatOnceForTerm(parent context.Context, term u
 				output.WriteString(text)
 			}
 		}
-		_, _, sendErr := m.Harness.Send(ctx, semanticHeartbeatSession, prompt, emit)
+		message := config.PrependAgentPrefix(m.harnessSettings().HeartbeatAgentPrefix, prompt)
+		_, _, sendErr := m.Harness.Send(ctx, semanticHeartbeatSession, message, emit)
 		providerDone <- providerResult{output: output.String(), err: sendErr}
 	}()
 	var completed providerResult
@@ -456,6 +459,11 @@ func (m *Manager) semanticHeartbeatPrompt(executionID string, now time.Time) (st
 		return "", err
 	}
 	prompt = strings.ReplaceAll(prompt, "{{SPYNEL_EXECUTABLE}}", filepath.ToSlash(executable))
+	prompt = appendTaskReviewModeInstruction(prompt, m.harnessSettings().Reviews)
+	prompt, err = instructions.Append(prompt, m.Config.StatePath(), instructions.Heartbeat)
+	if err != nil {
+		return "", err
+	}
 	if len(prompt) > maxHeartbeatPromptBytes {
 		return "", errors.New("rendered heartbeat prompt exceeds 128 KiB")
 	}
@@ -502,6 +510,11 @@ func parseSemanticHeartbeatResult(raw, executionID string, started time.Time) (s
 	}
 	if len(result.Findings) > 64 {
 		return result, errors.New("too many findings")
+	}
+	for index := range result.Findings {
+		if result.Findings[index].Action == "notify" {
+			result.Findings[index].Notification = cleanNotificationLine(result.Findings[index].Notification)
+		}
 	}
 	for _, finding := range result.Findings {
 		if !semanticCategories[finding.Category] {
@@ -607,40 +620,54 @@ func (m *Manager) recordSemanticHeartbeatResultForTerm(ctx context.Context, resu
 		evidenceHashBytes := sha256.Sum256([]byte(finding.Evidence))
 		evidenceHash := hex.EncodeToString(evidenceHashBytes[:16])
 		tracked := state.Findings[identity]
+		newFinding := tracked.FirstSeen.IsZero()
+		evidenceChanged := tracked.EvidenceHash != "" && tracked.EvidenceHash != evidenceHash
 		if tracked.FirstSeen.IsZero() {
 			tracked.FirstSeen = result.ObservedAt
 		}
 		tracked.LastSeen = result.ObservedAt
 		tracked.Occurrences++
 		tracked.EvidenceHash = evidenceHash
-		shouldNotify := tracked.LastNotified.IsZero() || result.ObservedAt.Sub(tracked.LastNotified) >= 24*time.Hour
-		materialChangePending := tracked.NotifiedEvidenceHash != "" && tracked.NotifiedEvidenceHash != evidenceHash
-		if materialChangePending && result.ObservedAt.Sub(tracked.LastNotified) >= time.Hour {
-			shouldNotify = true
-		}
 		switch finding.Action {
 		case "request_reconcile", "request_recover", "request_requeue":
-			if _, exists := actionDocuments[finding.WorkflowID]; exists {
+			if matched, exists := actionDocuments[finding.WorkflowID]; exists {
+				if finding.Action == "request_requeue" {
+					due, wakeErr := scheduledWake(matched.Document, result.ObservedAt)
+					if stringField(matched.Document, "status") != "waiting" || wakeErr != nil || !due {
+						m.log("semantic heartbeat requeue rejected: workflow has no due validated waiting condition")
+						break
+					}
+				}
+				if newFinding || evidenceChanged {
+					note := fmt.Sprintf("Semantic heartbeat recorded %s and requested %s through Spynel's serialized recovery path; no direct agent-authored state mutation was trusted.", strings.ReplaceAll(finding.Category, "_", " "), strings.TrimPrefix(strings.ReplaceAll(finding.Action, "_", " "), "request "))
+					if err := updateDocumentProgress(matched.Path, result.ObservedAt, note); err != nil {
+						return fmt.Errorf("journal semantic heartbeat repair before recovery: %w", err)
+					}
+				}
 				requestManagerScan = true
 			} else {
 				m.log("semantic heartbeat repair rejected: workflow is absent or ambiguous")
 			}
 		}
 		if finding.Action == "notify" {
-			document, exists := actionDocuments[finding.WorkflowID]
-			origin, authorized := authorizedSemanticOriginFromDocument(document, exists, finding.NotificationOrigin)
+			matched, exists := actionDocuments[finding.WorkflowID]
+			origin, authorized := authorizedSemanticOriginFromDocument(matched.Document, exists, finding.NotificationOrigin)
 			if !authorized || m.AuthorizeNotificationOrigin == nil || m.AuthorizeNotificationOrigin(origin) != nil {
 				m.log("semantic heartbeat notification rejected: origin is not authorized")
-			} else if shouldNotify {
+			} else {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				eventKey := fmt.Sprintf("semantic-heartbeat:%s:%d:%d", identity, tracked.FirstSeen.Unix(), tracked.Occurrences)
-				if _, err := m.Outbox.Enqueue(eventKey, "waiting", finding.NotificationOrigin, finding.Notification); err != nil {
+				eventKey := fmt.Sprintf("semantic-heartbeat:%s:%s", result.ExecutionID, identity)
+				status := stringField(matched.Document, "status")
+				entry, err := m.Outbox.Enqueue(eventKey, status, finding.NotificationOrigin, finding.Notification)
+				if err != nil {
 					return err
 				}
-				tracked.LastNotified = result.ObservedAt
-				tracked.NotifiedEvidenceHash = evidenceHash
+				note := "Semantic heartbeat queued this proactive notification: " + entry.Message
+				if err := updateDocumentProgress(matched.Path, result.ObservedAt, note); err != nil {
+					return fmt.Errorf("journal semantic heartbeat notification: %w", err)
+				}
 				requestManagerScan = true
 			}
 		}
@@ -700,8 +727,8 @@ func (m *Manager) authorizedSemanticOrigin(workflowID, proposed string) (Origin,
 	if err != nil {
 		return Origin{}, false
 	}
-	document, exists := documents[workflowID]
-	return authorizedSemanticOriginFromDocument(document, exists, proposed)
+	matched, exists := documents[workflowID]
+	return authorizedSemanticOriginFromDocument(matched.Document, exists, proposed)
 }
 
 func authorizedSemanticOriginFromDocument(document Document, exists bool, proposed string) (Origin, bool) {
@@ -709,7 +736,8 @@ func authorizedSemanticOriginFromDocument(document Document, exists bool, propos
 		return Origin{}, false
 	}
 	policy, err := NotificationFromDocument(document)
-	if err != nil || !policy.Enabled || !policy.Outcomes["waiting"] {
+	status := stringField(document, "status")
+	if err != nil || !policy.Enabled || !policy.Outcomes[status] {
 		return Origin{}, false
 	}
 	expected := policy.Origin.Channel + "/" + policy.Origin.Conversation
@@ -719,8 +747,13 @@ func authorizedSemanticOriginFromDocument(document Document, exists bool, propos
 	return policy.Origin, true
 }
 
-func (m *Manager) semanticDocuments(workflowIDs map[string]bool) (map[string]Document, error) {
-	matched := make(map[string]Document, len(workflowIDs))
+type semanticDocumentMatch struct {
+	Document Document
+	Path     string
+}
+
+func (m *Manager) semanticDocuments(workflowIDs map[string]bool) (map[string]semanticDocumentMatch, error) {
+	matched := make(map[string]semanticDocumentMatch, len(workflowIDs))
 	ambiguous := map[string]bool{}
 	if len(workflowIDs) == 0 {
 		return matched, nil
@@ -765,7 +798,7 @@ func (m *Manager) semanticDocuments(workflowIDs map[string]bool) (map[string]Doc
 					ambiguous[id] = true
 					continue
 				}
-				matched[id] = document
+				matched[id] = semanticDocumentMatch{Document: document, Path: filepath.Join(base, status, entry.Name())}
 			}
 		}
 	}

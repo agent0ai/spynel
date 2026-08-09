@@ -106,7 +106,7 @@ func HelpTopics() []Topic {
 // DocumentedSlashCommands returns the base slash commands named by the static
 // command topic. The app package verifies these against its canonical catalog.
 func DocumentedSlashCommands() []string {
-	return []string{"/help", "/status", "/config", "/harness", "/model", "/telegram", "/whatsapp", "/stop", "/restart", "/update", "/history", "/log", "/jobs", "/job", "/clear", "/task", "/goal", "/run", "/extension"}
+	return []string{"/help", "/status", "/config", "/harness", "/model", "/telegram", "/whatsapp", "/stop", "/restart", "/update", "/history", "/log", "/jobs", "/tasks", "/goals", "/job", "/clear", "/task", "/goal", "/run", "/extension"}
 }
 
 func Render(request Request) (string, error) {

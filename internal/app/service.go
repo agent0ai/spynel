@@ -22,6 +22,7 @@ import (
 	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
+	"github.com/agent0ai/spynel/internal/instructions"
 	"github.com/agent0ai/spynel/internal/media"
 	"github.com/agent0ai/spynel/internal/orchestrator"
 	"github.com/agent0ai/spynel/internal/shortid"
@@ -182,7 +183,7 @@ func (s *Service) validateOrigin(origin orchestrator.Origin) error {
 		}
 		number := config.NormalizeWhatsAppNumber(strings.TrimPrefix(origin.Conversation, "WA-"))
 		for _, allowed := range cfg.Channels.WhatsApp.AllowedNumbers {
-			if config.NormalizeWhatsAppNumber(allowed) == number {
+			if config.NormalizeAllowedWhatsAppNumber(allowed) == number {
 				return nil
 			}
 		}
@@ -193,38 +194,36 @@ func (s *Service) validateOrigin(origin orchestrator.Origin) error {
 	return errors.New("unsupported origin channel")
 }
 
-func (s *Service) deliverNotification(ctx context.Context, origin orchestrator.Origin, eventID, text string) ([]string, error) {
+func (s *Service) deliverNotification(ctx context.Context, origin orchestrator.Origin, eventID, text string) error {
 	if err := s.validateOrigin(origin); err != nil {
-		return nil, err
+		return err
 	}
-	var nativeMessageIDs []string
 	if origin.Channel == "telegram" || origin.Channel == "whatsapp" {
-		state, persistedIDs, stateErr := s.History.DeliveryInfo(origin.Channel, origin.Conversation, eventID)
+		state, stateErr := s.History.DeliveryState(origin.Channel, origin.Conversation, eventID)
 		if stateErr != nil {
-			return nil, stateErr
+			return stateErr
 		}
 		if state == "sent" {
-			return persistedIDs, nil
+			return nil
 		}
 		if s.DeliveryControl == nil {
-			return nil, fmt.Errorf("%s is disconnected", origin.Channel)
+			return fmt.Errorf("%s is disconnected", origin.Channel)
 		}
 		if _, err := s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: "notification_sending", EventID: eventID}); err != nil {
-			return nil, err
+			return err
 		}
-		receipt, err := s.DeliveryControl.Deliver(ctx, origin.Channel, origin.Conversation, eventID, text)
+		err := s.DeliveryControl.Deliver(ctx, origin.Channel, origin.Conversation, eventID, text)
 		if err != nil {
 			_, _ = s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: "notification_failed", EventID: eventID, Content: err.Error()})
-			return nil, err
+			return err
 		}
-		nativeMessageIDs = append([]string(nil), receipt.MessageIDs...)
 	}
 	role := "assistant"
 	if origin.Channel == "tui" && s.Harness.IsActive(sessionKey(core.Message{Channel: origin.Channel, Conversation: origin.Conversation})) {
 		role = "notification_pending"
 	}
-	_, err := s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: role, Sender: "Spy", Content: text, EventID: eventID, NativeMessageIDs: nativeMessageIDs})
-	return nativeMessageIDs, err
+	_, err := s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: role, Sender: "Spy", Content: text, EventID: eventID})
+	return err
 }
 
 func (s *Service) AckNotification(originText, eventID string, afterChars int) error {
@@ -243,6 +242,10 @@ func (s *Service) AckNotification(originText, eventID string, afterChars int) er
 }
 
 func (s *Service) Notify(ctx context.Context, originText, text string) (string, error) {
+	return s.NotifyWithIdentity(ctx, originText, text, "", "")
+}
+
+func (s *Service) NotifyWithIdentity(ctx context.Context, originText, text, eventKey, outcome string) (string, error) {
 	origin, err := orchestrator.ParseOrigin(originText)
 	if err != nil {
 		return "", err
@@ -253,15 +256,41 @@ func (s *Service) Notify(ctx context.Context, originText, text string) (string, 
 	if err := s.validateOrigin(origin); err != nil {
 		return "", err
 	}
-	id := fmt.Sprintf("manual-%d", time.Now().UTC().UnixNano())
-	entry, err := s.Orchestrator.Outbox.Enqueue(id, "manual", originText, strings.TrimSpace(text))
+	if eventKey == "" {
+		eventKey = fmt.Sprintf("manual-%d", time.Now().UTC().UnixNano())
+		outcome = "manual"
+	} else if outcome == "" {
+		return "", errors.New("notification outcome is required with event identity")
+	} else if err := s.Orchestrator.AuthorizeNotificationAgentCommand(eventKey, outcome, originText); err != nil {
+		return "", err
+	}
+	entry, err := s.Orchestrator.Outbox.Enqueue(eventKey, outcome, originText, strings.TrimSpace(text))
 	if err != nil {
 		return "", err
+	}
+	if strings.HasPrefix(eventKey, "task-notification:") {
+		if err := s.Orchestrator.JournalNotificationAgentCommand(eventKey, outcome, originText, entry.Message); err != nil {
+			return "", err
+		}
 	}
 	if processErr := s.Orchestrator.Outbox.Process(ctx); processErr != nil {
 		s.Runtime.LogEvent("error", "orchestrator", "notification_retry", "Notification retained for retry: "+processErr.Error())
 	}
 	return entry.ID, nil
+}
+
+func (s *Service) DeclineNotification(originText, eventKey, outcome string) error {
+	origin, err := orchestrator.ParseOrigin(originText)
+	if err != nil {
+		return err
+	}
+	if err := s.validateOrigin(origin); err != nil {
+		return err
+	}
+	if eventKey == "" || outcome == "" {
+		return errors.New("notification event identity and outcome are required to decline")
+	}
+	return s.Orchestrator.DeclineNotificationAgentCommand(eventKey, outcome, originText)
 }
 
 func (s *Service) Start(ctx context.Context) error {
@@ -288,9 +317,6 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 	if message.ReceivedAt.IsZero() {
 		message.ReceivedAt = time.Now().UTC()
 	}
-	if err := s.Orchestrator.RecordContactActivity(message.Channel+"/"+message.Conversation, message.ReceivedAt); err != nil {
-		s.Runtime.LogEvent("error", "orchestrator", "notification_activity", "Notification activity persistence failed")
-	}
 	message.Text = strings.TrimSpace(message.Text)
 	if message.Text == "" {
 		return nil
@@ -299,10 +325,7 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 		return errors.New("there is no active execution for this conversation")
 	}
 	if s.Config.Extensions.Enabled {
-		output, err := s.Hooks.Run(ctx, "message.received", map[string]any{
-			"channel": message.Channel, "conversation": message.Conversation,
-			"sender": message.Sender, "text": message.Text,
-		})
+		output, err := s.Hooks.Run(ctx, "message.received", messageHookPayload(message))
 		if err != nil {
 			return err
 		}
@@ -317,7 +340,7 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 		}
 	}
 	if _, err := s.History.Append(message.Channel, message.Conversation, history.Entry{
-		At: message.ReceivedAt, Role: "user", Sender: message.Sender, Content: redactSensitiveCommand(message.Text),
+		At: message.ReceivedAt, Role: "user", Sender: message.Sender, ReplyTo: message.ReplyTo, Content: redactSensitiveCommand(message.Text),
 	}); err != nil {
 		s.Runtime.LogEvent("error", "history", "append_failed", fmt.Sprintf("Persist incoming history failed (%T)", err))
 		return err
@@ -330,6 +353,13 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 		return err
 	}
 	return s.dispatchHarnessPrompt(ctx, message, prompt, emit)
+}
+
+func messageHookPayload(message core.Message) map[string]any {
+	return map[string]any{
+		"channel": message.Channel, "conversation": message.Conversation,
+		"sender": message.Sender, "text": message.Text, "reply_to": message.ReplyTo,
+	}
 }
 
 func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Message, prompt string, emit core.Emit) error {
@@ -347,12 +377,26 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 			prompt = value
 		}
 	}
+	preparedPrompt, err := s.prepareChatHarnessPrompt(prompt)
+	if err != nil {
+		return err
+	}
+	prompt = preparedPrompt
 	key := sessionKey(message)
 	jobID := s.Runtime.BeginJob(key, message.Channel, message.Conversation, message.Text)
 	s.Runtime.LogEvent("info", "harness", "turn_started", "Harness turn started")
-	wrapped := s.wrapEmit(message, jobID, emit)
-	threadID, steered, err := s.Harness.Send(ctx, key, prompt, wrapped)
+	activity := newChatActivityEmitter(emit)
+	activity.start()
+	wrapped := s.wrapEmit(message, jobID, activity.emit)
+	var threadID string
+	var steered bool
+	if sender, ok := s.Harness.(harness.ConversationSender); ok {
+		threadID, steered, err = sender.SendConversation(ctx, key, prompt, message.Text, wrapped)
+	} else {
+		threadID, steered, err = s.Harness.Send(ctx, key, prompt, wrapped)
+	}
 	if err != nil {
+		activity.stop()
 		s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobError), Detail: err.Error()})
 		s.Runtime.LogEvent("error", "harness", "start_failed", "Harness turn failed to start ("+harnessFailureEvidence(err)+")")
 		if !s.Harness.IsActive(key) {
@@ -369,6 +413,16 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 		emit(core.Event{Kind: core.EventStatus, Text: verb, ThreadID: threadID})
 	}
 	return nil
+}
+
+func (s *Service) prepareChatHarnessPrompt(prompt string) (string, error) {
+	harnessSettings := s.Settings.Snapshot().Harness
+	prompt = strings.TrimRight(prompt, "\r\n") + "\n\n" + orchestrator.TaskReviewModeInstruction(harnessSettings.Reviews)
+	prompt, err := instructions.Append(prompt, s.Config.StatePath(), instructions.Chat)
+	if err != nil {
+		return "", err
+	}
+	return config.PrependAgentPrefix(harnessSettings.ChatAgentPrefix, prompt), nil
 }
 
 func harnessFailureEvidence(err error) string {
@@ -438,12 +492,10 @@ func (s *Service) chatPrompt(message core.Message) (string, error) {
 	prompt = strings.ReplaceAll(prompt, "{{TASK_SOURCE}}", s.routeSource("tasks"))
 	prompt = strings.ReplaceAll(prompt, "{{GOAL_SOURCE}}", s.routeSource("goals"))
 	prompt = agentdocs.InjectPromptGuidance(prompt)
+	prompt = instructions.InjectChatGuidance(prompt)
 	// History is untrusted conversation data. Replace its placeholder only after
 	// every stock template token so placeholder-like history remains literal.
 	prompt = strings.ReplaceAll(prompt, "{{RECENT_HISTORY}}", recent)
-	if pending := s.Orchestrator.PendingActionSummary(message.Channel+"/"+message.Conversation, message.NativeReplyToID); pending != "" {
-		prompt += "\n\n" + pending
-	}
 	if message.Channel == "telegram" || message.Channel == "whatsapp" {
 		prompt += "\n\nTo send a readable local file back through this channel, put one directive on its own line in the final response: `[Send attachment](</absolute/path/to/file>)`. For an image displayed as a native photo, use `[Send photo](</absolute/path/to/image.png>)`. Keep any user-facing caption as ordinary text. The path may be outside the active workspace, but it must be absolute and resolve to a regular file within the attachment size limit."
 	}
@@ -642,6 +694,8 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		return s.logCommand(message, remainder, emit)
 	case "jobs":
 		return s.localReply(message, formatJobs(s.accessibleJobs(message)), emit)
+	case "tasks", "goals":
+		return s.workflowListCommand(message, command, remainder, emit)
 	case "job":
 		return s.jobCommand(ctx, message, remainder, emit)
 	case "clear":
@@ -667,8 +721,15 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		if !ok {
 			job.ID = s.Runtime.BeginJob(key, message.Channel, message.Conversation, remainder)
 		}
-		threadID, _, err := s.Harness.Send(ctx, key, remainder, s.wrapEmit(message, job.ID, emit))
+		prompt, err := s.prepareChatHarnessPrompt(remainder)
 		if err != nil {
+			return err
+		}
+		activity := newChatActivityEmitter(emit)
+		activity.start()
+		threadID, _, err := s.Harness.Send(ctx, key, prompt, s.wrapEmit(message, job.ID, activity.emit))
+		if err != nil {
+			activity.stop()
 			s.Runtime.EndJob(job.ID)
 			return err
 		}
@@ -689,7 +750,7 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		}
 		return s.localReply(message, "Stop requested for the active execution.", emit)
 	case "restart":
-		if err := s.localReply(message, "Restarting Spynel. Saved configuration and conversation history will be restored.", emit); err != nil {
+		if err := s.localReply(message, "Restarting Spynel...", emit); err != nil {
 			return err
 		}
 		s.requestRestart()
@@ -725,6 +786,44 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		return s.localReply(message, "/quit exits an interactive TUI only; it does not stop the Telegram or WhatsApp server.", emit)
 	default:
 		return s.localReply(message, "Unknown command /"+command+". Use /help.", emit)
+	}
+}
+
+// chatActivityEmitter publishes the canonical main communication-agent
+// activity boundary. It stops before forwarding a terminal response so remote
+// channels never keep native activity visible during final delivery. A done
+// status releases an emitter whose output ownership moved to a newer turn.
+type chatActivityEmitter struct {
+	downstream core.Emit
+	once       sync.Once
+}
+
+func newChatActivityEmitter(downstream core.Emit) *chatActivityEmitter {
+	return &chatActivityEmitter{downstream: downstream}
+}
+
+func (e *chatActivityEmitter) start() {
+	if e.downstream != nil {
+		e.downstream(core.Event{Kind: core.EventActivity, Active: true})
+	}
+}
+
+func (e *chatActivityEmitter) stop() {
+	e.once.Do(func() {
+		if e.downstream != nil {
+			e.downstream(core.Event{Kind: core.EventActivity})
+		}
+	})
+}
+
+func (e *chatActivityEmitter) emit(event core.Event) {
+	terminal := event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError)
+	released := event.Done && event.Kind == core.EventStatus
+	if terminal || released {
+		e.stop()
+	}
+	if e.downstream != nil {
+		e.downstream(event)
 	}
 }
 
@@ -840,7 +939,12 @@ func (s *Service) jobCommand(ctx context.Context, message core.Message, remainde
 		return s.localReply(message, fmt.Sprintf("Job %d was already finished.", id), emit)
 	}
 	s.Runtime.LogEvent("info", "jobs", "job_stop_requested", fmt.Sprintf("job_id=%d channel=%s kind=%s", job.ID, logField(job.Channel, "unknown"), logField(job.Kind, "chat")))
-	s.Runtime.EndJob(id)
+	// A semantic heartbeat owns its job lifetime from provider entry through
+	// provider release. Keep a cancellation-ignoring audit visible until its
+	// completion callback can prove that the provider has actually returned.
+	if job.Kind != "heartbeat" {
+		s.Runtime.EndJob(id)
+	}
 	return s.localReply(message, fmt.Sprintf("Kill requested for job %d.", id), emit)
 }
 
@@ -1095,10 +1199,6 @@ type StatusSnapshot struct {
 	WorkDiagnostics   []string                           `json:"work_count_diagnostics,omitempty"`
 	HeartbeatState    string                             `json:"heartbeat_state"`
 	NextHeartbeatAt   *time.Time                         `json:"next_heartbeat_at,omitempty"`
-	TriagePending     int                                `json:"triage_pending"`
-	TriageRunning     int                                `json:"triage_running"`
-	TriageFailed      int                                `json:"triage_failed"`
-	AwaitingResponse  int                                `json:"awaiting_response"`
 	ScheduledGoals    []orchestrator.ScheduledCheckpoint `json:"scheduled_goal_checkpoints,omitempty"`
 }
 
@@ -1145,7 +1245,6 @@ func (s *Service) Status(message core.Message) (StatusSnapshot, error) {
 		OrchestratorLease: leases, OrchestratorRuns: dispatches,
 		TasksActive: work.TasksActive, TasksWaiting: work.TasksWaiting, GoalsActive: work.GoalsActive, WorkDiagnostics: work.CountDiagnostics,
 		HeartbeatState: work.HeartbeatState, NextHeartbeatAt: nextHeartbeatAt,
-		TriagePending: work.TriagePending, TriageRunning: work.TriageRunning, TriageFailed: work.TriageFailed, AwaitingResponse: work.AwaitingResponse,
 		ScheduledGoals: scheduledGoals,
 	}, nil
 }
@@ -1188,7 +1287,6 @@ func FormatStatus(status StatusSnapshot) string {
 		fmt.Sprintf("- Tasks: %d active (%d waiting)", status.TasksActive, status.TasksWaiting),
 		fmt.Sprintf("- Goals: %d active", status.GoalsActive),
 		fmt.Sprintf("- Orchestrator: %d leases, %d dispatch goroutines", status.OrchestratorLease, status.OrchestratorRuns),
-		fmt.Sprintf("- Notifications: %d triage pending, %d running, %d failed; %d awaiting response", status.TriagePending, status.TriageRunning, status.TriageFailed, status.AwaitingResponse),
 		"- Next heartbeat: " + formatNextHeartbeat(status, time.Now().UTC()),
 		"- Telegram: " + connectionIndicator(telegram),
 		"- WhatsApp: " + connectionIndicator(whatsapp),
@@ -1349,7 +1447,7 @@ var slashCommands = []core.SlashCommand{
 	{Value: "/help about", Usage: "/help about", Description: "Learn what Spynel does and where it stores state"},
 	{Value: "/help commands", Usage: "/help commands", Description: "Show the complete slash-command reference"},
 	{Value: "/help extensions", Usage: "/help extensions", Description: "Learn how trusted project extensions work"},
-	{Value: "/help config", Usage: "/help config", Description: "Understand spynel.yaml and path resolution"},
+	{Value: "/help config", Usage: "/help config", Description: "Understand .spynel/config.yaml and path resolution"},
 	{Value: "/help channels", Usage: "/help channels", Description: "Learn about the TUI, Telegram, and WhatsApp"},
 	{Value: "/help workflows", Usage: "/help workflows", Description: "Learn how tasks, goals, and scans work"},
 	{Value: "/status", Usage: "/status", Description: "Show work, runtime, channel, and orchestrator state"},
@@ -1383,6 +1481,8 @@ var slashCommands = []core.SlashCommand{
 	{Value: "/log search ", Usage: "/log search <text>", Description: "Search captured runtime logs"},
 	{Value: "/log clear", Usage: "/log clear", Description: "Clear captured runtime logs"},
 	{Value: "/jobs", Usage: "/jobs", Description: "List running agent jobs"},
+	{Value: "/tasks", Usage: "/tasks [view] [options]", Description: "List open tasks or select a semantic view"},
+	{Value: "/goals", Usage: "/goals [view] [options]", Description: "List open goals or select a semantic view"},
 	{Value: "/job info ", Usage: "/job info <number>", Description: "Show safe details and durable progress for a running job"},
 	{Value: "/job message ", Usage: "/job message <number> <text>", Description: "Guide a running orchestrator job without replacing it"},
 	{Value: "/job ping ", Usage: "/job ping <number>", Description: "Request a durable progress update from a running job"},
@@ -1409,7 +1509,7 @@ var helpTopics = []struct {
 	{
 		name:        "about",
 		description: "What Spynel does and where it stores state",
-		body:        "# About Spynel\n\nSpynel connects local coding agents to a terminal UI, Telegram, and WhatsApp while keeping each conversation independent. It also turns durable Markdown task and goal files into agent work.\n\nThe project configuration is `spynel.yaml`. Runtime state, histories, harness sessions, attachments, and local UI preferences live under the configured state directory, `.spynel` by default.",
+		body:        "# About Spynel\n\n**Simplicity at scale.** Spynel is a classic, non-AI program that coordinates external coding agents through one assistant-facing relationship. It combines a communication interface, Markdown task management, and agentic planning, implementation, review, and debugging loops. The harness supplies intelligence and tools; Spynel supplies deterministic orchestration and oversight.\n\n**One human → one agent → infinite agents.** The middle agent is the assistant relationship, not Spynel itself, and infinite expresses scalable leverage rather than a literal resource guarantee. Use Spynel from a terminal or channels such as Telegram on a phone.\n\nThe project configuration is `.spynel/config.yaml`. Runtime state, histories, harness sessions, attachments, and local UI preferences live beside it in the fixed private `.spynel` directory.\n\n**Simplicity. Leverage. Quality.**",
 	},
 	{
 		name:        "commands",
@@ -1419,22 +1519,22 @@ var helpTopics = []struct {
 	{
 		name:        "extensions",
 		description: "Trusted project extensions and their hooks",
-		body:        "# Extensions\n\nExtensions are explicitly installed Git repositories that can run hooks around messages, harness calls, orchestration, and application-version transitions. Update hooks receive exact `from_version` and `to_version` values and must be retry-safe. Their directory and whether hooks are enabled are configured under `extensions` in `spynel.yaml`.\n\n- `/extension list` lists installed extensions.\n- `/extension install <git-url> [name]` installs a repository you trust.\n- `/extension remove <name>` removes an installed extension.",
+		body:        "# Extensions\n\nExtensions are explicitly installed Git repositories that can run hooks around messages, harness calls, orchestration, and application-version transitions. Update hooks receive exact `from_version` and `to_version` values and must be retry-safe. Their directory and whether hooks are enabled are configured under `extensions` in `.spynel/config.yaml`.\n\n- `/extension list` lists installed extensions.\n- `/extension install <git-url> [name]` installs a repository you trust.\n- `/extension remove <name>` removes an installed extension.",
 	},
 	{
 		name:        "config",
-		description: "spynel.yaml settings and path resolution",
-		body:        "# Configuration\n\n`spynel.yaml` controls the workspace, harness, channels, speech processing, orchestration routes, and extensions. `/config` shows the shared settings, `/config get <key>` reads one value, and `/config set <key> <value>` atomically validates and persists a change from any channel. `/harness [name]` and `/model [name]` are concise selectors. `/theme [name]` previews/lists or selects a semantic palette from `.spynel/themes`. `harness.sandbox` accepts `danger-full-access`, `workspace-write`, or `read-only`; unrestricted access is the default. Relative paths are resolved from the directory containing `spynel.yaml`, so a project can be moved without rewriting local paths.",
+		description: ".spynel/config.yaml settings and path resolution",
+		body:        "# Configuration\n\n`.spynel/config.yaml` controls the workspace, harness, channels, speech processing, orchestration routes, and extensions. `/config` shows the shared settings, `/config get <key>` reads one value, and `/config set <key> <value>` atomically validates and persists a change from any channel. `/harness [name]` and `/model [name]` are concise selectors. `/theme [name]` previews/lists or selects a semantic palette from `.spynel/themes`. All harness settings live in the `harness` group. `harness.sandbox` accepts `danger-full-access`, `workspace-write`, or `read-only`; unrestricted access is the default. Chat, developer, reviewer, and heartbeat prefixes are outer-trimmed and separated from the original prompt by one ASCII space, with `/goal` as the default for every non-chat agent. `harness.reviews` accepts `skip-trivial`, `always`, or `never` for task reviews. Relative paths resolve from the workspace root, one directory above `.spynel`, so a project can be moved without rewriting local paths.",
 	},
 	{
 		name:        "channels",
 		description: "The TUI, Telegram, and WhatsApp",
-		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, instance, and orchestrator indicators. From an idle local TUI, `/primary` safely hands workspace ownership to that TUI instance. Use `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to start a fresh harness thread without erasing channel history. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/update` checks npm with a ten-second deadline, and `/update install` lets a supervising npm launcher update after shutdown and then restart. `/log` shows bounded runtime output. `/jobs` lists accessible active executions; `/job info <number>` shows safe bounded details and durable progress, `/job message <number> <text>` sends nonterminal guidance through the existing job session, `/job ping <number>` requests a durable progress update, and `/job kill <number>` stops one.",
+		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, instance, and orchestrator indicators. From an idle local TUI, `/primary` safely hands workspace ownership to that TUI instance. Use `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to start a fresh harness thread without erasing channel history. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/update` checks npm with a ten-second deadline, and `/update install` lets a supervising npm launcher update after shutdown and then restart. `/log` shows bounded runtime output. `/jobs` lists accessible active executions; `/tasks` and `/goals` list open durable work by default with bounded semantic views. `/job info <number>` shows safe bounded details and durable progress, `/job message <number> <text>` sends nonterminal guidance through the existing job session, `/job ping <number>` requests a durable progress update, and `/job kill <number>` stops one.",
 	},
 	{
 		name:        "workflows",
 		description: "Durable tasks, goals, and orchestrator scans",
-		body:        "# Workflows\n\nA task is one finite, independently verifiable objective. `/task <request>` sends a dedicated creation directive and your request to the communication agent, which creates or refines a complete task in `todo` and sets its review policy deliberately. Review is mandatory for development/change and goal-derived tasks. Only bounded low-risk read-only collection may opt out and complete directly with evidence boundaries and uncertainty recorded; missing or malformed policy requires review.\n\nA goal is a long-term or multi-round outcome with measurable success criteria. `/goal <objective>` asks the communication agent to create or refine it in `proposed`. A leased planner creates reviewed finite task rounds, the goal remains unleased in `active` while they run, and a fresh goal review decides against the bar whether to finish, wait, abandon, or plan another round. Task review policy never bypasses goal review, and finished tasks never complete a goal automatically.\n\nUse `/run` to trigger an orchestrator scan immediately. Claimed `working`, `planning`, and `reviewing` documents have persisted leases and are recovered after crashes.",
+		body:        "# Workflows\n\nA task is one finite, independently verifiable objective. `/task <request>` sends a dedicated creation directive and your request to the communication agent, which creates or refines a complete task in `todo`. `harness.reviews` defaults to `skip-trivial`, where review is chosen by expected risk reduction versus latency and cost: broad, high-risk, hard-to-reverse, or materially uncertain work normally requires it; read-only work and minor localized reversible changes may complete directly with proportionate verification, evidence, and residual uncertainty. `always` forces every task through review and `never` forces the direct-evidence path.\n\nA goal is a long-term or multi-round outcome with measurable success criteria. `/goal <objective>` asks the communication agent to create or refine it in `proposed`. A leased planner creates finite task rounds under the configured task-review mode, the goal remains unleased in `active` while they run, and a fresh mandatory goal outcome review decides against the bar whether to finish, wait, abandon, or plan another round. Finished tasks never complete a goal automatically.\n\n`/tasks` and `/goals` list all open durable work by default without a harness. Choose `recent`, `active`, `review`, `waiting`, `done`, `failed`, or `all`; `failed` groups failed/cancelled tasks or abandoned goals. Add `--days`, `--limit`, and `--detail` as needed. Use `/run` to trigger an orchestrator scan immediately. Claimed `working`, `planning`, and `reviewing` documents have persisted leases and are recovered after crashes.",
 	},
 }
 
@@ -1458,7 +1558,7 @@ func formatHelpOverview() string {
 	lines := []string{
 		"# Spynel help",
 		"",
-		"Spynel connects coding agents to local and remote chat channels and can run durable Markdown task and goal workflows.",
+		"Spynel is a classic, non-AI program coordinating external coding agents through one assistant relationship and durable Markdown workflows.",
 		"",
 		"Choose a help topic:",
 		"",

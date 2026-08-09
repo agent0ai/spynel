@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"bytes"
 	"embed"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
 )
 
@@ -24,7 +26,7 @@ type fileSpec struct {
 }
 
 var files = []fileSpec{
-	{Path: "spynel.yaml", Template: "templates/spynel.yaml"},
+	{Path: config.FileName, Template: "templates/config.yaml"},
 	{Path: ".spynel/themes/spynel.yaml", Template: "templates/themes/spynel.yaml"},
 	{Path: ".spynel/themes/hack-the-box.yaml", Template: "templates/themes/hack-the-box.yaml"},
 	{Path: ".spynel/themes/github-colorblind-dark.yaml", Template: "templates/themes/github-colorblind-dark.yaml"},
@@ -50,13 +52,115 @@ var files = []fileSpec{
 	{Path: ".spynel/prompts/review.md", Template: "templates/review.md"},
 	{Path: ".spynel/prompts/heartbeat.md", Template: "templates/heartbeat.md"},
 	{Path: ".spynel/prompts/notification.md", Template: "templates/notification.md"},
+	{Path: ".spynel/instructions/agent-chat.md", Template: "templates/agent-chat.md"},
+	{Path: ".spynel/instructions/agent-developer.md", Template: "templates/agent-developer.md"},
+	{Path: ".spynel/instructions/agent-reviewer.md", Template: "templates/agent-reviewer.md"},
+	{Path: ".spynel/instructions/agent-notification.md", Template: "templates/agent-notification.md"},
+	{Path: ".spynel/instructions/agent-heartbeat.md", Template: "templates/agent-heartbeat.md"},
 	{Path: ".spynel/extensions/README.md", Template: "templates/extensions.md"},
 }
 
 var directories = []string{
-	".spynel/history", ".spynel/attachments", ".spynel/runtime/leases", ".spynel/extensions", ".spynel/themes",
+	".spynel/history", ".spynel/attachments", ".spynel/runtime/leases", ".spynel/extensions", ".spynel/themes", ".spynel/instructions",
 	".spynel/tasks/todo", ".spynel/tasks/working", ".spynel/tasks/review", ".spynel/tasks/reviewing", ".spynel/tasks/waiting", ".spynel/tasks/done", ".spynel/tasks/failed", ".spynel/tasks/cancelled",
 	".spynel/goals/proposed", ".spynel/goals/planning", ".spynel/goals/active", ".spynel/goals/review", ".spynel/goals/reviewing", ".spynel/goals/waiting", ".spynel/goals/done", ".spynel/goals/abandoned",
+}
+
+func ensureRealDirectory(path, description string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		if err := os.Mkdir(path, 0o700); err == nil {
+			return nil
+		} else if !os.IsExist(err) {
+			return err
+		}
+		info, err = os.Lstat(path)
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s must not be a symbolic link", description)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s must be a directory", description)
+	}
+	return nil
+}
+
+func ensureInstructionBoundary(root string) error {
+	stateRoot := filepath.Join(root, ".spynel")
+	if err := ensureRealDirectory(stateRoot, ".spynel state path"); err != nil {
+		return err
+	}
+	return ensureRealDirectory(filepath.Join(stateRoot, "instructions"), ".spynel/instructions path")
+}
+
+var persistentInstructionRoles = [...]string{"chat", "developer", "reviewer", "notification", "heartbeat"}
+
+func safeInstructionFile(path, relative string) (os.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("persistent instruction %s must be a regular, non-symlink file", relative)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return nil, fmt.Errorf("persistent instruction %s must not be group- or world-writable", relative)
+	}
+	return info, nil
+}
+
+// migrateLegacyInstructions publishes each legacy file under its canonical
+// agent-prefixed name without a clobber window. A hard link preserves the exact
+// bytes and mode; removing the legacy name makes retries idempotent. Dual files
+// are collapsed only when their bytes are identical.
+func migrateLegacyInstructions(root string) error {
+	dir := filepath.Join(root, ".spynel", "instructions")
+	for _, role := range persistentInstructionRoles {
+		legacyName := role + ".md"
+		canonicalName := "agent-" + role + ".md"
+		legacyPath := filepath.Join(dir, legacyName)
+		canonicalPath := filepath.Join(dir, canonicalName)
+		if _, err := safeInstructionFile(legacyPath, ".spynel/instructions/"+legacyName); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
+
+		if _, err := safeInstructionFile(canonicalPath, ".spynel/instructions/"+canonicalName); os.IsNotExist(err) {
+			if err := os.Link(legacyPath, canonicalPath); err != nil {
+				if os.IsExist(err) {
+					// A concurrent writer won publication; compare it below.
+				} else {
+					return fmt.Errorf("migrate persistent instruction %s to %s: %w", legacyName, canonicalName, err)
+				}
+			} else if err := os.Remove(legacyPath); err != nil {
+				return fmt.Errorf("remove migrated legacy persistent instruction %s: %w", legacyName, err)
+			} else {
+				continue
+			}
+		} else if err != nil {
+			return err
+		}
+
+		legacyData, err := os.ReadFile(legacyPath)
+		if err != nil {
+			return fmt.Errorf("read legacy persistent instruction %s: %w", legacyName, err)
+		}
+		canonicalData, err := os.ReadFile(canonicalPath)
+		if err != nil {
+			return fmt.Errorf("read canonical persistent instruction %s: %w", canonicalName, err)
+		}
+		if !bytes.Equal(legacyData, canonicalData) {
+			return fmt.Errorf("persistent instruction conflict: both .spynel/instructions/%s and .spynel/instructions/%s exist with different content; preserve both and resolve the conflict manually", legacyName, canonicalName)
+		}
+		if err := os.Remove(legacyPath); err != nil {
+			return fmt.Errorf("remove identical legacy persistent instruction %s: %w", legacyName, err)
+		}
+	}
+	return nil
 }
 
 func Init(root string, force bool) error {
@@ -64,13 +168,36 @@ func Init(root string, force bool) error {
 	if err != nil {
 		return err
 	}
-	configPath := filepath.Join(abs, "spynel.yaml")
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		return err
+	}
+	if err := ensureRealDirectory(filepath.Join(abs, ".spynel"), ".spynel state path"); err != nil {
+		return err
+	}
+	configPath := config.PathForRoot(abs)
+	legacyConfigPath := filepath.Join(abs, config.LegacyFileName)
+	if _, legacyErr := os.Stat(legacyConfigPath); legacyErr == nil {
+		if _, err := config.Load(legacyConfigPath); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(legacyErr) {
+		return legacyErr
+	}
 	if !force {
 		if _, err := os.Stat(configPath); err == nil {
-			return errors.New("spynel.yaml already exists (use --force to restore missing templates)")
+			return errors.New(".spynel/config.yaml already exists (use --force to restore missing templates)")
 		}
 	}
+	if err := ensureInstructionBoundary(abs); err != nil {
+		return err
+	}
+	if err := migrateLegacyInstructions(abs); err != nil {
+		return err
+	}
 	for _, dir := range directories {
+		if dir == ".spynel/instructions" {
+			continue
+		}
 		if err := os.MkdirAll(filepath.Join(abs, filepath.FromSlash(dir)), 0o700); err != nil {
 			return err
 		}
@@ -78,7 +205,7 @@ func Init(root string, force bool) error {
 	createdConfig := false
 	for _, spec := range files {
 		target := filepath.Join(abs, filepath.FromSlash(spec.Path))
-		if force && spec.Path == "spynel.yaml" {
+		if force && spec.Path == config.FileName {
 			if _, err := os.Stat(target); err == nil {
 				continue
 			}
@@ -98,7 +225,10 @@ func Init(root string, force bool) error {
 		if spec.Executable {
 			mode = 0o700
 		}
-		if err := os.WriteFile(target, data, mode); err != nil {
+		if err := fsx.AtomicCreateFile(target, data, mode); err != nil {
+			if os.IsExist(err) {
+				continue
+			}
 			return err
 		}
 		if spec.Path == config.FileName {
@@ -121,14 +251,26 @@ func Init(root string, force bool) error {
 }
 
 // Upgrade restores only missing runtime directories and embedded support
-// files. It never rewrites spynel.yaml or any existing user-owned prompt,
+// files. It never rewrites .spynel/config.yaml or any existing user-owned prompt,
 // instruction, theme, or extension file.
 func Upgrade(root string) error {
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		return err
+	}
+	if err := ensureInstructionBoundary(abs); err != nil {
+		return err
+	}
+	if err := migrateLegacyInstructions(abs); err != nil {
+		return err
+	}
 	for _, dir := range directories {
+		if dir == ".spynel/instructions" {
+			continue
+		}
 		if err := os.MkdirAll(filepath.Join(abs, filepath.FromSlash(dir)), 0o700); err != nil {
 			return err
 		}
@@ -155,7 +297,10 @@ func Upgrade(root string) error {
 		if spec.Executable {
 			mode = 0o700
 		}
-		if err := os.WriteFile(target, data, mode); err != nil {
+		if err := fsx.AtomicCreateFile(target, data, mode); err != nil {
+			if os.IsExist(err) {
+				continue
+			}
 			return err
 		}
 	}

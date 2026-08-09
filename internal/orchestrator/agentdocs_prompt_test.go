@@ -17,7 +17,7 @@ func TestEveryOrchestrationPhaseGetsOneCallableDocsGuidance(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}

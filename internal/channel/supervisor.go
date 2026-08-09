@@ -95,6 +95,7 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 		if !enabled {
 			if current != nil {
 				delete(s.running, managed.Name)
+				revokeRuntimeAuthorization(current.instance)
 				current.cancel()
 				s.event("info", managed.Name, "disconnected", "Channel disabled and disconnected")
 			}
@@ -108,6 +109,7 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 		}
 		if current != nil {
 			delete(s.running, managed.Name)
+			revokeRuntimeAuthorization(current.instance)
 			current.cancel()
 			s.event("info", managed.Name, "reconnecting", "Channel configuration changed; reconnecting")
 		}
@@ -137,6 +139,15 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 		}
 		if logger, ok := instance.(LogWriterSetter); ok {
 			logger.SetLogWriter(s.log)
+		}
+		if authorizer, ok := instance.(RuntimeAuthorizer); ok {
+			if err := authorizer.ValidateRuntimeAuthorization(); err != nil {
+				cancel()
+				s.publish(ConnectionStatus{Name: managed.Name, State: ConnectionError, Detail: err.Error()})
+				problems = append(problems, fmt.Errorf("%s: %w", managed.Name, err))
+				s.event("error", managed.Name, "authorization_failed", "Channel runtime authorization failed: "+err.Error())
+				continue
+			}
 		}
 		s.mu.Lock()
 		if s.running[managed.Name] == running {
@@ -191,7 +202,7 @@ func (s *Supervisor) PairPhone(ctx context.Context, name, phone string) (string,
 	return controller.PairPhone(ctx, phone)
 }
 
-func (s *Supervisor) Deliver(ctx context.Context, name, conversation, eventID, text string) (DeliveryReceipt, error) {
+func (s *Supervisor) Deliver(ctx context.Context, name, conversation, eventID, text string) error {
 	s.mu.Lock()
 	running := s.running[name]
 	var instance Channel
@@ -200,17 +211,28 @@ func (s *Supervisor) Deliver(ctx context.Context, name, conversation, eventID, t
 	}
 	s.mu.Unlock()
 	if instance == nil {
-		return DeliveryReceipt{}, fmt.Errorf("%s is disconnected", name)
+		return fmt.Errorf("%s is disconnected", name)
 	}
 	deliverer, ok := instance.(ProactiveDeliverer)
 	if !ok {
-		return DeliveryReceipt{}, fmt.Errorf("%s does not support proactive delivery", name)
+		return fmt.Errorf("%s does not support proactive delivery", name)
 	}
 	return deliverer.Deliver(ctx, conversation, eventID, text)
 }
 
 func (s *Supervisor) runOne(ctx context.Context, name string, running *runningChannel, instance Channel) {
 	err := instance.Run(ctx, s.handler)
+	if authorizer, ok := instance.(RuntimeAuthorizer); ok && err != nil && ctx.Err() == nil {
+		if authorizationErr := authorizer.ValidateRuntimeAuthorization(); authorizationErr != nil {
+			if !s.isCurrent(name, running) {
+				return
+			}
+			s.logf("%s: %v", name, authorizationErr)
+			s.publish(ConnectionStatus{Name: name, State: ConnectionError, Detail: authorizationErr.Error()})
+			s.event("error", name, "authorization_failed", "Channel runtime authorization failed: "+authorizationErr.Error())
+			return
+		}
+	}
 	if !s.removeIfCurrent(name, running) {
 		return
 	}
@@ -245,7 +267,14 @@ func (s *Supervisor) stopAll() {
 	s.running = map[string]*runningChannel{}
 	s.mu.Unlock()
 	for _, current := range running {
+		revokeRuntimeAuthorization(current.instance)
 		current.cancel()
+	}
+}
+
+func revokeRuntimeAuthorization(instance Channel) {
+	if authorizer, ok := instance.(RuntimeAuthorizer); ok {
+		authorizer.RevokeRuntimeAuthorization()
 	}
 }
 

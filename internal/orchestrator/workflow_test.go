@@ -21,7 +21,7 @@ func workflowTestManager(t *testing.T) (config.Config, *fakeHarness, *Manager) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,6 +50,10 @@ func TestOrphanedClaimedTaskReceivesRecoveryLease(t *testing.T) {
 	}
 	if leases[0].Phase != phaseTaskImplementation || leases[0].RecoveryCount == 0 || fake.calls != 1 {
 		t.Fatalf("orphan recovery = lease %#v, calls %d", leases[0], fake.calls)
+	}
+	recovered, err := ReadDocument(working)
+	if err != nil || !strings.Contains(recovered.Body, "Spynel started recovery attempt 1 for task implementation") {
+		t.Fatalf("recovery progress was not journaled: body=%q err=%v", recovered.Body, err)
 	}
 }
 
@@ -469,6 +473,24 @@ func TestWaitingTaskWithWakeTimeReturnsToImplementationQueue(t *testing.T) {
 	working := filepath.Join(filepath.Dir(filepath.Dir(task)), "working", filepath.Base(task))
 	if _, err := os.Stat(working); err != nil {
 		t.Fatalf("due waiting task was not claimed: %v", err)
+	}
+	resumed, err := ReadDocument(working)
+	if err != nil || !strings.Contains(resumed.Body, "scheduled wake condition became due") {
+		t.Fatalf("waiting wake was not journaled: body=%q err=%v", resumed.Body, err)
+	}
+}
+
+func TestRuntimeProgressJournalStaysInsideProgressSection(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 34, 56, 0, time.UTC)
+	document := Document{FrontMatter: map[string]any{}, Body: "# Task\n\n## Progress\n\n- Existing entry.\n\n## Notes\n\nKeep this note.\n"}
+	appendProgress(&document, now, "  Runtime repaired\n  a transition. ")
+	appendProgress(&document, now, "Runtime repaired a transition.")
+	want := "## Progress\n\n- Existing entry.\n\n- 2026-08-08T12:34:56Z — Runtime repaired a transition.\n\n## Notes\n\nKeep this note."
+	if !strings.Contains(document.Body, want) {
+		t.Fatalf("progress journal escaped its section:\n%s", document.Body)
+	}
+	if count := strings.Count(document.Body, "Runtime repaired a transition."); count != 1 {
+		t.Fatalf("idempotent progress count = %d:\n%s", count, document.Body)
 	}
 }
 

@@ -19,12 +19,13 @@ const (
 )
 
 type fixtureRecord struct {
-	Kind       string   `json:"kind"`
-	Args       []string `json:"args"`
-	Cwd        string   `json:"cwd"`
-	Executable string   `json:"executable"`
-	Text       string   `json:"text"`
-	Method     string   `json:"method"`
+	Kind       string          `json:"kind"`
+	Args       []string        `json:"args"`
+	Cwd        string          `json:"cwd"`
+	Executable string          `json:"executable"`
+	Text       string          `json:"text"`
+	Method     string          `json:"method"`
+	Params     json.RawMessage `json:"params"`
 }
 
 func TestMain(m *testing.M) {
@@ -110,10 +111,192 @@ func runHarnessFixture(mode string) int {
 		return runCodexFixture(mode)
 	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero":
 		return runClaudeFixture(mode)
+	case "pi-lifecycle", "pi-steer", "pi-interrupt", "pi-state-missing-session":
+		return runPiFixture(mode)
+	case "acp-lifecycle", "acp-interrupt", "acp-version-mismatch":
+		return runACPFixture(mode)
 	default:
 		_, _ = fmt.Fprintf(os.Stderr, "unknown harness fixture mode %q\n", mode)
 		return 2
 	}
+}
+
+func runPiFixture(mode string) int {
+	if len(os.Args) > 1 && os.Args[1] == "--version" {
+		_, _ = fmt.Fprintln(os.Stdout, "pi 0.fixture")
+		return 0
+	}
+	type request struct {
+		ID      string          `json:"id"`
+		Type    string          `json:"type"`
+		Message json.RawMessage `json:"message"`
+	}
+	var outputMu sync.Mutex
+	write := func(value any) {
+		outputMu.Lock()
+		defer outputMu.Unlock()
+		_ = json.NewEncoder(os.Stdout).Encode(value)
+	}
+	respond := func(message request, data any) {
+		write(map[string]any{"id": message.ID, "type": "response", "command": message.Type, "success": true, "data": data})
+	}
+	messageStart := func() {
+		write(map[string]any{"type": "message_start", "message": map[string]any{"role": "assistant", "content": []any{}}})
+	}
+	delta := func(text string) {
+		write(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": text}})
+	}
+	messageEnd := func(text, reason string) {
+		write(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": reason, "content": []any{map[string]any{"type": "text", "text": text}}}})
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		var message request
+		if json.Unmarshal(scanner.Bytes(), &message) != nil {
+			continue
+		}
+		appendFixtureLog(map[string]any{"kind": "request", "method": message.Type, "params": json.RawMessage(scanner.Bytes())})
+		switch message.Type {
+		case "get_state":
+			sessionFile := filepath.Join(mustGetwd(), "pi-fixture-session.jsonl")
+			_ = os.WriteFile(sessionFile, []byte("{}\n"), 0o600)
+			if mode == "pi-state-missing-session" {
+				respond(message, map[string]any{"isStreaming": false})
+			} else {
+				respond(message, map[string]any{"sessionId": "pi-session", "sessionFile": sessionFile, "isStreaming": false})
+			}
+		case "set_steering_mode", "set_follow_up_mode":
+			respond(message, map[string]any{})
+		case "get_available_models":
+			respond(message, map[string]any{"models": []any{map[string]any{"id": "model-a", "name": "Model A", "provider": "fixture", "reasoning": true}}})
+		case "prompt":
+			respond(message, map[string]any{})
+			messageStart()
+			if mode == "pi-steer" {
+				delta("first")
+			} else if mode == "pi-interrupt" {
+				delta("working")
+			} else {
+				delta("hello ")
+				delta("world")
+				messageEnd("hello world", "stop")
+				write(map[string]any{"type": "agent_end"})
+				go func() {
+					time.Sleep(80 * time.Millisecond)
+					write(map[string]any{"type": "agent_settled"})
+				}()
+			}
+		case "steer":
+			respond(message, map[string]any{})
+			delta(" second")
+			messageEnd("first second", "stop")
+			write(map[string]any{"type": "agent_settled"})
+		case "abort":
+			respond(message, map[string]any{})
+			messageEnd("working", "aborted")
+			write(map[string]any{"type": "agent_settled"})
+		}
+	}
+	return 0
+}
+
+func runACPFixture(mode string) int {
+	type message struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params"`
+		Result  json.RawMessage `json:"result"`
+	}
+	var outputMu sync.Mutex
+	write := func(value any) {
+		outputMu.Lock()
+		defer outputMu.Unlock()
+		_ = json.NewEncoder(os.Stdout).Encode(value)
+	}
+	respond := func(request message, result any) {
+		write(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result})
+	}
+	var promptMu sync.Mutex
+	var promptID json.RawMessage
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		var request message
+		if json.Unmarshal(scanner.Bytes(), &request) != nil {
+			continue
+		}
+		if request.Method == "" {
+			appendFixtureLog(map[string]any{"kind": "request", "method": "permission-response", "params": json.RawMessage(scanner.Bytes())})
+			if mode == "acp-interrupt" {
+				promptMu.Lock()
+				id := append(json.RawMessage(nil), promptID...)
+				promptMu.Unlock()
+				if len(id) != 0 {
+					respond(message{ID: id}, map[string]any{"stopReason": "cancelled"})
+				}
+			}
+			continue
+		}
+		appendFixtureLog(map[string]any{"kind": "request", "method": request.Method, "params": request.Params})
+		switch request.Method {
+		case "initialize":
+			protocolVersion := 1
+			if mode == "acp-version-mismatch" {
+				protocolVersion = 2
+			}
+			respond(request, map[string]any{
+				"protocolVersion":   protocolVersion,
+				"agentCapabilities": map[string]any{"loadSession": true, "sessionCapabilities": map[string]any{"resume": map[string]any{}, "close": map[string]any{}}},
+				"agentInfo":         map[string]string{"name": "fixture", "version": "1"},
+			})
+		case "session/new":
+			respond(request, map[string]any{
+				"sessionId": "acp-session",
+				"configOptions": []any{
+					map[string]any{"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "default", "options": []any{map[string]any{"value": "model-a", "name": "Model A"}}},
+					map[string]any{"id": "thought", "name": "Thought", "category": "thought_level", "type": "select", "currentValue": "medium", "options": []any{map[string]any{"value": "high", "name": "High"}}},
+				},
+			})
+		case "session/resume":
+			respond(request, map[string]any{})
+		case "session/load":
+			respond(request, nil)
+		case "session/set_config_option":
+			respond(request, map[string]any{"configOptions": []any{}})
+		case "session/prompt":
+			promptMu.Lock()
+			promptID = append(json.RawMessage(nil), request.ID...)
+			promptMu.Unlock()
+			if mode == "acp-lifecycle" {
+				write(map[string]any{"jsonrpc": "2.0", "id": 900, "method": "session/request_permission", "params": map[string]any{
+					"sessionId": "acp-session", "toolCall": map[string]any{"toolCallId": "tool-1", "kind": "edit"},
+					"options": []any{map[string]any{"optionId": "allow", "name": "Allow", "kind": "allow_once"}, map[string]any{"optionId": "reject", "name": "Reject", "kind": "reject_once"}},
+				}})
+				go func(id json.RawMessage) {
+					time.Sleep(20 * time.Millisecond)
+					write(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "acp-session", "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "hello "}}}})
+					write(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "acp-session", "update": map[string]any{"sessionUpdate": "tool_call", "toolCallId": "tool-1", "kind": "edit", "title": "Edit file", "status": "in_progress"}}})
+					write(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "acp-session", "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]any{"type": "text", "text": "world"}}}})
+					respond(message{ID: id}, map[string]any{"stopReason": "end_turn"})
+				}(append(json.RawMessage(nil), request.ID...))
+			}
+		case "session/cancel":
+			if mode == "acp-interrupt" {
+				write(map[string]any{"jsonrpc": "2.0", "id": 901, "method": "session/request_permission", "params": map[string]any{
+					"sessionId": "acp-session", "toolCall": map[string]any{"toolCallId": "tool-2", "kind": "read"},
+					"options": []any{map[string]any{"optionId": "allow", "name": "Allow", "kind": "allow_once"}, map[string]any{"optionId": "reject", "name": "Reject", "kind": "reject_once"}},
+				}})
+				continue
+			}
+			promptMu.Lock()
+			id := append(json.RawMessage(nil), promptID...)
+			promptMu.Unlock()
+			if len(id) != 0 {
+				respond(message{ID: id}, map[string]any{"stopReason": "cancelled"})
+			}
+		}
+	}
+	return 0
 }
 
 func mustGetwd() string {

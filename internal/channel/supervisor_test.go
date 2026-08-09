@@ -2,9 +2,10 @@ package channel
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,51 @@ type pairingFixture struct {
 	retried bool
 	phone   string
 }
+
+type runtimeAuthorizationFixture struct {
+	valid   bool
+	started atomic.Int32
+	revoked atomic.Bool
+}
+
+type losesAuthorizationFixture struct {
+	valid   atomic.Bool
+	started chan struct{}
+}
+
+func (c *losesAuthorizationFixture) Name() string { return "telegram" }
+
+func (c *losesAuthorizationFixture) Run(context.Context, Handler) error {
+	c.valid.Store(false)
+	close(c.started)
+	return errors.New("live allow-list disappeared")
+}
+
+func (c *losesAuthorizationFixture) ValidateRuntimeAuthorization() error {
+	if !c.valid.Load() {
+		return errors.New("Telegram runtime authorization is unavailable")
+	}
+	return nil
+}
+
+func (c *losesAuthorizationFixture) RevokeRuntimeAuthorization() { c.valid.Store(false) }
+
+func (c *runtimeAuthorizationFixture) Name() string { return "telegram" }
+
+func (c *runtimeAuthorizationFixture) Run(ctx context.Context, _ Handler) error {
+	c.started.Add(1)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (c *runtimeAuthorizationFixture) ValidateRuntimeAuthorization() error {
+	if !c.valid {
+		return errors.New("Telegram runtime authorization is unavailable")
+	}
+	return nil
+}
+
+func (c *runtimeAuthorizationFixture) RevokeRuntimeAuthorization() { c.revoked.Store(true) }
 
 func (c *pairingFixture) Name() string { return "whatsapp" }
 
@@ -60,7 +106,7 @@ func TestSupervisorHotReloadsAndDisablesChannels(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,4 +192,100 @@ func TestSupervisorRoutesPairingActionsToRunningChannel(t *testing.T) {
 	if err := supervisor.RetryPairing("telegram"); err == nil || !strings.Contains(err.Error(), "not running") {
 		t.Fatalf("missing pairing channel error = %v", err)
 	}
+}
+
+func TestSupervisorKeepsInvalidAuthorizationInPersistentErrorWithoutRetry(t *testing.T) {
+	cfg := config.Default()
+	cfg.Channels.Telegram.Enabled = true
+	builds := 0
+	fixture := &runtimeAuthorizationFixture{}
+	managed := []Managed{{
+		Name: "telegram", Enabled: func(config.Config) bool { return true }, Fingerprint: func(config.Config) string { return "invalid" },
+		Build: func(config.Config) (Channel, error) { builds++; return fixture, nil },
+	}}
+	var statuses []ConnectionStatus
+	supervisor := NewSupervisor(nil, nil, managed, func(status ConnectionStatus) { statuses = append(statuses, status) }, nil)
+	if err := supervisor.reconcile(context.Background(), cfg); err == nil {
+		t.Fatal("invalid runtime authorization was not reported")
+	}
+	if err := supervisor.reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("stable invalid fingerprint was retried: %v", err)
+	}
+	if builds != 1 || fixture.started.Load() != 0 {
+		t.Fatalf("invalid runtime builds=%d starts=%d", builds, fixture.started.Load())
+	}
+	if len(statuses) != 1 || statuses[0].State != ConnectionError {
+		t.Fatalf("statuses = %#v", statuses)
+	}
+}
+
+func TestSupervisorRevokesStaleRuntimeBeforeHotReplacement(t *testing.T) {
+	cfg := config.Default()
+	cfg.Channels.Telegram.Enabled = true
+	cfg.Channels.Telegram.Token = "one"
+	var fixtures []*runtimeAuthorizationFixture
+	managed := []Managed{{
+		Name: "telegram", Enabled: func(config.Config) bool { return true }, Fingerprint: func(cfg config.Config) string { return cfg.Channels.Telegram.Token },
+		Build: func(config.Config) (Channel, error) {
+			fixture := &runtimeAuthorizationFixture{valid: true}
+			fixtures = append(fixtures, fixture)
+			return fixture, nil
+		},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	supervisor := NewSupervisor(nil, nil, managed, nil, nil)
+	if err := supervisor.reconcile(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Channels.Telegram.Token = "two"
+	if err := supervisor.reconcile(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(fixtures) != 2 || !fixtures[0].revoked.Load() || fixtures[1].revoked.Load() {
+		t.Fatalf("hot replacement fixtures = %#v", fixtures)
+	}
+	cancel()
+	supervisor.stopAll()
+	supervisor.wait.Wait()
+}
+
+func TestSupervisorDoesNotRetryWhenLiveAuthorizationDisappears(t *testing.T) {
+	cfg := config.Default()
+	builds := 0
+	fixture := &losesAuthorizationFixture{started: make(chan struct{})}
+	fixture.valid.Store(true)
+	managed := []Managed{{
+		Name: "telegram", Enabled: func(config.Config) bool { return true }, Fingerprint: func(config.Config) string { return "same" },
+		Build: func(config.Config) (Channel, error) { builds++; return fixture, nil },
+	}}
+	statuses := make(chan ConnectionStatus, 4)
+	supervisor := NewSupervisor(nil, nil, managed, func(status ConnectionStatus) { statuses <- status }, nil)
+	if err := supervisor.reconcile(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fixture.started:
+	case <-time.After(time.Second):
+		t.Fatal("fixture did not start")
+	}
+	for {
+		select {
+		case status := <-statuses:
+			if status.State == ConnectionError {
+				goto observedError
+			}
+		case <-time.After(time.Second):
+			t.Fatal("authorization error status was not retained")
+		}
+	}
+
+observedError:
+	if err := supervisor.reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("stable failed runtime was retried: %v", err)
+	}
+	if builds != 1 {
+		t.Fatalf("live authorization loss triggered %d builds", builds)
+	}
+	supervisor.stopAll()
+	supervisor.wait.Wait()
 }

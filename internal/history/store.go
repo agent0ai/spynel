@@ -24,14 +24,15 @@ const (
 )
 
 type Entry struct {
-	At               time.Time `json:"at"`
-	Role             string    `json:"role"`
-	Sender           string    `json:"sender,omitempty"`
-	Content          string    `json:"content"`
-	EventID          string    `json:"event_id,omitempty"`
-	AfterChars       int       `json:"after_chars,omitempty"`
-	Terminal         bool      `json:"terminal,omitempty"`
-	NativeMessageIDs []string  `json:"native_message_ids,omitempty"`
+	At         time.Time `json:"at"`
+	Role       string    `json:"role"`
+	Sender     string    `json:"sender,omitempty"`
+	ReplyTo    string    `json:"reply_to,omitempty"`
+	Content    string    `json:"content"`
+	EventID    string    `json:"event_id,omitempty"`
+	AfterChars int       `json:"after_chars,omitempty"`
+	Terminal   bool      `json:"terminal,omitempty"`
+	compact    bool
 }
 
 type Conversation struct {
@@ -95,25 +96,19 @@ func (s *Store) Append(channel, conversation string, entry Entry) (string, error
 }
 
 func (s *Store) DeliveryState(channel, conversation, eventID string) (string, error) {
-	state, _, err := s.DeliveryInfo(channel, conversation, eventID)
-	return state, err
-}
-
-func (s *Store) DeliveryInfo(channel, conversation, eventID string) (string, []string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	file, err := os.Open(s.Path(channel, conversation))
 	if os.IsNotExist(err) {
-		return "", nil, nil
+		return "", nil
 	}
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
 	state := ""
-	var nativeMessageIDs []string
 	for scanner.Scan() {
 		var entry Entry
 		if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.EventID == eventID {
@@ -125,12 +120,11 @@ func (s *Store) DeliveryInfo(channel, conversation, eventID string) (string, []s
 			case "assistant":
 				if entry.Sender == "Spy" {
 					state = "sent"
-					nativeMessageIDs = append([]string(nil), entry.NativeMessageIDs...)
 				}
 			}
 		}
 	}
-	return state, nativeMessageIDs, scanner.Err()
+	return state, scanner.Err()
 }
 
 func (s *Store) Recent(channel, conversation string, characterLimit int) (string, string, error) {
@@ -205,9 +199,11 @@ func readRecentEntries(path string, messageLimit, characterLimit int) ([]Entry, 
 		formatted := formatEntry(entry)
 		characters := len([]rune(formatted))
 		if len(reversed) == 0 && characters > characterLimit {
-			content := []rune(entry.Content)
-			if len(content) > characterLimit {
-				entry.Content = "…" + string(content[len(content)-characterLimit:])
+			var ok bool
+			entry, ok = boundNewestEntry(entry, characterLimit)
+			if !ok {
+				stopped = true
+				return
 			}
 			formatted = formatEntry(entry)
 			characters = len([]rune(formatted))
@@ -261,11 +257,122 @@ func readRecentEntries(path string, messageLimit, characterLimit int) ([]Entry, 
 }
 
 func formatEntry(entry Entry) string {
+	reply := ""
+	if entry.ReplyTo != "" {
+		reply = "[reply_to: " + entry.ReplyTo + "]"
+	}
+	if entry.compact {
+		if entry.Content == "" {
+			return reply
+		}
+		return reply + " " + entry.Content
+	}
 	label := entry.Role
 	if entry.Sender != "" {
 		label += " (" + entry.Sender + ")"
 	}
-	return fmt.Sprintf("[%s] %s: %s", entry.At.Format(time.RFC3339), label, entry.Content)
+	if reply != "" {
+		reply += " "
+	}
+	return fmt.Sprintf("[%s] %s: %s%s", entry.At.Format(time.RFC3339), label, reply, entry.Content)
+}
+
+func boundNewestEntry(entry Entry, limit int) (Entry, bool) {
+	if limit <= 0 {
+		return Entry{}, false
+	}
+	if entry.ReplyTo == "" {
+		content := []rune(entry.Content)
+		if len(content) > limit {
+			entry.Content = "…" + string(content[len(content)-limit:])
+		}
+		return entry, true
+	}
+	for _, compact := range []bool{false, true} {
+		candidate, ok := boundReplyEntry(entry, limit, compact)
+		if ok {
+			return candidate, true
+		}
+	}
+	// A bound too small for a complete labeled native ID is safer as an empty
+	// history window than a misleading tail-sliced identifier.
+	return Entry{}, false
+}
+
+func boundReplyEntry(entry Entry, limit int, compact bool) (Entry, bool) {
+	id, preview := splitReply(entry.ReplyTo)
+	if id == "" {
+		return Entry{}, false
+	}
+	candidate := entry
+	candidate.compact = compact
+	candidate.ReplyTo = id
+	candidate.Content = ""
+	base := len([]rune(formatEntry(candidate)))
+	previewRunes := []rune(preview)
+	contentRunes := []rune(entry.Content)
+	minimum := base
+	if len(previewRunes) > 0 {
+		minimum += 2 // space and visible truncation marker
+	}
+	if len(contentRunes) > 0 {
+		minimum += 2 // separator and visible truncation marker
+	}
+	if minimum > limit {
+		return Entry{}, false
+	}
+	remaining := limit - base
+	if len(previewRunes) > 0 {
+		budget := remaining - 1
+		if len(contentRunes) > 0 {
+			budget -= 2
+		}
+		preview = truncateHead(previewRunes, budget)
+		candidate.ReplyTo = id + " " + preview
+		remaining -= 1 + len([]rune(preview))
+	}
+	if len(contentRunes) > 0 {
+		budget := remaining - 1
+		candidate.Content = truncateTail(contentRunes, budget)
+	}
+	return candidate, len([]rune(formatEntry(candidate))) <= limit
+}
+
+func splitReply(value string) (string, string) {
+	parts := strings.SplitN(strings.TrimSpace(value), " ", 2)
+	if len(parts) == 0 {
+		return "", ""
+	}
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], strings.TrimSpace(parts[1])
+}
+
+func truncateHead(value []rune, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	if len(value) <= budget {
+		return string(value)
+	}
+	if budget == 1 {
+		return "…"
+	}
+	return string(value[:budget-1]) + "…"
+}
+
+func truncateTail(value []rune, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
+	if len(value) <= budget {
+		return string(value)
+	}
+	if budget == 1 {
+		return "…"
+	}
+	return "…" + string(value[len(value)-budget+1:])
 }
 
 // Entries returns the complete structured history for one channel

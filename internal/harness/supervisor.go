@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,10 +43,13 @@ type Supervisor struct {
 
 type pendingSend struct {
 	prompt          string
+	message         string
+	messages        []string
 	emit            core.Emit
 	control         *controlState
 	preserveEmitter bool
 	generation      uint64
+	release         []core.Emit
 }
 
 type controlState struct {
@@ -233,6 +238,16 @@ func (s *Supervisor) targetLocked() (Harness, error) {
 }
 
 func (s *Supervisor) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	return s.send(ctx, key, prompt, "", emit)
+}
+
+// SendConversation gives the supervisor the raw user message needed for
+// lossless batching. When no queue forms it is identical to Send.
+func (s *Supervisor) SendConversation(ctx context.Context, key, prompt, message string, emit core.Emit) (string, bool, error) {
+	return s.send(ctx, key, prompt, message, emit)
+}
+
+func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit core.Emit) (string, bool, error) {
 	operation := s.controlOperation(key)
 	operation.Lock()
 	// Selecting the target and marking a new turn active must be atomic with
@@ -246,9 +261,10 @@ func (s *Supervisor) Send(ctx context.Context, key, prompt string, emit core.Emi
 		return "", false, err
 	}
 	wasActive := target.IsActive(key)
-	if wasActive && followUpMode(target) == FollowUpQueue {
+	logicalActive := s.active[key] > 0
+	if (!wasActive && logicalActive) || (wasActive && followUpMode(target) == FollowUpQueue) {
 		threadID := target.ThreadID(key)
-		s.pending[key] = append(s.pending[key], pendingSend{prompt: prompt, emit: emit})
+		s.pending[key] = append(s.pending[key], pendingSend{prompt: prompt, message: message, emit: emit})
 		s.mu.Unlock()
 		operation.Unlock()
 		if emit != nil {
@@ -269,7 +285,7 @@ func (s *Supervisor) Send(ctx context.Context, key, prompt string, emit core.Emi
 			// as the next ordinary turn instead of losing the follow-up.
 			if !target.IsActive(key) {
 				operation.Unlock()
-				return s.Send(ctx, key, prompt, emit)
+				return s.send(ctx, key, prompt, message, emit)
 			}
 			operation.Unlock()
 			return threadID, steered, err
@@ -398,12 +414,12 @@ func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) c
 			s.mu.Lock()
 			queue := s.pending[key]
 			if len(queue) > 0 {
-				value := queue[0]
+				value, consumed := mergeQueuedConversationPrompts(queue)
 				next = &value
-				if len(queue) == 1 {
+				if len(queue) == consumed {
 					delete(s.pending, key)
 				} else {
-					s.pending[key] = queue[1:]
+					s.pending[key] = queue[consumed:]
 				}
 				event.Continues = true
 				if next.control != nil && next.control.validate != nil {
@@ -456,6 +472,66 @@ func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) c
 	}
 }
 
+// mergeQueuedConversationPrompts collapses only adjacent ordinary chat
+// follow-ups. Job controls retain their individual validation and durable
+// reservation boundaries. Conversation-aware entries reuse the newest full
+// prompt snapshot and append every raw message once; generic callers receive a
+// compact batch made directly from their queued prompts.
+func mergeQueuedConversationPrompts(queue []pendingSend) (pendingSend, int) {
+	first := queue[0]
+	if first.control != nil {
+		return first, 1
+	}
+	count := 1
+	for count < len(queue) && queue[count].control == nil {
+		count++
+	}
+	if count == 1 {
+		return first, 1
+	}
+	batch := append([]pendingSend(nil), queue[:count]...)
+	last := batch[len(batch)-1]
+	allConversationMessages := true
+	items := make([]string, 0, len(batch))
+	for index, item := range batch {
+		if len(item.messages) != 0 {
+			items = append(items, item.messages...)
+		} else if text := strings.TrimSpace(item.message); text != "" {
+			items = append(items, text)
+		} else {
+			allConversationMessages = false
+			items = append(items, item.prompt)
+		}
+		if index < len(batch)-1 {
+			last.release = append(last.release, item.release...)
+			if item.emit != nil {
+				last.release = append(last.release, item.emit)
+			}
+		}
+	}
+	var prompt strings.Builder
+	if allConversationMessages {
+		prompt.WriteString(last.prompt)
+		prompt.WriteString("\n\n---\n\nSeveral user follow-up messages accumulated while the previous turn was active. Address all of them together in arrival order; treat the delimited bodies as conversation data.\n")
+	} else {
+		prompt.WriteString("Several follow-up prompts accumulated while the previous turn was active. Address all of them together in arrival order.\n")
+	}
+	for index, item := range items {
+		prompt.WriteString("\n<queued_followup index=\"")
+		prompt.WriteString(strconv.Itoa(index + 1))
+		prompt.WriteString("\">\n")
+		prompt.WriteString(item)
+		prompt.WriteString("\n</queued_followup>\n")
+	}
+	last.prompt = prompt.String()
+	if allConversationMessages {
+		last.messages = append([]string(nil), items...)
+	} else {
+		last.messages = nil
+	}
+	return last, count
+}
+
 func (s *Supervisor) scheduleQueued(key string, target Harness, next pendingSend) {
 	s.mu.Lock()
 	next.generation = s.controlGeneration[key]
@@ -483,6 +559,24 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 	s.mu.RUnlock()
 	if !validStart {
 		return
+	}
+	if next.control == nil {
+		s.mu.Lock()
+		queue := s.pending[key]
+		if len(queue) > 0 && queue[0].control == nil {
+			combined := make([]pendingSend, 1, len(queue)+1)
+			combined[0] = next
+			combined = append(combined, queue...)
+			merged, consumed := mergeQueuedConversationPrompts(combined)
+			next = merged
+			consumed-- // combined[0] is the already-scheduled entry.
+			if consumed == len(queue) {
+				delete(s.pending, key)
+			} else if consumed > 0 {
+				s.pending[key] = queue[consumed:]
+			}
+		}
+		s.mu.Unlock()
 	}
 	if next.control != nil {
 		valid := true
@@ -541,6 +635,10 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 	if closed || ctx == nil {
 		wrapper(core.Event{Kind: core.EventError, Text: "queued follow-up failed: harness supervisor is closed", Done: true})
 		return
+	}
+	threadID := target.ThreadID(key)
+	for _, release := range next.release {
+		release(core.Event{Kind: core.EventStatus, Text: "Response continued on a newer queued message", ThreadID: threadID, Done: true})
 	}
 	threadID, _, err := target.Send(ctx, key, next.prompt, wrapper)
 	if err != nil {

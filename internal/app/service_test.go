@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -53,9 +54,9 @@ type heldServiceHarness struct {
 
 type notificationRouter struct{ calls []string }
 
-func (r *notificationRouter) Deliver(_ context.Context, channelName, conversation, eventID, text string) (channel.DeliveryReceipt, error) {
+func (r *notificationRouter) Deliver(_ context.Context, channelName, conversation, eventID, text string) error {
 	r.calls = append(r.calls, channelName+"/"+conversation+"/"+eventID+"/"+text)
-	return channel.DeliveryReceipt{MessageIDs: []string{"native-" + eventID}}, nil
+	return nil
 }
 
 func TestNotifyDeliversAllOriginsWithStableEventIdentity(t *testing.T) {
@@ -63,7 +64,7 @@ func TestNotifyDeliversAllOriginsWithStableEventIdentity(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	cfg.Channels.Telegram.AllowedUsers = []string{"7"}
 	cfg.Channels.WhatsApp.AllowedNumbers = []string{"15557654321"}
 	service := New(cfg, newServiceHarness())
@@ -94,12 +95,117 @@ func TestNotifyDeliversAllOriginsWithStableEventIdentity(t *testing.T) {
 	}
 }
 
+func TestAutomaticNotifyCommandUsesAuthorizedTransitionAndDeduplicates(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	cfg.Orchestrator.TaskNotifications = config.TaskNotificationsAlways
+	service := New(cfg, newServiceHarness())
+	if _, err := service.History.Append("cli", "local", history.Entry{Role: "user", Content: "known"}); err != nil {
+		t.Fatal(err)
+	}
+	taskFile := filepath.Join(cfg.StatePath("tasks", "done"), "task.md")
+	document := orchestrator.Document{FrontMatter: map[string]any{
+		"id": "task-1", "title": "Report", "status": "done", "attempt": 1,
+		"notify": map[string]any{"enabled": true, "origin": "cli/local", "on": []any{"done"}},
+	}, Body: "# Report\n\n## Progress\n\n- Complete.\n"}
+	if err := orchestrator.WriteDocument(taskFile, document); err != nil {
+		t.Fatal(err)
+	}
+	eventDirectory := cfg.StatePath("runtime", "notification-agents")
+	if err := os.MkdirAll(eventDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	event := map[string]any{
+		"id": "event-1", "task_id": "task-1", "outcome": "done", "task_file": taskFile,
+		"transition": "task_implementation:1", "origin": "cli/local", "mode": "always", "state": "pending",
+	}
+	data, _ := json.Marshal(event)
+	if err := os.WriteFile(filepath.Join(eventDirectory, "event-1.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id, err := service.NotifyWithIdentity(context.Background(), "cli/local", "The report is ready.", "task-notification:event-1", "done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := service.NotifyWithIdentity(context.Background(), "cli/local", "Changed retry wording.", "task-notification:event-1", "done")
+	if err != nil || again != id {
+		t.Fatalf("retry identity = %q, %v; want %q", again, err, id)
+	}
+	if _, err := service.NotifyWithIdentity(context.Background(), "cli/other", "redirect", "task-notification:event-1", "done"); err == nil {
+		t.Fatal("automatic command redirected its authorized origin")
+	}
+	journaled, err := orchestrator.ReadDocument(taskFile)
+	if err != nil || strings.Count(journaled.Body, "Sent the user a notification: The report is ready.") != 1 {
+		t.Fatalf("transition journal = %#v, %v", journaled.Body, err)
+	}
+	eventData, err := os.ReadFile(filepath.Join(eventDirectory, "event-1.json"))
+	if err != nil || !strings.Contains(string(eventData), `"journaled": true`) {
+		t.Fatalf("transition receipt = %s, %v", eventData, err)
+	}
+	entries, _, err := service.History.RecentEntries("cli", "local", 10, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[1].Content != "The report is ready." {
+		t.Fatalf("deduplicated history = %#v", entries)
+	}
+}
+
+func TestNotificationDeclineRequiresAuthorizedDecideEvent(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	service := New(cfg, newServiceHarness())
+	if _, err := service.History.Append("cli", "local", history.Entry{Role: "user", Content: "known"}); err != nil {
+		t.Fatal(err)
+	}
+	taskFile := filepath.Join(cfg.StatePath("tasks", "done"), "task.md")
+	document := orchestrator.Document{FrontMatter: map[string]any{
+		"id": "task-1", "title": "Report", "status": "done", "attempt": 1,
+		"notify": map[string]any{"enabled": true, "origin": "cli/local", "on": []any{"done"}},
+	}, Body: "# Report\n\n## Progress\n\n- Complete.\n"}
+	if err := orchestrator.WriteDocument(taskFile, document); err != nil {
+		t.Fatal(err)
+	}
+	eventDirectory := cfg.StatePath("runtime", "notification-agents")
+	if err := os.MkdirAll(eventDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	event := map[string]any{
+		"id": "event-1", "task_id": "task-1", "outcome": "done", "task_file": taskFile,
+		"transition": "task_implementation:1", "origin": "cli/local", "mode": "decide", "state": "pending",
+	}
+	data, _ := json.Marshal(event)
+	if err := os.WriteFile(filepath.Join(eventDirectory, "event-1.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.DeclineNotification("cli/other", "task-notification:event-1", "done"); err == nil {
+		t.Fatal("decline redirected its authorized origin")
+	}
+	if err := service.DeclineNotification("cli/local", "task-notification:event-1", "done"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(eventDirectory, "event-1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]any
+	if json.Unmarshal(data, &saved) != nil || saved["state"] != "declined" {
+		t.Fatalf("declined event = %#v", saved)
+	}
+}
+
 func TestNotifyUsesVerifiedTelegramUsernameMappingAndRechecksRevocation(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	cfg.Channels.Telegram.AllowedUsers = []string{" @FrD3L "}
 	service := New(cfg, newServiceHarness())
 	service.DeliveryControl = &notificationRouter{}
@@ -129,7 +235,7 @@ func TestTaskCommandDelegatesCreationPolicyToCommunicationAgent(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	harness := newServiceHarness()
 	service := New(cfg, harness)
 	if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "deploy", Sender: "cli", Text: "/task ship it"}, func(core.Event) {}); err != nil {
@@ -141,30 +247,64 @@ func TestTaskCommandDelegatesCreationPolicyToCommunicationAgent(t *testing.T) {
 	}
 }
 
+func TestChatAgentPrefixAppliesToOrdinaryAndExplicitSteerMessages(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	cfg.Harness.ChatAgentPrefix = "/ultrathink"
+	instructionPath := cfg.StatePath("instructions", "agent-chat.md")
+	if err := os.WriteFile(instructionPath, []byte("ordinary chat rule"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := newServiceHarness()
+	service := New(cfg, target)
+	message := core.Message{Channel: "cli", Conversation: "prefix", Text: "inspect this"}
+	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	key := "chat:cli:prefix"
+	if got := target.prompts[key][0]; !strings.HasPrefix(got, "/ultrathink ") || !strings.Contains(got, "Configured task review mode: skip-trivial") || !strings.Contains(got, "ordinary chat rule") {
+		t.Fatalf("ordinary chat prompt = %q", got)
+	}
+	if err := os.WriteFile(instructionPath, []byte("fresh steer chat rule"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	target.active[key] = true
+	target.mu.Unlock()
+	message.Text = "/steer follow up"
+	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	if got := target.prompts[key][1]; !strings.HasPrefix(got, "/ultrathink follow up\n\n") || !strings.Contains(got, "Configured task review mode: skip-trivial") || !strings.Contains(got, "the chat agent from .spynel/instructions/agent-chat.md") || !strings.Contains(got, "fresh steer chat rule") || strings.Contains(got, "ordinary chat rule") || !strings.HasSuffix(got, "The precedence stated above still applies to every imported rule.") {
+		t.Fatalf("steer prompt = %q", got)
+	}
+}
+
 func TestRemoteNotificationEventIsNotRedeliveredAfterRetryOrRestart(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	cfg.Channels.Telegram.AllowedUsers = []string{"7"}
 	service := New(cfg, newServiceHarness())
 	router := &notificationRouter{}
 	service.DeliveryControl = router
 	_, _ = service.History.Append("telegram", "TG-7", history.Entry{Role: "user", Content: "known"})
 	origin := orchestrator.Origin{Channel: "telegram", Conversation: "TG-7"}
-	if _, err := service.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
+	if err := service.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
+	if err := service.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
 		t.Fatal(err)
 	}
 	restarted := New(cfg, newServiceHarness())
 	restarted.DeliveryControl = router
-	if receipt, err := restarted.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
+	if err := restarted.deliverNotification(context.Background(), origin, "stable-id", "complete"); err != nil {
 		t.Fatal(err)
-	} else if len(receipt) != 1 || receipt[0] != "native-stable-id" {
-		t.Fatalf("restart receipt = %#v", receipt)
 	}
 	if len(router.calls) != 1 {
 		t.Fatalf("duplicate provider deliveries = %#v", router.calls)
@@ -176,14 +316,14 @@ func TestRemoteNotificationRetriesPreSendCrashMarker(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	cfg.Channels.Telegram.AllowedUsers = []string{"7"}
 	service := New(cfg, newServiceHarness())
 	router := &notificationRouter{}
 	service.DeliveryControl = router
 	_, _ = service.History.Append("telegram", "TG-7", history.Entry{Role: "user", Content: "known"})
 	_, _ = service.History.Append("telegram", "TG-7", history.Entry{Role: "notification_sending", EventID: "interrupted"})
-	if _, err := service.deliverNotification(context.Background(), orchestrator.Origin{Channel: "telegram", Conversation: "TG-7"}, "interrupted", "complete"); err != nil {
+	if err := service.deliverNotification(context.Background(), orchestrator.Origin{Channel: "telegram", Conversation: "TG-7"}, "interrupted", "complete"); err != nil {
 		t.Fatal(err)
 	}
 	if len(router.calls) != 1 {
@@ -324,7 +464,7 @@ func TestServiceKeepsChannelContextsSeparateAndLinksFullHistory(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,12 +492,70 @@ func TestServiceKeepsChannelContextsSeparateAndLinksFullHistory(t *testing.T) {
 	}
 }
 
+func TestEveryChatTransportFreshLoadsTheSameChatInstructionsAtPromptEnd(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	path := cfg.StatePath("instructions", "agent-chat.md")
+	harness := newServiceHarness()
+	service := New(cfg, harness)
+	channels := []string{"tui", "telegram", "whatsapp", "cli"}
+	for index, channelName := range channels {
+		instruction := fmt.Sprintf("chat rule %d", index)
+		if err := os.WriteFile(path, []byte(instruction), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		message := core.Message{Channel: channelName, Conversation: "memory", Text: "question"}
+		if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+			t.Fatal(err)
+		}
+		prompt := harness.prompts["chat:"+channelName+":memory"][0]
+		if !strings.Contains(prompt, "\n"+instruction+"\n</workspace_owner_persistent_instructions>") || !strings.Contains(prompt, "the chat agent from .spynel/instructions/agent-chat.md") || !strings.HasSuffix(prompt, "The precedence stated above still applies to every imported rule.") {
+			t.Fatalf("%s prompt omitted final fresh chat instructions:\n%s", channelName, prompt)
+		}
+	}
+}
+
+func TestServicePersistsReplyContextAndProjectsItIntoChatPrompt(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := newServiceHarness()
+	service := New(cfg, harness)
+	message := core.Message{Channel: "telegram", Conversation: "TG-7", Sender: "@user", ReplyTo: "91 referenced caption", Text: "/tasks active"}
+	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := service.History.Entries("telegram", "TG-7")
+	if err != nil || len(entries) == 0 || entries[0].ReplyTo != message.ReplyTo {
+		t.Fatalf("persisted entries = %#v, %v", entries, err)
+	}
+	prompt, err := service.chatPrompt(message)
+	if err != nil || !strings.Contains(prompt, "[reply_to: 91 referenced caption]") {
+		t.Fatalf("chat prompt missing reply context: %v\n%s", err, prompt)
+	}
+}
+
+func TestMessageReceivedHookPayloadIncludesReplyContext(t *testing.T) {
+	payload := messageHookPayload(core.Message{Channel: "whatsapp", Conversation: "WA-1", Sender: "1", Text: "answer", ReplyTo: "quoted-id quoted text"})
+	if payload["reply_to"] != "quoted-id quoted text" || payload["conversation"] != "WA-1" {
+		t.Fatalf("message.received payload = %#v", payload)
+	}
+}
+
 func TestRemoteFinalResponseExtractsOutboundAttachment(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +600,7 @@ func TestNonterminalDoneEventDoesNotEndActiveJob(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,12 +617,61 @@ func TestNonterminalDoneEventDoesNotEndActiveJob(t *testing.T) {
 	}
 }
 
+func TestChatActivityEmitterStopsBeforeTerminalDeliveryAndOnHandoff(t *testing.T) {
+	var events []core.Event
+	activity := newChatActivityEmitter(func(event core.Event) { events = append(events, event) })
+	activity.start()
+	activity.emit(core.Event{Kind: core.EventFinal, Text: "partial", Done: true, Continues: true})
+	activity.emit(core.Event{Kind: core.EventStatus, Done: true})
+	activity.emit(core.Event{Kind: core.EventFinal, Text: "late", Done: true})
+
+	if len(events) != 5 {
+		t.Fatalf("activity event sequence = %#v", events)
+	}
+	if events[0].Kind != core.EventActivity || !events[0].Active {
+		t.Fatalf("first activity event = %#v", events[0])
+	}
+	if events[2].Kind != core.EventActivity || events[2].Active {
+		t.Fatalf("handoff did not stop activity before release: %#v", events)
+	}
+	if events[3].Kind != core.EventStatus || events[4].Kind != core.EventFinal {
+		t.Fatalf("downstream ordering = %#v", events)
+	}
+}
+
+func TestChatActivityEmitterReplacementOrdersNewStartBeforeOldRelease(t *testing.T) {
+	var events []core.Event
+	downstream := func(event core.Event) { events = append(events, event) }
+	old := newChatActivityEmitter(downstream)
+	replacement := newChatActivityEmitter(downstream)
+
+	old.start()
+	replacement.start()
+	old.emit(core.Event{Kind: core.EventStatus, Done: true})
+	old.emit(core.Event{Kind: core.EventFinal, Text: "replaced response", Done: true})
+	replacement.emit(core.Event{Kind: core.EventFinal, Text: "current response", Done: true})
+
+	wantActivity := []bool{true, true, false, false}
+	var gotActivity []bool
+	for _, event := range events {
+		if event.Kind == core.EventActivity {
+			gotActivity = append(gotActivity, event.Active)
+		}
+	}
+	if !reflect.DeepEqual(gotActivity, wantActivity) {
+		t.Fatalf("replacement activity sequence = %v, want %v; events = %#v", gotActivity, wantActivity, events)
+	}
+	if len(events) != 7 || events[2].Kind != core.EventActivity || events[3].Kind != core.EventStatus || events[5].Kind != core.EventActivity || events[6].Kind != core.EventFinal {
+		t.Fatalf("replacement handoff ordering = %#v", events)
+	}
+}
+
 func TestContinuingFinalDoesNotEndActiveJob(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +693,7 @@ func TestFollowUpTakesOverActiveResponseWithoutAbandoningTurn(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +742,7 @@ func TestSlashCommandsSendCreationPromptsToCommunicationAgent(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	harness := newServiceHarness()
 	service := New(cfg, harness)
 	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "7", Text: "/task inspect the queue"}, func(core.Event) {}); err != nil {
@@ -523,6 +770,8 @@ func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
 	}
 	const statusDescription = "Show work, runtime, channel, and orchestrator state"
 	statusFound := false
+	tasksFound := false
+	goalsFound := false
 	for _, command := range commands {
 		if !strings.Contains(commandHelp, command.Usage) || !strings.Contains(commandHelp, command.Description) {
 			t.Fatalf("command help does not contain %#v", command)
@@ -533,9 +782,21 @@ func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
 				t.Fatalf("status command description = %q, want %q", command.Description, statusDescription)
 			}
 		}
+		if command.Value == "/tasks" {
+			tasksFound = true
+		}
+		if command.Value == "/goals" {
+			goalsFound = true
+		}
+		if command.Value == "/tasks open" || command.Value == "/goals open" {
+			t.Fatalf("default-open listing has a redundant catalog entry: %#v", command)
+		}
 	}
 	if !statusFound {
 		t.Fatal("slash command catalog does not contain /status")
+	}
+	if !tasksFound || !goalsFound {
+		t.Fatalf("slash command catalog is missing base durable-work commands: tasks=%v goals=%v", tasksFound, goalsFound)
 	}
 
 	original := commands[0].Value
@@ -550,7 +811,7 @@ func TestThemeCommandOpensPickerListsAndPersistsThemes(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -579,7 +840,7 @@ func TestThemeCommandOpensPickerListsAndPersistsThemes(t *testing.T) {
 	default:
 		t.Fatal("theme selection was not published")
 	}
-	reloaded, err := config.Load(filepath.Join(root, config.FileName))
+	reloaded, err := config.Load(config.PathForRoot(root))
 	if err != nil || reloaded.Channels.TUI.Theme != "catppuccin-latte" {
 		t.Fatalf("persisted theme = %q, %v", reloaded.Channels.TUI.Theme, err)
 	}
@@ -606,7 +867,7 @@ func TestApplySettingsPublishesLiveHeartbeatConfiguration(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, config.FileName))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	service.SetPrimaryInstanceID("primary-instance")
 
@@ -639,7 +900,7 @@ func TestHelpRoutesToBriefIndexAndFocusedTopics(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	target := newServiceHarness()
 	service := New(cfg, target)
 
@@ -664,18 +925,29 @@ func TestHelpRoutesToBriefIndexAndFocusedTopics(t *testing.T) {
 	if strings.Contains(overview, "/extension install") {
 		t.Fatalf("bare help should stay brief, got %s", overview)
 	}
+	for _, want := range []string{"classic, non-AI program", "external coding agents", "one assistant relationship"} {
+		if !strings.Contains(overview, want) {
+			t.Errorf("help overview missing %q: %s", want, overview)
+		}
+	}
 
 	tests := map[string]string{
 		"/help about":      "# About Spynel",
 		"/help commands":   "/stop",
 		"/help extensions": "/extension install",
-		"/help config":     "spynel.yaml",
+		"/help config":     ".spynel/config.yaml",
 		"/help channels":   "Telegram",
 		"/help workflows":  "/task <request>",
 	}
 	for command, want := range tests {
 		if response := help(command); !strings.Contains(response, want) {
 			t.Errorf("%s response does not contain %q: %s", command, want, response)
+		}
+	}
+	about := help("/help about")
+	for _, want := range []string{"Simplicity at scale", "classic, non-AI program", "One human → one agent → infinite agents", "communication interface", "Markdown task management", "harness supplies intelligence", "Simplicity. Leverage. Quality."} {
+		if !strings.Contains(about, want) {
+			t.Errorf("about help missing %q: %s", want, about)
 		}
 	}
 
@@ -693,7 +965,7 @@ func TestCommunicationPromptGetsOneCallableDocsGuidance(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, config.FileName))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	prompt, err := service.chatPrompt(core.Message{Channel: "cli", Conversation: "docs-guidance"})
 	if err != nil {
@@ -741,7 +1013,7 @@ func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	target := newServiceHarness()
 	service := New(cfg, target)
 	service.SetPrimaryInstanceID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
@@ -833,7 +1105,6 @@ func TestFormatStatusGroupsWorkAndRoundsHeartbeatUp(t *testing.T) {
 		"- Tasks: 5 active (2 waiting)",
 		"- Goals: 2 active",
 		"- Orchestrator: 6 leases, 1 dispatch goroutines",
-		"- Notifications: 0 triage pending, 0 running, 0 failed; 0 awaiting response",
 		"- Next heartbeat: disabled",
 		"- Telegram: ○ not configured",
 		"- WhatsApp: ○ not configured",
@@ -847,7 +1118,7 @@ func TestFormatStatusGroupsWorkAndRoundsHeartbeatUp(t *testing.T) {
 	if text != want {
 		t.Fatalf("exact status changed:\ngot:\n%s\nwant:\n%s", text, want)
 	}
-	ordered := []string{"Title:", "Instance ID:", "Primary instance ID:", "Jobs:", "Tasks:", "Goals:", "Orchestrator:", "Notifications:", "Next heartbeat:", "Telegram:", "Coding harness:", "Agent filesystem access:", "Run at startup:", "Logs:", "Turn:"}
+	ordered := []string{"Title:", "Instance ID:", "Primary instance ID:", "Jobs:", "Tasks:", "Goals:", "Orchestrator:", "Next heartbeat:", "Telegram:", "Coding harness:", "Agent filesystem access:", "Run at startup:", "Logs:", "Turn:"}
 	previous := -1
 	for _, row := range ordered {
 		index := strings.Index(text, row)
@@ -868,7 +1139,7 @@ func TestStatusSurvivesUnreadableGoalCheckpointPath(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -898,7 +1169,7 @@ func TestStatusBoundsGoalCheckpointFilesystemDiagnostic(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -933,7 +1204,7 @@ func TestTelegramCommandMentionRoutesToSharedCommand(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	target := newServiceHarness()
 	service := New(cfg, target)
 	var response core.Event
@@ -954,7 +1225,7 @@ func TestTitleCommandPersistsFromRemoteChannelsAndNotifiesTUI(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	target := newServiceHarness()
 	service := New(cfg, target)
 
@@ -996,7 +1267,7 @@ func TestTitleNotificationsKeepOnlyLatestChange(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 
 	service.publishTitle("Older")
@@ -1011,7 +1282,7 @@ func TestQuitIsRecognizedButDoesNotStopRemoteServer(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 
 	for _, channel := range []string{"telegram", "whatsapp"} {
@@ -1030,7 +1301,7 @@ func TestStopCommandInterruptsOnlyAnActiveConversation(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	target := newServiceHarness()
 	service := New(cfg, target)
 	key := "chat:tui:local"
@@ -1057,17 +1328,18 @@ func TestRestartCommandAcknowledgesAndRequestsProcessRestartAcrossChannels(t *te
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	target := newServiceHarness()
 	service := New(cfg, target)
 
-	for _, channelName := range []string{"tui", "telegram", "whatsapp"} {
+	const acknowledgment = "Restarting Spynel..."
+	for _, channelName := range []string{"tui", "telegram", "whatsapp", "cli"} {
 		var response core.Event
 		message := core.Message{Channel: channelName, Conversation: "restart-" + channelName, Text: "/restart"}
 		if err := service.Handle(context.Background(), message, func(event core.Event) { response = event }); err != nil {
 			t.Fatalf("%s restart: %v", channelName, err)
 		}
-		if response.Kind != core.EventFinal || !response.Done || !response.Local || !strings.Contains(response.Text, "Restarting Spynel") {
+		if response.Kind != core.EventFinal || !response.Done || !response.Local || response.Text != acknowledgment {
 			t.Fatalf("%s restart response = %#v", channelName, response)
 		}
 		select {
@@ -1076,7 +1348,7 @@ func TestRestartCommandAcknowledgesAndRequestsProcessRestartAcrossChannels(t *te
 			t.Fatalf("%s restart did not publish a process request", channelName)
 		}
 		recent, _, err := service.History.Recent(channelName, message.Conversation, 1000)
-		if err != nil || !strings.Contains(recent, "Saved configuration and conversation history") {
+		if err != nil || !strings.Contains(recent, acknowledgment) || strings.Contains(recent, "Saved configuration and conversation history") {
 			t.Fatalf("%s restart acknowledgment was not persisted: %q, %v", channelName, recent, err)
 		}
 	}
@@ -1100,7 +1372,7 @@ func TestUpdateCommandChecksNPMAndRequestsLauncherManagedInstall(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	registry := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		_, _ = writer.Write([]byte(`{"name":"spynel","version":"1.3.0"}`))
 	}))
@@ -1144,7 +1416,7 @@ func TestPrimaryCommandRequestsSafeLocalHandoffOnlyWhileIdle(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	target := newServiceHarness()
 	service := New(cfg, target)
 	service.SetPrimaryInstanceID("primary-instance")
@@ -1198,7 +1470,7 @@ func TestJobsListAndKillActiveExecutionsByNumericID(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	target := newHeldServiceHarness()
 	service := New(cfg, target)
 
@@ -1241,12 +1513,47 @@ func TestJobsListAndKillActiveExecutionsByNumericID(t *testing.T) {
 	}
 }
 
+func TestJobKillKeepsHeartbeatInspectableUntilProviderRelease(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	target := newServiceHarness()
+	service := New(cfg, target)
+	sessionKey := "orchestrator:semantic-heartbeat"
+	target.active[sessionKey] = true
+	jobID := service.Runtime.BeginJobWithDetails(sessionKey, "orchestrator", "semantic-heartbeat", "semantic workflow heartbeat", JobDetails{
+		Kind:  "heartbeat",
+		Route: "semantic-heartbeat",
+	})
+
+	var response core.Event
+	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "/job kill 1"}, func(event core.Event) { response = event }); err != nil {
+		t.Fatal(err)
+	}
+	job, ok := service.Runtime.Job(jobID)
+	if !strings.Contains(response.Text, "Kill requested for job 1") || !ok {
+		t.Fatalf("kill response=%#v job=%#v exists=%t", response, job, ok)
+	}
+	if job.Execution != JobCancelling {
+		t.Fatalf("heartbeat execution = %q, want cancelling", job.Execution)
+	}
+
+	// The semantic-heartbeat completion callback owns this transition after
+	// the provider's Send call releases.
+	service.Runtime.EndJob(jobID)
+	if _, ok := service.Runtime.Job(jobID); ok {
+		t.Fatal("released heartbeat remains registered")
+	}
+}
+
 func TestLogCommandShowsCapturedRuntimeOutput(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	service.Runtime.Log("Spynel started")
 	service.Runtime.Log("orchestrator scan complete")
@@ -1265,7 +1572,7 @@ func TestLogCommandSupportsPaginationSearchAndClear(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	for index := 1; index <= 45; index++ {
 		service.Runtime.Log(fmt.Sprintf("entry-%02d", index))
@@ -1315,7 +1622,7 @@ func TestLogCommandSanitizesPagesRangesAndSearchAcrossChannels(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	service.Runtime.Log("\x1b[31mold failure\x1b[0m")
 	for index := 1; index < logPageEntries; index++ {
@@ -1359,7 +1666,7 @@ func TestLogCommandRejectsInvalidOptions(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	overflowingPage := strconv.FormatUint(uint64(^uint(0)>>1), 10) + "0"
 	for _, command := range []string{"/log page 0", "/log page nope", "/log page 1-", "/log page -1-2", "/log page 3-2", "/log page 1-" + overflowingPage, "/log page", "/log search", "/log clear extra", "/log unknown"} {
@@ -1411,7 +1718,7 @@ func TestLogCommandLargeRangeStopsAtAvailableRetainedPages(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	for index := 1; index <= 121; index++ {
 		service.Runtime.Log(fmt.Sprintf("bounded-range-%03d", index))
@@ -1435,7 +1742,7 @@ func TestConfigurationCommandsPersistAcrossChannelsAndProtectOwnChannel(t *testi
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(root, "spynel.yaml")
+	path := config.PathForRoot(root)
 	cfg, _ := config.Load(path)
 	service := New(cfg, newServiceHarness())
 	run := func(channel, command string) core.Event {
@@ -1520,7 +1827,7 @@ func TestHarnessAndModelCommandsUseSharedSettings(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	for _, test := range []struct {
 		command string
@@ -1541,11 +1848,14 @@ func TestHarnessAndModelCommandsUseSharedSettings(t *testing.T) {
 	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "/harness"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
-	if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != "harness" || len(response.Screen.Controls) != 2 || !response.Screen.SaveDisabled || response.Screen.InitialControl != "select:claude-code" || response.Screen.Controls[0].Kind != "action" {
+	if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != "harness" || len(response.Screen.Controls) != len(harness.Catalog()) || !response.Screen.SaveDisabled || response.Screen.InitialControl != "select:claude-code" || response.Screen.Controls[0].Kind != "action" {
 		t.Fatalf("/harness response = %#v", response)
 	}
-	if next, err := service.ScreenAction(context.Background(), "harness", "select:codex", nil); err != nil || next == nil || next.ID != "welcome" || service.Settings.Snapshot().Harness.Name != "codex" {
+	if next, err := service.ScreenAction(context.Background(), "harness", "select:codex", nil); err != nil || next == nil || next.ID != "welcome" || next.ActionMessage != "Saved `harness.name` = `codex` and connected the coding harness." || service.Settings.Snapshot().Harness.Name != "codex" {
 		t.Fatalf("harness screen selection = %#v, %v, config %#v", next, err, service.Settings.Snapshot().Harness)
+	}
+	if next, err := service.ScreenAction(context.Background(), "harness", "select:codex", nil); err != nil || next == nil || next.ID != "" || next.ActionMessage != "Saved `harness.name` = `codex` and connected the coding harness." {
+		t.Fatalf("harness screen result-only confirmation = %#v, %v", next, err)
 	}
 	response = core.Event{}
 	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "/model"}, func(event core.Event) { response = event }); err != nil {
@@ -1566,6 +1876,21 @@ func TestHarnessAndModelCommandsUseSharedSettings(t *testing.T) {
 	}
 }
 
+func TestInactiveCustomACPFieldsDoNotReconfigureAnotherHarness(t *testing.T) {
+	previous := config.Harness{Name: "codex", Model: "model-a", Sandbox: "read-only"}
+	next := previous
+	next.ACPCommand = "future-agent"
+	next.ACPArgs = []string{"--stdio"}
+	if harnessRuntimeChanged(previous, next) {
+		t.Fatal("inactive custom ACP fields reconfigured Codex")
+	}
+	previous.Name = "acp"
+	next.Name = "acp"
+	if !harnessRuntimeChanged(previous, next) {
+		t.Fatal("active custom ACP command change did not reconfigure ACP")
+	}
+}
+
 func TestSandboxSettingReconfiguresHarnessWithoutWorkspaceConfinement(t *testing.T) {
 	bin := t.TempDir()
 	if err := os.WriteFile(filepath.Join(bin, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
@@ -1576,7 +1901,7 @@ func TestSandboxSettingReconfiguresHarnessWithoutWorkspaceConfinement(t *testing
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1613,7 +1938,7 @@ func TestStartupSettingRegistersAndRollsBackTransactionally(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	manager := &fakeStartupManager{}
 	service.Startup = manager
@@ -1630,7 +1955,7 @@ func TestStartupSettingRegistersAndRollsBackTransactionally(t *testing.T) {
 	if !service.Settings.Snapshot().Startup.Enabled {
 		t.Fatal("startup setting was not rolled back after registration failure")
 	}
-	reloaded, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	reloaded, err := config.Load(config.PathForRoot(root))
 	if err != nil || !reloaded.Startup.Enabled {
 		t.Fatalf("persisted startup rollback = %#v, %v", reloaded.Startup, err)
 	}
@@ -1641,7 +1966,7 @@ func TestUnchangedStartupSettingDoesNotTouchOperatingSystem(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	manager := &fakeStartupManager{err: fmt.Errorf("must not be called")}
 	service.Startup = manager
@@ -1656,7 +1981,7 @@ func TestBareUnconfiguredTUIChannelCommandsOpenSetupWizards(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	if err := os.WriteFile(cfg.Resolve(cfg.Channels.WhatsApp.Database), []byte("existing session store"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1709,7 +2034,7 @@ func TestBareTUIChannelCommandsEvaluateSetupIndependently(t *testing.T) {
 			if err := workspace.Init(root, false); err != nil {
 				t.Fatal(err)
 			}
-			cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+			cfg, err := config.Load(config.PathForRoot(root))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1743,7 +2068,7 @@ func TestBareConfiguredTUIChannelCommandOpensTypedScreen(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	cfg.Channels.Telegram.Token = "123:secret"
 	cfg.Channels.Telegram.AllowedUsers = []string{"123456789"}
 	cfg.Channels.WhatsApp.AllowedNumbers = []string{"15551234567"}
@@ -1818,7 +2143,7 @@ func TestMainConfigurationStartsWithHarnessModelAndEssentials(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, config.FileName))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1830,7 +2155,7 @@ func TestMainConfigurationStartsWithHarnessModelAndEssentials(t *testing.T) {
 	if screen.Title != "" || screen.Subtitle != "" {
 		t.Fatalf("main configuration has redundant heading copy: title %q subtitle %q", screen.Title, screen.Subtitle)
 	}
-	want := []string{"harness", "model", "harness.sandbox", "workspace.history_max_messages", "workspace.history_char_limit", "startup.enabled", "advanced"}
+	want := []string{"harness", "model", "harness.sandbox", "harness.reviews", "workspace.history_max_messages", "workspace.history_char_limit", "startup.enabled", "advanced"}
 	if len(screen.Controls) < len(want)+1 {
 		t.Fatalf("main configuration controls = %#v", screen.Controls)
 	}
@@ -1839,14 +2164,14 @@ func TestMainConfigurationStartsWithHarnessModelAndEssentials(t *testing.T) {
 			t.Fatalf("main control %d = %q, want %q", index, screen.Controls[index].Key, key)
 		}
 	}
-	if screen.Controls[0].Kind != "action" || screen.Controls[1].Kind != "action" || screen.Controls[2].Kind != "select" || screen.Controls[6].Kind != "disclosure" || !screen.Controls[7].Advanced {
+	if screen.Controls[0].Kind != "action" || screen.Controls[1].Kind != "action" || screen.Controls[2].Kind != "select" || screen.Controls[3].Kind != "select" || screen.Controls[7].Kind != "disclosure" || !screen.Controls[8].Advanced {
 		t.Fatalf("main control kinds/order = %#v", screen.Controls)
 	}
-	if screen.Controls[0].Section != "Core settings" || screen.Controls[6].Section != "Advanced settings" {
-		t.Fatalf("main control sections = %#v", screen.Controls[:7])
+	if screen.Controls[0].Section != "Core settings" || screen.Controls[7].Section != "Advanced settings" {
+		t.Fatalf("main control sections = %#v", screen.Controls[:8])
 	}
 	harnessScreen, err := service.ScreenAction(context.Background(), "config", "harness", nil)
-	if err != nil || harnessScreen == nil || harnessScreen.ID != "harness" || harnessScreen.ParentID != "config" || len(harnessScreen.Controls) != 2 {
+	if err != nil || harnessScreen == nil || harnessScreen.ID != "harness" || harnessScreen.ParentID != "config" || len(harnessScreen.Controls) != len(harness.Catalog()) {
 		t.Fatalf("config harness action = %#v, %v", harnessScreen, err)
 	}
 	modelScreen, err := service.ScreenAction(context.Background(), "config", "model", nil)
@@ -1860,7 +2185,7 @@ func TestTelegramSetupWizardCarriesAndAtomicallySavesEssentials(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1919,7 +2244,7 @@ func TestWhatsAppSetupWizardEnablesAfterAccessThenShowsPairingStep(t *testing.T)
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1968,7 +2293,7 @@ func TestWhatsAppPairingActionsShowFullscreenRetryAndPhoneCode(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2016,7 +2341,7 @@ func TestWhatsAppTimeoutReopensPairingAndStartOverRetries(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2045,11 +2370,14 @@ func TestChatPromptNeutralizesRetiredChannelOverridesInExistingTemplates(t *test
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
 	legacy := "Channel: {{CHANNEL}}\nProject binding: {{PROJECT}}\nChannel instructions: {{INSTRUCTIONS}}\nCustom {{PROJECT}} {{INSTRUCTIONS}}\n{{RECENT_HISTORY}}\n"
+	if err := os.MkdirAll(cfg.StatePath("prompts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(cfg.StatePath("prompts", "chat.md"), []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -2070,7 +2398,7 @@ func TestRenderedRemotePromptKeepsRoutineConfirmationsHumanFacing(t *testing.T) 
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, err := config.Load(config.PathForRoot(root))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2084,7 +2412,7 @@ func TestRenderedRemotePromptKeepsRoutineConfirmationsHumanFacing(t *testing.T) 
 			"Understood—this is being worked on.",
 			"never include a local-path Markdown link",
 			"explicitly asks for technical details",
-			"/status`, `/jobs`, `/job info`, `/log`",
+			"/status`, `/jobs`, `/tasks`, `/goals`, `/job info`, `/log`",
 			"exact blocker",
 		} {
 			if !strings.Contains(prompt, want) {
@@ -2102,7 +2430,7 @@ func TestResumeBranchesExternalConversationIntoIndependentTUIChat(t *testing.T) 
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	_, _ = service.History.Append("telegram", "TG-7", history.Entry{Role: "user", Content: "remote question"})
 	_, _ = service.History.Append("telegram", "TG-7", history.Entry{Role: "assistant", Content: "remote answer"})
@@ -2194,7 +2522,7 @@ func TestCustomScreensDeclareContextSpecificHints(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 
 	tests := []struct {
@@ -2231,18 +2559,18 @@ func TestWelcomeScreenIsAutomaticOnceAndCommandPrintsAChannelAppropriateMessage(
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
 	first, err := service.InitialWelcome()
 	if err != nil || first == nil || first.ID != "welcome" || first.Banner != core.SpynelASCII || len(first.Controls) != 0 || !first.Markdown {
 		t.Fatalf("first welcome = %#v, %v", first, err)
 	}
-	for _, want := range []string{"👋 Hey, I'm **Spynel**", "call me **Spy**", "I handle tasks and orchestrate agents", "ask me for updates anytime", "👍", "- type `/help` if you ever feel lost", "- type `/telegram` to connect Telegram", "- type `/whatsapp` to connect WhatsApp"} {
+	for _, want := range []string{"👋 Hey, I'm **Spynel**", "call me **Spy**", "classic, non-AI core", "external coding agents", "desk or phone", "ask when your input is needed", "👍", "- type `/help` if you ever feel lost", "- type `/telegram` to connect Telegram", "- type `/whatsapp` to connect WhatsApp"} {
 		if !strings.Contains(first.Subtitle, want) {
 			t.Fatalf("welcome message is missing %q: %q", want, first.Subtitle)
 		}
 	}
-	if !strings.Contains(first.Subtitle, "leave the rest to me.\nFeel free") || strings.Contains(first.Subtitle, "leave the rest to me.\n\nFeel free") {
+	if !strings.Contains(first.Subtitle, "one assistant relationship.\nShare an objective") || strings.Contains(first.Subtitle, "one assistant relationship.\n\nShare an objective") {
 		t.Fatalf("welcome intro spacing = %q", first.Subtitle)
 	}
 	second, err := service.InitialWelcome()
@@ -2277,7 +2605,7 @@ func TestClearCommandRemovesDurableConversationHistory(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	harness := newServiceHarness()
 	service := New(cfg, harness)
 	_, _ = service.History.Append("tui", "local", history.Entry{Role: "assistant", Content: "old response"})
@@ -2316,7 +2644,7 @@ func TestClearCommandPreservesHistoryWhenRecipientResetFails(t *testing.T) {
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(filepath.Join(root, "spynel.yaml"))
+	cfg, _ := config.Load(config.PathForRoot(root))
 	harness := newServiceHarness()
 	harness.resetErr = fmt.Errorf("cannot reset while active")
 	service := New(cfg, harness)

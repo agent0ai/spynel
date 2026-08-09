@@ -20,6 +20,57 @@ func TestCatalogReferencesAreStableAndResolvable(t *testing.T) {
 	}
 }
 
+func TestTaskAndGoalTopicsDocumentLiveListingCommands(t *testing.T) {
+	for _, test := range []struct {
+		topic string
+		want  []string
+	}{
+		{topic: "tasks", want: []string{"/tasks", "direct `spynel tasks`", "default to `open`", "three", "review", "failed", "NDJSON", "Telegram", "--detail", "never starts a harness"}},
+		{topic: "goals", want: []string{"/goals", "direct `spynel goals`", "default to `open`", "seven", "abandoned", "NDJSON", "WhatsApp", "round", "without invoking a harness"}},
+	} {
+		document, err := Lookup(Request{Topic: test.topic})
+		if err != nil {
+			t.Fatal(err)
+		}
+		output, err := Render(Request{Topic: test.topic})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if document.Kind != "topic" {
+			t.Fatalf("%s document = %#v", test.topic, document)
+		}
+		for _, want := range test.want {
+			if !strings.Contains(output, want) {
+				t.Errorf("%s documentation missing %q:\n%s", test.topic, want, output)
+			}
+		}
+	}
+}
+
+func TestHarnessTopicDocumentsPiACPAndQueueBatching(t *testing.T) {
+	output, err := Render(Request{Topic: "harnesses"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"`pi`", "ACP aliases", "harness.acp_command", "stdio", "not an endpoint URL", "dispatched together", "not an operating-system sandbox"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("harness documentation missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestAboutTopicStatesProductBoundaryAndPillars(t *testing.T) {
+	output, err := Render(Request{Topic: "workspace-state"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Simplicity at scale", "classic, non-AI program", "One human → one agent → infinite agents", "assistant-facing relationship", "Three pillars", "communication interface", "Markdown task management", "Agentic loops", "harness supplies intelligence", "Simplicity. Leverage. Quality."} {
+		if !strings.Contains(output, want) {
+			t.Errorf("about documentation missing %q:\n%s", want, output)
+		}
+	}
+}
+
 func TestIndexTopicAndSearchPagination(t *testing.T) {
 	index, err := Lookup(Request{})
 	if err != nil {

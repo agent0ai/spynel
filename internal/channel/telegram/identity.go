@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/fsx"
 )
 
@@ -139,9 +140,7 @@ func (s *IdentityStore) read() (identityState, error) {
 }
 
 func normalizeAllowedUser(value string) string {
-	value = strings.TrimSpace(value)
-	value = strings.TrimPrefix(value, "@")
-	return strings.ToLower(strings.TrimSpace(value))
+	return config.NormalizeTelegramUser(value)
 }
 
 func normalizeUsername(value string) string {
