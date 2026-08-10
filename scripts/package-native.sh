@@ -43,7 +43,16 @@ mkdir -p "$stage_dir" "$output_dir"
 
 binary=spynel
 
-(cd "$project_dir" && CGO_ENABLED=1 GOOS="$target_os" GOARCH="$target_arch" "$go_bin" build -trimpath -ldflags="-s -w -X main.version=$version" -o "$stage_dir/$binary" ./cmd/spynel)
+case "$target_os" in
+  darwin)
+    # Go's cgo linker safelist intentionally rejects @loader_path by default.
+    # Permit only Spynel's exact packaged-library rpath on native macOS builds.
+    (cd "$project_dir" && CGO_LDFLAGS_ALLOW='^-Wl,-rpath,@loader_path/lib$' CGO_ENABLED=1 GOOS="$target_os" GOARCH="$target_arch" "$go_bin" build -trimpath -ldflags="-s -w -X main.version=$version" -o "$stage_dir/$binary" ./cmd/spynel)
+    ;;
+  *)
+    (cd "$project_dir" && CGO_ENABLED=1 GOOS="$target_os" GOARCH="$target_arch" "$go_bin" build -trimpath -ldflags="-s -w -X main.version=$version" -o "$stage_dir/$binary" ./cmd/spynel)
+    ;;
+esac
 
 case "$target_os" in
   linux)
