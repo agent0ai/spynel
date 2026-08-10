@@ -163,6 +163,39 @@ func migrateLegacyInstructions(root string) error {
 	return nil
 }
 
+// migrateRetiredNotificationPrompt replaces only the byte-identical stock
+// JSON-triage prompt retired by the CLI-action notification contract. Any
+// user-authored variation remains untouched.
+func migrateRetiredNotificationPrompt(root string) error {
+	path := filepath.Join(root, ".spynel", "prompts", "notification.md")
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return nil
+	}
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	retired, err := templates.ReadFile("templates/migrations/notification-triage-v1.md")
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(existing, retired) {
+		return nil
+	}
+	current, err := templates.ReadFile("templates/notification.md")
+	if err != nil {
+		return err
+	}
+	return fsx.AtomicWriteFile(path, current, info.Mode().Perm())
+}
+
 func Init(root string, force bool) error {
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -250,9 +283,10 @@ func Init(root string, force bool) error {
 	return nil
 }
 
-// Upgrade restores only missing runtime directories and embedded support
-// files. It never rewrites .spynel/config.yaml or any existing user-owned prompt,
-// instruction, theme, or extension file.
+// Upgrade restores missing runtime directories and embedded support files. It
+// never rewrites .spynel/config.yaml or user-owned prompts, instructions,
+// themes, or extensions; the sole prompt rewrite is an exact retired stock
+// notification template migrated to its current replacement.
 func Upgrade(root string) error {
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -265,6 +299,9 @@ func Upgrade(root string) error {
 		return err
 	}
 	if err := migrateLegacyInstructions(abs); err != nil {
+		return err
+	}
+	if err := migrateRetiredNotificationPrompt(abs); err != nil {
 		return err
 	}
 	for _, dir := range directories {

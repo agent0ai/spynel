@@ -15,4 +15,8 @@
 
 ## Child DOX Index
 
-No child DOX files.
+Direct child DOX files:
+
+| Child | Scope |
+| --- | --- |
+| [spynel/AGENTS.md](spynel/AGENTS.md) | Executable process composition. |

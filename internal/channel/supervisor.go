@@ -25,6 +25,8 @@ type runningChannel struct {
 	fingerprint string
 	generation  uint64
 	instance    Channel
+	lastStatus  ConnectionStatus
+	hasStatus   bool
 }
 
 // Supervisor owns channel lifecycles. It consumes the persisted config stream,
@@ -116,7 +118,13 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 		s.generation++
 		generation := s.generation
 		channelContext, cancel := context.WithCancel(ctx)
-		running := &runningChannel{cancel: cancel, fingerprint: fingerprint, generation: generation}
+		running := &runningChannel{
+			cancel:      cancel,
+			fingerprint: fingerprint,
+			generation:  generation,
+			lastStatus:  ConnectionStatus{Name: managed.Name, State: ConnectionConnecting},
+			hasStatus:   true,
+		}
 		s.running[managed.Name] = running
 		s.mu.Unlock()
 
@@ -131,10 +139,14 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 		}
 		if reporter, ok := instance.(ConnectionReporter); ok {
 			reporter.SetStatusReporter(func(status ConnectionStatus) {
-				if s.isCurrent(managed.Name, running) {
-					s.eventForStatus(status)
-					s.publish(status)
+				accepted, lifecycleChanged := s.acceptStatus(managed.Name, running, status)
+				if !accepted {
+					return
 				}
+				if lifecycleChanged {
+					s.eventForStatus(status)
+				}
+				s.publish(status)
 			})
 		}
 		if logger, ok := instance.(LogWriterSetter); ok {
@@ -249,6 +261,23 @@ func (s *Supervisor) isCurrent(name string, expected *runningChannel) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.running[name] == expected
+}
+
+// acceptStatus records the latest report for one adapter generation. Status
+// consumers continue to receive health and metadata updates, while lifecycle
+// logging occurs only for the generation's initial state and real state
+// transitions. The current-generation check and update share one lock so a
+// callback from a replaced adapter cannot alter transition tracking.
+func (s *Supervisor) acceptStatus(name string, expected *runningChannel, status ConnectionStatus) (bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running[name] != expected {
+		return false, false
+	}
+	lifecycleChanged := !expected.hasStatus || expected.lastStatus.State != status.State
+	expected.lastStatus = status
+	expected.hasStatus = true
+	return true, lifecycleChanged
 }
 
 func (s *Supervisor) removeIfCurrent(name string, expected *runningChannel) bool {

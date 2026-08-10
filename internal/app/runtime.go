@@ -682,18 +682,41 @@ func (r *Runtime) RecoverPanic(component, event string) {
 func (r *Runtime) Status() core.RuntimeStatus {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return core.RuntimeStatus{Logs: len(r.logs), Jobs: len(r.jobs)}
+	return r.statusLocked()
 }
 
 func (r *Runtime) Updates() <-chan core.RuntimeStatus { return r.updates }
 
 func (r *Runtime) publishLocked() {
-	status := core.RuntimeStatus{Logs: len(r.logs), Jobs: len(r.jobs)}
+	status := r.statusLocked()
 	select {
 	case <-r.updates:
 	default:
 	}
 	r.updates <- status
+}
+
+func (r *Runtime) statusLocked() core.RuntimeStatus {
+	background := 0
+	for _, job := range r.jobs {
+		if job.Channel == "orchestrator" && executionStateIsLive(job.Execution) {
+			background++
+		}
+	}
+	return core.RuntimeStatus{Logs: len(r.logs), Jobs: len(r.jobs), LiveBackgroundJobs: background}
+}
+
+// executionStateIsLive deliberately follows the structured process-local job
+// registry. Durable queue entries never enter this registry, and terminal,
+// cancelling, explicitly stalled, or failed executions do not keep activity
+// indicators alive while their final cleanup remains observable.
+func executionStateIsLive(state JobExecutionState) bool {
+	switch state {
+	case JobStarting, JobRunning, JobReconnecting, JobRecovering, JobDegraded, JobAudit:
+		return true
+	default:
+		return false
+	}
 }
 
 func formatLogs(entries []LogEntry) string {

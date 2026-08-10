@@ -5,7 +5,8 @@ const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const { resolve } = require("./platform");
-const { validateArchiveEntries, validateExtractedTree } = require("./install");
+const { install, validateArchiveEntries, validateExtractedTree } = require("./install");
+const { prepareRelease, releaseMetadata, rewriteReadme } = require("./prepare-release");
 const { checkForUpdate, compareVersions, shouldCheckAtStartup } = require("./update");
 const pkg = require("../package.json");
 
@@ -13,8 +14,8 @@ assert.deepStrictEqual(resolve("linux", "x64"), { os: "linux", arch: "amd64", ex
 assert.deepStrictEqual(resolve("linux", "arm64"), { os: "linux", arch: "arm64", ext: "tar.gz" });
 assert.deepStrictEqual(resolve("darwin", "x64"), { os: "darwin", arch: "amd64", ext: "tar.gz" });
 assert.deepStrictEqual(resolve("darwin", "arm64"), { os: "darwin", arch: "arm64", ext: "tar.gz" });
-assert.deepStrictEqual(resolve("win32", "x64"), { os: "windows", arch: "amd64", ext: "zip" });
-assert.throws(() => resolve("win32", "arm64"), /does not publish/);
+assert.throws(() => resolve("win32", "x64"), /does not currently support Windows/);
+assert.throws(() => resolve("win32", "arm64"), /does not currently support Windows/);
 assert.throws(() => resolve("freebsd", "x64"), /does not publish/);
 
 assert.strictEqual(pkg.name, "spynel");
@@ -23,6 +24,35 @@ assert.strictEqual(pkg.bin.spynel, "npm/bin/spynel.js");
 assert.strictEqual(pkg.publishConfig.registry, "https://registry.npmjs.org");
 assert.strictEqual(pkg.repository.url, "git+https://github.com/agent0ai/spynel.git");
 assert(fs.readFileSync(path.join(__dirname, "install.js"), "utf8").includes("https://github.com/agent0ai/spynel/releases/download/"));
+assert.deepStrictEqual(releaseMetadata("v1.2.3-beta.1", "true"), {
+  tag: "v1.2.3-beta.1",
+  version: "1.2.3-beta.1",
+  prerelease: true,
+});
+assert.throws(() => releaseMetadata("1.2.3", "false"), /release tag/);
+assert.throws(() => releaseMetadata("v1.2.3", "true"), /do not agree/);
+assert.strictEqual(
+  rewriteReadme(
+    "![Logo](assets/logo.png) [Guide](docs/guide.md) [Section](#section) <img src=\"./assets/demo image.png\">\n",
+    "v1.2.3",
+  ),
+  "![Logo](https://raw.githubusercontent.com/agent0ai/spynel/v1.2.3/assets/logo.png) " +
+    "[Guide](https://github.com/agent0ai/spynel/blob/v1.2.3/docs/guide.md) [Section](#section) " +
+    "<img src=\"https://raw.githubusercontent.com/agent0ai/spynel/v1.2.3/assets/demo%20image.png\">\n",
+);
+const prepared = fs.mkdtempSync(path.join(__dirname, ".test-release-"));
+try {
+  fs.writeFileSync(path.join(prepared, "package.json"), '{"name":"spynel","version":"0.0.0-development"}\n');
+  fs.writeFileSync(path.join(prepared, "README.md"), "[Docs](docs/README.md)\n");
+  assert.strictEqual(prepareRelease(prepared, "v2.0.0", "false").version, "2.0.0");
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(prepared, "package.json"), "utf8")).version, "2.0.0");
+  assert.strictEqual(
+    fs.readFileSync(path.join(prepared, "README.md"), "utf8"),
+    "[Docs](https://github.com/agent0ai/spynel/blob/v2.0.0/docs/README.md)\n",
+  );
+} finally {
+  fs.rmSync(prepared, { recursive: true, force: true });
+}
 assert.doesNotThrow(() => validateArchiveEntries(["./spynel", "./lib/runtime.so", "licenses/miniaudio/LICENSE"]));
 assert.throws(() => validateArchiveEntries(["../../outside"]), /escapes/);
 assert.throws(() => validateArchiveEntries(["C:\\outside\\spynel.exe"]), /absolute/);
@@ -64,6 +94,14 @@ async function close(server) {
 }
 
 async function main() {
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  try {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    await assert.rejects(install(), /does not currently support Windows/);
+  } finally {
+    Object.defineProperty(process, "platform", platformDescriptor);
+  }
+
   const registry = http.createServer((_, response) => {
     response.setHeader("content-type", "application/json");
     response.end(JSON.stringify({ name: "spynel", version: "0.3.0" }));

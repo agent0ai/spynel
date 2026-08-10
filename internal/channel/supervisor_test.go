@@ -36,6 +36,19 @@ type losesAuthorizationFixture struct {
 	started chan struct{}
 }
 
+type statusFixture struct {
+	report StatusReporter
+}
+
+func (c *statusFixture) Name() string { return "whatsapp" }
+
+func (c *statusFixture) Run(ctx context.Context, _ Handler) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (c *statusFixture) SetStatusReporter(report StatusReporter) { c.report = report }
+
 func (c *losesAuthorizationFixture) Name() string { return "telegram" }
 
 func (c *losesAuthorizationFixture) Run(context.Context, Handler) error {
@@ -191,6 +204,80 @@ func TestSupervisorRoutesPairingActionsToRunningChannel(t *testing.T) {
 	}
 	if err := supervisor.RetryPairing("telegram"); err == nil || !strings.Contains(err.Error(), "not running") {
 		t.Fatalf("missing pairing channel error = %v", err)
+	}
+}
+
+func TestSupervisorLogsStatusTransitionsPerGeneration(t *testing.T) {
+	cfg := config.Default()
+	cfg.Channels.WhatsApp.Enabled = true
+	cfg.Channels.WhatsApp.Mode = "dedicated"
+	var fixtures []*statusFixture
+	managed := []Managed{{
+		Name:        "whatsapp",
+		Enabled:     func(config.Config) bool { return true },
+		Fingerprint: func(cfg config.Config) string { return cfg.Channels.WhatsApp.Mode },
+		Build: func(config.Config) (Channel, error) {
+			fixture := &statusFixture{}
+			fixtures = append(fixtures, fixture)
+			return fixture, nil
+		},
+	}}
+	var statuses []ConnectionStatus
+	var events []string
+	supervisor := NewSupervisor(nil, nil, managed, func(status ConnectionStatus) {
+		statuses = append(statuses, status)
+	}, nil)
+	supervisor.SetEventLogger(func(_, component, event, _ string) {
+		events = append(events, component+"/"+event)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		supervisor.stopAll()
+		supervisor.wait.Wait()
+	}()
+
+	if err := supervisor.reconcile(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	first := fixtures[0].report
+	connected := ConnectionStatus{Name: "whatsapp", State: ConnectionConnected, Identity: "+15551234567", Link: "https://wa.me/15551234567"}
+	first(ConnectionStatus{Name: "whatsapp", State: ConnectionConnecting})
+	first(ConnectionStatus{Name: "whatsapp", State: ConnectionConnecting, Detail: "waiting for pairing"})
+	for range 20 {
+		first(connected)
+	}
+	first(ConnectionStatus{Name: "whatsapp", State: ConnectionConnected, Detail: "metadata refreshed", Identity: connected.Identity, Link: connected.Link})
+	first(ConnectionStatus{Name: "whatsapp", State: ConnectionError, Detail: "disconnected"})
+	first(ConnectionStatus{Name: "whatsapp", State: ConnectionError, Detail: "disconnected"})
+	first(connected)
+	first(connected)
+
+	beforeReplacementStatuses := len(statuses)
+	cfg.Channels.WhatsApp.Mode = "self"
+	if err := supervisor.reconcile(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	fixtures[1].report(connected)
+	first(ConnectionStatus{Name: "whatsapp", State: ConnectionError, Detail: "stale callback"})
+
+	wantEvents := []string{
+		"channel.whatsapp/connecting",
+		"channel.whatsapp/connected",
+		"channel.whatsapp/connection_error",
+		"channel.whatsapp/connected",
+		"channel.whatsapp/reconnecting",
+		"channel.whatsapp/connecting",
+		"channel.whatsapp/connected",
+	}
+	if got := strings.Join(events, " "); got != strings.Join(wantEvents, " ") {
+		t.Fatalf("lifecycle events = %q, want %q", got, strings.Join(wantEvents, " "))
+	}
+	if len(statuses) != beforeReplacementStatuses+2 {
+		t.Fatalf("replacement status count = %d, want %d; stale callback may have escaped", len(statuses), beforeReplacementStatuses+2)
+	}
+	if got := statuses[len(statuses)-1]; got != connected {
+		t.Fatalf("last status = %#v, want replacement generation %#v", got, connected)
 	}
 }
 

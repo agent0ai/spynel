@@ -5,6 +5,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 binary="$project_dir/bin/spynel"
 
+"$script_dir/dev.sh" dox
 "$script_dir/dev.sh" build >/dev/null
 smoke_dir=$(mktemp -d "${TMPDIR:-/tmp}/spynel-smoke.XXXXXX")
 trap 'rm -rf "$smoke_dir"' EXIT HUP INT TERM

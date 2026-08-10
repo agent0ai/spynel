@@ -13,10 +13,15 @@
 - Generated binaries stay in temporary or ignored directories and are removed when no longer required.
 - `cold-cache.sh` is repository-only developer tooling for deliberately requested diagnostics. It creates one uniquely owned cache outside the repository, starts the command in a dedicated process group, validates and terminates the complete owned process tree (including descendants that escape that group), waits for it, and removes only that cache on success, failure, cancellation, and documented recovery paths.
 - If host termination prevents the helper's trap from running, recovery is limited to the exact outside-repository `spynel-gocache.*` path recorded by that diagnostic. Find processes whose readable environment contains that exact `GOCACHE` value, terminate and wait for all of them, revalidate the path and its `spynel-gocache.*` ownership signature, then remove only that directory. Never delete by a broad name match or while an owned process remains live.
-- `package-native.sh` accepts only path-safe release version identifiers, builds one supported host target with CGO, stages and executes it with the matching sherpa-onnx/ONNX Runtime libraries, and packages those libraries and license notices beside the executable.
+- `package-native.sh` accepts only path-safe release version identifiers, builds one of the four supported Linux/macOS host targets with CGO, stages and executes it with the matching sherpa-onnx/ONNX Runtime libraries, and packages those libraries and license notices beside the executable. Windows targets stop at an explicit temporary stub error before host or compilation work.
 - `native-evidence` runs the synthetic `internal/harness` contract suite on the native host, safely extracts that host's archive into an awkward path, exercises only provider-free packaged commands, and writes a bounded, path-minimal JSON record classified as observed native evidence.
 - `capture-tui.sh` owns deterministic true-color screenshots of representative TUI states. It captures every stock theme with the same 120-by-34 fixture and produces a labeled light/dark/accessibility contact sheet. Keep its fixtures synchronized with durable layout contracts and inspect the PNGs after meaningful visual changes.
 
 ## Child DOX Index
 
-No child DOX files.
+Direct child DOX files:
+
+| Child | Scope |
+| --- | --- |
+| [doxcheck/AGENTS.md](doxcheck/AGENTS.md) | Deterministic repository DOX coverage and index validation. |
+| [native-evidence/AGENTS.md](native-evidence/AGENTS.md) | Synthetic native-package execution evidence helper. |

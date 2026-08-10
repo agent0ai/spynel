@@ -10,11 +10,7 @@ const { current } = require("./platform");
 const pkg = require("../package.json");
 
 const version = pkg.version;
-const target = current();
-const archive = `spynel_${version}_${target.os}_${target.arch}.${target.ext}`;
-const base = process.env.SPYNEL_DOWNLOAD_BASE || `https://github.com/agent0ai/spynel/releases/download/v${version}`;
 const vendor = path.join(__dirname, "vendor");
-const destination = path.join(vendor, process.platform === "win32" ? "spynel.exe" : "spynel");
 const marker = path.join(vendor, ".installed.json");
 const MAX_ARCHIVE_BYTES = 512 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES = 1024 * 1024;
@@ -94,15 +90,8 @@ function validateArchiveEntries(entries) {
   }
 }
 
-function listArchiveEntries(file, extension) {
-  let output;
-  if (extension === "zip") {
-    const quoted = file.replaceAll("'", "''");
-    const command = `$archive=[System.IO.Compression.ZipFile]::OpenRead('${quoted}'); try { $archive.Entries | ForEach-Object { $_.FullName } } finally { $archive.Dispose() }`;
-    output = childProcess.execFileSync("powershell", ["-NoProfile", "-Command", command], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
-  } else {
-    output = childProcess.execFileSync("tar", ["-tzf", file], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
-  }
+function listArchiveEntries(file) {
+  const output = childProcess.execFileSync("tar", ["-tzf", file], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
   const entries = output.split(/\r?\n/).filter(Boolean);
   validateArchiveEntries(entries);
   return entries;
@@ -132,6 +121,10 @@ function validateExtractedTree(root) {
 }
 
 async function install() {
+  const target = current();
+  const archive = `spynel_${version}_${target.os}_${target.arch}.${target.ext}`;
+  const base = process.env.SPYNEL_DOWNLOAD_BASE || `https://github.com/agent0ai/spynel/releases/download/v${version}`;
+  const destination = path.join(vendor, "spynel");
   if (fs.existsSync(destination) && fs.existsSync(marker)) {
     try {
       const installed = JSON.parse(fs.readFileSync(marker, "utf8"));
@@ -151,17 +144,13 @@ async function install() {
     const actual = await sha256File(temp);
     if (actual !== expected) throw new Error(`checksum mismatch for ${archive}`);
     fs.rmSync(checksums);
-    listArchiveEntries(temp, target.ext);
-    if (target.ext === "zip") {
-      childProcess.execFileSync("powershell", ["-NoProfile", "-Command", `Expand-Archive -Force '${temp.replaceAll("'", "''")}' '${staging.replaceAll("'", "''")}'`]);
-    } else {
-      childProcess.execFileSync("tar", ["-xzf", temp, "-C", staging, "--no-same-owner", "--no-same-permissions"]);
-    }
+    listArchiveEntries(temp);
+    childProcess.execFileSync("tar", ["-xzf", temp, "-C", staging, "--no-same-owner", "--no-same-permissions"]);
     fs.rmSync(temp);
     validateExtractedTree(staging);
-    const stagedBinary = path.join(staging, process.platform === "win32" ? "spynel.exe" : "spynel");
+    const stagedBinary = path.join(staging, "spynel");
     if (!fs.lstatSync(stagedBinary).isFile()) throw new Error(`release archive does not contain ${path.basename(stagedBinary)}`);
-    if (process.platform !== "win32") fs.chmodSync(stagedBinary, 0o755);
+    fs.chmodSync(stagedBinary, 0o755);
     fs.writeFileSync(path.join(staging, ".installed.json"), JSON.stringify({ version, os: target.os, arch: target.arch }) + "\n", { mode: 0o600 });
     const backup = path.join(__dirname, `.vendor-backup-${process.pid}`);
     fs.rmSync(backup, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
@@ -190,4 +179,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { validateArchiveEntries, validateExtractedTree };
+module.exports = { install, validateArchiveEntries, validateExtractedTree };

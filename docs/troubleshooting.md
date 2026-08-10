@@ -1,0 +1,37 @@
+# Troubleshooting
+
+Start with:
+
+```bash
+spynel doctor
+```
+
+Use `/status` in any interface for the current owner, harness, channel, workflow, and job summary. Use `/log` for bounded runtime diagnostics and `spynel instructions` to validate persistent instruction files without printing their contents.
+
+## Installation or startup
+
+- The public `npm install -g spynel` path is not available until the first public npm and GitHub release. For an authorized checkout, use the development steps in [getting started](getting-started.md).
+- Run `spynel` from the directory that should own the workspace. Its private configuration and state live in that directory's fixed `.spynel/` folder.
+- If a development install is not found, follow the exact PATH guidance printed by `scripts/install-dev.sh`, or choose a writable directory already on PATH with `--bin-dir`.
+- A legacy root `spynel.yaml` using the standard state location migrates automatically. A custom legacy state path must be moved to `.spynel` first.
+
+## Coding harness
+
+- If no supported harness is detected, open the harness setup and follow its installation guidance. Spynel does not copy credentials; sign in with the harness itself.
+- A working harness cannot be replaced while a turn is active, and Spynel will not replace it with a missing executable.
+- Pi and ACP permission mappings are application-level controls, not an operating-system sandbox. Review the [harness compatibility guide](harness-compatibility.md) and [configuration](configuration.md) before relying on a profile.
+
+## Telegram or WhatsApp
+
+- Both channels fail closed without a valid allow-list. Telegram also needs its token, and webhook mode needs a public HTTPS URL, local listener, and secret. WhatsApp needs at least one valid allowed phone number before setup is complete.
+- Channel setting changes apply live and isolate failures from the TUI and task manager. Inspect the channel's status form or `/status` for its current error.
+- Native service managers may not inherit variables exported only in a shell. Store the Telegram token privately in configuration or make its environment variable available to the service account.
+- WhatsApp pairing sessions retry automatically after expiry or terminal error. The manual retry action requests an immediate refresh; phone-number linking is available when QR pairing is unsuitable.
+
+## Updates, speech, and automation
+
+- Automatic npm update checks occur only for interactive npm-launched starts. `/update` reports availability explicitly; `/update install` requires an npm-supervised owner. Development and release-archive binaries report that npm updates are unavailable.
+- Speech accepts WAV, FLAC, MP3, and Telegram/WhatsApp Ogg/Opus voice notes. M4A/AAC, WebM, and other formats return an unsupported-format error. First supported use downloads a checksum-pinned model into the operating system's per-user cache unless `speech.model_dir` is configured.
+- Plain CLI flags precede positional command arguments. Add `--stream` for text deltas or `--json` for NDJSON events; default `send` output is only the final assistant message.
+
+Continue with [communication integrations](integrations.md), [configuration](configuration.md), or the [plain CLI guide](cli.md) for complete behavior and settings.

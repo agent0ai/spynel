@@ -12,12 +12,14 @@ const {
   runNPMUpdate,
   shouldCheckAtStartup
 } = require("../update");
+const { current } = require("../platform");
 
 const UPDATE_EXIT_CODE = 75;
 const packageRoot = path.resolve(__dirname, "..", "..");
 let args = process.argv.slice(2);
 
 async function main() {
+  current();
   if (shouldCheckAtStartup(args)) {
     try {
       const update = await checkForUpdate();
@@ -46,7 +48,7 @@ async function main() {
     SPYNEL_NPM_UPDATE_STATE: path.join(os.tmpdir(), `spynel-update-${process.pid}-${crypto.randomBytes(8).toString("hex")}.json`)
   };
   for (;;) {
-    const binary = path.join(__dirname, "..", "vendor", process.platform === "win32" ? "spynel.exe" : "spynel");
+    const binary = path.join(__dirname, "..", "vendor", "spynel");
     const result = childProcess.spawnSync(binary, args, { stdio: "inherit", env: environment });
     if (result.error) {
       fs.rmSync(environment.SPYNEL_NPM_UPDATE_STATE, { force: true });

@@ -2602,8 +2602,8 @@ func TestWorkingSpinnerTrailsStreamingResponseUntilFinal(t *testing.T) {
 	if !got.working || !strings.Contains(view, "Spy "+firstWorkingFrame) || strings.Contains(view, "Working") {
 		t.Fatalf("initial activity placeholder is not spinner-only: working=%t view=%q", got.working, view)
 	}
-	if logo := got.spynelLogo(); logo != firstLogoFrame {
-		t.Fatalf("working logo = %q, want logo frame %q", logo, firstLogoFrame)
+	if logo := got.spynelLogo(); logo == firstLogoFrame || got.logoAnimation != logoStopped {
+		t.Fatalf("pre-generation logo = %q mode %d, want stopped", logo, got.logoAnimation)
 	}
 	got.viewport.SetYOffset(7)
 	wantOffset := got.viewport.YOffset
@@ -2617,7 +2617,13 @@ func TestWorkingSpinnerTrailsStreamingResponseUntilFinal(t *testing.T) {
 		t.Fatalf("spinner moved history offset from %d to %d", wantOffset, got.viewport.YOffset)
 	}
 
-	next, _ = got.Update(got.logoSpinner.Tick())
+	next, _ = got.Update(uiEvent{event: core.Event{Kind: core.EventActivity, Active: true}})
+	got = next.(model)
+	firstLogoFrame = got.logoSpinner.View()
+	if got.logoAnimation != logoForeground || got.spynelLogo() != firstLogoFrame {
+		t.Fatalf("active-generation logo = %q mode %d, want foreground frame %q", got.spynelLogo(), got.logoAnimation, firstLogoFrame)
+	}
+	next, _ = got.Update(logoAnimationTickMsg{generation: got.logoGeneration})
 	got = next.(model)
 	if got.logoSpinner.View() == firstLogoFrame || got.spynelLogo() != got.logoSpinner.View() {
 		t.Fatalf("header logo did not advance independently: logo=%q first=%q", got.spynelLogo(), firstLogoFrame)
@@ -2655,14 +2661,17 @@ func TestWorkingSpinnerTrailsStreamingResponseUntilFinal(t *testing.T) {
 		t.Fatalf("spinner did not follow the newest streamed character: %q", view)
 	}
 
+	stableLogo := got.logoSpinner.View()
+	next, _ = got.Update(uiEvent{event: core.Event{Kind: core.EventActivity}})
+	got = next.(model)
 	next, _ = got.Update(uiEvent{event: core.Event{Kind: core.EventFinal, Text: "finished", Done: true}})
 	got = next.(model)
 	view = ansi.Strip(got.viewport.View())
 	if got.working || strings.Contains(view, "Working") || strings.Contains(view, got.workingSpinner.View()) || !strings.Contains(view, "finished") {
 		t.Fatalf("activity spinner was not removed by final response: working=%t view=%q", got.working, view)
 	}
-	if logo := got.spynelLogo(); logo != "◉◉" {
-		t.Fatalf("completed response logo = %q, want full logo", logo)
+	if logo := got.spynelLogo(); logo != stableLogo {
+		t.Fatalf("completed response logo = %q, want frozen frame %q", logo, stableLogo)
 	}
 }
 
@@ -3785,9 +3794,100 @@ func TestSpynelLogoIsBlankBeforeFirstMessageAndUsesRequestedFrames(t *testing.T)
 	if got := m.logoSpinner.Spinner.Frames; strings.Join(got, "") != strings.Join(want, "") {
 		t.Fatalf("Spynel logo frames = %q, want %q", got, want)
 	}
+	if got := m.logoSpinner.Spinner.FPS; got != logoFullInterval {
+		t.Fatalf("Spynel full-speed interval = %s, want %s", got, logoFullInterval)
+	}
 	workingFrames := []string{"⠋", "⠙", "⠸", "⠴", "⠦", "⠇"}
 	if got := m.workingSpinner.Spinner.Frames; strings.Join(got, "") != strings.Join(workingFrames, "") {
 		t.Fatalf("Working spinner frames = %q, want %q", got, workingFrames)
+	}
+}
+
+func TestLogoAnimationUsesForegroundBackgroundAndStoppedStateMachine(t *testing.T) {
+	m := testModel()
+	type scheduled struct {
+		after      time.Duration
+		generation uint64
+	}
+	var schedules []scheduled
+	m.logoTick = func(after time.Duration, generation uint64) tea.Cmd {
+		schedules = append(schedules, scheduled{after: after, generation: generation})
+		return func() tea.Msg { return logoAnimationTickMsg{generation: generation} }
+	}
+
+	// Two authoritative jobs start one background ticker immediately. Their
+	// first tick schedules the next frame at exactly twice the foreground rate.
+	m.runtimeStatus.LiveBackgroundJobs = 2
+	start := m.syncLogoAnimation()
+	if m.logoAnimation != logoBackground || start == nil || schedules[0].after != 0 {
+		t.Fatalf("background start = mode %d schedules %#v", m.logoAnimation, schedules)
+	}
+	firstFrame := m.logoSpinner.View()
+	next, _ := m.Update(start())
+	m = next.(model)
+	if m.logoSpinner.View() == firstFrame || schedules[len(schedules)-1].after != logoBackgroundInterval || logoBackgroundInterval != 2*logoFullInterval {
+		t.Fatalf("background tick = frame %q schedules %#v full %s background %s", m.logoSpinner.View(), schedules, logoFullInterval, logoBackgroundInterval)
+	}
+	backgroundGeneration := m.logoGeneration
+
+	// Foreground has precedence and resets the owned timer at the unchanged full
+	// interval. A queued tick from the prior generation cannot advance a frame.
+	m.mainAgentActivity = 1
+	if command := m.syncLogoAnimation(); command == nil || m.logoAnimation != logoForeground || schedules[len(schedules)-1].after != logoFullInterval {
+		t.Fatalf("foreground transition = mode %d schedules %#v", m.logoAnimation, schedules)
+	}
+	frameBeforeStale := m.logoSpinner.View()
+	next, command := m.Update(logoAnimationTickMsg{generation: backgroundGeneration})
+	m = next.(model)
+	if m.logoSpinner.View() != frameBeforeStale || command != nil {
+		t.Fatalf("stale background tick advanced or rescheduled: frame %q command %v", m.logoSpinner.View(), command != nil)
+	}
+
+	// Foreground completion falls back to half speed while either job remains.
+	m.mainAgentActivity = 0
+	m.runtimeStatus.LiveBackgroundJobs = 1
+	if command := m.syncLogoAnimation(); command == nil || m.logoAnimation != logoBackground || schedules[len(schedules)-1].after != logoBackgroundInterval {
+		t.Fatalf("foreground-to-background transition = mode %d schedules %#v", m.logoAnimation, schedules)
+	}
+	stable := m.logoSpinner.View()
+	m.runtimeStatus.LiveBackgroundJobs = 0
+	if command := m.syncLogoAnimation(); command != nil || m.logoAnimation != logoStopped {
+		t.Fatalf("final background settlement = mode %d command %v", m.logoAnimation, command != nil)
+	}
+	if m.spynelLogo() != stable {
+		t.Fatalf("stopped logo reset from %q to %q", stable, m.spynelLogo())
+	}
+	next, command = m.Update(logoAnimationTickMsg{generation: m.logoGeneration - 1})
+	m = next.(model)
+	if m.logoSpinner.View() != stable || command != nil {
+		t.Fatalf("stopped logo advanced or rescheduled: frame %q command %v", m.logoSpinner.View(), command != nil)
+	}
+}
+
+func TestLogoAnimationWaitsForCanonicalMainAgentActivity(t *testing.T) {
+	m := testModel()
+	m.dispatchMessage("hello", "hello")
+	if !m.working || m.mainAgentActivity != 0 || m.logoAnimation != logoStopped {
+		t.Fatalf("pre-generation dispatch = working %t activity %d logo %d", m.working, m.mainAgentActivity, m.logoAnimation)
+	}
+
+	m.runtimeStatus.LiveBackgroundJobs = 1
+	m.syncLogoAnimation()
+	backgroundGeneration := m.logoGeneration
+	m.dispatchMessage("follow up", "follow up")
+	if m.logoAnimation != logoBackground || m.logoGeneration != backgroundGeneration {
+		t.Fatalf("background pre-generation dispatch = logo %d generation %d, want background generation %d", m.logoAnimation, m.logoGeneration, backgroundGeneration)
+	}
+
+	next, _ := m.Update(uiEvent{event: core.Event{Kind: core.EventActivity, Active: true}})
+	m = next.(model)
+	if m.logoAnimation != logoForeground || m.mainAgentActivity != 1 {
+		t.Fatalf("canonical activity start = logo %d activity %d", m.logoAnimation, m.mainAgentActivity)
+	}
+	next, _ = m.Update(uiEvent{event: core.Event{Kind: core.EventActivity}})
+	m = next.(model)
+	if m.logoAnimation != logoBackground || m.mainAgentActivity != 0 {
+		t.Fatalf("canonical activity end = logo %d activity %d", m.logoAnimation, m.mainAgentActivity)
 	}
 }
 

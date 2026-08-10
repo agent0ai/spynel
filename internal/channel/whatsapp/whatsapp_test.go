@@ -339,6 +339,32 @@ func TestConnectionEventRequiresPairedDeviceIdentity(t *testing.T) {
 	}
 }
 
+func TestConnectionHealthReportsStablePollsAndRealTransitions(t *testing.T) {
+	client := New(config.WhatsApp{AllowedNumbers: []string{"15551234567"}}, filepath.Join(t.TempDir(), "whatsapp.db"))
+	pairedID := types.NewJID("15551234567", types.DefaultUserServer)
+	client.client = whatsmeow.NewClient(&store.Device{ID: &pairedID}, nil)
+	var statuses []channel.ConnectionStatus
+	client.SetStatusReporter(func(status channel.ConnectionStatus) { statuses = append(statuses, status) })
+
+	for range 20 {
+		client.reportConnectionHealth(true)
+	}
+	client.reportConnectionHealth(false)
+	client.reportConnectionHealth(true)
+
+	if len(statuses) != 22 {
+		t.Fatalf("health status count = %d, want 22", len(statuses))
+	}
+	for index, status := range statuses[:20] {
+		if status.State != channel.ConnectionConnected || status.Identity != "+15551234567" || status.Link != "https://wa.me/15551234567" {
+			t.Fatalf("stable health status %d = %#v", index, status)
+		}
+	}
+	if statuses[20].State != channel.ConnectionError || statuses[20].Detail != "disconnected" || statuses[21].State != channel.ConnectionConnected {
+		t.Fatalf("health transition statuses = %#v", statuses[20:])
+	}
+}
+
 func TestEmptyWhitelistReportsConnectionErrorAndRejectsNumbers(t *testing.T) {
 	client := New(config.WhatsApp{AllowedNumbers: []string{" + "}}, filepath.Join(t.TempDir(), "whatsapp.db"))
 	var got channel.ConnectionStatus

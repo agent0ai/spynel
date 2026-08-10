@@ -26,19 +26,21 @@ jobs:
           node-version: 24
           package-manager-cache: false
 
-      - name: Verify implementation and release version
+      - name: Prepare npm metadata from the GitHub release
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: node npm/prepare-release.js "$RELEASE_TAG" "$RELEASE_PRERELEASE"
+
+      - name: Verify implementation and release package
         run: |
+          node -e 'const p=require("./package.json"); if (p.version === "0.0.0-development") process.exit(1)'
+          npm pack --dry-run
           go test ./...
           go vet ./...
           go build ./cmd/spynel
           ./scripts/smoke.sh
           node npm/test.js
-          npm pack --dry-run
-          node -e 'const p=require("./package.json"); if (`v${p.version}` !== process.env.RELEASE_TAG) process.exit(1)'
-          node -e 'const pre=require("./package.json").version.includes("-"); if (pre !== (process.env.RELEASE_PRERELEASE === "true")) process.exit(1)'
 
   build:
     needs: verify
@@ -58,9 +60,6 @@ jobs:
           - runner: macos-15
             os: darwin
             arch: arm64
-          - runner: windows-2025
-            os: windows
-            arch: amd64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -72,25 +71,8 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Install the Windows C toolchain
-        if: matrix.os == 'windows'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: mingw-w64-x86_64-toolchain
-          path-type: inherit
-
-      - name: Build native Unix release archive
-        if: matrix.os != 'windows'
+      - name: Build native release archive
         shell: bash
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: ./scripts/package-native.sh "$RELEASE_TAG" "${{ matrix.os }}" "${{ matrix.arch }}" release
-
-      - name: Build native Windows release archive
-        if: matrix.os == 'windows'
-        shell: msys2 {0}
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: ./scripts/package-native.sh "$RELEASE_TAG" "${{ matrix.os }}" "${{ matrix.arch }}" release
@@ -145,6 +127,12 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
+
+      - name: Prepare npm metadata from the GitHub release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: node npm/prepare-release.js "$RELEASE_TAG" "$RELEASE_PRERELEASE"
 
       - name: Publish npm launcher
         env:

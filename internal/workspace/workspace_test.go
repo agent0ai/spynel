@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -567,6 +568,46 @@ func TestUpgradeAddsReviewAssetsWithoutOverwritingPrompts(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("upgrade did not restore %s: %v", path, err)
 		}
+	}
+}
+
+func TestUpgradeMigratesOnlyExactRetiredNotificationPrompt(t *testing.T) {
+	retired, err := templates.ReadFile("templates/migrations/notification-triage-v1.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := templates.ReadFile("templates/notification.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		data []byte
+		want []byte
+	}{
+		{name: "exact stock prompt", data: retired, want: current},
+		{name: "user customized legacy prompt", data: append(append([]byte(nil), retired...), "\nKeep my custom notification wording.\n"...), want: append(append([]byte(nil), retired...), "\nKeep my custom notification wording.\n"...)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, ".spynel", "prompts", "notification.md")
+			if err := os.WriteFile(path, test.data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := Upgrade(root); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(got, test.want) {
+				t.Fatalf("migrated prompt = %q, %v", got, err)
+			}
+			if err := Upgrade(root); err != nil {
+				t.Fatalf("repeated upgrade: %v", err)
+			}
+		})
 	}
 }
 

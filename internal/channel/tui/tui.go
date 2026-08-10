@@ -54,6 +54,16 @@ type notificationBoundaryMsg struct {
 	after    int
 }
 type redrawTickMsg struct{}
+type logoAnimationTickMsg struct{ generation uint64 }
+
+type logoAnimationMode uint8
+
+const (
+	logoStopped logoAnimationMode = iota
+	logoBackground
+	logoForeground
+)
+
 type screenSaveResult struct {
 	screenID       string
 	closeOnSuccess bool
@@ -164,6 +174,10 @@ type model struct {
 	working                  bool
 	mainAgentActivity        int
 	logoSpinner              bubblespinner.Model
+	logoAnimation            logoAnimationMode
+	logoGeneration           uint64
+	logoStoppedFrame         string
+	logoTick                 func(time.Duration, uint64) tea.Cmd
 	workingSpinner           bubblespinner.Model
 	commands                 []core.SlashCommand
 	commandMenu              bool
@@ -259,18 +273,20 @@ const (
 	compactPasteChars = 1000
 	maxTitleChars     = 80
 	// Header, footer, history top/bottom insets, and composer borders.
-	layoutOverhead        = 6
-	redrawInterval        = 10 * time.Second
-	maxTranscriptRows     = 500
-	maxTranscriptRunes    = 500000
-	maxPendingPastes      = 8
-	maxPendingRawRunes    = 8192
-	slowWorkerThreshold   = 100 * time.Millisecond
-	diagnosticInterval    = 5 * time.Second
-	asyncHistoryRunes     = 16 * 1024
-	asyncHistoryEntries   = 50
-	streamRefreshInterval = time.Second / 60
-	manualScrollGrace     = 2 * time.Second
+	layoutOverhead         = 6
+	redrawInterval         = 10 * time.Second
+	maxTranscriptRows      = 500
+	maxTranscriptRunes     = 500000
+	maxPendingPastes       = 8
+	maxPendingRawRunes     = 8192
+	slowWorkerThreshold    = 100 * time.Millisecond
+	diagnosticInterval     = 5 * time.Second
+	asyncHistoryRunes      = 16 * 1024
+	asyncHistoryEntries    = 50
+	streamRefreshInterval  = time.Second / 60
+	manualScrollGrace      = 2 * time.Second
+	logoFullInterval       = time.Second / 10
+	logoBackgroundInterval = 2 * logoFullInterval
 )
 
 const transcriptOmitted = "Older messages are omitted from the live display; use /history for the complete conversation file."
@@ -392,6 +408,7 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 		ctx: ctx, handler: handler, title: resolvedTitle, input: input,
 		viewport: viewport.New(80, 20), events: make(chan core.Event, 256), composerRows: minComposerHeight,
 		logoSpinner:          newLogoSpinner(),
+		logoTick:             scheduleLogoTick,
 		workingSpinner:       newWorkingSpinner(),
 		commands:             append([]core.SlashCommand(nil), commands...),
 		themes:               append([]theme.Theme(nil), options.Themes...),
@@ -423,6 +440,10 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 	}
 	if options.InitialScreen != nil {
 		m.openScreen(*options.InitialScreen)
+	}
+	m.logoAnimation = m.desiredLogoAnimation()
+	if m.logoAnimation != logoStopped {
+		m.logoGeneration = 1
 	}
 	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
 	_, err = program.Run()
@@ -523,9 +544,52 @@ func newLogoSpinner() bubblespinner.Model {
 	return bubblespinner.New(
 		bubblespinner.WithSpinner(bubblespinner.Spinner{
 			Frames: []string{"◉◉", "◑◉", "○◉", "○◑", "○○", "◐○", "◉○", "◉◐", "◉◉"},
-			FPS:    time.Second / 10,
+			FPS:    logoFullInterval,
 		}),
 	)
+}
+
+func scheduleLogoTick(after time.Duration, generation uint64) tea.Cmd {
+	return tea.Tick(after, func(time.Time) tea.Msg { return logoAnimationTickMsg{generation: generation} })
+}
+
+func (m *model) desiredLogoAnimation() logoAnimationMode {
+	if m.mainAgentActivity > 0 {
+		return logoForeground
+	}
+	if m.runtimeStatus.LiveBackgroundJobs > 0 {
+		return logoBackground
+	}
+	return logoStopped
+}
+
+func (m *model) syncLogoAnimation() tea.Cmd {
+	next := m.desiredLogoAnimation()
+	if next == m.logoAnimation {
+		return nil
+	}
+	previous := m.logoAnimation
+	m.logoAnimation = next
+	m.logoGeneration++
+	if next == logoStopped {
+		m.logoStoppedFrame = m.logoSpinner.View()
+		return nil
+	}
+	delay := next.interval()
+	if previous == logoStopped {
+		delay = 0
+	}
+	if m.logoTick == nil {
+		m.logoTick = scheduleLogoTick
+	}
+	return m.logoTick(delay, m.logoGeneration)
+}
+
+func (mode logoAnimationMode) interval() time.Duration {
+	if mode == logoBackground {
+		return logoBackgroundInterval
+	}
+	return logoFullInterval
 }
 
 func newWorkingSpinner() bubblespinner.Model {
@@ -540,7 +604,15 @@ func newWorkingSpinner() bubblespinner.Model {
 func (m model) Init() tea.Cmd {
 	// Keep terminal-native drag selection available and clear mouse reporting
 	// if a previous abnormal exit left the terminal mode enabled.
-	return tea.Batch(textarea.Blink, m.waitEvent(), m.redrawTick(), tea.DisableMouse)
+	var logo tea.Cmd
+	if m.logoAnimation != logoStopped {
+		tick := m.logoTick
+		if tick == nil {
+			tick = scheduleLogoTick
+		}
+		logo = tick(0, m.logoGeneration)
+	}
+	return tea.Batch(textarea.Blink, m.waitEvent(), m.redrawTick(), tea.DisableMouse, logo)
 }
 
 func (m model) redrawTick() tea.Cmd {
@@ -815,7 +887,7 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.responseText += event.Text
 			m.working = true
 			if !wasWorking {
-				commands = append(commands, m.logoSpinner.Tick, m.workingSpinner.Tick)
+				commands = append(commands, m.workingSpinner.Tick)
 			}
 			if len(m.pendingNotifications) > 0 && !m.notificationAckBusy {
 				commands = append(commands, notificationPause(m.deltaSequence))
@@ -887,7 +959,7 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if event.Active {
 				m.status = "Harness working"
 				if !wasWorking {
-					commands = append(commands, m.logoSpinner.Tick, m.workingSpinner.Tick)
+					commands = append(commands, m.workingSpinner.Tick)
 				}
 			}
 		case core.EventScreen:
@@ -899,6 +971,9 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if command := m.requestThemeMenu(); command != nil {
 				commands = append(commands, command)
 			}
+		}
+		if command := m.syncLogoAnimation(); command != nil {
+			commands = append(commands, command)
 		}
 		if refreshEvent {
 			m.refresh()
@@ -966,13 +1041,6 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		updateInput = false
 		updateViewport = false
 		switch value.ID {
-		case m.logoSpinner.ID():
-			if !m.working {
-				break
-			}
-			var tick tea.Cmd
-			m.logoSpinner, tick = m.logoSpinner.Update(value)
-			commands = append(commands, tick)
 		case m.workingSpinner.ID():
 			if !m.working {
 				break
@@ -982,6 +1050,17 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			commands = append(commands, tick)
 			m.refreshPreservingHistory()
 		}
+	case logoAnimationTickMsg:
+		updateInput = false
+		updateViewport = false
+		if value.generation != m.logoGeneration || m.logoAnimation == logoStopped {
+			break
+		}
+		m.logoSpinner, _ = m.logoSpinner.Update(m.logoSpinner.Tick())
+		if m.logoTick == nil {
+			m.logoTick = scheduleLogoTick
+		}
+		commands = append(commands, m.logoTick(m.logoAnimation.interval(), m.logoGeneration))
 	case connectionEvent:
 		if m.connection == nil {
 			m.connection = map[string]channel.ConnectionStatus{}
@@ -1041,6 +1120,9 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case runtimeEvent:
 		m.runtimeStatus = value.status
+		if command := m.syncLogoAnimation(); command != nil {
+			commands = append(commands, command)
+		}
 		commands = append(commands, m.waitEvent())
 	case screenSaveResult:
 		if m.screen == nil || m.screen.ID != value.screenID {
@@ -1474,7 +1556,10 @@ func (m *model) dispatchMessage(displayText, messageText string) []tea.Cmd {
 		return nil
 	}}
 	if m.working && !wasWorking {
-		commands = append(commands, m.logoSpinner.Tick, m.workingSpinner.Tick)
+		commands = append(commands, m.workingSpinner.Tick)
+	}
+	if command := m.syncLogoAnimation(); command != nil {
+		commands = append(commands, command)
 	}
 	return commands
 }
@@ -4003,8 +4088,11 @@ func (m model) inlineMenuView() string {
 }
 
 func (m model) spynelLogo() string {
-	if m.working || m.streaming != "" {
+	if m.logoAnimation != logoStopped {
 		return m.logoSpinner.View()
+	}
+	if m.logoStoppedFrame != "" {
+		return m.logoStoppedFrame
 	}
 	if len(m.transcript) > 0 && m.transcript[len(m.transcript)-1].role == "assistant" {
 		return "◉◉"

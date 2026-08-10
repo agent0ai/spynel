@@ -305,13 +305,17 @@ func (c *Client) waitForRuntime(ctx context.Context) error {
 		case <-c.authLost:
 			return errWhatsAppRuntimeAuthorization
 		case <-ticker.C:
-			if c.client.IsConnected() && c.isPaired() {
-				c.reportStatus(channel.ConnectionConnected, "")
-			} else {
-				c.reportStatus(channel.ConnectionError, "disconnected")
-			}
+			c.reportConnectionHealth(c.client.IsConnected() && c.isPaired())
 		}
 	}
+}
+
+func (c *Client) reportConnectionHealth(connected bool) {
+	if connected {
+		c.reportStatus(channel.ConnectionConnected, "")
+		return
+	}
+	c.reportStatus(channel.ConnectionError, "disconnected")
 }
 
 // configurePairingIdentity sets the companion metadata that WhatsApp records

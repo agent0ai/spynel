@@ -143,8 +143,9 @@ type SlashCommand struct {
 
 // RuntimeStatus is the live application activity summary shown by channels.
 type RuntimeStatus struct {
-	Logs int `json:"logs"`
-	Jobs int `json:"jobs"`
+	Logs               int `json:"logs"`
+	Jobs               int `json:"jobs"`
+	LiveBackgroundJobs int `json:"live_background_jobs"`
 }
 
 const (

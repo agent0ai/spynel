@@ -1,14 +1,13 @@
 # Releasing
 
-Publishing a GitHub Release is the release trigger. `.github/workflows/release.yml` checks out that release's tag, runs Go test/vet/build, the smoke test, npm launcher tests, and `npm pack --dry-run`, then requires the `v<package.json version>` tag to match exactly. Semantic prerelease versions must be published as GitHub prereleases.
+Publishing a GitHub Release is the release trigger and its `v<semantic version>` tag is the release version source. `.github/workflows/release.yml` checks out that tag, derives the npm package version from it, runs Go test/vet/build, the smoke test, npm launcher tests, and `npm pack --dry-run`. Semantic prerelease tags must be published as GitHub prereleases.
 
-Five CGO-enabled jobs build on matching native GitHub-hosted runners:
+Four CGO-enabled jobs build on matching native GitHub-hosted runners:
 
 - Linux amd64 and arm64;
-- macOS amd64 and arm64;
-- Windows amd64.
+- macOS amd64 and arm64.
 
-Windows arm64 is not published because the official sherpa-onnx Go package does not provide that target. Each archive contains the executable, matching sherpa-onnx and ONNX Runtime libraries, and required license notices. Model weights remain checksum-pinned first-use downloads rather than release assets.
+Windows distribution is temporarily unsupported. The workflow has no Windows job, native packaging rejects every Windows target before compilation, and the npm wrapper fails with explicit Linux/macOS guidance instead of requesting a missing artifact. Each supported archive contains the executable, matching sherpa-onnx and ONNX Runtime libraries, and required license notices. Model weights remain checksum-pinned first-use downloads rather than release assets.
 
 After every native job succeeds, the publish job creates `checksums.txt`, attaches all archives and checksums to the already-published GitHub Release, and publishes the npm wrapper. Stable releases use npm's `latest` distribution tag; GitHub prereleases use `next`. npm publication is not optional or silently skipped, so a missing or invalid publisher configuration fails the release visibly.
 
@@ -36,9 +35,11 @@ See npm's official [Trusted Publishing](https://docs.npmjs.com/trusted-publisher
 
 ## Release procedure
 
-Set the semantic version in `package.json`, commit it, and create a GitHub Release whose tag is exactly that version with a leading `v`, for example `v0.2.0`. Mark a version such as `0.3.0-beta.1` as a GitHub prerelease. Publishing the release starts the workflow; creating or editing a draft does not.
+Create a GitHub Release with a `v`-prefixed semantic version tag, for example `v0.2.1`. Mark a version such as `v0.3.0-beta.1` as a GitHub prerelease. Publishing the release starts the workflow; creating or editing a draft does not. The committed `package.json` uses `0.0.0-development` because npm requires a version field; both verification and publication replace it with the tag-derived version in their isolated checkouts.
 
-The npm postinstall script maps Node platforms to the five archive names, downloads the matching archive and `checksums.txt`, verifies SHA-256, validates the executable, and atomically replaces `npm/vendor/` with the complete extracted runtime. It never runs Spynel during package installation. `SPYNEL_DOWNLOAD_BASE` may point installation at a trusted compatible mirror.
+The npm package uses the root repository `README.md` from the released commit. Before publication, relative Markdown document links are pinned to that GitHub tag and relative Markdown or HTML image sources are pinned to `raw.githubusercontent.com` at the same tag. Consequently, an npm version keeps a stable README snapshot even when the default branch changes later.
+
+The npm postinstall script maps supported Node platforms to the four archive names, downloads the matching archive and `checksums.txt`, verifies SHA-256, validates the executable, and atomically replaces `npm/vendor/` with the complete extracted runtime. It rejects Windows before any download and never runs Spynel during package installation. `SPYNEL_DOWNLOAD_BASE` may point installation at a trusted compatible mirror.
 
 Before publishing, reproduce the local gates and build a runnable archive for the host target:
 

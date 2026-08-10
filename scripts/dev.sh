@@ -35,12 +35,15 @@ case "$action" in
   test)
     (cd "$project_dir" && CGO_ENABLED=1 "$go_bin" test ./... && CGO_ENABLED=1 "$go_bin" vet ./...)
     ;;
+  dox)
+    (cd "$project_dir" && "$go_bin" run ./scripts/doxcheck)
+    ;;
   run)
     "$script_dir/dev.sh" build >/dev/null
     exec "$project_dir/bin/spynel" "$@"
     ;;
   *)
-    echo "usage: $0 [build|test|run [spynel arguments...]]" >&2
+    echo "usage: $0 [build|test|dox|run [spynel arguments...]]" >&2
     exit 2
     ;;
 esac
