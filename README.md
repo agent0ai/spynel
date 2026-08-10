@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/resources/banner.png" alt="Spynel — Simplicity. Leverage. Quality." width="100%">
+  <img src=".github/resources/banner.webp" alt="Spynel — Simplicity. Leverage. Quality." width="100%">
 </p>
 
 <p align="center">
