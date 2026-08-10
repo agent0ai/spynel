@@ -2,11 +2,11 @@ package core
 
 import "time"
 
-const SpynelASCII = `     ████     ████     ███████ ██████  ██    ██ ███    ██ ███████ ██
-   ██    ██ ██    ██   ██      ██   ██  ██  ██  ████   ██ ██      ██
-  ██  ██  ███  ██  ██  ███████ ██████    ████   ██ ██  ██ █████   ██
-   ██    ██ ██    ██        ██ ██         ██    ██  ██ ██ ██      ██
-     ████     ████     ███████ ██         ██    ██   ████ ███████ ███████`
+const SpynelASCII = `    ████     ████     ███████ ██████  ██    ██ ███    ██ ███████ ██
+  ██    ██ ██    ██   ██      ██   ██  ██  ██  ████   ██ ██      ██
+ ██      ███      ██  ███████ ██████    ████   ██ ██  ██ █████   ██
+  ██    ██ ██    ██        ██ ██         ██    ██  ██ ██ ██      ██
+    ████     ████     ███████ ██         ██    ██   ████ ███████ ███████`
 
 // SpynelLogoMarkdown marks the full terminal logo for semantic primary-color
 // rendering when a welcome is persisted as an ordinary chat message.

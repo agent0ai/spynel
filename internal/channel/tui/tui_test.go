@@ -2684,7 +2684,6 @@ func TestWorkingSpinnerTrailsStreamingResponseUntilFinal(t *testing.T) {
 		t.Fatalf("spinner did not follow the newest streamed character: %q", view)
 	}
 
-	stableLogo := got.logoSpinner.View()
 	next, _ = got.Update(uiEvent{event: core.Event{Kind: core.EventActivity}})
 	got = next.(model)
 	next, _ = got.Update(uiEvent{event: core.Event{Kind: core.EventFinal, Text: "finished", Done: true}})
@@ -2693,8 +2692,8 @@ func TestWorkingSpinnerTrailsStreamingResponseUntilFinal(t *testing.T) {
 	if got.working || strings.Contains(view, "Working") || strings.Contains(view, got.workingSpinner.View()) || !strings.Contains(view, "finished") {
 		t.Fatalf("activity spinner was not removed by final response: working=%t view=%q", got.working, view)
 	}
-	if logo := got.spynelLogo(); logo != stableLogo {
-		t.Fatalf("completed response logo = %q, want frozen frame %q", logo, stableLogo)
+	if logo := got.spynelLogo(); logo != "○○" {
+		t.Fatalf("completed response logo = %q, want empty idle frame", logo)
 	}
 }
 
@@ -3812,6 +3811,9 @@ func TestParentWorkspaceScreenDefaultsToParentAndKeepsFailuresInPlace(t *testing
 	launchRoot := "/workspace/project/child"
 	parentRoot := "/workspace/project"
 	screen := ParentWorkspaceScreen(launchRoot, parentRoot)
+	if screen.Banner != core.SpynelASCII {
+		t.Fatalf("workspace choice banner does not use the canonical Spynel logo: %q", screen.Banner)
+	}
 	if len(screen.Controls) != 3 || screen.Controls[0].Key != string(WorkspaceChoiceUseParent) || screen.Controls[1].Key != string(WorkspaceChoiceInitializeHere) || screen.Controls[2].Key != string(WorkspaceChoiceExit) {
 		t.Fatalf("workspace actions = %#v", screen.Controls)
 	}
@@ -3989,10 +3991,18 @@ func assertEveryViewportCellBackground(t *testing.T, frame string, width, height
 	}
 }
 
-func TestSpynelLogoIsBlankBeforeFirstMessageAndUsesRequestedFrames(t *testing.T) {
+func TestSpynelLogoIsEmptyWheneverIdleAndUsesRequestedActiveFrames(t *testing.T) {
 	m := testModel()
 	if logo := m.spynelLogo(); logo != "○○" {
-		t.Fatalf("initial logo = %q, want blank logo", logo)
+		t.Fatalf("initial logo = %q, want empty logo", logo)
+	}
+	m.transcript = []transcriptEntry{{role: "assistant", text: "completed"}}
+	if logo := m.spynelLogo(); logo != "○○" {
+		t.Fatalf("post-response idle logo = %q, want empty logo", logo)
+	}
+	m.transcript = append(m.transcript, transcriptEntry{role: "error", text: "cancelled"})
+	if logo := m.spynelLogo(); logo != "○○" {
+		t.Fatalf("post-error idle logo = %q, want empty logo", logo)
 	}
 	want := []string{"◉◉", "◑◉", "○◉", "○◑", "○○", "◐○", "◉○", "◉◐", "◉◉"}
 	if got := m.logoSpinner.Spinner.Frames; strings.Join(got, "") != strings.Join(want, "") {
@@ -4053,17 +4063,17 @@ func TestLogoAnimationUsesForegroundBackgroundAndStoppedStateMachine(t *testing.
 	if command := m.syncLogoAnimation(); command == nil || m.logoAnimation != logoBackground || schedules[len(schedules)-1].after != logoBackgroundInterval {
 		t.Fatalf("foreground-to-background transition = mode %d schedules %#v", m.logoAnimation, schedules)
 	}
-	stable := m.logoSpinner.View()
+	activeFrame := m.logoSpinner.View()
 	m.runtimeStatus.LiveBackgroundJobs = 0
 	if command := m.syncLogoAnimation(); command != nil || m.logoAnimation != logoStopped {
 		t.Fatalf("final background settlement = mode %d command %v", m.logoAnimation, command != nil)
 	}
-	if m.spynelLogo() != stable {
-		t.Fatalf("stopped logo reset from %q to %q", stable, m.spynelLogo())
+	if m.spynelLogo() != "○○" {
+		t.Fatalf("stopped logo after active frame %q = %q, want empty", activeFrame, m.spynelLogo())
 	}
 	next, command = m.Update(logoAnimationTickMsg{generation: m.logoGeneration - 1})
 	m = next.(model)
-	if m.logoSpinner.View() != stable || command != nil {
+	if m.logoSpinner.View() != activeFrame || m.spynelLogo() != "○○" || command != nil {
 		t.Fatalf("stopped logo advanced or rescheduled: frame %q command %v", m.logoSpinner.View(), command != nil)
 	}
 }
@@ -4327,7 +4337,7 @@ func TestWelcomeRendersInlineAboveChatWithoutTakingComposerFocus(t *testing.T) {
 	if logoLine < 0 || helpLine <= logoLine || messageLine <= helpLine || strings.Contains(view, "Old button") {
 		t.Fatalf("inline welcome order = %q", view)
 	}
-	if !strings.Contains(view, "     ████     ████") || !strings.Contains(view, "  ██  ██  ███  ██  ██") {
+	if !strings.Contains(view, "    ████     ████") || !strings.Contains(view, " ██      ███      ██") {
 		t.Fatalf("inline welcome does not use the canonical five-row Spynel logo: %q", view)
 	}
 	if !m.input.Focused() || m.viewport.YOffset != 0 {

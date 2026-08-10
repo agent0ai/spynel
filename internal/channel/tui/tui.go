@@ -179,7 +179,6 @@ type model struct {
 	logoSpinner              bubblespinner.Model
 	logoAnimation            logoAnimationMode
 	logoGeneration           uint64
-	logoStoppedFrame         string
 	logoTick                 func(time.Duration, uint64) tea.Cmd
 	workingSpinner           bubblespinner.Model
 	commands                 []core.SlashCommand
@@ -579,7 +578,6 @@ func (m *model) syncLogoAnimation() tea.Cmd {
 	m.logoAnimation = next
 	m.logoGeneration++
 	if next == logoStopped {
-		m.logoStoppedFrame = m.logoSpinner.View()
 		return nil
 	}
 	delay := next.interval()
@@ -4105,12 +4103,6 @@ func (m model) inlineMenuView() string {
 func (m model) spynelLogo() string {
 	if m.logoAnimation != logoStopped {
 		return m.logoSpinner.View()
-	}
-	if m.logoStoppedFrame != "" {
-		return m.logoStoppedFrame
-	}
-	if len(m.transcript) > 0 && m.transcript[len(m.transcript)-1].role == "assistant" {
-		return "◉◉"
 	}
 	return "○○"
 }
