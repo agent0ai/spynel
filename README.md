@@ -14,13 +14,8 @@
   <a href="https://github.com/sponsors/agent0ai"><img alt="GitHub Sponsors" src="https://img.shields.io/badge/Sponsors-FF69B4?style=flat&amp;logo=githubsponsors&amp;logoColor=white"></a>
 </p>
 
-<!-- <p>
-  <img src=".github/resources/jan.jpeg" alt="Jan Tomášek" width="96" height="96" align="left">
-  <strong>Why I built Spynel.</strong><br>
-  -->
   <em>Using more agents should not mean spending more time managing agents - that's not leverage.<br> I want to have one communication channel to all my work. One assistant to talk to. One that will do all the management and scaling instead of me.</em>
   <br><em>Jan Tomášek, founder of <a href="https://github.com/agent0ai/agent-zero">Agent Zero</a></em>
-<!--</p> -->
 
 <table>
   <tr>
