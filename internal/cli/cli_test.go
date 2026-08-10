@@ -19,6 +19,7 @@ import (
 
 	"github.com/agent0ai/spynel/internal/app"
 	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/channel/tui"
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
@@ -73,6 +74,304 @@ func TestConfigPathArgument(t *testing.T) {
 		if got := configPathArgument(test.args); got != test.want {
 			t.Errorf("configPathArgument(%q) = %q, want %q", test.args, got, test.want)
 		}
+	}
+}
+
+func TestBareWorkspaceDiscoveryDistinguishesLocalAncestorAndSymlink(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(root, "nested", "child")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	discovery, err := discoverBareWorkspace(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !discovery.ancestorFound || discovery.parentRoot != root || discovery.discoveredConfig != config.PathForRoot(root) || discovery.localConfig != config.PathForRoot(child) {
+		t.Fatalf("ancestor discovery = %#v", discovery)
+	}
+
+	if err := workspace.Init(child, false); err != nil {
+		t.Fatal(err)
+	}
+	discovery, err = discoverBareWorkspace(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if discovery.ancestorFound || discovery.discoveredConfig != config.PathForRoot(child) {
+		t.Fatalf("local discovery = %#v", discovery)
+	}
+
+	linkParent := t.TempDir()
+	link := filepath.Join(linkParent, "workspace-link")
+	if err := os.Symlink(child, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	canonical, err := canonicalDirectory(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical != want {
+		t.Fatalf("canonical symlink directory = %q, want %q", canonical, want)
+	}
+}
+
+func TestBareInteractiveStartupOrdersChoiceDirectoryAndServerConstruction(t *testing.T) {
+	const (
+		launchRoot   = "/canonical/parent/child"
+		parentRoot   = "/canonical/parent"
+		localConfig  = "/canonical/parent/child/.spynel/config.yaml"
+		parentConfig = "/canonical/parent/.spynel/config.yaml"
+	)
+	tests := []struct {
+		name       string
+		choice     tui.WorkspaceChoice
+		wantEvents []string
+	}{
+		{
+			name: "parent changes directory before server construction", choice: tui.WorkspaceChoiceUseParent,
+			wantEvents: []string{"canonical", "discover:" + launchRoot, "choice:" + launchRoot + ":" + parentRoot, "chdir:" + parentRoot, "server:" + parentConfig},
+		},
+		{
+			name: "initialize creates only launch workspace before directory and server", choice: tui.WorkspaceChoiceInitializeHere,
+			wantEvents: []string{"canonical", "discover:" + launchRoot, "choice:" + launchRoot + ":" + parentRoot, "init:" + launchRoot, "chdir:" + launchRoot, "server:" + localConfig},
+		},
+		{
+			name:       "exit has no filesystem or server effects",
+			choice:     tui.WorkspaceChoiceExit,
+			wantEvents: []string{"canonical", "discover:" + launchRoot, "choice:" + launchRoot + ":" + parentRoot},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var events []string
+			runtime := bareInteractiveRuntime{
+				canonicalLaunchDirectory: func() (string, error) {
+					events = append(events, "canonical")
+					return launchRoot, nil
+				},
+				discoverWorkspace: func(root string) (bareWorkspaceDiscovery, error) {
+					events = append(events, "discover:"+root)
+					return bareWorkspaceDiscovery{localConfig: localConfig, discoveredConfig: parentConfig, parentRoot: parentRoot, ancestorFound: true}, nil
+				},
+				runParentChoice: func(_ context.Context, launch, parent string, initialize func() error) (tui.WorkspaceChoice, error) {
+					events = append(events, "choice:"+launch+":"+parent)
+					if test.choice == tui.WorkspaceChoiceInitializeHere {
+						if err := initialize(); err != nil {
+							return tui.WorkspaceChoiceExit, err
+						}
+					}
+					return test.choice, nil
+				},
+				initializeWorkspace: func(root string, force bool) error {
+					if force {
+						t.Fatal("startup initialization unexpectedly forced an overwrite")
+					}
+					events = append(events, "init:"+root)
+					return nil
+				},
+				changeDirectory: func(root string) error {
+					events = append(events, "chdir:"+root)
+					return nil
+				},
+				startServer: func(path string, withTUI bool, version string, restartArgs []string) error {
+					if !withTUI || version != "test" || restartArgs != nil {
+						t.Fatalf("server arguments = %q, %t, %q, %#v", path, withTUI, version, restartArgs)
+					}
+					events = append(events, "server:"+path)
+					return nil
+				},
+			}
+			if err := runBareInteractiveWithRuntime("test", runtime); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(events, "\n") != strings.Join(test.wantEvents, "\n") {
+				t.Fatalf("startup events = %#v, want %#v", events, test.wantEvents)
+			}
+		})
+	}
+}
+
+func TestBareInteractiveStartupHandlesLocalUninitializedAndInitializationFailure(t *testing.T) {
+	const launchRoot = "/canonical/new"
+	const localConfig = "/canonical/new/.spynel/config.yaml"
+	initFailure := errors.New("cannot initialize")
+	for _, test := range []struct {
+		name        string
+		initialized bool
+		initErr     error
+		wantEvents  []string
+		wantErr     error
+	}{
+		{name: "successful initialization", initialized: true, wantEvents: []string{"screen", "init", "chdir", "server"}},
+		{name: "cancelled initialization", wantEvents: []string{"screen"}},
+		{name: "failed initialization", initErr: initFailure, wantEvents: []string{"screen", "init"}, wantErr: initFailure},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var events []string
+			runtime := bareInteractiveRuntime{
+				canonicalLaunchDirectory: func() (string, error) { return launchRoot, nil },
+				discoverWorkspace: func(string) (bareWorkspaceDiscovery, error) {
+					return bareWorkspaceDiscovery{localConfig: localConfig}, nil
+				},
+				runInitialization: func(_ context.Context, root string, initialize func() error) (bool, error) {
+					events = append(events, "screen")
+					if test.initErr != nil || test.initialized {
+						if err := initialize(); err != nil {
+							return false, err
+						}
+					}
+					return test.initialized, nil
+				},
+				initializeWorkspace: func(root string, force bool) error {
+					events = append(events, "init")
+					return test.initErr
+				},
+				changeDirectory: func(string) error { events = append(events, "chdir"); return nil },
+				startServer:     func(string, bool, string, []string) error { events = append(events, "server"); return nil },
+			}
+			err := runBareInteractiveWithRuntime("test", runtime)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("startup error = %v, want %v", err, test.wantErr)
+			}
+			if strings.Join(events, "\n") != strings.Join(test.wantEvents, "\n") {
+				t.Fatalf("startup events = %#v, want %#v", events, test.wantEvents)
+			}
+		})
+	}
+}
+
+func TestBareInteractiveChoiceAlignsRealProcessDirectoryBeforeServer(t *testing.T) {
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(original) })
+	parent := t.TempDir()
+	child := filepath.Join(parent, "child")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		choice tui.WorkspaceChoice
+		want   string
+	}{
+		{name: "parent", choice: tui.WorkspaceChoiceUseParent, want: parent},
+		{name: "initialized child", choice: tui.WorkspaceChoiceInitializeHere, want: child},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.Chdir(original); err != nil {
+				t.Fatal(err)
+			}
+			runtime := bareInteractiveRuntime{
+				canonicalLaunchDirectory: func() (string, error) { return child, nil },
+				discoverWorkspace: func(string) (bareWorkspaceDiscovery, error) {
+					return bareWorkspaceDiscovery{
+						localConfig: config.PathForRoot(child), discoveredConfig: config.PathForRoot(parent),
+						parentRoot: parent, ancestorFound: true,
+					}, nil
+				},
+				runParentChoice: func(_ context.Context, _, _ string, initialize func() error) (tui.WorkspaceChoice, error) {
+					if test.choice == tui.WorkspaceChoiceInitializeHere {
+						if err := initialize(); err != nil {
+							return tui.WorkspaceChoiceExit, err
+						}
+					}
+					return test.choice, nil
+				},
+				initializeWorkspace: func(root string, force bool) error {
+					if root != child || force {
+						t.Fatalf("initialize request = %q, force %t", root, force)
+					}
+					return nil
+				},
+				changeDirectory: os.Chdir,
+				startServer: func(string, bool, string, []string) error {
+					got, err := os.Getwd()
+					if err != nil {
+						return err
+					}
+					if got != test.want {
+						return fmt.Errorf("server CWD = %q, want %q", got, test.want)
+					}
+					return nil
+				},
+			}
+			if err := runBareInteractiveWithRuntime("test", runtime); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestBareInteractiveInitializedRootStartsWithoutChoice(t *testing.T) {
+	const root = "/canonical/local"
+	const configPath = "/canonical/local/.spynel/config.yaml"
+	choiceCalled := false
+	serverCalled := false
+	runtime := bareInteractiveRuntime{
+		canonicalLaunchDirectory: func() (string, error) { return root, nil },
+		discoverWorkspace: func(string) (bareWorkspaceDiscovery, error) {
+			return bareWorkspaceDiscovery{localConfig: configPath, discoveredConfig: configPath}, nil
+		},
+		runParentChoice: func(context.Context, string, string, func() error) (tui.WorkspaceChoice, error) {
+			choiceCalled = true
+			return tui.WorkspaceChoiceExit, nil
+		},
+		startServer: func(path string, withTUI bool, version string, restartArgs []string) error {
+			serverCalled = path == configPath && withTUI && version == "test" && restartArgs == nil
+			return nil
+		},
+	}
+	if err := runBareInteractiveWithRuntime("test", runtime); err != nil {
+		t.Fatal(err)
+	}
+	if choiceCalled || !serverCalled {
+		t.Fatalf("choice called = %t, server called correctly = %t", choiceCalled, serverCalled)
+	}
+}
+
+func TestOnlyBareCommandRequestsInteractiveWorkspaceChoice(t *testing.T) {
+	if !bareInteractiveRequested(nil) {
+		t.Fatal("bare command did not request interactive startup")
+	}
+	for _, args := range [][]string{
+		{"serve"}, {"serve", "--tui"}, {"serve", "--config", "/explicit/.spynel/config.yaml"},
+		{"init", "--dir", "/explicit"}, {"status", "--config", "/explicit/.spynel/config.yaml"},
+	} {
+		if bareInteractiveRequested(args) {
+			t.Fatalf("explicit or noninteractive command unexpectedly requested workspace choice: %#v", args)
+		}
+	}
+}
+
+func TestBareFailureLoggingDoesNotAdoptAncestorBeforeChoice(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(root, "child")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(child); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+	if path, ok := failureConfigPath(nil); ok || path != "" {
+		t.Fatalf("bare failure path = %q, %t; ancestor must remain untouched", path, ok)
 	}
 }
 
@@ -523,15 +822,15 @@ func TestInitNoStartCreatesWorkspaceWithoutEnteringTUI(t *testing.T) {
 	}
 }
 
-func TestMessageCommandValidatesScriptableArguments(t *testing.T) {
-	if err := run([]string{"message"}, "test"); err == nil || !strings.Contains(err.Error(), "usage: spynel message") {
-		t.Fatalf("missing message text error = %v", err)
+func TestSendCommandValidatesScriptableArguments(t *testing.T) {
+	if err := run([]string{"send"}, "test"); err == nil || !strings.Contains(err.Error(), "usage: spynel send") {
+		t.Fatalf("missing send text error = %v", err)
 	}
-	if err := run([]string{"message", "--conversation", "", "hello"}, "test"); err == nil || !strings.Contains(err.Error(), "cannot be empty") {
+	if err := run([]string{"send", "--conversation", "", "hello"}, "test"); err == nil || !strings.Contains(err.Error(), "cannot be empty") {
 		t.Fatalf("empty conversation error = %v", err)
 	}
-	if !strings.Contains(helpText, "spynel message") || !strings.Contains(helpText, "--conversation") {
-		t.Fatalf("message command is not documented in CLI help:\n%s", helpText)
+	if !strings.Contains(helpText, "spynel send") || !strings.Contains(helpText, "--conversation") {
+		t.Fatalf("send command is not documented in CLI help:\n%s", helpText)
 	}
 }
 

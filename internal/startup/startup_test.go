@@ -50,13 +50,13 @@ func startupTestConfig(root string) config.Config {
 	return cfg
 }
 
-func TestWorkspaceIDIsStableAcrossConfigurationPathMigration(t *testing.T) {
+func TestWorkspaceIDUsesCanonicalWorkspacePath(t *testing.T) {
 	root := t.TempDir()
-	canonical := startupTestConfig(root)
-	legacy := canonical
-	legacy.Path = filepath.Join(root, config.LegacyFileName)
-	if workspaceID(canonical) != workspaceID(legacy) {
-		t.Fatalf("workspace ID changed from %q to %q", workspaceID(legacy), workspaceID(canonical))
+	first := startupTestConfig(root)
+	second := first
+	second.Path = filepath.Join(root, "caller-supplied-alias.yaml")
+	if workspaceID(first) != workspaceID(second) {
+		t.Fatalf("workspace ID depends on caller-supplied config path: %q != %q", workspaceID(first), workspaceID(second))
 	}
 }
 

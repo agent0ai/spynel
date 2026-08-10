@@ -725,17 +725,17 @@ func TestRuntimeLogRestoresWorstCaseEscapedEntry(t *testing.T) {
 	t.Fatalf("worst-case JSON-escaped entry was not restored: %#v", second.Logs())
 }
 
-func TestRuntimeLogNormalizesLegacyRetainedEntry(t *testing.T) {
+func TestRuntimeLogNormalizesUnsafeRetainedEntry(t *testing.T) {
 	directory := t.TempDir()
 	entry := LogEntry{
 		At: time.Now().UTC(), Level: "**ERROR**", Component: "[bad](target)", Event: "event`name",
-		Instance: "instance]", Text: "authorization: Bearer legacy-secret\x1b[31m",
+		Instance: "instance]", Text: "authorization: Bearer retained-secret\x1b[31m",
 	}
 	data, err := json.Marshal(entry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(directory, "runtime-legacy.jsonl")
+	path := filepath.Join(directory, "runtime-unsafe.jsonl")
 	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -747,7 +747,7 @@ func TestRuntimeLogNormalizesLegacyRetainedEntry(t *testing.T) {
 		t.Fatalf("restored logs = %#v", logs)
 	}
 	got := logs[0]
-	if strings.Contains(got.Text, "legacy-secret") || got.Text != "authorization: [REDACTED]" {
+	if strings.Contains(got.Text, "retained-secret") || got.Text != "authorization: [REDACTED]" {
 		t.Fatalf("restored text was not sanitized and redacted: %q", got.Text)
 	}
 	if got.Level != "error" || got.Component != "badtarget" || got.Event != "eventname" || got.Instance != "instance" {
@@ -875,7 +875,11 @@ func TestRuntimeLogRotationAndClear(t *testing.T) {
 	if len(paths) < 2 || len(paths) > maxRuntimeLogFiles {
 		t.Fatalf("rotated paths = %d, want 2..%d", len(paths), maxRuntimeLogFiles)
 	}
-	if count := runtime.ClearLogs(); count != 1101 {
+	count, err := runtime.ClearLogsResult()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1101 {
 		t.Fatalf("clear count = %d, want 1101", count)
 	}
 	paths, _ = filepath.Glob(filepath.Join(directory, "runtime-*.jsonl"))

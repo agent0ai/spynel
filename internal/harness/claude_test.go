@@ -3,6 +3,7 @@ package harness
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -412,25 +413,25 @@ func TestClaudeInterruptsActiveTurn(t *testing.T) {
 func TestClaudeRotatesSessionsWhenRuntimePolicyChanges(t *testing.T) {
 	root := t.TempDir()
 	sessionsPath := filepath.Join(root, "sessions.json")
-	if err := os.WriteFile(sessionsPath, []byte("{\"chat\":\"legacy-session\"}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	workspaceConfig := HarnessConfig{
 		Command: "claude", Cwd: root, ApprovalPolicy: "never", Sandbox: "workspace-write", SessionsFile: sessionsPath,
+	}
+	policy := claudeSessionPolicy(workspaceConfig)
+	data, err := json.Marshal(map[string]claudeSession{"chat": {ID: "configured-session", Policy: policy}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sessionsPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	claude, err := NewClaude(workspaceConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claude.ThreadID("chat") != "legacy-session" {
-		t.Fatalf("legacy session was not readable: %q", claude.ThreadID("chat"))
+	if claude.ThreadID("chat") != "configured-session" {
+		t.Fatalf("configured session was not loaded: %q", claude.ThreadID("chat"))
 	}
 	claude.mu.Lock()
-	if resumed := claude.resumeSessionLocked("chat", workspaceConfig); resumed != "" {
-		claude.mu.Unlock()
-		t.Fatalf("legacy session with unknown permissions was resumed: %q", resumed)
-	}
-	claude.sessions["chat"] = claudeSession{ID: "configured-session", Policy: claudeSessionPolicy(workspaceConfig)}
 	if resumed := claude.resumeSessionLocked("chat", workspaceConfig); resumed != "configured-session" {
 		claude.mu.Unlock()
 		t.Fatalf("matching configured session = %q", resumed)

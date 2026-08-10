@@ -25,11 +25,17 @@ type notificationActionHarness struct {
 const notificationTestTransition = "implementation:1"
 
 func TestNotificationTransitionIDUsesClaimPhaseAndAttempt(t *testing.T) {
-	first := notificationTransitionID(Lease{Route: "tasks", Phase: phaseTaskImplementation, ClaimAttempt: 1})
-	second := notificationTransitionID(Lease{Route: "tasks", Phase: phaseTaskImplementation, ClaimAttempt: 2})
-	review := notificationTransitionID(Lease{Route: "tasks", Phase: phaseTaskReview, ClaimAttempt: 1})
+	first, firstErr := notificationTransitionID(Lease{Route: "tasks", Phase: phaseTaskImplementation, ClaimAttempt: 1})
+	second, secondErr := notificationTransitionID(Lease{Route: "tasks", Phase: phaseTaskImplementation, ClaimAttempt: 2})
+	review, reviewErr := notificationTransitionID(Lease{Route: "tasks", Phase: phaseTaskReview, ClaimAttempt: 1})
+	if firstErr != nil || secondErr != nil || reviewErr != nil {
+		t.Fatalf("transition identity errors: %v %v %v", firstErr, secondErr, reviewErr)
+	}
 	if first == second || first == review || second == review {
 		t.Fatalf("transition identities are not phase/attempt scoped: %q %q %q", first, second, review)
+	}
+	if _, err := notificationTransitionID(Lease{Route: "tasks", Phase: phaseTaskImplementation}); err == nil {
+		t.Fatal("missing claim attempt produced a notification transition identity")
 	}
 }
 
@@ -90,7 +96,7 @@ func TestNotificationAgentPromptSuppliesFixedSafeCLIActionWithoutJSON(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Mode: decide", "<untrusted_task_evidence_json>", "Report published.", "notify", "--origin", `'tui/local'`, "--event-key", "--stdin", "--decline", "Do not return JSON"} {
+	for _, want := range []string{"Mode: decide", "<untrusted_task_evidence_json>", "Report published.", "notify", "--origin", `'tui/local'`, "--event-key", "--stdin", "--decline", "non-PTY", "terminal protocol replies", "Do not return JSON"} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt omitted %q:\n%s", want, prompt)
 		}
@@ -106,11 +112,11 @@ func TestNotificationAgentPromptSuppliesFixedSafeCLIActionWithoutJSON(t *testing
 	}
 }
 
-func TestLegacyNotificationPromptWithoutActionReceivesPreparedCommands(t *testing.T) {
+func TestCustomNotificationPromptWithoutActionsReceivesRequiredCommands(t *testing.T) {
 	for _, mode := range []string{config.TaskNotificationsDecide, config.TaskNotificationsAlways} {
 		t.Run(mode, func(t *testing.T) {
 			manager, path, _ := notificationTestManager(t, mode, &notificationActionHarness{})
-			if err := os.WriteFile(manager.Config.StatePath("prompts", "notification.md"), []byte("Legacy custom notification prompt.\n{{PROGRESS}}\nEdit {{TASK_FILE}} after sending.\n"), 0o600); err != nil {
+			if err := os.WriteFile(manager.Config.StatePath("prompts", "notification.md"), []byte("Custom notification prompt.\n{{PROGRESS}}\nEdit {{TASK_FILE}} after sending.\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			document, err := ReadDocument(path)
@@ -123,19 +129,22 @@ func TestLegacyNotificationPromptWithoutActionReceivesPreparedCommands(t *testin
 				t.Fatal(err)
 			}
 			if !strings.Contains(prompt, "--stdin") || !strings.Contains(prompt, "--event-key") {
-				t.Fatalf("legacy %s prompt omitted prepared send action:\n%s", mode, prompt)
+				t.Fatalf("custom %s prompt omitted prepared send action:\n%s", mode, prompt)
+			}
+			if !strings.Contains(prompt, "non-PTY") || !strings.Contains(prompt, "terminal protocol replies") {
+				t.Fatalf("custom %s prompt omitted safe stdin contract:\n%s", mode, prompt)
 			}
 			if mode == config.TaskNotificationsDecide && !strings.Contains(prompt, "--decline") {
-				t.Fatalf("legacy decide prompt omitted prepared decline action:\n%s", prompt)
+				t.Fatalf("custom decide prompt omitted prepared decline action:\n%s", prompt)
 			}
 			if mode == config.TaskNotificationsDecide && !strings.Contains(prompt, "sending is optional") {
-				t.Fatalf("legacy decide prompt omitted optional-send contract:\n%s", prompt)
+				t.Fatalf("custom decide prompt omitted optional-send contract:\n%s", prompt)
 			}
 			if mode == config.TaskNotificationsAlways && !strings.Contains(prompt, "you must send") {
-				t.Fatalf("legacy always prompt omitted mandatory-send instruction:\n%s", prompt)
+				t.Fatalf("custom always prompt omitted mandatory-send instruction:\n%s", prompt)
 			}
 			if !strings.Contains(prompt, "atomically journals") || strings.Contains(prompt, path) {
-				t.Fatalf("legacy %s prompt omitted successful-send journal action:\n%s", mode, prompt)
+				t.Fatalf("custom %s prompt omitted successful-send journal action:\n%s", mode, prompt)
 			}
 		})
 	}
@@ -351,7 +360,9 @@ func TestDisabledOrUnselectedNotificationCreatesNoAgentState(t *testing.T) {
 	if _, err := os.Stat(manager.notificationAgentDirectory()); !os.IsNotExist(err) {
 		t.Fatalf("off mode created agent state: %v", err)
 	}
-	manager.Config.Orchestrator.TaskNotifications = config.TaskNotificationsDecide
+	cfg := manager.runtimeSnapshot()
+	cfg.Orchestrator.TaskNotifications = config.TaskNotificationsDecide
+	manager.ApplyRuntimeConfig(cfg)
 	policy.Outcomes = map[string]bool{"failed": true}
 	if err := manager.scheduleTaskNotification("task-1", "done", notificationTestTransition, path, policy); err != nil {
 		t.Fatal(err)
@@ -371,7 +382,9 @@ func TestPendingNotificationDoesNotStartWhenCurrentGlobalModeIsOff(t *testing.T)
 	if err := manager.scheduleTaskNotification("task-1", "done", notificationTestTransition, path, policy); err != nil {
 		t.Fatal(err)
 	}
-	manager.Config.Orchestrator.TaskNotifications = config.TaskNotificationsOff
+	cfg := manager.runtimeSnapshot()
+	cfg.Orchestrator.TaskNotifications = config.TaskNotificationsOff
+	manager.ApplyRuntimeConfig(cfg)
 	if err := manager.startPendingNotificationAgents(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -386,6 +399,28 @@ func TestPendingNotificationDoesNotStartWhenCurrentGlobalModeIsOff(t *testing.T)
 	var event notificationAgentEvent
 	if json.Unmarshal(data, &event) != nil || event.State != "pending" {
 		t.Fatalf("off mode did not preserve dormant pending event: %#v", event)
+	}
+}
+
+func TestPendingNotificationUsesNewestAcceptedLiveMode(t *testing.T) {
+	var prompt string
+	target := &notificationActionHarness{action: func(value string) error {
+		prompt = value
+		return nil
+	}}
+	manager, path, policy := notificationTestManager(t, config.TaskNotificationsDecide, target)
+	if err := manager.scheduleTaskNotification("task-1", "done", notificationTestTransition, path, policy); err != nil {
+		t.Fatal(err)
+	}
+	cfg := manager.runtimeSnapshot()
+	cfg.Orchestrator.TaskNotifications = config.TaskNotificationsAlways
+	manager.ApplyRuntimeConfig(cfg)
+	if err := manager.startPendingNotificationAgents(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	if !strings.Contains(prompt, "Mode: always") || strings.Contains(prompt, "--decline") {
+		t.Fatalf("pending notification used stale mode:\n%s", prompt)
 	}
 }
 
@@ -459,9 +494,34 @@ func TestTerminalTransitionReturnsNotificationPersistenceFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	route := manager.Config.Orchestrator.Routes[0]
-	err := manager.completeTransition(context.Background(), route, Lease{ID: "task-1"}, "done", path)
+	err := manager.completeTransition(context.Background(), route, Lease{ID: "task-1", Phase: phaseTaskImplementation, ClaimAttempt: 1}, "done", path)
 	if err == nil || !strings.Contains(err.Error(), "persist task notification event") {
 		t.Fatalf("terminal transition error = %v", err)
+	}
+}
+
+func TestPendingNotificationKeepsAdmittedTaskRouteAfterLiveReplacement(t *testing.T) {
+	manager, path, policy := notificationTestManager(t, config.TaskNotificationsAlways, &notificationActionHarness{})
+	admittedRoute := manager.runtimeSnapshot().Orchestrator.Routes[0]
+	if err := manager.scheduleTaskNotificationForRoute("task-1", "done", notificationTestTransition, path, admittedRoute, policy); err != nil {
+		t.Fatal(err)
+	}
+	next := manager.runtimeSnapshot()
+	next.Orchestrator.Routes = cloneRoutes(next.Orchestrator.Routes)
+	next.Orchestrator.Routes[0].Source = ".spynel/replaced-notification-tasks/todo"
+	next.Orchestrator.Routes[0].AllowedNext = []string{"todo", "working"}
+	manager.ApplyRuntimeConfig(next)
+	eventID := notificationAgentID("task-1", "done", notificationTestTransition)
+	event, err := readNotificationAgentEvent(filepath.Join(manager.notificationAgentDirectory(), eventID+".json"), eventID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, document, err := manager.resolveNotificationTask(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != path || documentID(document) != "task-1" {
+		t.Fatalf("resolved pending notification = %q, %#v", resolved, document.FrontMatter)
 	}
 }
 

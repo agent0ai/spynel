@@ -1,23 +1,47 @@
 package config
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
 
-func TestHeartbeatSettingsAreLiveWhileOtherOrchestratorControlsRequireRestart(t *testing.T) {
+func TestOnlyExtensionSettingsRequireRestart(t *testing.T) {
 	cfg := Default()
-	for _, key := range []string{"orchestrator.enabled", "orchestrator.semantic_heartbeat_minutes"} {
+	for _, key := range []string{"orchestrator.enabled", "orchestrator.interval_seconds", "orchestrator.semantic_heartbeat_minutes", "orchestrator.task_notifications", "orchestrator.max_parallel"} {
 		setting, ok := SettingByKey(cfg, key)
 		if !ok || setting.Restart {
 			t.Fatalf("live setting %q = %#v, present %t", key, setting, ok)
 		}
 	}
-	for _, key := range []string{"orchestrator.interval_seconds", "orchestrator.max_parallel"} {
+	for _, key := range []string{"extensions.enabled", "extensions.directory", "extensions.hook_timeout"} {
 		setting, ok := SettingByKey(cfg, key)
 		if !ok || !setting.Restart {
 			t.Fatalf("restart-bound setting %q = %#v, present %t", key, setting, ok)
 		}
+	}
+	if _, ok := SettingByKey(cfg, "channels.tui.enabled"); ok {
+		t.Fatal("retired TUI launch preference remains exposed")
+	}
+}
+
+func TestStructuredRoutesRoundTripThroughSharedSetting(t *testing.T) {
+	cfg := Default()
+	routes := append([]Route(nil), cfg.Orchestrator.Routes...)
+	routes[0].Source = ".spynel/custom-tasks/todo"
+	data, err := json.Marshal(routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetSetting(&cfg, "orchestrator.routes", string(data)); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Orchestrator.Routes[0].Source != routes[0].Source {
+		t.Fatalf("live routes = %#v", cfg.Orchestrator.Routes)
+	}
+	setting, ok := SettingByKey(cfg, "orchestrator.routes")
+	if !ok || setting.Restart || !strings.Contains(setting.Value, "custom-tasks") {
+		t.Fatalf("route setting = %#v, present %t", setting, ok)
 	}
 }
 
@@ -28,8 +52,8 @@ func TestSetSettingParsesSharedCommandValues(t *testing.T) {
 		value string
 	}{
 		{"workspace.history_max_messages", "24"},
-		{"harness.name", "claude"},
-		{"harness.sandbox", "unrestricted"},
+		{"harness.name", "claude-code"},
+		{"harness.sandbox", "danger-full-access"},
 		{"channels.tui.theme", "catppuccin-latte"},
 		{"channels.telegram.allowed_users", "@one, 42"},
 		{"channels.whatsapp.mode", "dedicated"},
@@ -167,6 +191,18 @@ func TestMainSettingsExposeOnlySimpleHarnessChoicesAndPutAdvancedLast(t *testing
 			t.Fatalf("harness setting %q = %#v, %t", key, setting, ok)
 		}
 	}
+	prefixDescriptions := map[string]string{
+		"harness.chat_agent_prefix":      "communication-agent messages",
+		"harness.developer_agent_prefix": "implementation and planning agent messages",
+		"harness.reviewer_agent_prefix":  "task and goal reviewer messages",
+		"harness.heartbeat_agent_prefix": "semantic-heartbeat audit agent messages",
+	}
+	for key, role := range prefixDescriptions {
+		setting, ok := SettingByKey(cfg, key)
+		if !ok || setting.Value != "" || !strings.Contains(setting.Description, "Optionally prefix "+role) || !strings.Contains(setting.Description, "like `/goal`") {
+			t.Fatalf("agent-prefix setting %q = %#v, %t", key, setting, ok)
+		}
+	}
 	for _, key := range []string{"harness.acp_command", "harness.acp_args"} {
 		setting, ok := SettingByKey(cfg, key)
 		if !ok || setting.Section != "harness" || !setting.Advanced {
@@ -190,7 +226,7 @@ func TestSetHarnessAgentPolicySettings(t *testing.T) {
 		"harness.developer_agent_prefix": "/dev",
 		"harness.reviewer_agent_prefix":  "/review",
 		"harness.heartbeat_agent_prefix": "/audit",
-		"harness.reviews":                "Skip trivial",
+		"harness.reviews":                "skip-trivial",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -206,9 +242,9 @@ func TestSetHarnessAgentPolicySettings(t *testing.T) {
 func TestCustomACPSettingsParseArgumentsAtomically(t *testing.T) {
 	cfg := Default()
 	changed, err := SetSettings(&cfg, map[string]string{
-		"harness.name":        "custom-acp",
+		"harness.name":        "acp",
 		"harness.acp_command": "fixture-agent",
-		"harness.acp_args":    `["--stdio","value with spaces"]`,
+		"harness.acp_args":    `--stdio "value with spaces"`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -217,8 +253,11 @@ func TestCustomACPSettingsParseArgumentsAtomically(t *testing.T) {
 		t.Fatalf("custom ACP settings = %#v, changes %#v", cfg.Harness, changed)
 	}
 	previous := cfg
-	if _, err := SetSetting(&cfg, "harness.acp_args", `["unterminated"`); err == nil {
-		t.Fatal("invalid ACP argument JSON was accepted")
+	if _, err := SetSetting(&cfg, "harness.acp_args", `"unterminated`); err == nil {
+		t.Fatal("invalid ACP argument text was accepted")
+	}
+	if _, err := SetSetting(&cfg, "harness.acp_args", "--stdio\n--unsafe"); err == nil {
+		t.Fatal("multiline ACP argument text was accepted")
 	}
 	if cfg.Harness.ACPArgs[1] != previous.Harness.ACPArgs[1] {
 		t.Fatal("failed ACP argument update mutated configuration")

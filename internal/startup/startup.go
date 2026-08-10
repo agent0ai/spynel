@@ -118,10 +118,7 @@ func (m *Manager) Sync(cfg config.Config, enabled bool) error {
 }
 
 func workspaceID(cfg config.Config) string {
-	// Preserve the identifier used by pre-migration default workspaces so an
-	// existing service is replaced or removed instead of being orphaned when
-	// its command moves from root spynel.yaml to .spynel/config.yaml.
-	identityPath := filepath.Join(cfg.Root, config.LegacyFileName)
+	identityPath := config.PathForRoot(cfg.Root)
 	hash := sha256.Sum256([]byte(filepath.Clean(identityPath)))
 	return hex.EncodeToString(hash[:4])
 }

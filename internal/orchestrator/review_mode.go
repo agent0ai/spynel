@@ -7,7 +7,7 @@ import (
 )
 
 // TaskReviewModeInstruction is injected outside user-overridable templates so
-// the deterministic framework policy remains visible even in legacy or custom
+// the deterministic framework policy remains visible even in custom
 // prompts. The setting governs task review only; goal outcome review remains
 // mandatory because it decides whether a long-running goal met its success bar.
 func TaskReviewModeInstruction(mode string) string {

@@ -40,10 +40,11 @@ type Supervisor struct {
 	log      io.Writer
 	logEvent func(level, component, event, message string)
 
-	mu         sync.Mutex
-	running    map[string]*runningChannel
-	generation uint64
-	wait       sync.WaitGroup
+	mu          sync.Mutex
+	reconcileMu sync.Mutex
+	running     map[string]*runningChannel
+	generation  uint64
+	wait        sync.WaitGroup
 }
 
 // SetEventLogger installs the structured lifecycle boundary used by the
@@ -84,6 +85,12 @@ func (s *Supervisor) Run(ctx context.Context) error {
 }
 
 func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
+	return s.reconcileConfig(ctx, cfg)
+}
+
+func (s *Supervisor) reconcileConfig(ctx context.Context, cfg config.Config) error {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
 	var problems []error
 	for _, managed := range s.managed {
 		if managed.Name == "" || managed.Enabled == nil || managed.Fingerprint == nil || managed.Build == nil {
@@ -109,6 +116,44 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 			s.mu.Unlock()
 			continue
 		}
+		// Build and validate the replacement before revoking the current
+		// generation. A rejected save therefore cannot strand a live channel.
+		s.mu.Unlock()
+		instance, err := managed.Build(cfg)
+		if err != nil {
+			if current == nil {
+				_, cancel := context.WithCancel(ctx)
+				s.mu.Lock()
+				s.running[managed.Name] = &runningChannel{cancel: cancel, fingerprint: fingerprint}
+				s.mu.Unlock()
+				s.publish(ConnectionStatus{Name: managed.Name, State: ConnectionError, Detail: err.Error()})
+			}
+			problems = append(problems, fmt.Errorf("%s: %w", managed.Name, err))
+			s.event("error", managed.Name, "build_failed", "Channel construction failed: "+err.Error())
+			continue
+		}
+		if authorizer, ok := instance.(RuntimeAuthorizer); ok {
+			if err := authorizer.ValidateRuntimeAuthorization(); err != nil {
+				revokeRuntimeAuthorization(instance)
+				if current == nil {
+					_, cancel := context.WithCancel(ctx)
+					s.mu.Lock()
+					s.running[managed.Name] = &runningChannel{cancel: cancel, fingerprint: fingerprint}
+					s.mu.Unlock()
+					s.publish(ConnectionStatus{Name: managed.Name, State: ConnectionError, Detail: err.Error()})
+				}
+				problems = append(problems, fmt.Errorf("%s: %w", managed.Name, err))
+				s.event("error", managed.Name, "authorization_failed", "Channel runtime authorization failed: "+err.Error())
+				continue
+			}
+		}
+		s.mu.Lock()
+		current = s.running[managed.Name]
+		if current != nil && current.fingerprint == fingerprint {
+			s.mu.Unlock()
+			revokeRuntimeAuthorization(instance)
+			continue
+		}
 		if current != nil {
 			delete(s.running, managed.Name)
 			revokeRuntimeAuthorization(current.instance)
@@ -128,15 +173,6 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 		s.running[managed.Name] = running
 		s.mu.Unlock()
 
-		instance, err := managed.Build(cfg)
-		if err != nil {
-			s.removeIfCurrent(managed.Name, running)
-			cancel()
-			s.publish(ConnectionStatus{Name: managed.Name, State: ConnectionError, Detail: err.Error()})
-			problems = append(problems, fmt.Errorf("%s: %w", managed.Name, err))
-			s.event("error", managed.Name, "build_failed", "Channel construction failed: "+err.Error())
-			continue
-		}
 		if reporter, ok := instance.(ConnectionReporter); ok {
 			reporter.SetStatusReporter(func(status ConnectionStatus) {
 				accepted, lifecycleChanged := s.acceptStatus(managed.Name, running, status)
@@ -151,15 +187,6 @@ func (s *Supervisor) reconcile(ctx context.Context, cfg config.Config) error {
 		}
 		if logger, ok := instance.(LogWriterSetter); ok {
 			logger.SetLogWriter(s.log)
-		}
-		if authorizer, ok := instance.(RuntimeAuthorizer); ok {
-			if err := authorizer.ValidateRuntimeAuthorization(); err != nil {
-				cancel()
-				s.publish(ConnectionStatus{Name: managed.Name, State: ConnectionError, Detail: err.Error()})
-				problems = append(problems, fmt.Errorf("%s: %w", managed.Name, err))
-				s.event("error", managed.Name, "authorization_failed", "Channel runtime authorization failed: "+err.Error())
-				continue
-			}
 		}
 		s.mu.Lock()
 		if s.running[managed.Name] == running {

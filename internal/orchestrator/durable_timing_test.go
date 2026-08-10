@@ -86,13 +86,13 @@ func TestClaimAndProviderTurnsPreserveDurableTiming(t *testing.T) {
 	}
 }
 
-func TestLegacyAndCorruptDurableTimingMigratesOnlyOnRealWork(t *testing.T) {
+func TestMissingAndCorruptDurableTimingInitializesOnlyOnRealWork(t *testing.T) {
 	now := time.Date(2026, 8, 8, 11, 0, 0, 0, time.UTC)
 	for _, test := range []struct {
 		name  string
 		front map[string]any
 	}{
-		{name: "legacy", front: map[string]any{"created_at": "2020-01-01T00:00:00Z"}},
+		{name: "unassigned", front: map[string]any{"created_at": "2026-08-08T00:00:00Z"}},
 		{name: "corrupt", front: map[string]any{"first_assigned_at": "not-a-time", "provider_iterations": -7}},
 		{name: "future", front: map[string]any{"first_assigned_at": now.Add(time.Hour).Format(time.RFC3339)}},
 	} {
@@ -105,14 +105,14 @@ func TestLegacyAndCorruptDurableTimingMigratesOnlyOnRealWork(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if test.name == "legacy" {
+			if test.name == "unassigned" {
 				if _, exists := before.FrontMatter["first_assigned_at"]; exists {
-					t.Fatal("reading legacy document falsely initialized first assignment")
+					t.Fatal("reading unassigned document falsely initialized first assignment")
 				}
 			}
 			first, iterations, err := ReserveProviderTurn(path, now)
 			if err != nil || !first.Equal(now) || iterations != 1 {
-				t.Fatalf("migration = %v, %d, %v", first, iterations, err)
+				t.Fatalf("initialization = %v, %d, %v", first, iterations, err)
 			}
 		})
 	}

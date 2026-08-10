@@ -92,6 +92,22 @@ func TestHookCanRewritePayload(t *testing.T) {
 	}
 }
 
+func TestDiscoveryRejectsUnsupportedHooks(t *testing.T) {
+	root := t.TempDir()
+	extension := filepath.Join(root, "stale")
+	if err := os.MkdirAll(extension, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "name: stale\nhooks:\n  update.before: [\"./hook.sh\"]\n"
+	if err := os.WriteFile(filepath.Join(extension, ManifestName), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := (Runner{Directory: root}).Run(context.Background(), "message.received", nil)
+	if err == nil || !strings.Contains(err.Error(), `unsupported hook "update.before"`) {
+		t.Fatalf("unsupported hook error = %v", err)
+	}
+}
+
 func TestTrackedHookSkipsOnlyHooksWithDurableCompletionReceipts(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fixture")
@@ -170,31 +186,5 @@ func TestTrackedHookRetriesWhenCompletionReceiptCannotPersist(t *testing.T) {
 	}
 	if strings.Count(string(data), "stable-completion") != 2 {
 		t.Fatalf("retried event payloads = %q", data)
-	}
-}
-
-func TestHarnessHookFallsBackToLegacyRecipientManifestKey(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell fixture")
-	}
-	root := t.TempDir()
-	extension := filepath.Join(root, "legacy")
-	if err := os.MkdirAll(extension, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	manifest := "name: legacy\nhooks:\n  recipient.before: [\"./hook.sh\"]\n"
-	script := "#!/bin/sh\nread input\nprintf '%s\\n' '{\"payload\":{\"prompt\":\"legacy hook ran\"}}'\n"
-	if err := os.WriteFile(filepath.Join(extension, ManifestName), []byte(manifest), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(extension, "hook.sh"), []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	result, err := (Runner{Directory: root, Timeout: time.Second}).Run(context.Background(), "harness.before", map[string]any{"prompt": "original"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Payload["prompt"] != "legacy hook ran" {
-		t.Fatalf("legacy hook payload = %#v", result.Payload)
 	}
 }

@@ -4,8 +4,6 @@ package memoization
 
 import (
 	"container/list"
-	"crypto/sha256"
-	"fmt"
 	"sync"
 )
 
@@ -106,20 +104,4 @@ func (m *MemoCache[H, T]) Set(h H, value T) {
 	element := m.evictionList.PushFront(newEntry)
 	m.cache[hashedKey] = element
 	m.hashableItems[hashedKey] = value // if you're keeping track of original items
-}
-
-// HString is a type that implements the Hasher interface for strings.
-type HString string
-
-// Hash is a method that returns the hash of the string.
-func (h HString) Hash() string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(h)))
-}
-
-// HInt is a type that implements the Hasher interface for integers.
-type HInt int
-
-// Hash is a method that returns the hash of the integer.
-func (h HInt) Hash() string {
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%d", h))))
 }

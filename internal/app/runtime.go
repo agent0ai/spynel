@@ -601,15 +601,8 @@ func (r *Runtime) Logs() []LogEntry {
 	return logs
 }
 
-// ClearLogs removes completed and partially captured runtime output and
-// publishes the new count to status consumers.
-func (r *Runtime) ClearLogs() int {
-	count, _ := r.ClearLogsResult()
-	return count
-}
-
-// ClearLogsResult exposes retention failures to user-facing commands while
-// preserving the compatibility helper used by in-memory callers.
+// ClearLogsResult removes completed and partially captured runtime output,
+// publishes the new count to status consumers, and reports retention failures.
 func (r *Runtime) ClearLogsResult() (int, error) {
 	r.writerMu.Lock()
 	defer r.writerMu.Unlock()
@@ -785,7 +778,7 @@ func formatLogEntry(entry LogEntry) []string {
 	textLines := strings.Split(sanitizeLogText(entry.Text), "\n")
 	metadata := strings.Trim(strings.Join([]string{entry.Level, entry.Component, entry.Event, entry.Instance}, "/"), "/")
 	if metadata == "" {
-		metadata = "legacy"
+		metadata = "runtime"
 	}
 	lines := []string{fmt.Sprintf("- `%s` `%s` %s", entry.At.UTC().Format(time.RFC3339), metadata, textLines[0])}
 	for _, line := range textLines[1:] {
@@ -832,8 +825,8 @@ func sanitizeLogText(text string) string {
 	return clean.String()
 }
 
-// decodeLogRunes preserves valid UTF-8 while recovering legacy single-byte
-// C1 controls so the terminal parser can remove them instead of rendering a
+// decodeLogRunes preserves valid UTF-8 while recovering raw single-byte C1
+// controls so the terminal parser can remove them instead of rendering a
 // replacement rune followed by the command parameters.
 func decodeLogRunes(text string) []rune {
 	runes := make([]rune, 0, utf8.RuneCountInString(text))

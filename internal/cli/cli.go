@@ -48,10 +48,12 @@ const (
 func Run(args []string, version string) (runErr error) {
 	defer func() {
 		if value := recover(); value != nil {
-			if cfg, err := config.Load(configPathArgument(args)); err == nil {
-				runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d", os.Getpid()))
-				runtimeState.LogEvent("fatal", "process", "top_level_panic", fmt.Sprintf("panic: %v\n%s", value, debug.Stack()))
-				runtimeState.Close()
+			if path, ok := failureConfigPath(args); ok {
+				if cfg, err := config.Load(path); err == nil {
+					runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d", os.Getpid()))
+					runtimeState.LogEvent("fatal", "process", "top_level_panic", fmt.Sprintf("panic: %v\n%s", value, debug.Stack()))
+					runtimeState.Close()
+				}
 			}
 			panic(value)
 		}
@@ -66,13 +68,33 @@ func Run(args []string, version string) (runErr error) {
 }
 
 func recordCommandFailure(args []string, runErr error) {
-	cfg, err := config.Load(configPathArgument(args))
+	path, ok := failureConfigPath(args)
+	if !ok {
+		return
+	}
+	cfg, err := config.Load(path)
 	if err != nil {
 		return
 	}
 	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d-error", os.Getpid()))
 	runtimeState.LogEvent("error", "process", "command_failed", fmt.Sprintf("Spynel command failed (%T)", runErr))
 	runtimeState.Close()
+}
+
+func failureConfigPath(args []string) (string, bool) {
+	path := configPathArgument(args)
+	if len(args) != 0 || path != "" {
+		return path, true
+	}
+	launchRoot, err := canonicalLaunchDirectory()
+	if err != nil {
+		return "", false
+	}
+	path = config.PathForRoot(launchRoot)
+	if _, err := os.Stat(path); err != nil {
+		return "", false
+	}
+	return path, true
 }
 
 func configPathArgument(args []string) string {
@@ -88,8 +110,8 @@ func configPathArgument(args []string) string {
 }
 
 func run(args []string, version string) error {
-	if len(args) == 0 {
-		return runServer("", true, version, nil)
+	if bareInteractiveRequested(args) {
+		return runBareInteractive(version)
 	}
 	switch args[0] {
 	case "help", "--help", "-h":
@@ -140,9 +162,9 @@ func run(args []string, version string) error {
 			return errors.New("run currently requires --once; use 'spynel serve' for the continuous loop")
 		}
 		return runOnce(*configPath, version)
-	case "message", "send":
+	case "send":
 		return runSendCommand(args[0], args[1:], version, false)
-	case "followup", "follow-up":
+	case "followup":
 		return runSendCommand("followup", args[1:], version, true)
 	case "notify":
 		return runNotifyCommand(args[1:], version)
@@ -213,6 +235,127 @@ func run(args []string, version string) error {
 		return runFrameworkCLICommand("whatsapp", args[1:], version)
 	default:
 		return fmt.Errorf("unknown command %q; run 'spynel help'", args[0])
+	}
+}
+
+func bareInteractiveRequested(args []string) bool {
+	return len(args) == 0
+}
+
+func canonicalLaunchDirectory() (string, error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return canonicalDirectory(root)
+}
+
+func canonicalDirectory(root string) (string, error) {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(root)
+}
+
+type bareWorkspaceDiscovery struct {
+	localConfig      string
+	discoveredConfig string
+	parentRoot       string
+	ancestorFound    bool
+}
+
+func discoverBareWorkspace(launchRoot string) (bareWorkspaceDiscovery, error) {
+	result := bareWorkspaceDiscovery{localConfig: config.PathForRoot(launchRoot)}
+	if _, err := os.Stat(result.localConfig); err == nil {
+		result.discoveredConfig = result.localConfig
+		return result, nil
+	} else if !os.IsNotExist(err) {
+		return bareWorkspaceDiscovery{}, err
+	}
+	discovered, err := config.Find(launchRoot)
+	if errors.Is(err, config.ErrNotInitialized) {
+		return result, nil
+	}
+	if err != nil {
+		return bareWorkspaceDiscovery{}, err
+	}
+	result.discoveredConfig = discovered
+	result.parentRoot = filepath.Dir(filepath.Dir(discovered))
+	result.ancestorFound = filepath.Clean(result.parentRoot) != filepath.Clean(launchRoot)
+	return result, nil
+}
+
+func runBareInteractive(version string) error {
+	return runBareInteractiveWithRuntime(version, defaultBareInteractiveRuntime())
+}
+
+type bareInteractiveRuntime struct {
+	canonicalLaunchDirectory func() (string, error)
+	discoverWorkspace        func(string) (bareWorkspaceDiscovery, error)
+	runInitialization        func(context.Context, string, func() error) (bool, error)
+	runParentChoice          func(context.Context, string, string, func() error) (tui.WorkspaceChoice, error)
+	initializeWorkspace      func(string, bool) error
+	changeDirectory          func(string) error
+	startServer              func(string, bool, string, []string) error
+}
+
+func defaultBareInteractiveRuntime() bareInteractiveRuntime {
+	return bareInteractiveRuntime{
+		canonicalLaunchDirectory: canonicalLaunchDirectory,
+		discoverWorkspace:        discoverBareWorkspace,
+		runInitialization:        tui.RunInitialization,
+		runParentChoice:          tui.RunParentWorkspaceChoice,
+		initializeWorkspace:      workspace.Init,
+		changeDirectory:          os.Chdir,
+		startServer:              runServer,
+	}
+}
+
+func runBareInteractiveWithRuntime(version string, runtime bareInteractiveRuntime) error {
+	launchRoot, err := runtime.canonicalLaunchDirectory()
+	if err != nil {
+		return err
+	}
+	discovery, err := runtime.discoverWorkspace(launchRoot)
+	if err != nil {
+		return err
+	}
+	if discovery.discoveredConfig == "" {
+		initialized, setupErr := runtime.runInitialization(context.Background(), launchRoot, func() error {
+			return runtime.initializeWorkspace(launchRoot, false)
+		})
+		if setupErr != nil || !initialized {
+			return setupErr
+		}
+		if err := runtime.changeDirectory(launchRoot); err != nil {
+			return fmt.Errorf("enter initialized workspace: %w", err)
+		}
+		return runtime.startServer(discovery.localConfig, true, version, nil)
+	}
+	if !discovery.ancestorFound {
+		return runtime.startServer(discovery.localConfig, true, version, nil)
+	}
+
+	choice, choiceErr := runtime.runParentChoice(context.Background(), launchRoot, discovery.parentRoot, func() error {
+		return runtime.initializeWorkspace(launchRoot, false)
+	})
+	if choiceErr != nil {
+		return choiceErr
+	}
+	switch choice {
+	case tui.WorkspaceChoiceUseParent:
+		if err := runtime.changeDirectory(discovery.parentRoot); err != nil {
+			return fmt.Errorf("enter parent workspace: %w", err)
+		}
+		return runtime.startServer(discovery.discoveredConfig, true, version, nil)
+	case tui.WorkspaceChoiceInitializeHere:
+		if err := runtime.changeDirectory(launchRoot); err != nil {
+			return fmt.Errorf("enter initialized workspace: %w", err)
+		}
+		return runtime.startServer(discovery.localConfig, true, version, nil)
+	default:
+		return nil
 	}
 }
 
@@ -315,19 +458,6 @@ func completeRun(err error, restart func([]string) error) error {
 func runServer(configPath string, withTUI bool, version string, restartArgs []string) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		if withTUI && configPath == "" && errors.Is(err, config.ErrNotInitialized) {
-			root, cwdErr := os.Getwd()
-			if cwdErr != nil {
-				return cwdErr
-			}
-			initialized, setupErr := tui.RunInitialization(context.Background(), root, func() error {
-				return workspace.Init(root, false)
-			})
-			if setupErr != nil || !initialized {
-				return setupErr
-			}
-			return runServer(config.PathForRoot(root), true, version, restartArgs)
-		}
 		return err
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -340,7 +470,9 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 	if lease, leaseErr := election.Current(); leaseErr == nil {
 		hadHealthyPrimary = !election.IsStale(lease)
 	}
-	launchTUI := withTUI || (cfg.Channels.TUI.Enabled && len(os.Args) == 1)
+	// Invocation decides presentation deterministically: the bare command and
+	// init continuation pass withTUI=true; `serve` is headless unless --tui.
+	launchTUI := withTUI
 	var restartScheduled atomic.Bool
 	var restarting atomic.Bool
 	var updateScheduled atomic.Bool
@@ -480,6 +612,8 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 			InitialConnections: shared.Connections,
 			RuntimeEvents:      stateEvents.runtime,
 			InitialRuntime:     shared.Runtime,
+			DurableWorkEvents:  stateEvents.durableWork,
+			InitialDurableWork: shared.DurableWork,
 			SaveSettings: func(values map[string]string) error {
 				return client.ApplySettings(ctx, values)
 			},
@@ -546,10 +680,6 @@ func runOnce(configPath, version string) error {
 		return err
 	}
 	return service.Orchestrator.WaitForIdle(ctx)
-}
-
-func runMessage(configPath, conversation, text, version string) error {
-	return runMessageMode(configPath, conversation, text, version, messageRunOptions{Output: os.Stdout})
 }
 
 func runMessageMode(configPath, conversation, text, version string, options messageRunOptions) error {
@@ -762,12 +892,7 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 		Version: version, Stderr: runtimeState.Writer("harness"),
 	})
 	service := app.NewWithRuntime(cfg, target, runtimeState)
-	service.Updates = updater.Detect(version, cfg.StatePath("runtime", "application-version.json"))
-	if err := service.Updates.Migrate(context.Background(), cfg, cfg.Extensions.Enabled, service.Hooks); err != nil {
-		service.Runtime.LogEvent("error", "startup", "migration_failed", "Application migration failed")
-		_ = service.Close()
-		return nil, fmt.Errorf("migrate Spynel workspace from application update: %w", err)
-	}
+	service.Updates = updater.Detect(version)
 	startup, err := startupmanager.New("")
 	if err != nil {
 		service.Runtime.LogEvent("error", "startup", "manager_failed", "Startup manager initialization failed")
@@ -785,7 +910,7 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 	if cacheErr != nil && initial.Speech.Enabled && strings.TrimSpace(initial.Speech.ModelDir) == "" {
 		return nil, cacheErr
 	}
-	speech := media.NewParakeet(service.Settings, cacheRoot, initial.StatePath("models", "parakeet"), cacheErr, service.Runtime.Writer("media"))
+	speech := media.NewParakeet(service.Settings, cacheRoot, cacheErr, service.Runtime.Writer("media"))
 	managed := []channel.Managed{
 		{
 			Name:    "telegram",
@@ -800,7 +925,6 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 			},
 			Build: func(cfg config.Config) (channel.Channel, error) {
 				bot := telegram.NewWithIdentityStore(cfg.Channels.Telegram, cfg.TelegramToken(), cfg.StatePath("runtime", "telegram-identities.json"))
-				bot.SetAllowedUsersSource(func() []string { return service.Settings.Snapshot().Channels.Telegram.AllowedUsers })
 				bot.SetNoticeReporter(service.SetNotice)
 				store := &media.Store{Directory: cfg.StatePath("attachments", "telegram"), MaxBytes: int64(cfg.Workspace.AttachmentMaxMB) * 1024 * 1024}
 				var transcriber media.Transcriber
@@ -823,7 +947,6 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 			},
 			Build: func(cfg config.Config) (channel.Channel, error) {
 				client := whatsapp.New(cfg.Channels.WhatsApp, cfg.Resolve(cfg.Channels.WhatsApp.Database))
-				client.SetAllowedNumbersSource(func() []string { return service.Settings.Snapshot().Channels.WhatsApp.AllowedNumbers })
 				client.SetPairingReporter(service.SetPairing)
 				store := &media.Store{Directory: cfg.StatePath("attachments", "whatsapp"), MaxBytes: int64(cfg.Workspace.AttachmentMaxMB) * 1024 * 1024}
 				var transcriber media.Transcriber
@@ -980,8 +1103,7 @@ Usage:
   spynel serve [--tui]           Run Telegram, WhatsApp, and the loop as a server
   spynel init [--dir DIR]        Initialize and continue into the TUI
     --no-start                   Initialize only (for scripts and automation)
-  spynel send [flags] TEXT       Send or stream a message (message is an alias)
-  spynel message [flags] TEXT    Backward-compatible alias for send
+  spynel send [flags] TEXT       Send or stream a message
     --config PATH                Load an explicit workspace configuration
     --conversation NAME          Reuse a durable CLI conversation (default local)
     --stream                     Print response deltas as they arrive

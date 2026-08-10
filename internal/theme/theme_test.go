@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestDefaultIsComplete(t *testing.T) {
@@ -258,6 +260,33 @@ func TestLoadDirFallsBackWhenEmpty(t *testing.T) {
 	values, err := LoadDir(t.TempDir())
 	if err != nil || len(values) != len(Builtins()) {
 		t.Fatalf("themes = %#v, err = %v", values, err)
+	}
+}
+
+func TestInstallBuiltinsUsesEmbeddedAssetsWithoutReplacingFiles(t *testing.T) {
+	directory := t.TempDir()
+	custom := []byte("user-owned palette\n")
+	if err := os.WriteFile(filepath.Join(directory, "spynel.yaml"), custom, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := InstallBuiltins(directory); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(directory, "spynel.yaml")); err != nil || string(got) != string(custom) {
+		t.Fatalf("existing palette = %q, %v", got, err)
+	}
+	for index, name := range StockNames()[1:] {
+		data, err := os.ReadFile(filepath.Join(directory, name+".yaml"))
+		if err != nil {
+			t.Fatalf("read installed theme %q: %v", name, err)
+		}
+		var installed Theme
+		if err := yaml.Unmarshal(data, &installed); err != nil {
+			t.Fatalf("parse installed theme %q: %v", name, err)
+		}
+		if installed != Builtins()[index+1] {
+			t.Fatalf("installed theme %q differs from runtime built-in", name)
+		}
 	}
 }
 

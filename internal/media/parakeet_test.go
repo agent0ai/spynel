@@ -83,46 +83,7 @@ func TestSpeechCacheDirReportsResolutionAndCreationFailures(t *testing.T) {
 	}
 }
 
-func TestParakeetAdoptsLegacyModelConcurrentlyWithoutRemovingSource(t *testing.T) {
-	root := t.TempDir()
-	spec := defaultParakeetModels()[parakeetEnglishModel]
-	spec = testParakeetSpec(spec.ID)
-	legacyRoot := filepath.Join(root, "workspace", ".spynel", "models", "parakeet")
-	source := testParakeetModel(t, filepath.Join(legacyRoot, spec.ID))
-	cache := filepath.Join(root, "cache")
-	workers := []*Parakeet{
-		NewParakeet(config.NewStore(config.Default()), cache, legacyRoot, nil, nil),
-		NewParakeet(config.NewStore(config.Default()), cache, legacyRoot, nil, nil),
-	}
-	for _, worker := range workers {
-		worker.models[parakeetEnglishModel] = spec
-	}
-	var group sync.WaitGroup
-	errorsChannel := make(chan error, len(workers))
-	for _, worker := range workers {
-		group.Add(1)
-		go func(worker *Parakeet) {
-			defer group.Done()
-			_, err := worker.model(context.Background(), config.Default().Speech)
-			errorsChannel <- err
-		}(worker)
-	}
-	group.Wait()
-	close(errorsChannel)
-	for err := range errorsChannel {
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := inspectParakeetModel(source); err != nil {
-		t.Fatalf("legacy model source changed: %v", err)
-	}
-	if _, err := inspectManagedParakeetModel(filepath.Join(cache, spec.ID), spec); err != nil {
-		t.Fatalf("shared model invalid: %v", err)
-	}
-}
-
-func TestManagedParakeetModelRejectsCorruptionAndUnpinnedLegacy(t *testing.T) {
+func TestManagedParakeetModelRejectsCorruptionAndDownloadsReplacement(t *testing.T) {
 	root := t.TempDir()
 	spec := testParakeetSpec("fixture")
 	cache := filepath.Join(root, "cache")
@@ -141,7 +102,7 @@ func TestManagedParakeetModelRejectsCorruptionAndUnpinnedLegacy(t *testing.T) {
 		t.Fatalf("corrupt managed fixture error = %v", err)
 	}
 	if _, err := verifyParakeetAssets(directory, spec.Files); err == nil {
-		t.Fatal("corrupt legacy fixture was accepted")
+		t.Fatal("corrupt model fixture was accepted")
 	}
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
@@ -149,7 +110,7 @@ func TestManagedParakeetModelRejectsCorruptionAndUnpinnedLegacy(t *testing.T) {
 		http.Error(writer, "offline", http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
-	worker := NewParakeet(config.NewStore(config.Default()), cache, filepath.Join(root, "missing-legacy"), nil, nil)
+	worker := NewParakeet(config.NewStore(config.Default()), cache, nil, nil)
 	worker.models[parakeetEnglishModel] = spec
 	worker.modelBaseURL = server.URL + "/"
 	if _, err := worker.model(context.Background(), config.Default().Speech); err == nil || !strings.Contains(err.Error(), "HTTP 503") {
@@ -161,34 +122,11 @@ func TestManagedParakeetModelRejectsCorruptionAndUnpinnedLegacy(t *testing.T) {
 	if _, err := os.Stat(directory); !os.IsNotExist(err) {
 		t.Fatalf("corrupt managed model survived repair: %v", err)
 	}
-
-	legacyRoot := filepath.Join(root, "legacy")
-	legacy := testParakeetModel(t, filepath.Join(legacyRoot, spec.ID))
-	if err := os.WriteFile(filepath.Join(legacy, "joiner.int8.onnx"), []byte(strings.Repeat("z", len("joiner.int8.onnx"))), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	worker = NewParakeet(config.NewStore(config.Default()), cache, legacyRoot, nil, nil)
-	worker.models[parakeetEnglishModel] = spec
-	worker.modelBaseURL = server.URL + "/"
-	if _, err := worker.model(context.Background(), config.Default().Speech); err == nil || !strings.Contains(err.Error(), "HTTP 503") {
-		t.Fatalf("corrupt legacy fallback error = %v", err)
-	}
-	if requests.Load() != 2 {
-		t.Fatalf("corrupt legacy fallback downloads = %d", requests.Load())
-	}
-	if _, err := os.Stat(legacy); err != nil {
-		t.Fatalf("corrupt legacy source was removed: %v", err)
-	}
 }
 
-func TestParakeetIgnoresLegacyPartialAndRepairsIncompleteManagedModel(t *testing.T) {
+func TestParakeetRepairsIncompleteManagedModel(t *testing.T) {
 	root := t.TempDir()
 	spec := defaultParakeetModels()[parakeetEnglishModel]
-	legacy := filepath.Join(root, "legacy")
-	partial := filepath.Join(legacy, "."+spec.ID+"-interrupted.partial")
-	if err := os.MkdirAll(partial, 0o700); err != nil {
-		t.Fatal(err)
-	}
 	cache := filepath.Join(root, "cache")
 	if err := os.MkdirAll(filepath.Join(cache, spec.ID), 0o700); err != nil {
 		t.Fatal(err)
@@ -202,7 +140,7 @@ func TestParakeetIgnoresLegacyPartialAndRepairsIncompleteManagedModel(t *testing
 		http.Error(writer, "offline", http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
-	worker := NewParakeet(config.NewStore(config.Default()), cache, legacy, nil, nil)
+	worker := NewParakeet(config.NewStore(config.Default()), cache, nil, nil)
 	worker.modelBaseURL = server.URL + "/"
 	_, err := worker.model(context.Background(), config.Default().Speech)
 	if err == nil || !strings.Contains(err.Error(), "HTTP 503") {
@@ -210,9 +148,6 @@ func TestParakeetIgnoresLegacyPartialAndRepairsIncompleteManagedModel(t *testing
 	}
 	if requests.Load() != 1 {
 		t.Fatalf("download requests = %d", requests.Load())
-	}
-	if _, err := os.Stat(partial); err != nil {
-		t.Fatalf("legacy partial was modified: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(cache, spec.ID)); !os.IsNotExist(err) {
 		t.Fatalf("incomplete managed model survived: %v", err)
@@ -225,7 +160,7 @@ func TestParakeetExplicitModelBypassesUnavailableCache(t *testing.T) {
 	cfg := config.Default()
 	cfg.Root = root
 	cfg.Speech.ModelDir = explicit
-	worker := NewParakeet(config.NewStore(cfg), "", filepath.Join(root, "legacy"), errors.New("cache unavailable"), nil)
+	worker := NewParakeet(config.NewStore(cfg), "", errors.New("cache unavailable"), nil)
 	files, err := worker.model(context.Background(), cfg.Speech)
 	if err != nil {
 		t.Fatal(err)
@@ -249,7 +184,7 @@ func TestParakeetChunksAndSerializesTranscription(t *testing.T) {
 	cfg.Speech.MaxDurationSec = 2
 	store := config.NewStore(cfg)
 	recognizer := &recordingRecognizer{delay: 20 * time.Millisecond}
-	worker := NewParakeet(store, filepath.Join(root, "managed"), filepath.Join(root, "legacy"), nil, nil)
+	worker := NewParakeet(store, filepath.Join(root, "managed"), nil, nil)
 	worker.openAudio = func(string) (audioDecoder, error) {
 		return &sliceDecoder{samples: make([]float32, parakeetSampleRate+8000)}, nil
 	}
@@ -302,7 +237,7 @@ func TestParakeetUsesMiniaudioForWAV(t *testing.T) {
 	cfg := config.Default()
 	cfg.Root = root
 	cfg.Speech.ModelDir = modelDir
-	worker := NewParakeet(config.NewStore(cfg), filepath.Join(root, "managed"), filepath.Join(root, "legacy"), nil, nil)
+	worker := NewParakeet(config.NewStore(cfg), filepath.Join(root, "managed"), nil, nil)
 	worker.newRecognizer = func(parakeetFiles, int) (speechRecognizer, error) {
 		return &fixedRecognizer{text: "decoded locally"}, nil
 	}
@@ -330,7 +265,7 @@ func TestParakeetDecodesTelegramStyleOggOpus(t *testing.T) {
 	cfg.Root = root
 	cfg.Speech.ModelDir = modelDir
 	recognizer := &sampleRecognizer{}
-	worker := NewParakeet(config.NewStore(cfg), filepath.Join(root, "managed"), filepath.Join(root, "legacy"), nil, nil)
+	worker := NewParakeet(config.NewStore(cfg), filepath.Join(root, "managed"), nil, nil)
 	worker.newRecognizer = func(parakeetFiles, int) (speechRecognizer, error) {
 		return recognizer, nil
 	}
@@ -406,7 +341,7 @@ func TestOggOpusParsesSignedGainAndBoundsGranuleConversion(t *testing.T) {
 }
 
 func TestRecognizerReplacementKeepsWorkingRecognizerOnLoadFailure(t *testing.T) {
-	worker := NewParakeet(config.NewStore(config.Default()), t.TempDir(), t.TempDir(), nil, nil)
+	worker := NewParakeet(config.NewStore(config.Default()), t.TempDir(), nil, nil)
 	previous := &trackingRecognizer{}
 	worker.cached = previous
 	worker.cachedModel = "old"
@@ -428,7 +363,7 @@ func TestParakeetRejectsUnsupportedAudioBeforeModelDownload(t *testing.T) {
 	if err := os.WriteFile(audio, []byte("not an AAC decoder fixture"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	worker := NewParakeet(config.NewStore(config.Default()), filepath.Join(root, "models"), filepath.Join(root, "legacy"), nil, nil)
+	worker := NewParakeet(config.NewStore(config.Default()), filepath.Join(root, "models"), nil, nil)
 	_, err := worker.Transcribe(context.Background(), audio)
 	if err == nil || !strings.Contains(err.Error(), "supported formats: WAV, FLAC, MP3, Ogg/Opus") {
 		t.Fatalf("unsupported format error = %v", err)
@@ -452,7 +387,7 @@ func TestParakeetDownloadsVerifiedPartialArchive(t *testing.T) {
 	}))
 	defer server.Close()
 	root := t.TempDir()
-	worker := NewParakeet(config.NewStore(config.Default()), root, filepath.Join(root, "legacy"), nil, nil)
+	worker := NewParakeet(config.NewStore(config.Default()), root, nil, nil)
 	worker.modelBaseURL = server.URL + "/"
 	spec := parakeetModel{ID: "fixture", Archive: "model.tar.bz2", SHA256: hex.EncodeToString(hash[:]), ArchiveBytes: int64(len(payload))}
 	archive, cleanup, err := worker.downloadModel(context.Background(), spec)
@@ -481,7 +416,7 @@ func TestParakeetRejectsModelChecksumMismatch(t *testing.T) {
 	}))
 	defer server.Close()
 	root := t.TempDir()
-	worker := NewParakeet(config.NewStore(config.Default()), root, filepath.Join(root, "legacy"), nil, nil)
+	worker := NewParakeet(config.NewStore(config.Default()), root, nil, nil)
 	worker.modelBaseURL = server.URL + "/"
 	_, cleanup, err := worker.downloadModel(context.Background(), parakeetModel{
 		ID: "fixture", Archive: "model.tar.bz2", SHA256: strings.Repeat("0", 64), ArchiveBytes: 7,
@@ -528,7 +463,7 @@ func TestParakeetRealIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	worker := NewParakeet(config.NewStore(cfg), cacheRoot, filepath.Join(cfg.Root, "models"), nil, os.Stderr)
+	worker := NewParakeet(config.NewStore(cfg), cacheRoot, nil, os.Stderr)
 	text, err := worker.Transcribe(context.Background(), audio)
 	if err != nil {
 		t.Fatal(err)

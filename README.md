@@ -94,7 +94,7 @@ npm install -g spynel
 spynel
 ```
 
-Run `spynel` from the directory you want to initialize as a Spynel workspace. This can be your existing work folder.
+Run `spynel` from the directory you want to initialize as a Spynel workspace. This can be your existing work folder. If it is an uninitialized child of an existing Spynel workspace, startup asks whether to use the parent (the default), initialize the current folder, or exit before either workspace starts.
 
 ## Documentation
 

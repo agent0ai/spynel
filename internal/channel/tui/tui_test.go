@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,11 +11,13 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent0ai/spynel/internal/channel/tui/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -1714,6 +1717,7 @@ func TestHeaderShowsRuntimeStatusAndFooterOnlyShowsControls(t *testing.T) {
 		{Name: "whatsapp", State: channel.ConnectionError, Detail: "offline"},
 	})
 	m.runtimeStatus = core.RuntimeStatus{Logs: 922, Jobs: 3}
+	m.durableWork = core.DurableWorkCounts{Goals: 0, Tasks: 1}
 
 	view := ansi.Strip(m.View())
 	lines := strings.Split(view, "\n")
@@ -1723,7 +1727,7 @@ func TestHeaderShowsRuntimeStatusAndFooterOnlyShowsControls(t *testing.T) {
 	if !strings.HasPrefix(header, "▀▀○○ Payments") || !strings.HasSuffix(header, "▀▀") || !strings.HasPrefix(footerLine, "▄▄") || !strings.HasSuffix(footerLine, "▄") {
 		t.Fatalf("status ribbons do not surround their items: header=%q footer=%q", header, footerLine)
 	}
-	if !strings.Contains(header, "● TG▀▀▲ WA▀▀3 jobs▀▀922 logs▀▀") {
+	if !strings.Contains(header, "● TG▀▀▲ WA▀▀0 goals▀▀1 task▀▀3 jobs▀▀922 logs▀▀") {
 		t.Fatalf("status header is incomplete: %q", header)
 	}
 	if strings.Contains(header, "Ready") || strings.Contains(header, "local") {
@@ -1762,11 +1766,23 @@ func TestHeaderKeepsLogoAndTitleAccent(t *testing.T) {
 
 func TestRuntimeEventUpdatesHeaderCounts(t *testing.T) {
 	m := testModel()
-	m.width = 80
+	m.width = 100
+	m.durableWork = core.DurableWorkCounts{Goals: 2, Tasks: 1}
 	next, _ := m.Update(runtimeEvent{status: core.RuntimeStatus{Logs: 12, Jobs: 4}})
 	got := next.(model)
-	if view := got.View(); !strings.Contains(view, "12 logs") || !strings.Contains(view, "4 jobs") || strings.Contains(view, "Log (") || strings.Contains(view, "/jobs") {
+	if view := got.View(); !strings.Contains(view, "2 goals▀▀1 task▀▀4 jobs▀▀12 logs") || strings.Contains(view, "Log (") || strings.Contains(view, "/jobs") {
 		t.Fatalf("runtime status counts are missing or misplaced: %q", view)
+	}
+}
+
+func TestDurableWorkEventUpdatesHeaderCounts(t *testing.T) {
+	m := testModel()
+	m.width = 100
+	m.runtimeStatus = core.RuntimeStatus{Logs: 239, Jobs: 2}
+	next, _ := m.Update(durableWorkEvent{counts: core.DurableWorkCounts{Goals: 0, Tasks: 1}})
+	got := next.(model)
+	if view := ansi.Strip(got.View()); !strings.Contains(view, "0 goals▀▀1 task▀▀2 jobs▀▀239 logs") {
+		t.Fatalf("durable work counts are missing or misplaced: %q", view)
 	}
 }
 
@@ -1786,17 +1802,17 @@ func TestCommandFooterReplacesOrdinaryComposerHints(t *testing.T) {
 
 func TestJobsStatusIsPlainTextWithoutSpinner(t *testing.T) {
 	m := testModel()
-	if got := runtimeCount(m.runtimeStatus.Jobs, "jobs"); got != "0 jobs" {
+	if got := runtimeCount(m.runtimeStatus.Jobs, "job"); got != "0 jobs" {
 		t.Fatalf("jobs status = %q", got)
 	}
 }
 
-func TestCompactRuntimeCountsAreSharedAcrossLogsAndJobs(t *testing.T) {
+func TestCompactHeaderCountsUseExactGrammar(t *testing.T) {
 	tests := []struct {
 		count int
 		want  string
 	}{
-		{-1, "0"}, {0, "0"}, {999, "999"}, {1000, "1k"},
+		{-1, "0"}, {0, "0"}, {1, "1"}, {2, "2"}, {999, "999"}, {1000, "1k"},
 		{1540, "1.5k"}, {999499, "999k"}, {999500, "1m"},
 		{14700000, "15m"}, {999500000, "1b"},
 		{int(^uint(0) >> 1), "9.2e"},
@@ -1805,8 +1821,15 @@ func TestCompactRuntimeCountsAreSharedAcrossLogsAndJobs(t *testing.T) {
 		if got := core.CompactCount(test.count); got != test.want {
 			t.Errorf("CompactCount(%d) = %q, want %q", test.count, got, test.want)
 		}
-		if jobs, logs := runtimeCount(test.count, "jobs"), runtimeCount(test.count, "logs"); !strings.HasPrefix(jobs, test.want+" ") || !strings.HasPrefix(logs, test.want+" ") {
-			t.Errorf("shared count mismatch for %d: jobs=%q logs=%q", test.count, jobs, logs)
+		for _, singular := range []string{"goal", "task", "job", "log"} {
+			got := runtimeCount(test.count, singular)
+			wantLabel := singular + "s"
+			if test.count == 1 {
+				wantLabel = singular
+			}
+			if want := test.want + " " + wantLabel; got != want {
+				t.Errorf("runtimeCount(%d, %q) = %q, want %q", test.count, singular, got, want)
+			}
 		}
 	}
 }
@@ -3785,6 +3808,187 @@ func TestRequiredInitializationScreenActionsAndCannotFallIntoChat(t *testing.T) 
 	}
 }
 
+func TestParentWorkspaceScreenDefaultsToParentAndKeepsFailuresInPlace(t *testing.T) {
+	launchRoot := "/workspace/project/child"
+	parentRoot := "/workspace/project"
+	screen := ParentWorkspaceScreen(launchRoot, parentRoot)
+	if len(screen.Controls) != 3 || screen.Controls[0].Key != string(WorkspaceChoiceUseParent) || screen.Controls[1].Key != string(WorkspaceChoiceInitializeHere) || screen.Controls[2].Key != string(WorkspaceChoiceExit) {
+		t.Fatalf("workspace actions = %#v", screen.Controls)
+	}
+	if !strings.Contains(screen.Subtitle, launchRoot) || !strings.Contains(screen.Subtitle, parentRoot) {
+		t.Fatalf("workspace explanation omits a path: %q", screen.Subtitle)
+	}
+
+	called := ""
+	m := newRequiredActionModel(context.Background(), screen, func(_ string, action string) error {
+		called = action
+		return nil
+	})
+	if m.screenIndex != 0 {
+		t.Fatalf("default selection = %d, want parent action", m.screenIndex)
+	}
+	next, command := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(model)
+	next, quit := m.Update(command())
+	m = next.(model)
+	if called != string(WorkspaceChoiceUseParent) || m.screenResult != string(WorkspaceChoiceUseParent) || quit == nil {
+		t.Fatalf("default action = %q result=%q quit=%#v", called, m.screenResult, quit)
+	}
+
+	m = newRequiredActionModel(context.Background(), screen, func(_ string, action string) error {
+		if action == string(WorkspaceChoiceInitializeHere) {
+			return errors.New("filesystem denied initialization")
+		}
+		return nil
+	})
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = next.(model)
+	next, command = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = next.(model)
+	next, quit = m.Update(command())
+	m = next.(model)
+	if quit != nil || m.screen == nil || m.screenResult != "" || !strings.Contains(m.status, "filesystem denied initialization") {
+		t.Fatalf("failed initialization escaped setup: screen=%#v result=%q status=%q quit=%#v", m.screen, m.screenResult, m.status, quit)
+	}
+
+	for _, key := range []tea.KeyMsg{{Type: tea.KeyEsc}, {Type: tea.KeyCtrlC}} {
+		m = newRequiredActionModel(context.Background(), screen, func(_, _ string) error { return nil })
+		next, quit = m.Update(key)
+		m = next.(model)
+		if m.screenResult != string(WorkspaceChoiceExit) || quit == nil {
+			t.Fatalf("safe-exit key %v result=%q quit=%#v", key.Type, m.screenResult, quit)
+		}
+	}
+}
+
+func TestInitializationOptionBlocksHaveOneSemanticSeparatorRow(t *testing.T) {
+	m := newInitializationModel(context.Background(), "/workspace/fresh-project", func() error { return nil })
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 34})
+	m = next.(model)
+	frame := m.View()
+	plainRows := strings.Split(ansi.Strip(frame), "\n")
+
+	initializeRow := -1
+	for index, row := range plainRows {
+		if strings.Contains(row, "Initialize Spynel in /workspace/fresh-project") {
+			initializeRow = index
+			break
+		}
+	}
+	if initializeRow < 0 || initializeRow+3 >= len(plainRows) {
+		t.Fatalf("initialization option block is incomplete: %q", ansi.Strip(frame))
+	}
+	if !strings.Contains(plainRows[initializeRow+1], "Create the private .spynel workspace and its config.yaml") ||
+		strings.TrimSpace(plainRows[initializeRow+2]) != "" ||
+		!strings.Contains(plainRows[initializeRow+3], "Exit") ||
+		initializeRow+4 >= len(plainRows) ||
+		!strings.Contains(plainRows[initializeRow+4], "Leave this directory unchanged") {
+		t.Fatalf("option rows = %#v, want label, description, one blank row, label, description", plainRows[initializeRow:min(len(plainRows), initializeRow+5)])
+	}
+	assertEveryViewportCellBackground(t, frame, 120, 34, m.activeTheme.Colors)
+}
+
+func TestInitializationUsesCanonicalDefaultThemeAndPaintsEveryViewportCell(t *testing.T) {
+	profile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.Ascii)
+	t.Cleanup(func() { lipgloss.SetColorProfile(profile) })
+
+	m := newInitializationModel(context.Background(), "/workspace/fresh-project", func() error { return nil })
+	if got, want := m.activeTheme, theme.Default(); got != want {
+		t.Fatalf("initial theme = %#v, want canonical default %#v", got, want)
+	}
+	if got := lipgloss.ColorProfile(); got != termenv.TrueColor {
+		t.Fatalf("initial color profile = %v, want true color", got)
+	}
+
+	sizes := []struct {
+		name          string
+		width, height int
+	}{
+		{name: "narrow", width: 24, height: 16},
+		{name: "ordinary", width: 120, height: 34},
+		{name: "resized", width: 73, height: 27},
+	}
+	for _, size := range sizes {
+		t.Run(size.name, func(t *testing.T) {
+			next, _ := m.Update(tea.WindowSizeMsg{Width: size.width, Height: size.height})
+			m = next.(model)
+			assertEveryViewportCellBackground(t, m.View(), size.width, size.height, m.activeTheme.Colors)
+		})
+	}
+}
+
+func assertEveryViewportCellBackground(t *testing.T, frame string, width, height int, colors theme.Colors) {
+	t.Helper()
+	wanted := map[string]bool{}
+	for _, color := range []string{colors.Background, colors.Surface, colors.SurfaceElevated, colors.SurfaceSelected} {
+		parsed, err := strconv.ParseUint(strings.TrimPrefix(color, "#"), 16, 24)
+		if err != nil {
+			t.Fatalf("parse semantic background %q: %v", color, err)
+		}
+		wanted[fmt.Sprintf("%d;%d;%d", (parsed>>16)&0xff, (parsed>>8)&0xff, parsed&0xff)] = true
+		rendered := lipgloss.NewStyle().Background(lipgloss.Color(color)).Render(" ")
+		if start := strings.Index(rendered, "48;2;"); start >= 0 {
+			start += len("48;2;")
+			if end := strings.IndexByte(rendered[start:], 'm'); end >= 0 {
+				wanted[rendered[start:start+end]] = true
+			}
+		}
+	}
+	background := ""
+	row, column := 0, 0
+	for index := 0; index < len(frame); {
+		if frame[index] == '\x1b' && index+1 < len(frame) && frame[index+1] == '[' {
+			end := index + 2
+			for end < len(frame) && frame[end] != 'm' {
+				end++
+			}
+			if end >= len(frame) {
+				t.Fatalf("unterminated SGR at byte %d", index)
+			}
+			codes := strings.Split(frame[index+2:end], ";")
+			for codeIndex := 0; codeIndex < len(codes); codeIndex++ {
+				code, parseErr := strconv.Atoi(codes[codeIndex])
+				if parseErr != nil && codes[codeIndex] != "" {
+					t.Fatalf("parse SGR %q: %v", codes[codeIndex], parseErr)
+				}
+				if codes[codeIndex] == "" || code == 0 || code == 49 {
+					background = ""
+				}
+				if code == 48 && codeIndex+4 < len(codes) && codes[codeIndex+1] == "2" {
+					background = strings.Join(codes[codeIndex+2:codeIndex+5], ";")
+					codeIndex += 4
+				}
+			}
+			index = end + 1
+			continue
+		}
+		character := frame[index:]
+		r, runeWidth := utf8.DecodeRuneInString(character)
+		if r == '\n' {
+			if column != width {
+				t.Fatalf("row %d width = %d, want %d", row, column, width)
+			}
+			row++
+			column = 0
+			index += runeWidth
+			continue
+		}
+		cells := lipgloss.Width(string(r))
+		if cells > 0 && !wanted[background] {
+			t.Fatalf("row %d column %d has non-semantic background %q", row, column, background)
+		}
+		column += cells
+		index += runeWidth
+	}
+	if column != width {
+		t.Fatalf("row %d width = %d, want %d", row, column, width)
+	}
+	if got := row + 1; got != height {
+		t.Fatalf("frame height = %d, want %d", got, height)
+	}
+}
+
 func TestSpynelLogoIsBlankBeforeFirstMessageAndUsesRequestedFrames(t *testing.T) {
 	m := testModel()
 	if logo := m.spynelLogo(); logo != "○○" {
@@ -4419,12 +4623,12 @@ func TestPersistedWelcomeLogoUsesThemePrimaryStyle(t *testing.T) {
 	}
 }
 
-func TestPersistedWelcomeReplacesHistoricalLogoBodyWithCanonicalLogo(t *testing.T) {
+func TestPersistedWelcomeTreatsLogoFenceAsSemanticMarker(t *testing.T) {
 	m := testModel()
-	legacy := "```spynel-logo\nOLD WELCOME LOGO\n```\n\nWelcome back."
-	rendered := ansi.Strip(m.renderAgentMarkdown(legacy))
-	if !strings.HasPrefix(rendered, strings.Split(core.SpynelASCII, "\n")[0]) || strings.Contains(rendered, "OLD WELCOME LOGO") || !strings.Contains(rendered, "Welcome back.") {
-		t.Fatalf("historical welcome logo was not canonicalized: %q", rendered)
+	storedMarker := "```spynel-logo\nIGNORED MARKER BODY\n```\n\nWelcome back."
+	rendered := ansi.Strip(m.renderAgentMarkdown(storedMarker))
+	if !strings.HasPrefix(rendered, strings.Split(core.SpynelASCII, "\n")[0]) || strings.Contains(rendered, "IGNORED MARKER BODY") || !strings.Contains(rendered, "Welcome back.") {
+		t.Fatalf("stored welcome marker was not canonicalized: %q", rendered)
 	}
 }
 

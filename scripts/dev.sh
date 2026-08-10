@@ -13,7 +13,7 @@ else
     aarch64|arm64) go_arch=arm64 ;;
     *) echo "unsupported development architecture: $(uname -m)" >&2; exit 1 ;;
   esac
-  toolchain_dir="$project_dir/.spynel-dev/toolchains"
+  toolchain_dir="$project_dir/.tmp-toolchains"
   go_bin="$toolchain_dir/go/bin/go"
   if [ ! -x "$go_bin" ]; then
     mkdir -p "$toolchain_dir"
@@ -28,9 +28,9 @@ if [ "$#" -gt 0 ]; then shift; fi
 
 case "$action" in
   build)
-    mkdir -p "$project_dir/bin"
-    (cd "$project_dir" && CGO_ENABLED=1 "$go_bin" build -o bin/spynel ./cmd/spynel)
-    echo "$project_dir/bin/spynel"
+    mkdir -p "$project_dir/.tmp-bin"
+    (cd "$project_dir" && CGO_ENABLED=1 "$go_bin" build -o .tmp-bin/spynel ./cmd/spynel)
+    echo "$project_dir/.tmp-bin/spynel"
     ;;
   test)
     (cd "$project_dir" && CGO_ENABLED=1 "$go_bin" test ./... && CGO_ENABLED=1 "$go_bin" vet ./...)
@@ -40,7 +40,7 @@ case "$action" in
     ;;
   run)
     "$script_dir/dev.sh" build >/dev/null
-    exec "$project_dir/bin/spynel" "$@"
+    exec "$project_dir/.tmp-bin/spynel" "$@"
     ;;
   *)
     echo "usage: $0 [build|test|dox|run [spynel arguments...]]" >&2

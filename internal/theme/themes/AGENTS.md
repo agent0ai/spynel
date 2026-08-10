@@ -1,8 +1,8 @@
-# Built-In Theme Template DOX
+# Built-In Theme Asset DOX
 
 ## Purpose
 
-- Own validated built-in semantic theme YAML files copied into initialized workspaces.
+- Own validated built-in semantic theme YAML files loaded as runtime fallbacks and copied into initialized workspaces.
 
 ## Local Contracts
 

@@ -85,12 +85,6 @@ type pageWeight struct {
 	runes  int
 }
 
-func Topics() []Topic {
-	out := make([]Topic, len(topics))
-	copy(out, topics)
-	return out
-}
-
 func HelpTopics() []Topic {
 	var out []Topic
 	for _, topic := range topics {

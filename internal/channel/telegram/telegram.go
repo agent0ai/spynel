@@ -179,10 +179,6 @@ func (b *Bot) Run(ctx context.Context, handler channel.Handler) error {
 	return b.runPolling(ctx, handler)
 }
 
-func hasAllowedUser(values []string) bool {
-	return config.HasAllowedTelegramUser(values)
-}
-
 func (b *Bot) cleanupAttachments(ctx context.Context) {
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()

@@ -52,7 +52,7 @@ func TestHarnessTopicDocumentsPiACPAndQueueBatching(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"`pi`", "ACP aliases", "harness.acp_command", "stdio", "not an endpoint URL", "dispatched together", "not an operating-system sandbox"} {
+	for _, want := range []string{"`pi`", "ACP aliases", "harness.acp_command", "stdio", "not an endpoint URL", "every agent prefix defaults empty", "such as `/goal`", "dispatched together", "not an operating-system sandbox"} {
 		if !strings.Contains(output, want) {
 			t.Errorf("harness documentation missing %q:\n%s", want, output)
 		}

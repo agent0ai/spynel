@@ -31,68 +31,6 @@ func TestFindDiscoversCanonicalConfigFromChildDirectory(t *testing.T) {
 	}
 }
 
-func TestLoadMigratesLegacyRootConfig(t *testing.T) {
-	root := t.TempDir()
-	legacyPath := filepath.Join(root, LegacyFileName)
-	data := []byte("version: 1\nworkspace:\n  state_dir: .spynel\n  history_char_limit: 321\n")
-	if err := os.WriteFile(legacyPath, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(legacyPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	canonicalPath := PathForRoot(root)
-	if cfg.Path != canonicalPath || cfg.Root != root || cfg.StatePath() != filepath.Join(root, StateDirectoryName) {
-		t.Fatalf("migrated paths = path %q root %q state %q", cfg.Path, cfg.Root, cfg.StatePath())
-	}
-	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
-		t.Fatalf("legacy config still exists: %v", err)
-	}
-	saved, err := os.ReadFile(canonicalPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(saved), "state_dir") {
-		t.Fatalf("canonical config retained workspace.state_dir:\n%s", saved)
-	}
-	if cfg.Workspace.HistoryCharLimit != 321 {
-		t.Fatalf("migrated workspace values = %#v", cfg.Workspace)
-	}
-}
-
-func TestLoadCanonicalPathMigratesLegacyRootConfig(t *testing.T) {
-	root := t.TempDir()
-	legacyPath := filepath.Join(root, LegacyFileName)
-	if err := os.WriteFile(legacyPath, []byte("version: 1\nworkspace:\n  state_dir: .spynel\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(PathForRoot(root))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Path != PathForRoot(root) || cfg.Root != root {
-		t.Fatalf("migrated config = path %q root %q", cfg.Path, cfg.Root)
-	}
-}
-
-func TestLoadRejectsLegacyCustomStateDirectory(t *testing.T) {
-	root := t.TempDir()
-	legacyPath := filepath.Join(root, LegacyFileName)
-	if err := os.WriteFile(legacyPath, []byte("version: 1\nworkspace:\n  state_dir: private-state\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Load(legacyPath); err == nil || !strings.Contains(err.Error(), "cannot automatically migrate") {
-		t.Fatalf("custom legacy state migration error = %v", err)
-	}
-	if _, err := os.Stat(legacyPath); err != nil {
-		t.Fatalf("rejected migration changed the legacy config: %v", err)
-	}
-	if _, err := os.Stat(PathForRoot(root)); !os.IsNotExist(err) {
-		t.Fatalf("rejected migration created a canonical config: %v", err)
-	}
-}
-
 func writeTestConfig(t *testing.T, root string, data []byte) string {
 	t.Helper()
 	path := PathForRoot(root)
@@ -119,7 +57,7 @@ func TestDefaultIsValidAndRoutesAreExtensible(t *testing.T) {
 	if cfg.Harness.Sandbox != "danger-full-access" {
 		t.Fatalf("default coding harness should be unrestricted, got %q", cfg.Harness.Sandbox)
 	}
-	if cfg.Harness.ChatAgentPrefix != "" || cfg.Harness.DeveloperAgentPrefix != "/goal" || cfg.Harness.ReviewerAgentPrefix != "/goal" || cfg.Harness.HeartbeatAgentPrefix != "/goal" || cfg.Harness.Reviews != TaskReviewsSkipTrivial {
+	if cfg.Harness.ChatAgentPrefix != "" || cfg.Harness.DeveloperAgentPrefix != "" || cfg.Harness.ReviewerAgentPrefix != "" || cfg.Harness.HeartbeatAgentPrefix != "" || cfg.Harness.Reviews != TaskReviewsSkipTrivial {
 		t.Fatalf("unexpected harness agent defaults: %#v", cfg.Harness)
 	}
 	if !cfg.Speech.Enabled || cfg.Speech.Language != "en" || cfg.Speech.NumThreads != 2 {
@@ -179,15 +117,15 @@ func TestHarnessAgentPrefixesAndReviewModeValidation(t *testing.T) {
 	}
 }
 
-func TestMinimalConfigRetainsHarnessAgentDefaults(t *testing.T) {
+func TestMinimalConfigUsesEmptyHarnessAgentPrefixDefaults(t *testing.T) {
 	root := t.TempDir()
 	path := writeTestConfig(t, root, []byte("version: 1\n"))
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Harness.DeveloperAgentPrefix != "/goal" || cfg.Harness.ReviewerAgentPrefix != "/goal" || cfg.Harness.HeartbeatAgentPrefix != "/goal" || cfg.Harness.Reviews != TaskReviewsSkipTrivial {
-		t.Fatalf("legacy defaults were not retained: %#v", cfg.Harness)
+	if cfg.Harness.ChatAgentPrefix != "" || cfg.Harness.DeveloperAgentPrefix != "" || cfg.Harness.ReviewerAgentPrefix != "" || cfg.Harness.HeartbeatAgentPrefix != "" || cfg.Harness.Reviews != TaskReviewsSkipTrivial {
+		t.Fatalf("default harness settings were not retained: %#v", cfg.Harness)
 	}
 }
 
@@ -202,20 +140,6 @@ func TestSemanticHeartbeatValidationSupportsExplicitDisable(t *testing.T) {
 		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "semantic_heartbeat_minutes") {
 			t.Fatalf("invalid semantic heartbeat %d produced %v", invalid, err)
 		}
-	}
-}
-
-func TestLoadUpgradesLegacyGoalRouteToTypedLifecycle(t *testing.T) {
-	root := t.TempDir()
-	data := []byte("version: 1\norchestrator:\n  enabled: true\n  interval_seconds: 10\n  max_parallel: 1\n  routes:\n    - name: goals\n      source: .spynel/goals/active\n      working: .spynel/goals/working\n      prompt: .spynel/prompts/goal.md\n      recovery_prompt: .spynel/prompts/recovery.md\n      stale_after: 2h\n      allowed_next: [active, working, waiting, done]\n")
-	path := writeTestConfig(t, root, data)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	route := cfg.Orchestrator.Routes[0]
-	if filepath.Base(route.Source) != "proposed" || filepath.Base(route.Working) != "planning" || filepath.Base(route.ReviewPrompt) != "goal-review.md" || !strings.Contains(strings.Join(route.AllowedNext, ","), "reviewing") {
-		t.Fatalf("legacy goal route was not upgraded: %#v", route)
 	}
 }
 
@@ -293,7 +217,7 @@ func TestNormalizeWhatsAppNumber(t *testing.T) {
 
 func TestLoadMergesUserValuesWithDefaults(t *testing.T) {
 	root := t.TempDir()
-	data := []byte("version: 1\nworkspace:\n  history_char_limit: 321\nrecipient:\n  name: codex\nchannels:\n  whatsapp:\n    mode: dedicated\n")
+	data := []byte("version: 1\nworkspace:\n  history_char_limit: 321\nharness:\n  name: codex\nchannels:\n  whatsapp:\n    mode: dedicated\n")
 	path := writeTestConfig(t, root, data)
 	cfg, err := Load(path)
 	if err != nil {
@@ -316,29 +240,51 @@ func TestLoadMergesUserValuesWithDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadIgnoresLegacyWhisperFields(t *testing.T) {
+func TestLoadRejectsUnknownConfigurationFields(t *testing.T) {
 	root := t.TempDir()
-	data := []byte("version: 1\nspeech:\n  enabled: true\n  command: whisper-cli\n  ffmpeg_command: ffmpeg\n  model: small\n  model_path: old.bin\n  language: auto\n")
-	path := writeTestConfig(t, root, data)
+	path := writeTestConfig(t, root, []byte("version: 1\nspeech:\n  command: retired-speech-command\n"))
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "field command not found") {
+		t.Fatalf("unknown configuration field error = %v", err)
+	}
+}
+
+func TestLoadSafelyNormalizesRetiredTUILaunchPreference(t *testing.T) {
+	root := t.TempDir()
+	path := writeTestConfig(t, root, []byte("version: 1\nchannels:\n  tui:\n    enabled: false\n    title: Legacy\n"))
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Speech.Language != "auto" || cfg.Speech.NumThreads != 2 || cfg.Speech.ModelDir != "" {
-		t.Fatalf("legacy speech config did not migrate to Parakeet defaults: %#v", cfg.Speech)
+	if cfg.Channels.TUI.Title != "Legacy" {
+		t.Fatalf("TUI title = %q", cfg.Channels.TUI.Title)
 	}
-	if err := Save(cfg); err != nil {
-		t.Fatal(err)
+	changed, err := NormalizeLegacyFile(path)
+	if err != nil || !changed {
+		t.Fatalf("NormalizeLegacyFile() = %t, %v", changed, err)
 	}
-	saved, err := os.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(saved)
-	for _, obsolete := range []string{"command:", "ffmpeg_command:", "model:", "model_path:"} {
-		if strings.Contains(text, obsolete) {
-			t.Fatalf("saved Parakeet config retained %q:\n%s", obsolete, text)
-		}
+	if strings.Contains(string(data), "tui:\n    enabled:") {
+		t.Fatalf("retired TUI launch preference survived canonical save:\n%s", data)
+	}
+}
+
+func TestNormalizeLegacyFileLeavesCurrentSchemaByteExact(t *testing.T) {
+	root := t.TempDir()
+	data := []byte("# keep this comment\nversion: 1\n")
+	path := writeTestConfig(t, root, data)
+	changed, err := NormalizeLegacyFile(path)
+	if err != nil || changed {
+		t.Fatalf("NormalizeLegacyFile() = %t, %v", changed, err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(data) {
+		t.Fatalf("current schema was rewritten:\n%s", after)
 	}
 }
 
@@ -382,40 +328,12 @@ func TestCustomACPRequiresCommandAndPreservesShellFreeArguments(t *testing.T) {
 	}
 }
 
-func TestLoadNormalizesACPAndHarnessAliases(t *testing.T) {
+func TestLoadRejectsUnknownHarnessName(t *testing.T) {
 	root := t.TempDir()
 	data := []byte("version: 1\nharness:\n  name: custom-acp\n  sandbox: danger-full-access\n  acp_command: fixture\n")
 	path := writeTestConfig(t, root, data)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Harness.Name != "acp" {
-		t.Fatalf("custom ACP alias normalized to %q", cfg.Harness.Name)
-	}
-}
-
-func TestLoadMigratesLegacyRecipientSectionAndSaveUsesHarness(t *testing.T) {
-	root := t.TempDir()
-	data := []byte("version: 1\nrecipient:\n  name: claude-code\n  command: /old/manual/path\n  model: sonnet\n")
-	path := writeTestConfig(t, root, data)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Harness.Name != "claude-code" || cfg.Harness.Model != "sonnet" {
-		t.Fatalf("legacy harness values were not migrated: %#v", cfg.Harness)
-	}
-	if err := Save(cfg); err != nil {
-		t.Fatal(err)
-	}
-	saved, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(saved)
-	if !strings.Contains(text, "harness:\n") || strings.Contains(text, "recipient:\n") || strings.Contains(text, "manual/path") {
-		t.Fatalf("saved config did not use the simplified harness contract:\n%s", text)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "harness.name") {
+		t.Fatalf("unknown harness error = %v", err)
 	}
 }
 
@@ -466,21 +384,27 @@ func TestStorePersistsValidatedUpdatesAndPublishesSnapshot(t *testing.T) {
 	}
 }
 
-func TestLegacyNotificationWorkflowConfigurationIsDroppedOnSave(t *testing.T) {
+func TestStoreUpdateSavesAndReloadsSharedSnapshot(t *testing.T) {
 	root := t.TempDir()
-	path := writeTestConfig(t, root, []byte("version: 1\nnotifications:\n  contact_bindings:\n    - principal: owner\n      contacts: [tui/local]\n  quiet_hours:\n    enabled: true\n    start: 22:00\n    end: 07:00\n"))
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := Default()
+	cfg.Path = PathForRoot(root)
+	cfg.Root = root
 	if err := Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(path)
+	store := NewStore(cfg)
+	updated, err := store.Update(func(next *Config) error {
+		next.Channels.Telegram.Name = "reloaded"
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "\nnotifications:") || strings.Contains(string(data), "contact_bindings") || strings.Contains(string(data), "quiet_hours") {
-		t.Fatalf("retired notification workflow configuration survived save:\n%s", data)
+	reloaded, err := Load(cfg.Path)
+	if err != nil || reloaded.Channels.Telegram.Name != "reloaded" {
+		t.Fatalf("saved configuration = %q, %v", reloaded.Channels.Telegram.Name, err)
+	}
+	if updated.Channels.Telegram.Name != "reloaded" || store.Snapshot().Channels.Telegram.Name != "reloaded" {
+		t.Fatalf("shared snapshot was not refreshed: update=%q snapshot=%q", updated.Channels.Telegram.Name, store.Snapshot().Channels.Telegram.Name)
 	}
 }

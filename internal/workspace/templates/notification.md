@@ -22,7 +22,7 @@ In `decide` mode, a deliberate no-send must be recorded by invoking this separat
 {{DECLINE_COMMAND}}
 ```
 
-`MESSAGE_TEXT` is supplied on standard input. Invoke the command directly with your tool's stdin facility; do not interpolate the message into shell syntax, alter the origin, event key, outcome, or config path, and do not add credentials.
+`MESSAGE_TEXT` is supplied on standard input. Invoke the command directly with your tool's non-PTY stdin facility when available; do not interpolate the message into shell syntax, alter the origin, event key, outcome, or config path, and do not add credentials. The CLI independently removes terminal protocol replies and control sequences before accepting the message.
 
 In `decide` mode, sending is optional. Send only when a concise user-facing notification is useful; otherwise invoke the prepared decline command. Provider silence alone is not a decision and remains retryable. In `always` mode, you must send unless the command reports a real safety or authorization failure. Lead with the practical outcome in natural language. Keep the message concise and omit filesystem paths, task IDs, transcripts, secrets, and orchestration details.
 

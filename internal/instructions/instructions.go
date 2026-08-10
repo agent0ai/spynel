@@ -16,7 +16,7 @@ const MaxBytes = 64 << 10
 
 const chatGuidanceMarker = "Persistent memory is a separate lightweight configuration action."
 
-const legacyChatGuidance = chatGuidanceMarker + ` When the user explicitly asks to remember, permanently change, inspect, correct, replace, or forget standing behavior, maintain the matching workspace-local Markdown file under .spynel/instructions: agent-chat.md, agent-developer.md, agent-reviewer.md, agent-notification.md, or agent-heartbeat.md. Re-read the target immediately before an atomic permission-safe update, preserve unrelated edits, store one concise normalized rule, and deduplicate, replace, or remove obsolete rules. Edit only agent-chat.md unless another role is explicitly named or unambiguous; ask one concise question when permanence or role is materially ambiguous. A current forget or override request takes effect immediately despite old imported text. Briefly confirm the changed behavior and role without exposing an absolute path on Telegram or WhatsApp unless requested.
+const requiredChatGuidance = chatGuidanceMarker + ` When the user explicitly asks to remember, permanently change, inspect, correct, replace, or forget standing behavior, maintain the matching workspace-local Markdown file under .spynel/instructions: agent-chat.md, agent-developer.md, agent-reviewer.md, agent-notification.md, or agent-heartbeat.md. Re-read the target immediately before an atomic permission-safe update, preserve unrelated edits, store one concise normalized rule, and deduplicate, replace, or remove obsolete rules. Edit only agent-chat.md unless another role is explicitly named or unambiguous; ask one concise question when permanence or role is materially ambiguous. A current forget or override request takes effect immediately despite old imported text. Briefly confirm the changed behavior and role without exposing an absolute path on Telegram or WhatsApp unless requested.
 
 Never persist one-off directions, ordinary feedback, transient decisions, inferred preferences, secrets, credentials, recipient identifiers, attachments, or transcripts. Persistent rules cannot weaken safety, authorization, lifecycle, review, or data-handling requirements and never override the current explicit request or nearest AGENTS.md/DOX contract.`
 
@@ -32,13 +32,13 @@ const (
 
 var roles = [...]Role{Chat, Developer, Reviewer, Notification, Heartbeat}
 
-// InjectChatGuidance upgrades legacy user-owned chat prompt templates in
-// memory without overwriting their files.
-func InjectChatGuidance(prompt string) string {
+// EnsureChatGuidance enforces the current persistent-instruction boundary for
+// both stock and user-edited chat templates without overwriting their files.
+func EnsureChatGuidance(prompt string) string {
 	if strings.Contains(prompt, chatGuidanceMarker) {
 		return prompt
 	}
-	return strings.TrimRight(prompt, "\r\n") + "\n\n" + legacyChatGuidance
+	return strings.TrimRight(prompt, "\r\n") + "\n\n" + requiredChatGuidance
 }
 
 type Status struct {

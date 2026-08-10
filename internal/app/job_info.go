@@ -114,11 +114,6 @@ func (s *Service) formatJobInfo(job Job, lease orchestrator.Lease, hasLease bool
 		lines = append(lines, "- Execution: `"+safeJobText(thread, maxJobMetadataRunes)+"`")
 	}
 	leaseState, leasePhase, leaseHeartbeat := job.LeaseState, job.LeasePhase, job.LeaseHeartbeatAt
-	if leaseState == "" && leasePhase == "" && leaseHeartbeat.IsZero() && hasLease {
-		// Compatibility fallback for callers that construct a Job without the
-		// runtime's canonical lease snapshot. Never combine fields from the two.
-		leaseState, leasePhase, leaseHeartbeat = lease.State, lease.Phase, lease.HeartbeatAt
-	}
 	if leasePhase != "" {
 		lines = append(lines, "- Phase: "+safeJobText(leasePhase, maxJobMetadataRunes))
 	}

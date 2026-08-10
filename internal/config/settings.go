@@ -34,21 +34,21 @@ func Settings(cfg Config) []Setting {
 		{Key: "workspace.history_max_messages", Section: "config", Description: "Maximum recent messages passed to the harness (0 disables history)", Value: strconv.Itoa(cfg.Workspace.HistoryMaxMessages)},
 		{Key: "workspace.history_char_limit", Section: "config", Description: "Maximum total history characters passed to the harness", Value: strconv.Itoa(cfg.Workspace.HistoryCharLimit)},
 		{Key: "startup.enabled", Section: "config", Description: "Run Spynel automatically for this workspace", Value: formatBool(cfg.Startup.Enabled), Choices: []string{"on", "off"}},
-		{Key: "harness.chat_agent_prefix", Section: "harness", Description: "Optional harness-native command prepended to every communication-agent message", Value: cfg.Harness.ChatAgentPrefix, Advanced: true},
-		{Key: "harness.developer_agent_prefix", Section: "harness", Description: "Harness-native command prepended to implementation and planning agent messages", Value: cfg.Harness.DeveloperAgentPrefix, Advanced: true},
-		{Key: "harness.reviewer_agent_prefix", Section: "harness", Description: "Harness-native command prepended to task and goal reviewer messages", Value: cfg.Harness.ReviewerAgentPrefix, Advanced: true},
-		{Key: "harness.heartbeat_agent_prefix", Section: "harness", Description: "Harness-native command prepended to semantic heartbeat audit messages", Value: cfg.Harness.HeartbeatAgentPrefix, Advanced: true},
+		{Key: "harness.chat_agent_prefix", Section: "harness", Description: "Optionally prefix communication-agent messages with harness-native commands like `/goal`", Value: cfg.Harness.ChatAgentPrefix, Advanced: true},
+		{Key: "harness.developer_agent_prefix", Section: "harness", Description: "Optionally prefix implementation and planning agent messages with harness-native commands like `/goal`", Value: cfg.Harness.DeveloperAgentPrefix, Advanced: true},
+		{Key: "harness.reviewer_agent_prefix", Section: "harness", Description: "Optionally prefix task and goal reviewer messages with harness-native commands like `/goal`", Value: cfg.Harness.ReviewerAgentPrefix, Advanced: true},
+		{Key: "harness.heartbeat_agent_prefix", Section: "harness", Description: "Optionally prefix semantic-heartbeat audit agent messages with harness-native commands like `/goal`", Value: cfg.Harness.HeartbeatAgentPrefix, Advanced: true},
 		{Key: "harness.acp_command", Section: "harness", Description: "Executable name or absolute path for the custom ACP stdio agent", Value: cfg.Harness.ACPCommand, Advanced: true},
-		{Key: "harness.acp_args", Section: "harness", Description: "JSON array of arguments for the custom ACP command", Value: cfg.ACPArgsJSON(), Advanced: true},
+		{Key: "harness.acp_args", Section: "harness", Description: "Command-line arguments for custom ACP (quotes and escapes group values; no shell expansion)", Value: cfg.ACPArgsText(), Advanced: true},
 		{Key: "workspace.attachment_max_mb", Section: "config", Description: "Maximum downloaded attachment size", Value: strconv.Itoa(cfg.Workspace.AttachmentMaxMB), Advanced: true},
-		{Key: "channels.tui.enabled", Section: "config", Description: "Launch the TUI by default on the next start", Value: formatBool(cfg.Channels.TUI.Enabled), Choices: []string{"on", "off"}, Restart: true, Advanced: true},
 		{Key: "channels.tui.title", Section: "config", Description: "Default TUI title", Value: cfg.Channels.TUI.Title, Advanced: true},
 		{Key: "channels.tui.theme", Section: "config", Description: "Active color theme from .spynel/themes", Value: cfg.Channels.TUI.Theme, Advanced: true},
 		{Key: "orchestrator.enabled", Section: "config", Description: "Run Markdown task and goal routes", Value: formatBool(cfg.Orchestrator.Enabled), Choices: []string{"on", "off"}, Advanced: true},
-		{Key: "orchestrator.interval_seconds", Section: "config", Description: "Route scan interval after restart", Value: strconv.Itoa(cfg.Orchestrator.IntervalSec), Restart: true, Advanced: true},
+		{Key: "orchestrator.interval_seconds", Section: "config", Description: "Live route scan interval; saving resets the next scan deadline", Value: strconv.Itoa(cfg.Orchestrator.IntervalSec), Advanced: true},
 		{Key: "orchestrator.semantic_heartbeat_minutes", Section: "config", Description: "Fixed delay after each agent workflow audit completes; 0 disables it", Value: strconv.Itoa(cfg.Orchestrator.SemanticHeartbeatMinutes), Advanced: true},
-		{Key: "orchestrator.task_notifications", Section: "config", Description: "Automatic task notification agents after restart: off, agent-decided, or always send", Value: cfg.Orchestrator.TaskNotifications, Choices: []string{TaskNotificationsOff, TaskNotificationsDecide, TaskNotificationsAlways}, Restart: true, Advanced: true},
-		{Key: "orchestrator.max_parallel", Section: "config", Description: "Maximum concurrent Markdown jobs after restart", Value: strconv.Itoa(cfg.Orchestrator.MaxParallel), Restart: true, Advanced: true},
+		{Key: "orchestrator.task_notifications", Section: "config", Description: "Live automatic task notification policy: off, agent-decided, or always send", Value: cfg.Orchestrator.TaskNotifications, Choices: []string{TaskNotificationsOff, TaskNotificationsDecide, TaskNotificationsAlways}, Advanced: true},
+		{Key: "orchestrator.max_parallel", Section: "config", Description: "Live maximum concurrent Markdown jobs; lowering never cancels active work", Value: strconv.Itoa(cfg.Orchestrator.MaxParallel), Advanced: true},
+		{Key: "orchestrator.routes", Section: "config", Description: "JSON array of live Markdown route definitions", Value: routesJSON(cfg.Orchestrator.Routes), Advanced: true},
 		{Key: "extensions.enabled", Section: "config", Description: "Run trusted extension hooks after restart", Value: formatBool(cfg.Extensions.Enabled), Choices: []string{"on", "off"}, Restart: true, Advanced: true},
 		{Key: "extensions.directory", Section: "config", Description: "Installed extension directory after restart", Value: cfg.Extensions.Directory, Restart: true, Advanced: true},
 		{Key: "extensions.hook_timeout", Section: "config", Description: "Per-hook timeout after restart", Value: cfg.Extensions.HookTimeout, Restart: true, Advanced: true},
@@ -138,6 +138,7 @@ func SetSettings(cfg *Config, values map[string]string) ([]Setting, error) {
 
 func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocyclo
 	key = normalizeSettingKey(key)
+	rawValue := value
 	value = strings.TrimSpace(value)
 	parseInteger := func(minimum int) (int, error) {
 		number, err := strconv.Atoi(value)
@@ -174,18 +175,11 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 	case "harness.acp_command":
 		cfg.Harness.ACPCommand = value
 	case "harness.acp_args":
-		var arguments []string
-		if err = json.Unmarshal([]byte(value), &arguments); err == nil {
-			cfg.Harness.ACPArgs = arguments
-		} else {
-			err = fmt.Errorf("harness.acp_args must be a JSON string array: %w", err)
-		}
+		cfg.Harness.ACPArgs, err = ParseCommandLineArguments(rawValue)
 	case "channels.tui.title":
 		cfg.Channels.TUI.Title = value
 	case "channels.tui.theme":
 		cfg.Channels.TUI.Theme = value
-	case "channels.tui.enabled":
-		cfg.Channels.TUI.Enabled, err = parseBoolean()
 	case "orchestrator.enabled":
 		cfg.Orchestrator.Enabled, err = parseBoolean()
 	case "orchestrator.interval_seconds":
@@ -196,6 +190,13 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Orchestrator.TaskNotifications = strings.ToLower(value)
 	case "orchestrator.max_parallel":
 		cfg.Orchestrator.MaxParallel, err = parseInteger(1)
+	case "orchestrator.routes":
+		var routes []Route
+		if err = json.Unmarshal([]byte(value), &routes); err == nil {
+			cfg.Orchestrator.Routes = routes
+		} else {
+			err = fmt.Errorf("orchestrator.routes must be a JSON route array: %w", err)
+		}
 	case "extensions.enabled":
 		cfg.Extensions.Enabled, err = parseBoolean()
 	case "extensions.directory":
@@ -283,13 +284,7 @@ func normalizeSettingKey(key string) string {
 }
 
 func normalizeTaskReviewMode(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	value = strings.ReplaceAll(value, "_", "-")
-	value = strings.ReplaceAll(value, " ", "-")
-	for strings.Contains(value, "--") {
-		value = strings.ReplaceAll(value, "--", "-")
-	}
-	return value
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func IsSecretSetting(key string) bool {
@@ -327,6 +322,11 @@ func formatBool(value bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+func routesJSON(routes []Route) string {
+	data, _ := json.Marshal(routes)
+	return string(data)
 }
 
 func secretState(value string) string {

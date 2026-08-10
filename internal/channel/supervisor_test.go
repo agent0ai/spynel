@@ -336,6 +336,43 @@ func TestSupervisorRevokesStaleRuntimeBeforeHotReplacement(t *testing.T) {
 	supervisor.wait.Wait()
 }
 
+func TestSupervisorKeepsCurrentGenerationWhenCandidateBuildFails(t *testing.T) {
+	cfg := config.Default()
+	cfg.Channels.Telegram.Enabled = true
+	cfg.Channels.Telegram.Token = "working"
+	started := make(chan string, 2)
+	stopped := make(chan string, 2)
+	managed := []Managed{{
+		Name:        "telegram",
+		Enabled:     func(config.Config) bool { return true },
+		Fingerprint: func(cfg config.Config) string { return cfg.Channels.Telegram.Token },
+		Build: func(cfg config.Config) (Channel, error) {
+			if cfg.Channels.Telegram.Token == "broken" {
+				return nil, errors.New("candidate rejected")
+			}
+			return &supervisedFixture{name: cfg.Channels.Telegram.Token, started: started, stopped: stopped}, nil
+		},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	supervisor := NewSupervisor(nil, nil, managed, nil, nil)
+	if err := supervisor.reconcile(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	cfg.Channels.Telegram.Token = "broken"
+	if err := supervisor.reconcile(ctx, cfg); err == nil {
+		t.Fatal("broken candidate was accepted")
+	}
+	select {
+	case <-stopped:
+		t.Fatal("current generation stopped after candidate failure")
+	case <-time.After(25 * time.Millisecond):
+	}
+	supervisor.stopAll()
+	supervisor.wait.Wait()
+}
+
 func TestSupervisorDoesNotRetryWhenLiveAuthorizationDisappears(t *testing.T) {
 	cfg := config.Default()
 	builds := 0

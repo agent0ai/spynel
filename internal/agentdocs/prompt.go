@@ -27,8 +27,8 @@ func promptCommand(executable string) string {
 	return executable
 }
 
-// InjectPromptGuidance upgrades both stock and user-owned legacy prompts while
-// guaranteeing that the current guidance is present exactly once.
+// InjectPromptGuidance guarantees that current stock and user-edited prompts
+// contain the callable documentation guidance exactly once.
 func InjectPromptGuidance(prompt string) string {
 	guidance := PromptGuidance()
 	if strings.Contains(prompt, PromptPlaceholder) {

@@ -6,16 +6,11 @@
 
 ## Local Contracts
 
-- Treat files here as source for new workspaces while preserving user-modified copies during upgrades; migrations create only missing canonical assets or perform explicitly safe legacy reconciliation.
-- Keep retired byte-for-byte migration fixtures under `migrations/`; they are comparison inputs only and must never be copied into new workspaces or rendered as current behavior.
+- Treat files here as current source for new workspaces while preserving user-modified copies when missing assets are repaired.
+- Do not store theme assets, migration fixtures, retired prompts, or other package-owned data in this directory.
 - Keep prompt placeholders, lifecycle instructions, exact status folders, timestamp rules, review modes, privacy boundaries, and `spynel docs` guidance synchronized with orchestrator behavior and tests.
 - Default configuration must validate without secrets and must not introduce a configurable state directory.
 
 ## Child DOX Index
 
-Direct child DOX files:
-
-| Child | Scope |
-| --- | --- |
-| [migrations/AGENTS.md](migrations/AGENTS.md) | Retired byte-exact workspace migration fixtures. |
-| [themes/AGENTS.md](themes/AGENTS.md) | Built-in semantic theme YAML templates. |
+No child DOX files.

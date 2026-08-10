@@ -2,6 +2,7 @@
 package theme
 
 import (
+	"embed"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/agent0ai/spynel/internal/fsx"
 	"gopkg.in/yaml.v3"
 )
 
@@ -19,6 +21,18 @@ var (
 	validName  = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 	validColor = regexp.MustCompile(`^#[0-9a-fA-F]{6}$`)
 )
+
+//go:embed themes/*.yaml
+var builtinFS embed.FS
+
+// builtinFiles defines the deliberate picker progression. The YAML assets are
+// the only source of palette values and are also materialized as editable
+// workspace files during initialization.
+var builtinFiles = [...]string{
+	"spynel.yaml", "hack-the-box.yaml", "github-colorblind-dark.yaml", "gruvbox-dark.yaml",
+	"nord.yaml", "okabe-ito-dark.yaml", "gruvbox-light.yaml", "rose-pine-dawn.yaml",
+	"tol-muted-light.yaml", "catppuccin-latte.yaml", "okabe-ito-light.yaml", "solarized-light.yaml",
+}
 
 // Colors names colors by their UI purpose so renderers never depend on a
 // particular palette. Theme files may change every value independently.
@@ -49,126 +63,61 @@ type Theme struct {
 	Colors             Colors `yaml:"colors"`
 }
 
-// Default returns the embedded compatibility palette used when a workspace
-// predates theme files or its selected theme disappears.
+// Default returns the primary built-in palette used when the selected theme is
+// unavailable.
 func Default() Theme {
-	return Theme{
-		Name:        DefaultName,
-		Description: "Spynel's vivid midnight palette",
-		Appearance:  "dark",
-		Colors: Colors{
-			Background: "#111927", Surface: "#171F2D", SurfaceElevated: "#1D2939", SurfaceSelected: "#2A3B50",
-			Text: "#D4DCEB", TextMuted: "#8292AE", Primary: "#F472B6", Secondary: "#A7F3D0", Border: "#3D5276",
-			User: "#60A5FA", Success: "#5EE6A8", Warning: "#F7C76B", Error: "#FB7185", Info: "#7DD3FC", Code: "#C4B5FD",
-		},
-	}
+	return Builtins()[0]
 }
 
-// Builtins returns the palettes available when an older workspace has no
-// theme files yet. Fresh workspaces receive editable copies of the same twelve
-// palettes, while this fallback makes upgrades useful without a forced init.
+// Builtins loads the palettes embedded with the theme package. Invalid bundled
+// assets are programmer errors and panic during use rather than silently
+// weakening renderer invariants.
 func Builtins() []Theme {
-	return []Theme{
-		Default(),
-		{
-			Name: "hack-the-box", Description: "Hack The Box chartreuse over deep green-navy surfaces", Appearance: "dark",
-			Colors: Colors{
-				Background: "#111927", Surface: "#171717", SurfaceElevated: "#1A2332", SurfaceSelected: "#26354A",
-				Text: "#A4B1CD", TextMuted: "#7183A4", Primary: "#9FEF00", Secondary: "#D5FF80", Border: "#3D5276",
-				User: "#5CB8FF", Success: "#9FEF00", Warning: "#FFCC66", Error: "#FF5F5F", Info: "#5CB8FF", Code: "#D5FF80",
-			},
-		},
-		{
-			Name: "github-colorblind-dark", Description: "Color-blind friendly: GitHub Primer blue/orange semantics on a dark canvas", Appearance: "dark", ColorBlindFriendly: true,
-			Colors: Colors{
-				Background: "#0D1117", Surface: "#151B23", SurfaceElevated: "#212830", SurfaceSelected: "#2F3742",
-				Text: "#F0F6FC", TextMuted: "#9198A1", Primary: "#58A6FF", Secondary: "#D2A8FF", Border: "#656C76",
-				User: "#79C0FF", Success: "#58A6FF", Warning: "#E3B341", Error: "#F0883E", Info: "#79C0FF", Code: "#D2A8FF",
-			},
-		},
-		{
-			Name: "gruvbox-dark", Description: "Warm yellow and sandy contrast from the original Gruvbox dark palette", Appearance: "dark",
-			Colors: Colors{
-				Background: "#282828", Surface: "#32302F", SurfaceElevated: "#3C3836", SurfaceSelected: "#504945",
-				Text: "#EBDBB2", TextMuted: "#BDAE93", Primary: "#FFA85F", Secondary: "#D8DA66", Border: "#7C6F64",
-				User: "#A9C6BA", Success: "#D8DA66", Warning: "#FABD2F", Error: "#FF7664", Info: "#A9C6BA", Code: "#E2A7B8",
-			},
-		},
-		{
-			Name: "nord", Description: "Arctic blue Polar Night and muted Frost accents from Nord", Appearance: "dark",
-			Colors: Colors{
-				Background: "#2E3440", Surface: "#3B4252", SurfaceElevated: "#434C5E", SurfaceSelected: "#4C566A",
-				Text: "#ECEFF4", TextMuted: "#D8DEE9", Primary: "#A7D9E3", Secondary: "#D9BED3", Border: "#71809A",
-				User: "#A6BED8", Success: "#B7CF9E", Warning: "#F0D39A", Error: "#E28A91", Info: "#A6BED8", Code: "#D9BED3",
-			},
-		},
-		{
-			Name: "okabe-ito-dark", Description: "Color-blind friendly: Okabe-Ito blue, orange, yellow, and purple on charcoal", Appearance: "dark", ColorBlindFriendly: true,
-			Colors: Colors{
-				Background: "#121212", Surface: "#1D1D1D", SurfaceElevated: "#292929", SurfaceSelected: "#383838",
-				Text: "#F2F2F2", TextMuted: "#B5B5B5", Primary: "#56B4E9", Secondary: "#E69F00", Border: "#6E6E6E",
-				User: "#72C5ED", Success: "#F0E442", Warning: "#E69F00", Error: "#FF8A52", Info: "#E39BC1", Code: "#F0E442",
-			},
-		},
-		{
-			Name: "gruvbox-light", Description: "Warm paper and earthy accents from the original Gruvbox light palette", Appearance: "light",
-			Colors: Colors{
-				Background: "#FBF1C7", Surface: "#F2E5BC", SurfaceElevated: "#EBDBB2", SurfaceSelected: "#D5C4A1",
-				Text: "#3C3836", TextMuted: "#665C54", Primary: "#8D0005", Secondary: "#075F70", Border: "#7C6F64",
-				User: "#075F70", Success: "#526B13", Warning: "#805100", Error: "#8D0005", Info: "#075F70", Code: "#7A365F",
-			},
-		},
-		{
-			Name: "rose-pine-dawn", Description: "Rosé Pine Dawn's warm porcelain canvas and rose, pine, and iris accents", Appearance: "light",
-			Colors: Colors{
-				Background: "#FAF4ED", Surface: "#FFFAF3", SurfaceElevated: "#F2E9E1", SurfaceSelected: "#DFDAD9",
-				Text: "#575279", TextMuted: "#6F6A86", Primary: "#98445F", Secondary: "#286983", Border: "#8A849C",
-				User: "#286983", Success: "#3A6B35", Warning: "#795000", Error: "#98445F", Info: "#286983", Code: "#6D4C87",
-			},
-		},
-		{
-			Name: "tol-muted-light", Description: "Color-blind friendly: Paul Tol muted categorical accents on a cool paper canvas", Appearance: "light", ColorBlindFriendly: true,
-			Colors: Colors{
-				Background: "#EAF3F7", Surface: "#DCEBF1", SurfaceElevated: "#CFDFE7", SurfaceSelected: "#BED2DC",
-				Text: "#24343D", TextMuted: "#4D626C", Primary: "#5F2450", Secondary: "#332288", Border: "#607984",
-				User: "#332288", Success: "#117733", Warning: "#665500", Error: "#882255", Info: "#315F78", Code: "#5F2450",
-			},
-		},
-		{
-			Name: "catppuccin-latte", Description: "Warm pastel accents on Catppuccin Latte surfaces", Appearance: "light",
-			Colors: Colors{
-				Background: "#EFF1F5", Surface: "#E6E9EF", SurfaceElevated: "#DCE0E8", SurfaceSelected: "#D8DCE4",
-				Text: "#3C3F57", TextMuted: "#5C5F77", Primary: "#1856C9", Secondary: "#6F2CC5", Border: "#73768C",
-				User: "#1454B8", Success: "#347522", Warning: "#825000", Error: "#B90B31", Info: "#006D82", Code: "#6F2CC5",
-			},
-		},
-		{
-			Name: "okabe-ito-light", Description: "Color-blind friendly: Okabe-Ito blue, orange, yellow, and purple on soft white", Appearance: "light", ColorBlindFriendly: true,
-			Colors: Colors{
-				Background: "#FCFCFA", Surface: "#F4F4F0", SurfaceElevated: "#EAEAE4", SurfaceSelected: "#DCEBF2",
-				Text: "#171717", TextMuted: "#595959", Primary: "#00689F", Secondary: "#743F68", Border: "#767676",
-				User: "#005C8E", Success: "#00689F", Warning: "#6A5500", Error: "#743F68", Info: "#005C8E", Code: "#743F68",
-			},
-		},
-		{
-			Name: "solarized-light", Description: "Ethan Schoonover's precision-balanced Solarized light palette", Appearance: "light",
-			Colors: Colors{
-				Background: "#FDF6E3", Surface: "#EEE8D5", SurfaceElevated: "#E5DECA", SurfaceSelected: "#EBE3CF",
-				Text: "#4B626A", TextMuted: "#526A73", Primary: "#00689C", Secondary: "#575CA0", Border: "#71888F",
-				User: "#00689C", Success: "#596B00", Warning: "#765800", Error: "#AA2530", Info: "#00736F", Code: "#575CA0",
-			},
-		},
+	values := make([]Theme, 0, len(builtinFiles))
+	for _, name := range builtinFiles {
+		data, err := builtinFS.ReadFile("themes/" + name)
+		if err != nil {
+			panic(fmt.Sprintf("read built-in theme %s: %v", name, err))
+		}
+		var value Theme
+		if err := yaml.Unmarshal(data, &value); err != nil {
+			panic(fmt.Sprintf("parse built-in theme %s: %v", name, err))
+		}
+		if err := value.Validate(); err != nil {
+			panic(fmt.Sprintf("validate built-in theme %s: %v", name, err))
+		}
+		values = append(values, value)
 	}
+	return values
 }
 
-// StockNames is the deliberate picker progression for the stock collection.
-// User themes follow these entries alphabetically.
+// StockNames returns the built-in picker progression. User themes follow these
+// entries alphabetically.
 func StockNames() []string {
-	return []string{
-		"spynel", "hack-the-box", "github-colorblind-dark", "gruvbox-dark",
-		"nord", "okabe-ito-dark", "gruvbox-light", "rose-pine-dawn",
-		"tol-muted-light", "catppuccin-latte", "okabe-ito-light", "solarized-light",
+	values := Builtins()
+	names := make([]string, len(values))
+	for index, value := range values {
+		names[index] = value.Name
 	}
+	return names
+}
+
+// InstallBuiltins materializes missing built-in palettes as editable workspace
+// files without replacing existing stock-named or custom themes.
+func InstallBuiltins(directory string) error {
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	for _, name := range builtinFiles {
+		data, err := builtinFS.ReadFile("themes/" + name)
+		if err != nil {
+			return fmt.Errorf("read built-in theme %s: %w", name, err)
+		}
+		if err := fsx.AtomicCreateFile(filepath.Join(directory, name), data, 0o600); err != nil && !os.IsExist(err) {
+			return fmt.Errorf("install built-in theme %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // Validate rejects incomplete palettes so a renderer can safely use every
@@ -206,7 +155,7 @@ func (t Theme) Validate() error {
 }
 
 // LoadDir loads all YAML palettes in deterministic name order. A missing or
-// empty directory is not an error and yields the stock upgrade palettes.
+// empty directory is not an error and yields the built-in palettes.
 func LoadDir(directory string) ([]Theme, error) {
 	entries, err := os.ReadDir(directory)
 	if err != nil {

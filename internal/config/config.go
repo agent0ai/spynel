@@ -1,7 +1,7 @@
 package config
 
 import (
-	"encoding/json"
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
@@ -20,7 +21,6 @@ import (
 const (
 	// FileName is the canonical workspace-relative configuration path.
 	FileName           = ".spynel/config.yaml"
-	LegacyFileName     = "spynel.yaml"
 	StateDirectoryName = ".spynel"
 
 	TaskReviewsSkipTrivial  = "skip-trivial"
@@ -100,9 +100,8 @@ type Channels struct {
 }
 
 type TUI struct {
-	Enabled bool   `yaml:"enabled"`
-	Title   string `yaml:"title"`
-	Theme   string `yaml:"theme"`
+	Title string `yaml:"title"`
+	Theme string `yaml:"theme"`
 }
 
 type Telegram struct {
@@ -178,14 +177,14 @@ type Orchestrator struct {
 }
 
 type Route struct {
-	Name           string   `yaml:"name"`
-	Source         string   `yaml:"source"`
-	Working        string   `yaml:"working"`
-	Prompt         string   `yaml:"prompt"`
-	RecoveryPrompt string   `yaml:"recovery_prompt"`
-	ReviewPrompt   string   `yaml:"review_prompt,omitempty"`
-	StaleAfter     string   `yaml:"stale_after"`
-	AllowedNext    []string `yaml:"allowed_next"`
+	Name           string   `yaml:"name" json:"name"`
+	Source         string   `yaml:"source" json:"source"`
+	Working        string   `yaml:"working" json:"working"`
+	Prompt         string   `yaml:"prompt" json:"prompt"`
+	RecoveryPrompt string   `yaml:"recovery_prompt" json:"recovery_prompt"`
+	ReviewPrompt   string   `yaml:"review_prompt,omitempty" json:"review_prompt,omitempty"`
+	StaleAfter     string   `yaml:"stale_after" json:"stale_after"`
+	AllowedNext    []string `yaml:"allowed_next" json:"allowed_next"`
 }
 
 func (r Route) StaleDuration() time.Duration {
@@ -216,11 +215,10 @@ func Default() Config {
 		Workspace: Workspace{HistoryMaxMessages: 50, HistoryCharLimit: 12000, AttachmentMaxMB: 100},
 		Harness: Harness{
 			Name: "", Model: "", Sandbox: "danger-full-access",
-			DeveloperAgentPrefix: "/goal", ReviewerAgentPrefix: "/goal", HeartbeatAgentPrefix: "/goal",
 			Reviews: TaskReviewsSkipTrivial,
 		},
 		Channels: Channels{
-			TUI:      TUI{Enabled: true, Title: "Spynel", Theme: "spynel"},
+			TUI:      TUI{Title: "Spynel", Theme: "spynel"},
 			Telegram: Telegram{Name: "spynel", TokenEnv: "SPYNEL_TELEGRAM_TOKEN", Mode: "polling", WebhookListen: "127.0.0.1:8787", PollTimeoutSec: 30, GroupMode: "mention", WelcomeMessage: "Welcome, {name}!"},
 			WhatsApp: WhatsApp{Mode: "self-chat", Database: ".spynel/whatsapp.db", PollIntervalSec: 3},
 		},
@@ -250,10 +248,6 @@ func Find(start string) (string, error) {
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate, nil
 		}
-		legacy := filepath.Join(root, LegacyFileName)
-		if _, err := os.Stat(legacy); err == nil {
-			return legacy, nil
-		}
 		parent := filepath.Dir(root)
 		if parent == root {
 			return "", fmt.Errorf("%w: %s not found from %s", ErrNotInitialized, filepath.ToSlash(FileName), start)
@@ -274,28 +268,6 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	if rootForConfigPath(abs) != filepath.Dir(abs) {
-		if _, statErr := os.Stat(abs); os.IsNotExist(statErr) {
-			legacy := filepath.Join(rootForConfigPath(abs), LegacyFileName)
-			if _, legacyErr := os.Stat(legacy); legacyErr == nil {
-				return migrateLegacyConfig(legacy, abs)
-			} else if !os.IsNotExist(legacyErr) {
-				return Config{}, legacyErr
-			}
-		} else if statErr != nil {
-			return Config{}, statErr
-		}
-	}
-	if filepath.Base(abs) == LegacyFileName {
-		canonical := PathForRoot(filepath.Dir(abs))
-		if _, statErr := os.Stat(canonical); statErr == nil {
-			abs = canonical
-		} else if !os.IsNotExist(statErr) {
-			return Config{}, statErr
-		} else {
-			return migrateLegacyConfig(abs, canonical)
-		}
-	}
 	return loadAt(abs)
 }
 
@@ -308,25 +280,15 @@ func loadAt(abs string) (Config, error) {
 }
 
 func decode(data []byte, abs string) (Config, error) {
+	data, _, err := normalizeLegacyConfig(data)
+	if err != nil {
+		return Config{}, fmt.Errorf("parse %s: %w", abs, err)
+	}
 	cfg := Default()
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", abs, err)
-	}
-	// Version-one workspaces used `recipient`. Read that shape as a legacy
-	// alias, but Save always emits the simpler canonical `harness` section.
-	var compatibility struct {
-		Harness *Harness `yaml:"harness"`
-		Legacy  *struct {
-			Name  string `yaml:"name"`
-			Model string `yaml:"model,omitempty"`
-		} `yaml:"recipient"`
-	}
-	if err := yaml.Unmarshal(data, &compatibility); err != nil {
-		return Config{}, fmt.Errorf("parse %s: %w", abs, err)
-	}
-	if compatibility.Harness == nil && compatibility.Legacy != nil {
-		cfg.Harness.Name = compatibility.Legacy.Name
-		cfg.Harness.Model = compatibility.Legacy.Model
 	}
 	cfg.Harness.Name = harness.NormalizeName(cfg.Harness.Name)
 	cfg.Harness.Sandbox = normalizeSandbox(cfg.Harness.Sandbox)
@@ -336,36 +298,79 @@ func decode(data []byte, abs string) (Config, error) {
 	cfg.Harness.HeartbeatAgentPrefix = strings.TrimSpace(cfg.Harness.HeartbeatAgentPrefix)
 	cfg.Harness.Reviews = normalizeTaskReviewMode(cfg.Harness.Reviews)
 	cfg.Speech.Language = strings.ToLower(strings.TrimSpace(cfg.Speech.Language))
-	// Upgrade version-one built-in workflow values in memory without
-	// overwriting the user's configuration file. Workspace.Upgrade restores
-	// missing prompts and directories separately and non-destructively.
-	for i := range cfg.Orchestrator.Routes {
-		route := &cfg.Orchestrator.Routes[i]
-		switch route.Name {
-		case "tasks":
-			if route.ReviewPrompt == "" {
-				route.ReviewPrompt = ".spynel/prompts/review.md"
-			}
-			route.AllowedNext = []string{"todo", "working", "review", "reviewing", "waiting", "done", "failed", "cancelled"}
-		case "goals":
-			if filepath.Base(filepath.Clean(route.Source)) == "active" {
-				route.Source = filepath.Join(filepath.Dir(route.Source), "proposed")
-			}
-			if filepath.Base(filepath.Clean(route.Working)) == "working" {
-				route.Working = filepath.Join(filepath.Dir(route.Working), "planning")
-			}
-			if route.ReviewPrompt == "" {
-				route.ReviewPrompt = ".spynel/prompts/goal-review.md"
-			}
-			route.AllowedNext = []string{"proposed", "planning", "active", "review", "reviewing", "waiting", "done", "abandoned"}
-		}
-	}
 	cfg.Path = abs
 	cfg.Root = rootForConfigPath(abs)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// normalizeLegacyConfig accepts the one retired launch preference long enough
+// to remove it from the decoded representation. A subsequent ordinary save
+// writes only the canonical schema; all other unknown fields still fail closed.
+func normalizeLegacyConfig(data []byte) ([]byte, bool, error) {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return nil, false, err
+	}
+	if len(document.Content) == 0 {
+		return data, false, nil
+	}
+	root := document.Content[0]
+	channels := mappingValue(root, "channels")
+	tui := mappingValue(channels, "tui")
+	changed := removeMappingKey(tui, "enabled")
+	if !changed {
+		return data, false, nil
+	}
+	normalized, err := yaml.Marshal(&document)
+	return normalized, true, err
+}
+
+func mappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		if node.Content[index].Value == key {
+			return node.Content[index+1]
+		}
+	}
+	return nil
+}
+
+func removeMappingKey(node *yaml.Node, key string) bool {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return false
+	}
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		if node.Content[index].Value == key {
+			node.Content = append(node.Content[:index], node.Content[index+2:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeLegacyFile performs the one supported one-time schema cleanup.
+// Current-schema files are not rewritten.
+func NormalizeLegacyFile(path string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	normalized, changed, err := normalizeLegacyConfig(data)
+	if err != nil || !changed {
+		return false, err
+	}
+	if _, err := decode(normalized, path); err != nil {
+		return false, err
+	}
+	if err := fsx.AtomicWriteFile(path, normalized, 0o600); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // PathForRoot returns the fixed configuration path for a workspace root.
@@ -379,81 +384,6 @@ func rootForConfigPath(path string) string {
 		return filepath.Dir(directory)
 	}
 	return directory
-}
-
-func migrateLegacyConfig(legacyPath, canonicalPath string) (Config, error) {
-	data, err := os.ReadFile(legacyPath)
-	if err != nil {
-		return Config{}, err
-	}
-	var legacy struct {
-		Workspace struct {
-			StateDir string `yaml:"state_dir"`
-		} `yaml:"workspace"`
-	}
-	if err := yaml.Unmarshal(data, &legacy); err != nil {
-		return Config{}, fmt.Errorf("parse %s: %w", legacyPath, err)
-	}
-	workspaceRoot := filepath.Dir(legacyPath)
-	legacyState := strings.TrimSpace(legacy.Workspace.StateDir)
-	if legacyState != "" {
-		resolved := legacyState
-		if !filepath.IsAbs(resolved) {
-			resolved = filepath.Join(workspaceRoot, filepath.FromSlash(resolved))
-		}
-		if filepath.Clean(resolved) != filepath.Clean(filepath.Join(workspaceRoot, StateDirectoryName)) {
-			return Config{}, fmt.Errorf("cannot automatically migrate legacy workspace.state_dir %q; move that state to %s and retry", legacyState, filepath.Join(workspaceRoot, StateDirectoryName))
-		}
-	}
-	data, err = removeLegacyStateDir(data)
-	if err != nil {
-		return Config{}, fmt.Errorf("migrate %s: %w", legacyPath, err)
-	}
-	cfg, err := decode(data, canonicalPath)
-	if err != nil {
-		return Config{}, err
-	}
-	if err := os.MkdirAll(filepath.Dir(canonicalPath), 0o700); err != nil {
-		return Config{}, err
-	}
-	if err := fsx.AtomicWriteFile(canonicalPath, data, 0o600); err != nil {
-		return Config{}, fmt.Errorf("migrate configuration to %s: %w", canonicalPath, err)
-	}
-	if err := os.Remove(legacyPath); err != nil {
-		if os.IsNotExist(err) {
-			// Another process may have completed the same one-time migration
-			// after this process read the legacy file. Keep the atomically
-			// published canonical file and use its validated contents.
-			return loadAt(canonicalPath)
-		}
-		return Config{}, fmt.Errorf("remove migrated legacy configuration %s: %w", legacyPath, err)
-	}
-	return cfg, nil
-}
-
-func removeLegacyStateDir(data []byte) ([]byte, error) {
-	var document yaml.Node
-	if err := yaml.Unmarshal(data, &document); err != nil {
-		return nil, err
-	}
-	if len(document.Content) == 0 || document.Content[0].Kind != yaml.MappingNode {
-		return data, nil
-	}
-	root := document.Content[0]
-	for index := 0; index+1 < len(root.Content); index += 2 {
-		if root.Content[index].Value != "workspace" || root.Content[index+1].Kind != yaml.MappingNode {
-			continue
-		}
-		workspace := root.Content[index+1]
-		for child := 0; child+1 < len(workspace.Content); child += 2 {
-			if workspace.Content[child].Value == "state_dir" {
-				workspace.Content = append(workspace.Content[:child], workspace.Content[child+2:]...)
-				break
-			}
-		}
-		break
-	}
-	return yaml.Marshal(&document)
 }
 
 func (c Config) Validate() error {
@@ -487,6 +417,14 @@ func (c Config) Validate() error {
 	for _, argument := range c.Harness.ACPArgs {
 		if strings.ContainsRune(argument, '\x00') {
 			problems = append(problems, "harness.acp_args contains an invalid NUL byte")
+			break
+		}
+		if !utf8.ValidString(argument) {
+			problems = append(problems, "harness.acp_args contains invalid UTF-8")
+			break
+		}
+		if strings.ContainsAny(argument, "\r\n") {
+			problems = append(problems, "harness.acp_args cannot contain multiline arguments")
 			break
 		}
 	}
@@ -686,17 +624,7 @@ func NormalizeWhatsAppNumber(value string) string {
 }
 
 func normalizeSandbox(value string) string {
-	compact := strings.NewReplacer("-", "", "_", "", " ", "").Replace(strings.ToLower(strings.TrimSpace(value)))
-	switch compact {
-	case "readonly":
-		return "read-only"
-	case "workspacewrite", "restricted":
-		return "workspace-write"
-	case "dangerfullaccess", "unrestricted", "fullaccess":
-		return "danger-full-access"
-	default:
-		return strings.ToLower(strings.TrimSpace(value))
-	}
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func (c Config) Resolve(path string) string {
@@ -711,25 +639,13 @@ func (c Config) StatePath(parts ...string) string {
 	return filepath.Join(append([]string{base}, parts...)...)
 }
 
-// HarnessSessionsPath uses the canonical harness filename for new sessions
-// while continuing an existing version-one recipient session map in place.
+// HarnessSessionsPath returns the canonical session map for one harness.
 func (c Config) HarnessSessionsPath(name string) string {
 	name = strings.NewReplacer("/", "-", "\\", "-").Replace(strings.ToLower(strings.TrimSpace(name)))
 	if name == "" {
 		name = "unselected"
 	}
-	canonical := c.StatePath("runtime", "harness-"+name+"-sessions.json")
-	legacyName := "recipient-" + name + "-sessions.json"
-	if name == "codex" {
-		legacyName = "recipient-sessions.json"
-	}
-	legacy := c.StatePath("runtime", legacyName)
-	if _, err := os.Stat(canonical); os.IsNotExist(err) {
-		if _, legacyErr := os.Stat(legacy); legacyErr == nil {
-			return legacy
-		}
-	}
-	return canonical
+	return c.StatePath("runtime", "harness-"+name+"-sessions.json")
 }
 
 // HarnessArgs returns the shell-free process arguments for the selected
@@ -738,11 +654,11 @@ func (c Config) HarnessArgs() []string {
 	return harness.CommandArgs(c.Harness.Name, c.Harness.ACPArgs)
 }
 
-// ACPArgsJSON provides the stable scalar representation used by shared
-// configuration commands and forms.
-func (c Config) ACPArgsJSON() string {
-	data, _ := json.Marshal(c.Harness.ACPArgs)
-	return string(data)
+// ACPArgsText provides the stable command-line scalar representation used by
+// every shared settings surface. Validate guarantees it is representable.
+func (c Config) ACPArgsText() string {
+	text, _ := FormatCommandLineArguments(c.Harness.ACPArgs)
+	return text
 }
 
 func (c Config) TelegramToken() string {
@@ -780,6 +696,7 @@ func Save(cfg Config) error {
 // Store serializes validated configuration changes and publishes the newest
 // persisted snapshot without retaining an unbounded update queue.
 type Store struct {
+	writeMu sync.Mutex
 	mu      sync.RWMutex
 	current Config
 	updates chan Config
@@ -796,6 +713,8 @@ func (s *Store) Snapshot() Config {
 }
 
 func (s *Store) Update(change func(*Config) error) (Config, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	next := s.current
@@ -805,13 +724,21 @@ func (s *Store) Update(change func(*Config) error) (Config, error) {
 	if err := Save(next); err != nil {
 		return s.current, err
 	}
-	s.current = next
+	reloaded, err := Load(next.Path)
+	if err != nil {
+		return s.current, fmt.Errorf("reload saved configuration: %w", err)
+	}
+	s.current = reloaded
+	s.publishLocked(reloaded)
+	return reloaded, nil
+}
+
+func (s *Store) publishLocked(next Config) {
 	select {
 	case <-s.updates:
 	default:
 	}
 	s.updates <- next
-	return next, nil
 }
 
 func (s *Store) Updates() <-chan Config { return s.updates }

@@ -10,9 +10,9 @@ harness:
   model: ""
   sandbox: danger-full-access
   chat_agent_prefix: ""
-  developer_agent_prefix: /goal
-  reviewer_agent_prefix: /goal
-  heartbeat_agent_prefix: /goal
+  developer_agent_prefix: ""
+  reviewer_agent_prefix: ""
+  heartbeat_agent_prefix: ""
   # skip-trivial lets each task creator decide; always and never override it.
   reviews: skip-trivial
   # Used only when name is acp. Built-in ACP aliases supply these themselves.
@@ -21,7 +21,6 @@ harness:
 
 channels:
   tui:
-    enabled: true
     title: Spynel
     theme: spynel
   telegram:

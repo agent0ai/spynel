@@ -1,15 +1,10 @@
 package workspace
 
 import (
-	"bytes"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/harness"
@@ -129,113 +124,7 @@ func TestInitAndUpgradeRejectSymlinkedInstructionBoundaries(t *testing.T) {
 	}
 }
 
-func TestUpgradeMigratesLegacyPersistentInstructionsSafely(t *testing.T) {
-	const custom = "Keep this exact workspace rule. ✓\n"
-	for _, test := range []struct {
-		name             string
-		legacy           *string
-		canonical        *string
-		wantErr          string
-		wantLegacy       bool
-		wantCanonical    string
-		legacyPermission os.FileMode
-	}{
-		{name: "legacy only", legacy: stringPointer(custom), wantCanonical: custom, legacyPermission: 0o400},
-		{name: "canonical only", canonical: stringPointer(custom), wantCanonical: custom},
-		{name: "identical dual", legacy: stringPointer(custom), canonical: stringPointer(custom), wantCanonical: custom},
-		{name: "conflicting dual", legacy: stringPointer("legacy rule\n"), canonical: stringPointer("canonical rule\n"), wantErr: "different content", wantLegacy: true, wantCanonical: "canonical rule\n"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			root := t.TempDir()
-			dir := filepath.Join(root, ".spynel", "instructions")
-			if err := os.MkdirAll(dir, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			legacyPath := filepath.Join(dir, "chat.md")
-			canonicalPath := filepath.Join(dir, "agent-chat.md")
-			if test.legacy != nil {
-				mode := test.legacyPermission
-				if mode == 0 {
-					mode = 0o600
-				}
-				if err := os.WriteFile(legacyPath, []byte(*test.legacy), mode); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if test.canonical != nil {
-				if err := os.WriteFile(canonicalPath, []byte(*test.canonical), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			err := Upgrade(root)
-			if test.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
-					t.Fatalf("Upgrade() error = %v, want %q", err, test.wantErr)
-				}
-			} else if err != nil {
-				t.Fatal(err)
-			}
-			got, readErr := os.ReadFile(canonicalPath)
-			if readErr != nil || string(got) != test.wantCanonical {
-				t.Fatalf("canonical content = %q, %v", got, readErr)
-			}
-			_, legacyErr := os.Stat(legacyPath)
-			if test.wantLegacy && legacyErr != nil {
-				t.Fatalf("conflicting legacy file was not preserved: %v", legacyErr)
-			}
-			if !test.wantLegacy && !os.IsNotExist(legacyErr) {
-				t.Fatalf("legacy file remains after migration: %v", legacyErr)
-			}
-			if test.legacyPermission != 0 && test.wantErr == "" {
-				info, statErr := os.Stat(canonicalPath)
-				if statErr != nil {
-					t.Fatal(statErr)
-				}
-				if info.Mode().Perm() != test.legacyPermission {
-					t.Fatalf("canonical mode = %v; want %v", info.Mode().Perm(), test.legacyPermission)
-				}
-			}
-			if test.wantErr == "" {
-				if err := Upgrade(root); err != nil {
-					t.Fatalf("repeated upgrade was not idempotent: %v", err)
-				}
-				if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
-					t.Fatalf("repeated upgrade recreated legacy file: %v", err)
-				}
-			}
-		})
-	}
-}
-
-func stringPointer(value string) *string { return &value }
-
-func TestUpgradeRejectsUnsafeLegacyPersistentInstruction(t *testing.T) {
-	root := t.TempDir()
-	dir := filepath.Join(root, ".spynel", "instructions")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	legacyPath := filepath.Join(dir, "chat.md")
-	if err := os.WriteFile(legacyPath, []byte("unsafe rule\n"), 0o622); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(legacyPath, 0o622); err != nil {
-		t.Fatal(err)
-	}
-	err := Upgrade(root)
-	if err == nil || !strings.Contains(err.Error(), "must not be group- or world-writable") {
-		t.Fatalf("Upgrade() error = %v", err)
-	}
-	if _, err := os.Stat(legacyPath); err != nil {
-		t.Fatalf("unsafe legacy file was not preserved: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "agent-chat.md")); !os.IsNotExist(err) {
-		t.Fatalf("unsafe legacy file was migrated: %v", err)
-	}
-}
-
-func TestGoVerificationCacheContracts(t *testing.T) {
+func TestWorkspaceTemplatesExcludeRepositoryDeveloperPolicy(t *testing.T) {
 	generatedRoot := t.TempDir()
 	previousDetection := detectCodingHarness
 	detectCodingHarness = func(func(string) (string, error)) (harness.Definition, string, bool) {
@@ -261,7 +150,7 @@ func TestGoVerificationCacheContracts(t *testing.T) {
 		}
 		for source, text := range map[string]string{"embedded": string(embedded), "generated": string(generated)} {
 			lower := strings.ToLower(text)
-			for _, forbidden := range []string{"cache", "gocache", "cold-cache", "shared user cache", "go test", "go build", "build artifact", ".spynel-dev"} {
+			for _, forbidden := range []string{"cache", "gocache", "cold-cache", "shared user cache", "go test", "go build", "build artifact", ".tmp-bin", ".tmp-toolchains", ".tmp-artifacts", ".tmp-tui-captures"} {
 				if strings.Contains(lower, forbidden) {
 					t.Errorf("%s %s contains repository development guidance %q", source, name, forbidden)
 				}
@@ -269,45 +158,6 @@ func TestGoVerificationCacheContracts(t *testing.T) {
 		}
 	}
 
-	rootDOX, err := os.ReadFile("../../AGENTS.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, required := range []string{"shared user cache", "scripts/cold-cache.sh", ".spynel-dev/artifacts/<task-id>/"} {
-		if !strings.Contains(string(rootDOX), required) {
-			t.Errorf("canonical repository AGENTS.md is missing %q", required)
-		}
-	}
-	scriptDOX, err := os.ReadFile("../../scripts/AGENTS.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, required := range []string{"cold-cache.sh", "dedicated process group", "complete owned process tree"} {
-		if !strings.Contains(string(scriptDOX), required) {
-			t.Errorf("repository-only cold-cache contract is missing %q", required)
-		}
-	}
-	for path, text := range map[string][]byte{"AGENTS.md": rootDOX, "scripts/AGENTS.md": scriptDOX} {
-		if strings.Contains(string(text), "GOCACHE=") {
-			t.Errorf("%s contains an ordinary GOCACHE assignment", path)
-		}
-	}
-	readme, err := os.ReadFile("../../README.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, forbidden := range []string{"GOCACHE", "cold-cache.sh", ".spynel-dev/artifacts"} {
-		if strings.Contains(string(readme), forbidden) {
-			t.Errorf("README carries canonical developer policy %q", forbidden)
-		}
-	}
-	ignored, err := os.ReadFile("../../.gitignore")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(ignored), "/bin/") || (!strings.Contains(string(ignored), "/.spynel-dev/") && !strings.Contains(string(ignored), ".spynel-dev/")) {
-		t.Fatal("verification binary and retained-evidence locations must be ignored")
-	}
 }
 
 func TestFrameworkPromptsEncodeRiskProportionateReview(t *testing.T) {
@@ -338,157 +188,6 @@ func TestFrameworkPromptsEncodeRiskProportionateReview(t *testing.T) {
 	for _, required := range []string{"If the workspace uses Git", "trivial, localized, low-risk corrections", "rerun the relevant verification", "requires design judgment"} {
 		if !strings.Contains(string(review), required) {
 			t.Errorf("review prompt is missing correction boundary %q", required)
-		}
-	}
-}
-
-func TestColdCacheHelperCleansCancelledRunOutsideWorkspace(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("Linux procfs cancellation contract")
-	}
-	tempBase := t.TempDir()
-	cachePathFile := filepath.Join(tempBase, "cache-path")
-	childPIDFile := filepath.Join(tempBase, "child-pid")
-	descendantPIDFile := filepath.Join(tempBase, "descendant-pid")
-	script := filepath.Join("..", "..", "scripts", "cold-cache.sh")
-	command := exec.Command("sh", script, "sh", "-c", `printf '%s' "$GOCACHE" >"$1"; printf '%s' "$$" >"$2"; trap '' TERM; (trap '' TERM; sleep 2; mkdir -p "$GOCACHE/recreated"; while :; do sleep 1; done) & printf '%s' "$!" >"$3"; while :; do sleep 1; done`, "sh", cachePathFile, childPIDFile, descendantPIDFile)
-	command.Env = append(os.Environ(), "TMPDIR="+tempBase)
-	if err := command.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if command.Process != nil {
-			_ = command.Process.Kill()
-		}
-	})
-
-	var cacheDir string
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(cachePathFile)
-		if err == nil && len(data) != 0 {
-			cacheDir = string(data)
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if cacheDir == "" {
-		t.Fatal("cold-cache child did not publish its cache path")
-	}
-	if err := exec.Command("kill", "-TERM", strconv.Itoa(command.Process.Pid)).Run(); err != nil {
-		t.Fatalf("send TERM to cold-cache helper: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("cancelled cold-cache helper unexpectedly succeeded")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("cold-cache helper did not exit promptly after TERM")
-	}
-	assertColdCacheRemoved(t, cacheDir, childPIDFile, descendantPIDFile)
-	time.Sleep(2500 * time.Millisecond)
-	if _, err := os.Stat(filepath.Join(cacheDir, "recreated")); !os.IsNotExist(err) {
-		t.Fatalf("cold-cache descendant recreated the cache after cancellation: %v", err)
-	}
-}
-
-func TestColdCacheHelperCleansFailedRunOutsideWorkspace(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("Linux procfs ownership contract")
-	}
-	tempBase := t.TempDir()
-	script := filepath.Join("..", "..", "scripts", "cold-cache.sh")
-	command := exec.Command("sh", script, "sh", "-c", `printf '%s' "$GOCACHE"; exit 7`)
-	command.Env = append(os.Environ(), "TMPDIR="+tempBase)
-	output, err := command.CombinedOutput()
-	if err == nil {
-		t.Fatal("cold-cache helper unexpectedly succeeded")
-	}
-	cacheDir := string(output)
-	if !strings.HasPrefix(cacheDir, tempBase+string(filepath.Separator)+"spynel-gocache.") {
-		t.Fatalf("cold cache path %q is not a unique child of %q", cacheDir, tempBase)
-	}
-	if _, statErr := os.Stat(cacheDir); !os.IsNotExist(statErr) {
-		t.Fatalf("cold cache was not removed after failure: %v", statErr)
-	}
-
-	projectRoot, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
-		t.Fatal(err)
-	}
-	rejected := exec.Command("sh", script, "true")
-	rejected.Env = append(os.Environ(), "TMPDIR="+projectRoot)
-	output, err = rejected.CombinedOutput()
-	if err == nil || !strings.Contains(string(output), "must be outside the project workspace") {
-		t.Fatalf("cold-cache helper accepted workspace TMPDIR: err=%v output=%q", err, output)
-	}
-}
-
-func TestColdCacheHelperCleansCompletedRunWithDescendant(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("Linux procfs process-tree contract")
-	}
-	tempBase := t.TempDir()
-	script := filepath.Join("..", "..", "scripts", "cold-cache.sh")
-	command := exec.Command("sh", script, "sh", "-c", `printf '%s' "$GOCACHE"; (trap '' TERM; sleep 2; mkdir -p "$GOCACHE/recreated"; while :; do sleep 1; done) &`)
-	command.Env = append(os.Environ(), "TMPDIR="+tempBase)
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("completed cold-cache diagnostic failed: %v output=%q", err, output)
-	}
-	cacheDir := string(output)
-	if !strings.HasPrefix(cacheDir, tempBase+string(filepath.Separator)+"spynel-gocache.") {
-		t.Fatalf("cold cache path %q is not a unique child of %q", cacheDir, tempBase)
-	}
-	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
-		t.Fatalf("cold cache was not removed after success: %v", err)
-	}
-	time.Sleep(2500 * time.Millisecond)
-	if _, err := os.Stat(filepath.Join(cacheDir, "recreated")); !os.IsNotExist(err) {
-		t.Fatalf("cold-cache descendant recreated the cache after successful command exit: %v", err)
-	}
-}
-
-func TestColdCacheHelperCleansCompletedRunWithEscapedSession(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("Linux procfs ownership contract")
-	}
-	tempBase := t.TempDir()
-	cachePathFile := filepath.Join(tempBase, "cache-path")
-	descendantPIDFile := filepath.Join(tempBase, "descendant-pid")
-	script := filepath.Join("..", "..", "scripts", "cold-cache.sh")
-	command := exec.Command("sh", script, "sh", "-c", `printf '%s' "$GOCACHE" >"$1"; setsid sh -c 'trap "" TERM; printf "%s" "$$" >"$1"; sleep 2; mkdir -p "$GOCACHE/escaped-recreated"; while :; do sleep 1; done' sh "$2" >/dev/null 2>&1 & while [ ! -s "$2" ]; do sleep 0.01; done`, "sh", cachePathFile, descendantPIDFile)
-	command.Env = append(os.Environ(), "TMPDIR="+tempBase)
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("completed cold-cache diagnostic failed: %v output=%q", err, output)
-	}
-	cacheDir, err := os.ReadFile(cachePathFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertColdCacheRemoved(t, string(cacheDir), descendantPIDFile)
-	time.Sleep(2500 * time.Millisecond)
-	if _, err := os.Stat(filepath.Join(string(cacheDir), "escaped-recreated")); !os.IsNotExist(err) {
-		t.Fatalf("escaped cold-cache descendant recreated the cache: %v", err)
-	}
-}
-
-func assertColdCacheRemoved(t *testing.T, cacheDir string, pidFiles ...string) {
-	t.Helper()
-	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
-		t.Fatalf("cold cache was not removed: %v", err)
-	}
-	for _, pidFile := range pidFiles {
-		pid, err := os.ReadFile(pidFile)
-		if err != nil {
-			t.Fatal(err)
-		}
-		state, err := exec.Command("ps", "-o", "stat=", "-p", string(pid)).Output()
-		if err == nil && !strings.HasPrefix(strings.TrimSpace(string(state)), "Z") {
-			t.Fatalf("cold-cache process %s survived with state %q", pid, state)
 		}
 	}
 }
@@ -571,46 +270,6 @@ func TestUpgradeAddsReviewAssetsWithoutOverwritingPrompts(t *testing.T) {
 	}
 }
 
-func TestUpgradeMigratesOnlyExactRetiredNotificationPrompt(t *testing.T) {
-	retired, err := templates.ReadFile("templates/migrations/notification-triage-v1.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	current, err := templates.ReadFile("templates/notification.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, test := range []struct {
-		name string
-		data []byte
-		want []byte
-	}{
-		{name: "exact stock prompt", data: retired, want: current},
-		{name: "user customized legacy prompt", data: append(append([]byte(nil), retired...), "\nKeep my custom notification wording.\n"...), want: append(append([]byte(nil), retired...), "\nKeep my custom notification wording.\n"...)},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			root := t.TempDir()
-			if err := Init(root, false); err != nil {
-				t.Fatal(err)
-			}
-			path := filepath.Join(root, ".spynel", "prompts", "notification.md")
-			if err := os.WriteFile(path, test.data, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := Upgrade(root); err != nil {
-				t.Fatal(err)
-			}
-			got, err := os.ReadFile(path)
-			if err != nil || !bytes.Equal(got, test.want) {
-				t.Fatalf("migrated prompt = %q, %v", got, err)
-			}
-			if err := Upgrade(root); err != nil {
-				t.Fatalf("repeated upgrade: %v", err)
-			}
-		})
-	}
-}
-
 func TestUpgradePreservesCustomThemeCollection(t *testing.T) {
 	root := t.TempDir()
 	themeDir := filepath.Join(root, ".spynel", "themes")
@@ -656,8 +315,8 @@ func TestForceInitAddsRevisedThemesWithoutReplacingExistingFiles(t *testing.T) {
 	if err := os.Remove(newPath); err != nil {
 		t.Fatal(err)
 	}
-	legacyPath := filepath.Join(root, ".spynel", "themes", "tokyo-night.yaml")
-	if err := os.WriteFile(legacyPath, []byte("user-owned legacy theme\n"), 0o600); err != nil {
+	customExtraPath := filepath.Join(root, ".spynel", "themes", "tokyo-night.yaml")
+	if err := os.WriteFile(customExtraPath, []byte("user-owned custom theme\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := Init(root, true); err != nil {
@@ -666,8 +325,8 @@ func TestForceInitAddsRevisedThemesWithoutReplacingExistingFiles(t *testing.T) {
 	if got, err := os.ReadFile(customPath); err != nil || string(got) != string(custom) {
 		t.Fatalf("force init replaced existing stock-named file: %q, %v", got, err)
 	}
-	if got, err := os.ReadFile(legacyPath); err != nil || string(got) != "user-owned legacy theme\n" {
-		t.Fatalf("force init removed legacy theme: %q, %v", got, err)
+	if got, err := os.ReadFile(customExtraPath); err != nil || string(got) != "user-owned custom theme\n" {
+		t.Fatalf("force init removed custom theme: %q, %v", got, err)
 	}
 	if _, err := os.Stat(newPath); err != nil {
 		t.Fatalf("force init did not materialize missing revised theme: %v", err)
@@ -725,7 +384,7 @@ func TestOrchestrationPromptsRequireClockDerivedTimestamps(t *testing.T) {
 		if strings.Count(prompt, "{{SPYNEL_DOCS_GUIDANCE}}") != 1 {
 			t.Fatalf("%s does not have exactly one docs guidance insertion point", name)
 		}
-		if (name == "task.md" || name == "review.md") && !strings.Contains(prompt, "notification_summary") {
+		if (name == "task.md" || name == "review.md") && !strings.Contains(prompt, "completion_summary") {
 			t.Fatalf("%s does not require a durable notification summary", name)
 		}
 	}
@@ -770,5 +429,31 @@ func TestInitLeavesHarnessSelectionOpenWhenNothingIsDetected(t *testing.T) {
 	}
 	if cfg.Harness.Name != "" {
 		t.Fatalf("unexpected coding harness selection: %#v", cfg.Harness)
+	}
+}
+
+func TestUpgradeRemovesRetiredTUILaunchPreference(t *testing.T) {
+	root := t.TempDir()
+	if err := Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	path := config.PathForRoot(root)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = []byte(strings.Replace(string(data), "\n    tui:\n", "\n    tui:\n        enabled: false\n", 1))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Upgrade(root); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(after), "tui:\n        enabled:") || strings.Contains(string(after), "tui:\n    enabled:") {
+		t.Fatalf("upgrade retained retired TUI launch preference:\n%s", after)
 	}
 }

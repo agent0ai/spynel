@@ -38,7 +38,8 @@ jobs:
           npm pack --dry-run
           go test ./...
           go vet ./...
-          go build ./cmd/spynel
+          mkdir -p .tmp-bin
+          go build -o .tmp-bin/spynel ./cmd/spynel
           ./scripts/smoke.sh
           node npm/test.js
 

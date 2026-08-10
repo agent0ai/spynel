@@ -13,6 +13,8 @@ spynel
 
 The npm launcher downloads the checksummed native archive for the current platform and keeps the speech runtime libraries beside the executable. On first start in a directory without `.spynel/config.yaml`, choose **Initialize Spynel**. Spynel creates the private workspace state under that directory's fixed `.spynel/` folder and continues to setup or chat.
 
+If that directory is nested below an initialized workspace, bare interactive `spynel` pauses before starting any workspace owner. The startup screen offers **Use parent workspace** (the default), **Initialize here**, or **Exit**. Using the parent changes the process working directory to its root; initializing creates a distinct local `.spynel`; exiting, Escape, and Ctrl+C leave both locations unchanged. Explicit `--config` commands, `spynel serve`, and other automation retain deterministic ancestor discovery and never wait for this choice.
+
 Explicit initialization is also available:
 
 ```bash
@@ -29,7 +31,7 @@ Spynel detects supported coding harnesses. If none is available, setup shows ins
 
 ## Run from a development checkout
 
-The development helper can download a pinned Go toolchain into the ignored repository-level `.spynel-dev/` directory when Go is unavailable:
+The development helper can download a pinned Go toolchain into the ignored, disposable repository-level `.tmp-toolchains/` directory when Go is unavailable:
 
 ```bash
 git clone https://github.com/agent0ai/spynel.git
@@ -44,7 +46,7 @@ spynel_source="$(pwd)"
 spynel_playground="${TMPDIR:-/tmp}/spynel-playground"
 mkdir -p "$spynel_playground"
 cd "$spynel_playground"
-"$spynel_source/bin/spynel"
+"$spynel_source/.tmp-bin/spynel"
 ```
 
 To install the development executable under your user account:

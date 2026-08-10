@@ -28,7 +28,7 @@ func TestEveryOrchestrationPhaseGetsOneCallableDocsGuidance(t *testing.T) {
 			paths = append(paths, route.ReviewPrompt)
 		}
 		for _, path := range paths {
-			prompt, err := manager.renderPrompt(route, filepath.Join(root, ".spynel", route.Name, "working", "example.md"), path)
+			prompt, err := manager.renderPrompt(route, Lease{File: filepath.Join(root, ".spynel", route.Name, "working", "example.md")}, path)
 			if err != nil {
 				t.Fatalf("render %s: %v", path, err)
 			}
@@ -38,16 +38,16 @@ func TestEveryOrchestrationPhaseGetsOneCallableDocsGuidance(t *testing.T) {
 		}
 	}
 
-	legacy := filepath.Join(root, ".spynel", "prompts", "legacy.md")
-	if err := os.WriteFile(legacy, []byte("custom recovery prompt\n"), 0o600); err != nil {
+	custom := filepath.Join(root, ".spynel", "prompts", "custom.md")
+	if err := os.WriteFile(custom, []byte("custom recovery prompt\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	route := cfg.Orchestrator.Routes[0]
-	prompt, err := manager.renderPrompt(route, filepath.Join(root, "example.md"), legacy)
+	prompt, err := manager.renderPrompt(route, Lease{File: filepath.Join(root, "example.md")}, custom)
 	if err != nil || strings.Count(prompt, " docs <topic>") != 1 {
-		t.Fatalf("legacy prompt upgrade = %q, %v", prompt, err)
+		t.Fatalf("custom prompt guidance = %q, %v", prompt, err)
 	}
-	prompt, err = manager.renderPrompt(route, filepath.Join(root, agentdocs.PromptPlaceholder+".md"), route.Prompt)
+	prompt, err = manager.renderPrompt(route, Lease{File: filepath.Join(root, agentdocs.PromptPlaceholder+".md")}, route.Prompt)
 	if err != nil || strings.Count(prompt, " docs <topic>") != 1 {
 		t.Fatalf("placeholder-like replacement data duplicated guidance = %q, %v", prompt, err)
 	}

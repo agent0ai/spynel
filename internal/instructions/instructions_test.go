@@ -175,9 +175,9 @@ func TestMissingFileHasDeterministicEmptySection(t *testing.T) {
 	}
 }
 
-func TestInjectChatGuidanceUpgradesLegacyTemplatesOnce(t *testing.T) {
-	legacy := InjectChatGuidance("custom chat prompt")
-	if !strings.Contains(legacy, chatGuidanceMarker) || strings.Count(InjectChatGuidance(legacy), chatGuidanceMarker) != 1 {
-		t.Fatalf("legacy chat guidance was missing or duplicated: %q", legacy)
+func TestEnsureChatGuidanceAppendsCurrentContractOnce(t *testing.T) {
+	custom := EnsureChatGuidance("custom chat prompt")
+	if !strings.Contains(custom, chatGuidanceMarker) || strings.Count(EnsureChatGuidance(custom), chatGuidanceMarker) != 1 {
+		t.Fatalf("chat guidance was missing or duplicated: %q", custom)
 	}
 }

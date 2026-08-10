@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Upstream single-header dependency; keep GitHub language statistics focused
+# on Spynel's own implementation while retaining the pinned source we build.
+/internal/media/miniaudio/miniaudio.h linguist-vendored

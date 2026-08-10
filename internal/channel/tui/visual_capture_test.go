@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,6 +31,8 @@ func TestVisualCapture(t *testing.T) {
 	lipgloss.SetColorProfile(termenv.TrueColor)
 
 	captures := map[string]model{
+		"initialization":        visualInitializationModel(),
+		"workspace-choice":      visualWorkspaceChoiceModel(),
 		"chat":                  visualChatModel(),
 		"history-boundary":      visualHistoryBoundaryModel(),
 		"fresh":                 visualFreshModel(),
@@ -74,6 +77,21 @@ func TestVisualCapture(t *testing.T) {
 			t.Fatalf("write %s capture: %v", name, err)
 		}
 	}
+}
+
+func visualWorkspaceChoiceModel() model {
+	value := newRequiredActionModel(context.Background(), ParentWorkspaceScreen("/workspace/spynel/example", "/workspace"), func(_, _ string) error { return nil })
+	next, _ := value.Update(tea.WindowSizeMsg{Width: 120, Height: 34})
+	return next.(model)
+}
+
+func visualInitializationModel() model {
+	value := newInitializationModel(context.Background(), "/workspace/fresh-project", func() error { return nil })
+	value.title = "API workspace"
+	value.runtimeStatus = visualBaseModel().runtimeStatus
+	next, _ := value.Update(tea.WindowSizeMsg{Width: 120, Height: 34})
+	value = next.(model)
+	return value
 }
 
 func visualJobsModel() model {
@@ -291,6 +309,7 @@ func visualBaseModel() model {
 		{Name: "whatsapp", State: channel.ConnectionConnecting},
 	})
 	value.runtimeStatus = core.RuntimeStatus{Jobs: 2, Logs: 18}
+	value.durableWork = core.DurableWorkCounts{Goals: 3, Tasks: 7}
 	value.width = 120
 	value.height = 34
 	value.viewport.Width = 117

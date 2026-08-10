@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +88,106 @@ func TestOutboxDeduplicatesAndRecoversRetryState(t *testing.T) {
 	entry, _ = decodeOutboxForTest(data)
 	if entry.State != "delivered" || entry.Attempts != 2 || entry.DeliveredAt.IsZero() {
 		t.Fatalf("delivered state = %#v", entry)
+	}
+}
+
+func TestNormalizeNotificationTextRemovesTerminalControls(t *testing.T) {
+	exactReply := "\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R"
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "observed OSC 11 and cursor reply", input: exactReply + "Report ready.", want: "Report ready."},
+		{name: "CSI styles and queries", input: "A\x1b[31mred\x1b[0m B\u009b6nC", want: "Ared BC"},
+		{name: "OSC ST", input: "before\x1b]0;unsafe title\x1b\\after", want: "beforeafter"},
+		{name: "DCS APC PM and SOS", input: "a\x1bPpayload\x1b\\b\x1b_hidden\x1b\\c\x1b^private\u009cd\u0098secret\u009ce", want: "abcde"},
+		{name: "C0 and C1 preserve newline tab", input: "one\x00\x08\ttwo\r\nthree\u0085four\x7f", want: "one\ttwo\nthreefour"},
+		{name: "truncated CSI", input: "safe\x1b[12;", want: "safe"},
+		{name: "truncated OSC", input: "safe\x1b]11;rgb:ffff/ffff/ffff", want: "safe"},
+		{name: "malformed CSI keeps following Unicode", input: "safe\x1b[12;🛰️ prose", want: "safe🛰️ prose"},
+		{name: "Unicode Markdown multiline", input: "  **Done** — café 🚀\n\n- 第一\n\tindented  ", want: "**Done** — café 🚀\n\n- 第一\n\tindented"},
+		{name: "8-bit C1 CSI", input: "before\x9b1;1Rafter", want: "beforeafter"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := NormalizeNotificationText(test.input)
+			if err != nil || got != test.want {
+				t.Fatalf("NormalizeNotificationText(%q) = %q, %v; want %q", test.input, got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeNotificationTextRejectsControlOnlyAndInvalidUTF8(t *testing.T) {
+	for _, input := range []string{"\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R", "\x00\r\x7f", string([]byte{'o', 'k', 0xff})} {
+		if got, err := NormalizeNotificationText(input); err == nil || got != "" {
+			t.Fatalf("NormalizeNotificationText(%q) = %q, %v; want rejection", input, got, err)
+		}
+	}
+}
+
+func TestOutboxNormalizesBeforePersistenceAndDelivery(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "outbox")
+	var delivered string
+	outbox := &Outbox{Directory: directory, Deliver: func(_ context.Context, _ Origin, _ string, message string) error {
+		delivered = message
+		return nil
+	}}
+	unsafe := "\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1R**Ready** 🚀\nnext"
+	entry, err := outbox.Enqueue("event", "done", "cli/local", unsafe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Message != "**Ready** 🚀\nnext" {
+		t.Fatalf("normalized entry = %q", entry.Message)
+	}
+	data, err := os.ReadFile(outbox.path(entry.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "rgb:0000") || strings.ContainsRune(string(data), '\x1b') {
+		t.Fatalf("unsafe bytes reached durable outbox: %q", data)
+	}
+	if err := outbox.Process(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if delivered != entry.Message {
+		t.Fatalf("delivered = %q; want %q", delivered, entry.Message)
+	}
+	if _, err := outbox.Enqueue("empty", "done", "cli/local", "\x1b[6n"); err == nil {
+		t.Fatal("control-only notification was enqueued")
+	}
+}
+
+func TestOutboxNormalizesLegacyPendingEntryBeforeDelivery(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "outbox")
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 10, 15, 0, 0, 0, time.UTC)
+	unsafeEntry := OutboxEntry{
+		ID: "legacy", Origin: "cli/local", Message: "\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1RReady.",
+		State: "pending", CreatedAt: now, UpdatedAt: now, NextAttemptAt: now,
+	}
+	data, _ := json.Marshal(unsafeEntry)
+	if err := os.WriteFile(filepath.Join(directory, "legacy.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var delivered string
+	outbox := &Outbox{Directory: directory, Now: func() time.Time { return now }, Deliver: func(_ context.Context, _ Origin, _ string, message string) error {
+		delivered = message
+		return nil
+	}}
+	if err := outbox.Process(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if delivered != "Ready." {
+		t.Fatalf("legacy delivery = %q", delivered)
+	}
+	stored, err := os.ReadFile(filepath.Join(directory, "legacy.json"))
+	if err != nil || strings.Contains(string(stored), "rgb:0000") {
+		t.Fatalf("legacy outbox was not normalized: %q, %v", stored, err)
 	}
 }
 

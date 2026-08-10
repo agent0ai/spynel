@@ -102,10 +102,6 @@ func (c *Client) State(ctx context.Context) (app.SharedState, error) {
 	return state, nil
 }
 
-func (c *Client) Notify(ctx context.Context, origin, message string) (string, error) {
-	return c.NotifyWithIdentity(ctx, origin, message, "", "")
-}
-
 func (c *Client) NotifyWithIdentity(ctx context.Context, origin, message, eventKey, outcome string) (string, error) {
 	body, err := json.Marshal(notifyRequest{Origin: origin, Message: message, EventKey: eventKey, Outcome: outcome})
 	if err != nil {

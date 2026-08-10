@@ -124,15 +124,6 @@ func (p *Parakeet) model(ctx context.Context, cfg config.Speech) (parakeetFiles,
 	} else if !os.IsNotExist(statErr) {
 		return parakeetFiles{}, fmt.Errorf("inspect managed Parakeet model: %w", statErr)
 	}
-	legacy := filepath.Join(p.legacyModelDir, spec.ID)
-	if _, legacyErr := verifyParakeetAssets(legacy, spec.Files); legacyErr == nil {
-		if err := adoptLegacyParakeetModel(legacy, destination, spec); err != nil {
-			return parakeetFiles{}, fmt.Errorf("adopt legacy Parakeet model: %w", err)
-		}
-		p.logf("Adopted legacy Parakeet model into shared cache: %s", destination)
-		return inspectManagedParakeetModel(destination, spec)
-	}
-
 	p.logf("Downloading Parakeet model %s (first use)", spec.ID)
 	archive, cleanup, err := p.downloadModel(ctx, spec)
 	if err != nil {
@@ -193,51 +184,6 @@ func writeParakeetManifest(directory string, spec parakeetModel) error {
 		return fmt.Errorf("write Parakeet model integrity marker: %w", err)
 	}
 	return nil
-}
-
-func adoptLegacyParakeetModel(source, destination string, spec parakeetModel) error {
-	temporary, err := os.MkdirTemp(filepath.Dir(destination), ".legacy-"+spec.ID+"-*.partial")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(temporary)
-	for _, name := range append(append([]string(nil), requiredParakeetFiles...), "MODEL_NOTICE.txt") {
-		input, err := os.Open(filepath.Join(source, name))
-		if err != nil {
-			if name == "MODEL_NOTICE.txt" && os.IsNotExist(err) {
-				continue
-			}
-			return err
-		}
-		output, err := os.OpenFile(filepath.Join(temporary, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err != nil {
-			_ = input.Close()
-			return err
-		}
-		_, copyErr := io.Copy(output, input)
-		syncErr := output.Sync()
-		closeOutputErr := output.Close()
-		closeInputErr := input.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		if syncErr != nil {
-			return syncErr
-		}
-		if closeOutputErr != nil {
-			return closeOutputErr
-		}
-		if closeInputErr != nil {
-			return closeInputErr
-		}
-	}
-	if _, err := verifyParakeetAssets(temporary, spec.Files); err != nil {
-		return err
-	}
-	if err := writeParakeetManifest(temporary, spec); err != nil {
-		return err
-	}
-	return os.Rename(temporary, destination)
 }
 
 func verifyParakeetAssets(directory string, expected map[string]parakeetAsset) (parakeetFiles, error) {

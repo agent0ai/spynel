@@ -3,7 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-binary="$project_dir/bin/spynel"
+binary="$project_dir/.tmp-bin/spynel"
 
 "$script_dir/dev.sh" dox
 "$script_dir/dev.sh" build >/dev/null
@@ -84,6 +84,12 @@ if grep -q 'state_dir:' "$smoke_dir/.spynel/config.yaml"; then
   echo "canonical config unexpectedly contains workspace.state_dir" >&2
   exit 1
 fi
+for prefix in chat developer reviewer heartbeat; do
+  if ! grep -q "^[[:space:]]*${prefix}_agent_prefix: \"\"$" "$smoke_dir/.spynel/config.yaml"; then
+    echo "canonical config does not default ${prefix}_agent_prefix to empty" >&2
+    exit 1
+  fi
+done
 test -f "$smoke_dir/.spynel/AGENTS.md"
 test -f "$smoke_dir/.spynel/prompts/create-task.md"
 test -f "$smoke_dir/.spynel/prompts/create-goal.md"

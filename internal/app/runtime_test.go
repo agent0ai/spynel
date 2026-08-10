@@ -52,7 +52,11 @@ func TestRuntimeClearLogsDropsEntriesAndPartialOutput(t *testing.T) {
 	if _, err := attributed.Write([]byte("also unfinished")); err != nil {
 		t.Fatal(err)
 	}
-	if count := runtime.ClearLogs(); count != 1 {
+	count, err := runtime.ClearLogsResult()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
 		t.Fatalf("cleared count = %d, want 1", count)
 	}
 	if len(runtime.Logs()) != 0 || runtime.Status().Logs != 0 {

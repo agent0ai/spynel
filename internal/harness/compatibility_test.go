@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -183,11 +184,16 @@ func TestClaudeRejectsMissingCLIFlagBeforeStarting(t *testing.T) {
 func TestClaudeRejectsChangedInitEventWithoutPersistence(t *testing.T) {
 	command, root, _ := portableHarnessFixture(t, "claude-init-changed-event")
 	sessions := filepath.Join(root, "sessions.json")
-	original := []byte("{\n  \"chat\": \"persisted-session\"\n}\n")
+	config := HarnessConfig{Command: command, Cwd: root, ApprovalPolicy: "plan", SessionsFile: sessions}
+	original, err := json.Marshal(map[string]claudeSession{"chat": {ID: "persisted-session", Policy: claudeSessionPolicy(config)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original = append(original, '\n')
 	if err := os.WriteFile(sessions, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	claude, err := NewClaude(HarnessConfig{Command: command, Cwd: root, ApprovalPolicy: "plan", SessionsFile: sessions})
+	claude, err := NewClaude(config)
 	if err != nil {
 		t.Fatal(err)
 	}

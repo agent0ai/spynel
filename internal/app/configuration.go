@@ -590,19 +590,24 @@ func (s *Service) NoticeEvents() <-chan channel.Notice { return s.noticeEvents }
 // intentionally excludes configuration secrets, log bodies, and conversation
 // contents.
 type SharedState struct {
-	Title          string                     `json:"title"`
-	Theme          string                     `json:"theme"`
-	Connections    []channel.ConnectionStatus `json:"connections"`
-	Pairings       []channel.PairingEvent     `json:"pairings"`
-	Runtime        core.RuntimeStatus         `json:"runtime"`
-	NoticeSequence uint64                     `json:"notice_sequence"`
-	Notice         channel.Notice             `json:"notice"`
+	Title           string                     `json:"title"`
+	Theme           string                     `json:"theme"`
+	Connections     []channel.ConnectionStatus `json:"connections"`
+	Pairings        []channel.PairingEvent     `json:"pairings"`
+	Runtime         core.RuntimeStatus         `json:"runtime"`
+	DurableWork     core.DurableWorkCounts     `json:"durable_work"`
+	WorkDiagnostics []string                   `json:"work_count_diagnostics,omitempty"`
+	NoticeSequence  uint64                     `json:"notice_sequence"`
+	Notice          channel.Notice             `json:"notice"`
 }
 
 func (s *Service) SharedState() SharedState {
+	work := s.Orchestrator.WorkStatus()
 	state := SharedState{
 		Title: s.currentTitle(), Theme: s.Settings.Snapshot().Channels.TUI.Theme,
-		Runtime: s.Runtime.Status(),
+		Runtime:         s.Runtime.Status(),
+		DurableWork:     core.DurableWorkCounts{Tasks: work.TasksActive, Goals: work.GoalsActive},
+		WorkDiagnostics: append([]string(nil), work.CountDiagnostics...),
 	}
 	s.connectionMu.RLock()
 	for _, name := range []string{"telegram", "whatsapp"} {
@@ -637,7 +642,7 @@ func (s *Service) harnessCommand(message core.Message, remainder string, emit co
 		if _, err := s.resolveHarnessCommand(name); err != nil {
 			definition, _ := harness.Lookup(name)
 			if definition.Custom {
-				return s.localReply(message, "Saved `harness.name` = `acp`, but the custom ACP command is unavailable. Set `harness.acp_command` and optional JSON-array `harness.acp_args`, then run `/harness acp` again.", emit)
+				return s.localReply(message, "Saved `harness.name` = `acp`, but the custom ACP command is unavailable. Set `harness.acp_command` and optional command-line `harness.acp_args`, then run `/harness acp` again.", emit)
 			}
 			return s.localReply(message, fmt.Sprintf("Saved `harness.name` = `%s`. **%s** is not installed or not on PATH. Install it from %s, then run `/harness %s` again to connect.", name, definition.DisplayName, definition.InstallURL, name), emit)
 		}
@@ -892,7 +897,7 @@ func (s *Service) setSetting(message core.Message, key, value string, emit core.
 	setting := changed[0]
 	response := fmt.Sprintf("Saved `%s` = `%s`.", setting.Key, setting.Value)
 	if setting.Restart {
-		response += " Restart Spynel to apply this change to the running harness or service."
+		response += " Restart Spynel to apply this extension change."
 	}
 	return s.localReply(message, response, emit)
 }
@@ -942,10 +947,11 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		}
 		return changed, nil
 	}
-	if _, err := s.Settings.Update(func(current *config.Config) error {
+	reloaded, err := s.Settings.Update(func(current *config.Config) error {
 		*current = next
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		var rollback error
 		if harnessChanged {
 			rollback = s.reconfigureHarness(previous)
@@ -953,20 +959,11 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		s.Runtime.LogEvent("error", "config", "persist_failed", "Configuration persistence failed")
 		return nil, errors.Join(err, wrapRollback("harness", rollback))
 	}
+	next = reloaded
 	if startupChanged && s.Startup != nil {
 		if err := s.Startup.Sync(next, next.Startup.Enabled); err != nil {
-			var rollbacks []error
-			_, rollbackConfig := s.Settings.Update(func(current *config.Config) error {
-				*current = previous
-				return nil
-			})
-			rollbacks = append(rollbacks, wrapRollback("configuration", rollbackConfig))
-			if harnessChanged {
-				rollbacks = append(rollbacks, wrapRollback("harness", s.reconfigureHarness(previous)))
-			}
-			rollbacks = append(rollbacks, wrapRollback("startup registration", s.Startup.Sync(previous, previous.Startup.Enabled)))
-			s.Runtime.LogEvent("error", "config", "side_effect_failed", "Configuration side effect failed and rollback was requested")
-			return nil, errors.Join(fmt.Errorf("configure run at startup: %w", err), errors.Join(rollbacks...))
+			s.Runtime.LogEvent("error", "config", "side_effect_failed", "Configuration was saved but startup registration could not be refreshed")
+			return nil, fmt.Errorf("configure run at startup: %w", err)
 		}
 	}
 	for _, setting := range changed {
@@ -977,7 +974,7 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	if themeChanged {
 		s.publishTheme(selectedTheme)
 	}
-	if previous.Orchestrator.Enabled != next.Orchestrator.Enabled || previous.Orchestrator.SemanticHeartbeatMinutes != next.Orchestrator.SemanticHeartbeatMinutes {
+	if !reflect.DeepEqual(previous.Orchestrator, next.Orchestrator) {
 		s.Orchestrator.ApplyRuntimeConfig(next)
 	} else if harnessAgentPolicyChanged(previous.Harness, next.Harness) {
 		s.Orchestrator.ApplyHarnessConfig(next.Harness)

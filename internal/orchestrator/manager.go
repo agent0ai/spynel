@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +23,7 @@ import (
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/instructions"
 	"github.com/agent0ai/spynel/internal/shortid"
+	"gopkg.in/yaml.v3"
 )
 
 type Lease struct {
@@ -32,6 +32,8 @@ type Lease struct {
 	DocumentType           string          `json:"document_type,omitempty"`
 	OwnerID                string          `json:"owner_id,omitempty"`
 	Route                  string          `json:"route"`
+	RouteSnapshot          *config.Route   `json:"route_snapshot,omitempty"`
+	RoutesSnapshot         []config.Route  `json:"routes_snapshot,omitempty"`
 	File                   string          `json:"file"`
 	SourceFile             string          `json:"source_file,omitempty"`
 	SessionKey             string          `json:"session_key"`
@@ -45,10 +47,6 @@ type Lease struct {
 	ClaimAttempt           int             `json:"claim_attempt,omitempty"`
 	ImplementerThread      string          `json:"implementer_thread,omitempty"`
 	TerminalHooksCompleted map[string]bool `json:"terminal_hooks_completed,omitempty"`
-	// TerminalHooksStarted is a legacy intent/process-start fence. It is read
-	// only for compatibility and deliberately ignored because it cannot prove
-	// successful delivery.
-	TerminalHooksStarted map[string]bool `json:"terminal_hooks_started,omitempty"`
 }
 
 type ScheduledCheckpoint struct {
@@ -72,6 +70,8 @@ type Manager struct {
 	notificationDecisionTimeout time.Duration
 	notificationMu              sync.Mutex
 	notificationRunning         map[string]bool
+	runtimeConfigMu             sync.RWMutex
+	runtimeConfig               config.Config
 
 	mu                          sync.Mutex
 	scanMu                      sync.Mutex
@@ -79,10 +79,18 @@ type Manager struct {
 	runtimeJobs                 map[string]int
 	controlCancelled            map[string]bool
 	jobs                        sync.WaitGroup
-	sem                         chan struct{}
+	capacityMu                  sync.Mutex
+	capacityActive              int
+	capacityLimit               int
+	capacityChanged             chan struct{}
 	Outbox                      *Outbox
 	ownerID                     string
 	scanNow                     chan struct{}
+	scanTimerMu                 sync.Mutex
+	scanTimer                   *time.Timer
+	scanTimerGeneration         uint64
+	scanNext                    time.Time
+	scanTimerChanged            chan struct{}
 	heartbeatNow                func() time.Time
 	heartbeatTicks              <-chan time.Time
 	heartbeatTimeout            time.Duration
@@ -117,31 +125,61 @@ func (m *Manager) SetPrimaryOwned(owned bool) {
 	m.primaryOwned.Store(owned)
 }
 
-// ApplyRuntimeConfig publishes the orchestrator controls whose scheduler
-// semantics are live. Structural routes, scan cadence, and parallelism remain
-// fixed for the manager lifetime and continue to require a restart.
+// ApplyRuntimeConfig publishes one accepted runtime snapshot. Existing jobs
+// retain their immutable admission snapshot; every subsequent scan, claim,
+// notification decision, and hook dispatch observes the newest snapshot.
 func (m *Manager) ApplyRuntimeConfig(cfg config.Config) {
+	m.scanMu.Lock()
+	defer m.scanMu.Unlock()
+	m.runtimeConfigMu.Lock()
+	previous := m.runtimeConfig
+	// Extension controls are the sole intentional restart boundary. Keep the
+	// process-start snapshot even when a transaction changes them alongside
+	// live settings.
+	cfg.Extensions = previous.Extensions
+	m.runtimeConfig = cfg
+	m.runtimeConfigMu.Unlock()
 	m.harnessPolicy.Store(cfg.Harness)
 	wasEnabled := m.orchestratorEnabled.Load()
-	acceptedAt := m.semanticHeartbeatNow()
-	m.heartbeatCommit.Lock()
-	m.orchestratorEnabled.Store(cfg.Orchestrator.Enabled)
-	m.heartbeatMinutes.Store(int64(cfg.Orchestrator.SemanticHeartbeatMinutes))
-	m.heartbeatConfigAcceptedAt.Store(acceptedAt.UnixNano())
-	m.heartbeatConfigGeneration.Add(1)
-	// Fence result commit, deadline publication, timer ownership, and tick
-	// dispatch synchronously with the accepted configuration change. The
-	// scheduler will cancel the superseded audit context and establish a fresh
-	// term when it consumes the notification below.
-	m.heartbeatTerm++
-	m.stopSemanticHeartbeatTimer(nil)
-	// A previously published deadline belongs to the superseded configuration.
-	// Leave status honestly unavailable until the scheduler owns its new timer.
-	m.setSemanticHeartbeatSchedule(false, time.Time{})
-	m.heartbeatCommit.Unlock()
-	select {
-	case m.heartbeatConfigChanged <- struct{}{}:
-	default:
+	heartbeatChanged := previous.Orchestrator.Enabled != cfg.Orchestrator.Enabled || previous.Orchestrator.SemanticHeartbeatMinutes != cfg.Orchestrator.SemanticHeartbeatMinutes
+	if heartbeatChanged {
+		acceptedAt := m.semanticHeartbeatNow()
+		m.heartbeatCommit.Lock()
+		m.orchestratorEnabled.Store(cfg.Orchestrator.Enabled)
+		m.heartbeatMinutes.Store(int64(cfg.Orchestrator.SemanticHeartbeatMinutes))
+		m.heartbeatConfigAcceptedAt.Store(acceptedAt.UnixNano())
+		m.heartbeatConfigGeneration.Add(1)
+		// Fence result commit, deadline publication, timer ownership, and tick
+		// dispatch synchronously with the accepted configuration change.
+		m.heartbeatTerm++
+		m.stopSemanticHeartbeatTimer(nil)
+		m.setSemanticHeartbeatSchedule(false, time.Time{})
+		m.heartbeatCommit.Unlock()
+		select {
+		case m.heartbeatConfigChanged <- struct{}{}:
+		default:
+		}
+	}
+	if previous.Orchestrator.IntervalSec != cfg.Orchestrator.IntervalSec {
+		// Reset the production timer synchronously. ApplyRuntimeConfig holds the
+		// scan lock, so an old timer event either finishes before acceptance or
+		// observes the new generation and is discarded afterward.
+		m.resetScanTimer(time.Now())
+	}
+	if previous.Orchestrator.MaxParallel != cfg.Orchestrator.MaxParallel {
+		m.capacityMu.Lock()
+		m.capacityLimit = max(1, cfg.Orchestrator.MaxParallel)
+		m.capacityMu.Unlock()
+		m.signalCapacityChanged()
+		if cfg.Orchestrator.MaxParallel > previous.Orchestrator.MaxParallel {
+			m.requestScan()
+		}
+	}
+	if previous.Orchestrator.TaskNotifications != cfg.Orchestrator.TaskNotifications {
+		// Reconcile durable pending events under the newest accepted mode now.
+		// Running agents remain fenced by their persisted event and authorization
+		// rechecks; off makes their prepared action fail closed.
+		m.requestScan()
 	}
 	if cfg.Orchestrator.Enabled && !wasEnabled {
 		m.requestScan()
@@ -182,10 +220,12 @@ func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Ma
 		parallel = 1
 	}
 	manager := &Manager{
-		Config: cfg, Harness: target, Hooks: hooks, inflight: map[string]bool{}, runtimeJobs: map[string]int{}, controlCancelled: map[string]bool{}, sem: make(chan struct{}, parallel),
+		Config: cfg, runtimeConfig: cfg, Harness: target, Hooks: hooks, inflight: map[string]bool{}, runtimeJobs: map[string]int{}, controlCancelled: map[string]bool{}, capacityLimit: parallel,
 		Outbox:                 &Outbox{Directory: cfg.StatePath("runtime", "outbox")},
 		ownerID:                fmt.Sprintf("%d-%d-%s", os.Getpid(), time.Now().UTC().UnixNano(), randomSuffix()),
 		scanNow:                make(chan struct{}, 1),
+		capacityChanged:        make(chan struct{}, 1),
+		scanTimerChanged:       make(chan struct{}, 1),
 		heartbeatConfigChanged: make(chan struct{}, 1),
 		heartbeatNow:           time.Now, heartbeatTimeout: 5 * time.Minute,
 		notificationRunning: map[string]bool{},
@@ -210,9 +250,13 @@ func (m *Manager) Run(ctx context.Context) error {
 		m.runSemanticHeartbeat(ctx)
 	}()
 	defer func() { <-heartbeatDone }()
-	ticker := time.NewTicker(time.Duration(m.Config.Orchestrator.IntervalSec) * time.Second)
-	defer ticker.Stop()
+	timer := m.startScanTimer()
+	defer m.stopScanTimer(timer)
 	for {
+		m.scanTimerMu.Lock()
+		timer = m.scanTimer
+		generation := m.scanTimerGeneration
+		m.scanTimerMu.Unlock()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -220,12 +264,135 @@ func (m *Manager) Run(ctx context.Context) error {
 			if err := m.ScanOnce(ctx); err != nil {
 				m.log("orchestrator event scan: " + err.Error())
 			}
-		case <-ticker.C:
-			if err := m.ScanOnce(ctx); err != nil {
+		case <-m.scanTimerChanged:
+			continue
+		case <-timer.C:
+			if err := m.scanScheduled(ctx, generation); err != nil {
 				m.log("orchestrator scan: " + err.Error())
 			}
 		}
 	}
+}
+
+func (m *Manager) startScanTimer() *time.Timer {
+	m.scanTimerMu.Lock()
+	defer m.scanTimerMu.Unlock()
+	now := time.Now()
+	if m.scanNext.IsZero() {
+		m.scanNext = now.Add(m.scanInterval())
+		m.scanTimerGeneration++
+	}
+	delay := time.Until(m.scanNext)
+	if delay < 0 {
+		delay = 0
+	}
+	m.scanTimer = time.NewTimer(delay)
+	return m.scanTimer
+}
+
+func (m *Manager) stopScanTimer(_ *time.Timer) {
+	m.scanTimerMu.Lock()
+	defer m.scanTimerMu.Unlock()
+	if m.scanTimer == nil {
+		return
+	}
+	if !m.scanTimer.Stop() {
+		select {
+		case <-m.scanTimer.C:
+		default:
+		}
+	}
+	m.scanTimer = nil
+}
+
+// resetScanTimer arms the next route scan from the accepted configuration
+// instant and returns only after the production timer observes the new
+// generation. When Run has not started yet, startScanTimer preserves the same
+// accepted deadline.
+func (m *Manager) resetScanTimer(acceptedAt time.Time) {
+	m.scanTimerMu.Lock()
+	defer m.scanTimerMu.Unlock()
+	m.scanNext = acceptedAt.Add(m.scanInterval())
+	m.scanTimerGeneration++
+	if m.scanTimer == nil {
+		return
+	}
+	if !m.scanTimer.Stop() {
+		select {
+		case <-m.scanTimer.C:
+		default:
+		}
+	}
+	delay := time.Until(m.scanNext)
+	if delay < 0 {
+		delay = 0
+	}
+	m.scanTimer = time.NewTimer(delay)
+	select {
+	case m.scanTimerChanged <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Manager) scanScheduled(ctx context.Context, generation uint64) error {
+	m.scanMu.Lock()
+	defer m.scanMu.Unlock()
+	m.scanTimerMu.Lock()
+	current := m.scanTimerGeneration
+	m.scanTimerMu.Unlock()
+	if current != generation {
+		return nil
+	}
+	err := m.scanOnce(ctx)
+	m.resetScanTimer(time.Now())
+	return err
+}
+
+func (m *Manager) runtimeSnapshot() config.Config {
+	m.runtimeConfigMu.RLock()
+	defer m.runtimeConfigMu.RUnlock()
+	return m.runtimeConfig
+}
+
+func (m *Manager) scanInterval() time.Duration {
+	seconds := m.runtimeSnapshot().Orchestrator.IntervalSec
+	if seconds < 1 {
+		seconds = 1
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (m *Manager) signalCapacityChanged() {
+	select {
+	case m.capacityChanged <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Manager) acquireCapacity(ctx context.Context) bool {
+	for {
+		m.capacityMu.Lock()
+		if m.capacityActive < m.capacityLimit {
+			m.capacityActive++
+			m.capacityMu.Unlock()
+			return true
+		}
+		m.capacityMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-m.capacityChanged:
+		}
+	}
+}
+
+func (m *Manager) releaseCapacity() {
+	m.capacityMu.Lock()
+	if m.capacityActive > 0 {
+		m.capacityActive--
+	}
+	m.capacityMu.Unlock()
+	m.signalCapacityChanged()
 }
 
 func (m *Manager) requestScan() {
@@ -238,9 +405,11 @@ func (m *Manager) requestScan() {
 func (m *Manager) ScanOnce(ctx context.Context) error {
 	m.scanMu.Lock()
 	defer m.scanMu.Unlock()
-	if err := m.removeLegacyNotificationWorkflowState(); err != nil {
-		m.log("legacy notification state cleanup deferred: " + err.Error())
-	}
+	return m.scanOnce(ctx)
+}
+
+func (m *Manager) scanOnce(ctx context.Context) error {
+	cfg := m.runtimeSnapshot()
 	if !m.orchestratorEnabled.Load() {
 		return nil
 	}
@@ -248,9 +417,6 @@ func (m *Manager) ScanOnce(ctx context.Context) error {
 		return err
 	}
 	if err := m.ensureRouteDirectories(); err != nil {
-		return err
-	}
-	if err := m.migrateLegacyGoals(); err != nil {
 		return err
 	}
 	if err := m.resumeInterruptedClaims(ctx); err != nil {
@@ -271,13 +437,13 @@ func (m *Manager) ScanOnce(ctx context.Context) error {
 	if err := m.advanceActiveGoals(); err != nil {
 		return err
 	}
-	for _, route := range m.Config.Orchestrator.Routes {
+	for _, route := range cfg.Orchestrator.Routes {
 		var err error
 		switch route.Name {
 		case "tasks":
-			err = m.scanPhaseQueue(ctx, route, m.Config.Resolve(route.Source), m.Config.Resolve(route.Working), phaseTaskImplementation)
+			err = m.scanPhaseQueue(ctx, route, cfg.Resolve(route.Source), cfg.Resolve(route.Working), phaseTaskImplementation)
 		case "goals":
-			err = m.scanPhaseQueue(ctx, route, m.Config.Resolve(route.Source), m.Config.Resolve(route.Working), phaseGoalPlanning)
+			err = m.scanPhaseQueue(ctx, route, cfg.Resolve(route.Source), cfg.Resolve(route.Working), phaseGoalPlanning)
 		default:
 			err = m.scanRoute(ctx, route)
 		}
@@ -285,8 +451,8 @@ func (m *Manager) ScanOnce(ctx context.Context) error {
 			return fmt.Errorf("route %s: %w", route.Name, err)
 		}
 	}
-	for _, route := range m.Config.Orchestrator.Routes {
-		base := filepath.Dir(m.Config.Resolve(route.Source))
+	for _, route := range cfg.Orchestrator.Routes {
+		base := filepath.Dir(cfg.Resolve(route.Source))
 		var phase string
 		switch route.Name {
 		case "tasks":
@@ -310,7 +476,8 @@ func (m *Manager) ScanOnce(ctx context.Context) error {
 }
 
 func (m *Manager) scanRoute(ctx context.Context, route config.Route) error {
-	sourceDir := m.Config.Resolve(route.Source)
+	cfg := m.runtimeSnapshot()
+	sourceDir := cfg.Resolve(route.Source)
 	entries, err := os.ReadDir(sourceDir)
 	if os.IsNotExist(err) {
 		return os.MkdirAll(sourceDir, 0o700)
@@ -335,7 +502,10 @@ func (m *Manager) scanRoute(ctx context.Context, route config.Route) error {
 		if m.isInflight(key) || m.leaseExists(key) {
 			continue
 		}
-		target := filepath.Join(m.Config.Resolve(route.Working), entry.Name())
+		if !m.canAdmitClaim() {
+			break
+		}
+		target := filepath.Join(cfg.Resolve(route.Working), entry.Name())
 		document, err := ClaimDocument(source, target, filepath.Base(filepath.Clean(route.Working)), time.Now())
 		if err != nil {
 			m.log(fmt.Sprintf("claim %s: %v", source, err))
@@ -347,13 +517,13 @@ func (m *Manager) scanRoute(ctx context.Context, route config.Route) error {
 		}
 		lease := Lease{
 			ID: key, ClaimID: key, DocumentType: strings.TrimSuffix(route.Name, "s"), OwnerID: m.ownerID,
-			Route: route.Name, File: target, SessionKey: "orchestrator:" + route.Name + ":" + documentID,
+			Route: route.Name, RouteSnapshot: cloneRoute(route), RoutesSnapshot: cloneRoutes(cfg.Orchestrator.Routes), File: target, SessionKey: "orchestrator:" + route.Name + ":" + documentID,
 			State: "processing", Phase: "implementation", StartedAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(),
 		}
 		if err := m.saveLease(lease); err != nil {
 			return err
 		}
-		if m.Config.Extensions.Enabled {
+		if m.runtimeSnapshot().Extensions.Enabled {
 			output, hookErr := m.Hooks.Run(ctx, "task.claimed", map[string]any{"route": route.Name, "file": target, "id": documentID})
 			if hookErr != nil {
 				m.recordError(lease, hookErr)
@@ -415,6 +585,9 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route config.Route, source
 		if m.isInflight(key) || m.leaseExists(key) || documentLeased {
 			continue
 		}
+		if !m.canAdmitClaim() {
+			break
+		}
 		if phase == phaseTaskReview && m.harnessSettings().Reviews == config.TaskReviewsNever {
 			target := filepath.Join(filepath.Dir(sourceDir), "todo", entry.Name())
 			note := "Independent task review is disabled by harness.reviews=never; Spynel returned this task to todo so an implementation session can record the required direct-completion evidence."
@@ -429,8 +602,10 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route config.Route, source
 		attempt := numberValue(document.FrontMatter[attemptField]) + 1
 		lease := Lease{
 			ID: key, ClaimID: key, DocumentType: strings.TrimSuffix(route.Name, "s"), Route: route.Name,
-			OwnerID: m.ownerID,
-			File:    target, SourceFile: source, SessionKey: phaseSessionKey(route.Name, documentID, phase, attempt),
+			RouteSnapshot:  cloneRoute(route),
+			RoutesSnapshot: cloneRoutes(m.runtimeSnapshot().Orchestrator.Routes),
+			OwnerID:        m.ownerID,
+			File:           target, SourceFile: source, SessionKey: phaseSessionKey(route.Name, documentID, phase, attempt),
 			State: "claiming", Phase: phase, ClaimAttempt: attempt, StartedAt: now, HeartbeatAt: now,
 		}
 		if phase == phaseTaskReview {
@@ -458,7 +633,7 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route config.Route, source
 		if err := m.saveLease(lease); err != nil {
 			return err
 		}
-		if phase == phaseTaskImplementation && m.Config.Extensions.Enabled {
+		if phase == phaseTaskImplementation && m.runtimeSnapshot().Extensions.Enabled {
 			output, hookErr := m.Hooks.Run(ctx, "task.claimed", map[string]any{"route": route.Name, "phase": phase, "file": target, "id": documentID})
 			if hookErr != nil {
 				m.recordError(lease, hookErr)
@@ -509,9 +684,11 @@ func (m *Manager) startExistingClaim(ctx context.Context, route config.Route, pa
 	}
 	lease := Lease{
 		ID: key, ClaimID: key, DocumentType: strings.TrimSuffix(route.Name, "s"), Route: route.Name,
-		OwnerID: m.ownerID,
-		File:    path, SessionKey: phaseSessionKey(route.Name, id, phase, attempt), State: state,
-		Phase: phase, StartedAt: now, HeartbeatAt: now,
+		RouteSnapshot:  cloneRoute(route),
+		RoutesSnapshot: cloneRoutes(m.runtimeSnapshot().Orchestrator.Routes),
+		OwnerID:        m.ownerID,
+		File:           path, SessionKey: phaseSessionKey(route.Name, id, phase, attempt), State: state,
+		Phase: phase, ClaimAttempt: attempt, StartedAt: now, HeartbeatAt: now,
 	}
 	if phase == phaseTaskReview {
 		lease.ImplementerThread, _ = document.FrontMatter["implementation_thread"].(string)
@@ -535,22 +712,11 @@ func numberValue(value any) int {
 	return 0
 }
 
-func claimAttemptFromSession(sessionKey string) int {
-	separator := strings.LastIndexByte(sessionKey, ':')
-	if separator < 0 || separator == len(sessionKey)-1 {
-		return 0
-	}
-	attempt, err := strconv.Atoi(sessionKey[separator+1:])
-	if err != nil || attempt < 1 {
-		return 0
-	}
-	return attempt
-}
-
 func (m *Manager) ensureRouteDirectories() error {
-	for _, route := range m.Config.Orchestrator.Routes {
-		paths := []string{m.Config.Resolve(route.Source), m.Config.Resolve(route.Working)}
-		base := filepath.Dir(m.Config.Resolve(route.Source))
+	cfg := m.runtimeSnapshot()
+	for _, route := range cfg.Orchestrator.Routes {
+		paths := []string{cfg.Resolve(route.Source), cfg.Resolve(route.Working)}
+		base := filepath.Dir(cfg.Resolve(route.Source))
 		for _, status := range route.AllowedNext {
 			paths = append(paths, filepath.Join(base, status))
 		}
@@ -575,12 +741,10 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 			// waiting for the periodic recovery scan.
 			m.requestScan()
 		}()
-		select {
-		case m.sem <- struct{}{}:
-			defer func() { <-m.sem }()
-		case <-ctx.Done():
+		if !m.acquireCapacity(ctx) {
 			return
 		}
+		defer m.releaseCapacity()
 		promptPath := route.Prompt
 		if recovery {
 			promptPath = route.RecoveryPrompt
@@ -595,7 +759,7 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 				return
 			}
 		}
-		prompt, err := m.renderPrompt(route, lease.File, promptPath)
+		prompt, err := m.renderPrompt(route, lease, promptPath)
 		if err != nil {
 			m.recordError(lease, err)
 			return
@@ -703,7 +867,7 @@ func (m *Manager) reconcileTransitions(ctx context.Context) error {
 		} else if !os.IsNotExist(statErr) {
 			return statErr
 		}
-		route, ok := m.route(lease.Route)
+		route, ok := m.routeForLease(lease)
 		if !ok {
 			continue
 		}
@@ -840,7 +1004,7 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route config.Rout
 			}
 		}
 		if status == "done" {
-			m.finalizeTaskNotificationSummary(path, status)
+			m.finalizeTaskCompletionSummary(path, status)
 		}
 		if status == "done" || status == "waiting" || status == "failed" || status == "cancelled" {
 			if err := m.completeTransition(ctx, route, lease, status, path); err != nil {
@@ -862,7 +1026,7 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route config.Rout
 			return status, path, err
 		}
 	}
-	m.finalizeTaskNotificationSummary(path, status)
+	m.finalizeTaskCompletionSummary(path, status)
 	if status == "done" {
 		if err := m.completeTransition(ctx, route, lease, status, path); err != nil {
 			return status, path, err
@@ -871,7 +1035,7 @@ func (m *Manager) reconcileTaskTransition(ctx context.Context, route config.Rout
 	return status, path, nil
 }
 
-func (m *Manager) reconcileGoalTransition(_ context.Context, route config.Route, _ Lease, phase, status, path string) (string, string, error) {
+func (m *Manager) reconcileGoalTransition(_ context.Context, route config.Route, lease Lease, phase, status, path string) (string, string, error) {
 	base := filepath.Dir(m.Config.Resolve(route.Source))
 	name := filepath.Base(path)
 	document, err := ReadDocument(path)
@@ -880,7 +1044,19 @@ func (m *Manager) reconcileGoalTransition(_ context.Context, route config.Route,
 	}
 	if phase == phaseGoalPlanning {
 		if status == "active" {
-			if err := m.validateGoalPlanningTransition(document); err == nil {
+			taskRoute, ok := routeFromSnapshot(lease.RoutesSnapshot, "tasks")
+			if !ok {
+				taskRoute, ok = m.route("tasks")
+			}
+			if !ok {
+				return m.redirectTransition(path, statusPath(base, "proposed", name), "proposed", "Goal activation rejected: tasks route is required for goals")
+			}
+			if err := m.validateGoalPlanningTransitionForRoute(document, taskRoute); err == nil {
+				document.FrontMatter["round_task_route"] = *cloneRoute(taskRoute)
+				document.FrontMatter["round_task_route_round"] = numberValue(document.FrontMatter["round"])
+				if err := WriteDocument(path, document); err != nil {
+					return status, path, err
+				}
 				return status, path, nil
 			} else {
 				return m.redirectTransition(path, statusPath(base, "proposed", name), "proposed", "Goal activation rejected: "+err.Error())
@@ -923,17 +1099,22 @@ func (m *Manager) completeTransition(ctx context.Context, route config.Route, le
 		m.log("invalid notification metadata in " + path + ": " + err.Error())
 		policy = NotificationPolicy{}
 	}
-	if policy.Enabled && policy.Outcomes[status] && m.Config.Orchestrator.TaskNotifications != config.TaskNotificationsOff {
+	runtimeCfg := m.runtimeSnapshot()
+	if policy.Enabled && policy.Outcomes[status] && runtimeCfg.Orchestrator.TaskNotifications != config.TaskNotificationsOff {
 		id, _ := document.FrontMatter["id"].(string)
 		if id == "" {
 			id = lease.ID
 		}
-		if err := m.scheduleTaskNotification(id, status, notificationTransitionID(lease), path, policy); err != nil {
+		transition, transitionErr := notificationTransitionID(lease)
+		if transitionErr != nil {
+			return transitionErr
+		}
+		if err := m.scheduleTaskNotificationForRoute(id, status, transition, path, route, policy); err != nil {
 			m.log("notification agent schedule failed: " + err.Error())
 			return fmt.Errorf("persist task notification event: %w", err)
 		}
 	}
-	if m.Config.Extensions.Enabled {
+	if runtimeCfg.Extensions.Enabled {
 		if lease.TerminalHooksCompleted == nil {
 			lease.TerminalHooksCompleted = map[string]bool{}
 		}
@@ -979,7 +1160,7 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 			}
 		}
 		if _, err := os.Stat(lease.File); err == nil {
-			route, ok := m.route(lease.Route)
+			route, ok := m.routeForLease(lease)
 			if !ok {
 				continue
 			}
@@ -990,34 +1171,8 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 				return readErr
 			}
 			attempt := lease.ClaimAttempt
-			if attempt == 0 {
-				attempt = claimAttemptFromSession(lease.SessionKey)
-				currentAttempt := numberValue(document.FrontMatter[field])
-				claimedStatus := stringField(document, "status") == phaseClaimedStatus(phase)
-				if attempt == 0 {
-					attempt = currentAttempt
-				}
-				if attempt == 0 || (!claimedStatus && attempt <= currentAttempt) {
-					attempt++
-				}
-				if attempt < 1 {
-					attempt = 1
-				}
-				// Older phase claims first used the generic ClaimDocument, which
-				// incremented `attempt` before a second write populated the real
-				// phase field. This exact mismatch identifies that interrupted
-				// first write and lets recovery remove its spurious increment.
-				if field != "attempt" && claimedStatus && stringField(document, "_spynel_attempt_repair_claim") != lease.ID {
-					implementationAttempt := numberValue(document.FrontMatter["attempt"])
-					if implementationAttempt > 0 {
-						document.FrontMatter["attempt"] = implementationAttempt - 1
-					}
-					// This marker makes the cross-file legacy migration replay-safe if
-					// the process exits after the document write but before the lease
-					// records ClaimAttempt. It is intentionally retained as evidence.
-					document.FrontMatter["_spynel_attempt_repair_claim"] = lease.ID
-				}
-				lease.ClaimAttempt = attempt
+			if attempt < 1 {
+				return fmt.Errorf("claim lease %s has no phase attempt", lease.ID)
 			}
 			document.FrontMatter["status"] = phaseClaimedStatus(phase)
 			document.FrontMatter["updated_at"] = lease.StartedAt.UTC().Format(time.RFC3339)
@@ -1056,8 +1211,9 @@ func (m *Manager) claimPhaseDocument(source, target, status, attemptField string
 }
 
 func (m *Manager) recoverOrphanClaims(ctx context.Context) error {
-	for _, route := range m.Config.Orchestrator.Routes {
-		base := filepath.Dir(m.Config.Resolve(route.Source))
+	cfg := m.runtimeSnapshot()
+	for _, route := range cfg.Orchestrator.Routes {
+		base := filepath.Dir(cfg.Resolve(route.Source))
 		var phases map[string]string
 		switch route.Name {
 		case "tasks":
@@ -1127,11 +1283,12 @@ func (m *Manager) leaseForDocument(routeName, name, phase, exceptID string) (Lea
 
 func (m *Manager) wakeWaitingDocuments(ctx context.Context) error {
 	now := time.Now().UTC()
-	for _, route := range m.Config.Orchestrator.Routes {
+	cfg := m.runtimeSnapshot()
+	for _, route := range cfg.Orchestrator.Routes {
 		if route.Name != "tasks" && route.Name != "goals" {
 			continue
 		}
-		base := filepath.Dir(m.Config.Resolve(route.Source))
+		base := filepath.Dir(cfg.Resolve(route.Source))
 		directory := filepath.Join(base, "waiting")
 		entries, err := os.ReadDir(directory)
 		if os.IsNotExist(err) {
@@ -1207,7 +1364,7 @@ func (m *Manager) advanceActiveGoals() error {
 		}
 		if err := m.validateGoalActivation(document); err != nil {
 			target := filepath.Join(base, "proposed", entry.Name())
-			if _, _, moveErr := m.redirectTransition(path, target, "proposed", "Legacy or invalid active goal returned to planning queue: "+err.Error()); moveErr != nil {
+			if _, _, moveErr := m.redirectTransition(path, target, "proposed", "Invalid active goal returned to planning queue: "+err.Error()); moveErr != nil {
 				return moveErr
 			}
 			continue
@@ -1329,10 +1486,23 @@ func (m *Manager) validateGoalPlanningTransition(document Document) error {
 	return nil
 }
 
+func (m *Manager) validateGoalPlanningTransitionForRoute(document Document, taskRoute config.Route) error {
+	copy := Document{FrontMatter: make(map[string]any, len(document.FrontMatter)+2), Body: document.Body}
+	for key, value := range document.FrontMatter {
+		copy.FrontMatter[key] = value
+	}
+	copy.FrontMatter["round_task_route"] = *cloneRoute(taskRoute)
+	copy.FrontMatter["round_task_route_round"] = numberValue(document.FrontMatter["round"])
+	return m.validateGoalPlanningTransition(copy)
+}
+
 func (m *Manager) goalRoundTasks(document Document) ([]linkedTask, error) {
-	taskRoute, ok := m.route("tasks")
+	taskRoute, ok := roundTaskRoute(document)
 	if !ok {
-		return nil, errors.New("tasks route is required for goals")
+		taskRoute, ok = m.route("tasks")
+		if !ok {
+			return nil, errors.New("tasks route is required for goals")
+		}
 	}
 	id := documentID(document)
 	if id == "" {
@@ -1341,47 +1511,23 @@ func (m *Manager) goalRoundTasks(document Document) ([]linkedTask, error) {
 	return linkedRoundTasks(filepath.Dir(m.Config.Resolve(taskRoute.Source)), id, numberValue(document.FrontMatter["round"]))
 }
 
-func (m *Manager) migrateLegacyGoals() error {
-	route, ok := m.route("goals")
+func roundTaskRoute(document Document) (config.Route, bool) {
+	if numberValue(document.FrontMatter["round_task_route_round"]) != numberValue(document.FrontMatter["round"]) {
+		return config.Route{}, false
+	}
+	value, ok := document.FrontMatter["round_task_route"]
 	if !ok {
-		return nil
+		return config.Route{}, false
 	}
-	base := filepath.Dir(m.Config.Resolve(route.Source))
-	legacy := filepath.Join(base, "working")
-	entries, err := os.ReadDir(legacy)
-	if os.IsNotExist(err) {
-		return nil
-	}
+	data, err := yaml.Marshal(value)
 	if err != nil {
-		return err
+		return config.Route{}, false
 	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") || entry.Name() == "AGENTS.md" {
-			continue
-		}
-		source := filepath.Join(legacy, entry.Name())
-		target := filepath.Join(base, "planning", entry.Name())
-		if _, err := os.Stat(target); err == nil {
-			continue
-		}
-		now := time.Now().UTC()
-		if err := moveDocumentWithProgress(source, target, "planning", now, "Spynel migrated this legacy claimed goal into the current planning workflow and preserved its recovery ownership."); err != nil {
-			return err
-		}
-		leases, _ := m.loadLeases()
-		for _, lease := range leases {
-			if filepath.Clean(lease.File) != filepath.Clean(source) {
-				continue
-			}
-			lease.File = target
-			lease.Phase = phaseGoalPlanning
-			lease.DocumentType = "goal"
-			if err := m.saveLease(lease); err != nil {
-				return err
-			}
-		}
+	var route config.Route
+	if err := yaml.Unmarshal(data, &route); err != nil || route.Name != "tasks" || strings.TrimSpace(route.Source) == "" {
+		return config.Route{}, false
 	}
-	return nil
+	return *cloneRoute(route), true
 }
 
 func (m *Manager) recoverStale(ctx context.Context) error {
@@ -1400,7 +1546,7 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 			// notification enqueueing cannot be skipped by a concurrent scan.
 			continue
 		}
-		route, ok := m.route(lease.Route)
+		route, ok := m.routeForLease(lease)
 		if !ok {
 			continue
 		}
@@ -1418,7 +1564,8 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 	return nil
 }
 
-func (m *Manager) renderPrompt(route config.Route, file, promptPath string) (string, error) {
+func (m *Manager) renderPrompt(route config.Route, lease Lease, promptPath string) (string, error) {
+	file := lease.File
 	data, err := os.ReadFile(m.Config.Resolve(promptPath))
 	if err != nil {
 		return "", err
@@ -1434,9 +1581,9 @@ func (m *Manager) renderPrompt(route config.Route, file, promptPath string) (str
 		"{{STATUS_FOLDERS}}": strings.Join(statuses, "\n"),
 		"{{STALE_AFTER}}":    route.StaleAfter,
 		"{{PHASE}}":          phaseForFile(route.Name, file),
-		"{{RELATED_TASKS}}":  m.relatedTasksForGoal(file),
-		"{{TASK_SOURCE}}":    m.routeSource("tasks"),
-		"{{GOAL_SOURCE}}":    m.routeSource("goals"),
+		"{{RELATED_TASKS}}":  m.relatedTasksForGoal(file, lease.RoutesSnapshot),
+		"{{TASK_SOURCE}}":    m.routeSourceFromSnapshot(lease.RoutesSnapshot, "tasks"),
+		"{{GOAL_SOURCE}}":    m.routeSourceFromSnapshot(lease.RoutesSnapshot, "goals"),
 	}
 	prompt := string(data)
 	prompt = agentdocs.InjectPromptGuidance(prompt)
@@ -1456,7 +1603,7 @@ func (m *Manager) harnessSettings() config.Harness {
 	if value := m.harnessPolicy.Load(); value != nil {
 		return value.(config.Harness)
 	}
-	return m.Config.Harness
+	return m.runtimeSnapshot().Harness
 }
 
 func (m *Manager) agentPrefix(phase string, settings config.Harness) string {
@@ -1475,6 +1622,13 @@ func (m *Manager) routeSource(name string) string {
 	return "(route not configured)"
 }
 
+func (m *Manager) routeSourceFromSnapshot(routes []config.Route, name string) string {
+	if route, ok := routeFromSnapshot(routes, name); ok {
+		return m.Config.Resolve(route.Source)
+	}
+	return m.routeSource(name)
+}
+
 func phaseForFile(routeName, file string) string {
 	status := filepath.Base(filepath.Dir(file))
 	switch routeName + ":" + status {
@@ -1491,13 +1645,22 @@ func phaseForFile(routeName, file string) string {
 	}
 }
 
-func (m *Manager) relatedTasksForGoal(file string) string {
+func (m *Manager) relatedTasksForGoal(file string, routes []config.Route) string {
 	if filepath.Base(filepath.Dir(filepath.Dir(file))) != "goals" {
 		return "- Not applicable."
 	}
 	document, err := ReadDocument(file)
 	if err != nil {
 		return "- Unable to read linked tasks: " + err.Error()
+	}
+	// Before a planned round is activated, its durable round_task_route has not
+	// been written yet. Resolve linked-task evidence against the same admitted
+	// route generation used for TASK_SOURCE instead of the newest live routes.
+	if _, ok := roundTaskRoute(document); !ok {
+		if taskRoute, exists := routeFromSnapshot(routes, "tasks"); exists {
+			document.FrontMatter["round_task_route"] = *cloneRoute(taskRoute)
+			document.FrontMatter["round_task_route_round"] = numberValue(document.FrontMatter["round"])
+		}
 	}
 	tasks, err := m.goalRoundTasks(document)
 	if err != nil {
@@ -1616,12 +1779,43 @@ func (m *Manager) ScheduledCheckpoints(now time.Time) ([]ScheduledCheckpoint, er
 }
 
 func (m *Manager) route(name string) (config.Route, bool) {
-	for _, route := range m.Config.Orchestrator.Routes {
+	for _, route := range m.runtimeSnapshot().Orchestrator.Routes {
 		if route.Name == name {
 			return route, true
 		}
 	}
 	return config.Route{}, false
+}
+
+func cloneRoute(route config.Route) *config.Route {
+	snapshot := route
+	snapshot.AllowedNext = append([]string(nil), route.AllowedNext...)
+	return &snapshot
+}
+
+func cloneRoutes(routes []config.Route) []config.Route {
+	cloned := make([]config.Route, len(routes))
+	for index, route := range routes {
+		cloned[index] = *cloneRoute(route)
+	}
+	return cloned
+}
+
+func routeFromSnapshot(routes []config.Route, name string) (config.Route, bool) {
+	for _, route := range routes {
+		if route.Name == name {
+			return *cloneRoute(route), true
+		}
+	}
+	return config.Route{}, false
+}
+
+func (m *Manager) routeForLease(lease Lease) (config.Route, bool) {
+	if lease.RouteSnapshot != nil && lease.RouteSnapshot.Name == lease.Route {
+		return *cloneRoute(*lease.RouteSnapshot), true
+	}
+	// Pre-snapshot leases remain recoverable while their named route exists.
+	return m.route(lease.Route)
 }
 
 func (m *Manager) leaseDirectory() string     { return m.Config.StatePath("runtime", "leases") }
@@ -1805,6 +1999,16 @@ func (m *Manager) isInflight(key string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.inflight[key]
+}
+
+func (m *Manager) canAdmitClaim() bool {
+	m.capacityMu.Lock()
+	limit := m.capacityLimit
+	m.capacityMu.Unlock()
+	m.mu.Lock()
+	count := len(m.inflight)
+	m.mu.Unlock()
+	return count < limit
 }
 
 func (m *Manager) setInflight(key string, value bool) {

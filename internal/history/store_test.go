@@ -68,13 +68,13 @@ func TestReplyContextSerializesAndRendersWithinBounds(t *testing.T) {
 	if err != nil || len([]rune(recent)) > 70 || !strings.Contains(recent, "[reply_to: 123 referenced text]") || !strings.Contains(recent, "…") {
 		t.Fatalf("bounded reply history = %q (%v)", recent, err)
 	}
-	legacy := []byte(`{"at":"2026-08-09T00:00:00Z","role":"user","content":"legacy"}` + "\n")
-	if err := os.WriteFile(store.Path("telegram", "legacy"), legacy, 0o600); err != nil {
+	withoutReply := []byte(`{"at":"2026-08-09T00:00:00Z","role":"user","content":"ordinary"}` + "\n")
+	if err := os.WriteFile(store.Path("telegram", "ordinary-entry"), withoutReply, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	entries, _, err := store.Entries("telegram", "legacy")
-	if err != nil || len(entries) != 1 || entries[0].ReplyTo != "" || entries[0].Content != "legacy" {
-		t.Fatalf("legacy history = %#v, %v", entries, err)
+	entries, _, err := store.Entries("telegram", "ordinary-entry")
+	if err != nil || len(entries) != 1 || entries[0].ReplyTo != "" || entries[0].Content != "ordinary" {
+		t.Fatalf("ordinary history = %#v, %v", entries, err)
 	}
 }
 

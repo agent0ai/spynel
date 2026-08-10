@@ -52,12 +52,13 @@ type WorkflowInventory struct {
 func (m *Manager) WorkflowItems(kind string) WorkflowInventory {
 	result := WorkflowInventory{}
 	var routeFound bool
-	for _, route := range m.Config.Orchestrator.Routes {
+	cfg := m.runtimeSnapshot()
+	for _, route := range cfg.Orchestrator.Routes {
 		if route.Name != kind || (kind != "tasks" && kind != "goals") {
 			continue
 		}
 		routeFound = true
-		base := filepath.Dir(m.Config.Resolve(route.Source))
+		base := filepath.Dir(cfg.Resolve(route.Source))
 		statuses := workflowRouteStatuses(route.Source, route.Working, route.AllowedNext)
 		result.Statuses = append(result.Statuses, statuses...)
 		inspected := 0

@@ -25,22 +25,23 @@ const maxNotificationInputBytes = 128 << 10
 var errNotificationTransitionSuperseded = errors.New("automatic notification transition was superseded")
 
 type notificationAgentEvent struct {
-	ID             string    `json:"id"`
-	TaskID         string    `json:"task_id"`
-	Outcome        string    `json:"outcome"`
-	Transition     string    `json:"transition"`
-	TaskFile       string    `json:"task_file"`
-	Origin         string    `json:"origin"`
-	Mode           string    `json:"mode"`
-	State          string    `json:"state"`
-	Attempts       int       `json:"attempts"`
-	Journaled      bool      `json:"journaled,omitempty"`
-	JournaledAt    time.Time `json:"journaled_at,omitempty"`
-	JournalMessage string    `json:"journal_message,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	NextAttemptAt  time.Time `json:"next_attempt_at,omitempty"`
-	LastError      string    `json:"last_error,omitempty"`
+	ID             string        `json:"id"`
+	TaskID         string        `json:"task_id"`
+	Outcome        string        `json:"outcome"`
+	Transition     string        `json:"transition"`
+	TaskFile       string        `json:"task_file"`
+	RouteSnapshot  *config.Route `json:"route_snapshot,omitempty"`
+	Origin         string        `json:"origin"`
+	Mode           string        `json:"mode"`
+	State          string        `json:"state"`
+	Attempts       int           `json:"attempts"`
+	Journaled      bool          `json:"journaled,omitempty"`
+	JournaledAt    time.Time     `json:"journaled_at,omitempty"`
+	JournalMessage string        `json:"journal_message,omitempty"`
+	CreatedAt      time.Time     `json:"created_at"`
+	UpdatedAt      time.Time     `json:"updated_at"`
+	NextAttemptAt  time.Time     `json:"next_attempt_at,omitempty"`
+	LastError      string        `json:"last_error,omitempty"`
 }
 
 func notificationAgentID(taskID, outcome, transition string) string {
@@ -48,18 +49,15 @@ func notificationAgentID(taskID, outcome, transition string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
-func notificationTransitionID(lease Lease) string {
+func notificationTransitionID(lease Lease) (string, error) {
 	phase := normalizeLeasePhase(lease.Route, lease.Phase)
 	if phase == "" {
 		phase = "implementation"
 	}
-	if lease.ClaimAttempt > 0 {
-		return fmt.Sprintf("%s:%d", phase, lease.ClaimAttempt)
+	if lease.ClaimAttempt < 1 {
+		return "", errors.New("notification transition requires a positive claim attempt")
 	}
-	if !lease.StartedAt.IsZero() {
-		return phase + ":" + lease.StartedAt.UTC().Format(time.RFC3339Nano)
-	}
-	return phase + ":legacy"
+	return fmt.Sprintf("%s:%d", phase, lease.ClaimAttempt), nil
 }
 
 func (m *Manager) notificationAgentDirectory() string {
@@ -76,7 +74,8 @@ func (m *Manager) notificationNow() time.Time {
 // AuthorizeNotificationAgentCommand binds the CLI's opaque event key to the
 // exact origin and transition persisted before the agent session started.
 func (m *Manager) AuthorizeNotificationAgentCommand(eventKey, outcome, origin string) error {
-	if m.Config.Orchestrator.TaskNotifications == config.TaskNotificationsOff {
+	mode := m.runtimeSnapshot().Orchestrator.TaskNotifications
+	if mode == config.TaskNotificationsOff {
 		return errors.New("automatic task notifications are currently off")
 	}
 	const prefix = "task-notification:"
@@ -92,7 +91,7 @@ func (m *Manager) AuthorizeNotificationAgentCommand(eventKey, outcome, origin st
 		return errors.New("automatic notification event is not pending")
 	}
 	var event notificationAgentEvent
-	if json.Unmarshal(data, &event) != nil || event.ID != id || event.Outcome != outcome || event.Origin != origin || event.Mode != m.Config.Orchestrator.TaskNotifications || event.State != "pending" {
+	if json.Unmarshal(data, &event) != nil || event.ID != id || event.Outcome != outcome || event.Origin != origin || event.Mode != mode || event.State != "pending" {
 		return errors.New("automatic notification command does not match its authorized event")
 	}
 	_, document, err := m.resolveNotificationTask(event)
@@ -117,7 +116,13 @@ func (m *Manager) AuthorizeNotificationAgentCommand(eventKey, outcome, origin st
 }
 
 func (m *Manager) resolveNotificationTask(event notificationAgentEvent) (string, Document, error) {
-	route, ok := m.route("tasks")
+	var route config.Route
+	var ok bool
+	if event.RouteSnapshot != nil && event.RouteSnapshot.Name == "tasks" {
+		route, ok = *cloneRoute(*event.RouteSnapshot), true
+	} else {
+		route, ok = m.route("tasks")
+	}
 	if !ok {
 		return "", Document{}, errors.New("task route is unavailable")
 	}
@@ -194,6 +199,10 @@ func (m *Manager) notificationOutboxEntry(event notificationAgentEvent) (OutboxE
 	if entry.ID != id || entry.Origin != event.Origin || strings.TrimSpace(entry.Message) == "" {
 		return OutboxEntry{}, errors.New("notification outbox entry does not match its event")
 	}
+	entry.Message, err = NormalizeNotificationText(entry.Message)
+	if err != nil {
+		return OutboxEntry{}, fmt.Errorf("notification outbox entry has unsafe message text: %w", err)
+	}
 	return entry, nil
 }
 
@@ -252,7 +261,15 @@ func (m *Manager) JournalNotificationAgentCommand(eventKey, outcome, origin, mes
 }
 
 func (m *Manager) scheduleTaskNotification(taskID, outcome, transition, taskFile string, policy NotificationPolicy) error {
-	mode := m.Config.Orchestrator.TaskNotifications
+	route, ok := m.route("tasks")
+	if !ok {
+		return errors.New("task route is unavailable")
+	}
+	return m.scheduleTaskNotificationForRoute(taskID, outcome, transition, taskFile, route, policy)
+}
+
+func (m *Manager) scheduleTaskNotificationForRoute(taskID, outcome, transition, taskFile string, route config.Route, policy NotificationPolicy) error {
+	mode := m.runtimeSnapshot().Orchestrator.TaskNotifications
 	if mode == config.TaskNotificationsOff || !policy.Enabled || !policy.Outcomes[outcome] {
 		return nil
 	}
@@ -270,8 +287,9 @@ func (m *Manager) scheduleTaskNotification(taskID, outcome, transition, taskFile
 	now := m.notificationNow()
 	event := notificationAgentEvent{
 		ID: id, TaskID: taskID, Outcome: outcome, Transition: transition, TaskFile: taskFile,
-		Origin: policy.Origin.Channel + "/" + policy.Origin.Conversation,
-		Mode:   mode, State: "pending",
+		RouteSnapshot: cloneRoute(route),
+		Origin:        policy.Origin.Channel + "/" + policy.Origin.Conversation,
+		Mode:          mode, State: "pending",
 		CreatedAt: now, UpdatedAt: now, NextAttemptAt: now,
 	}
 	return writeNotificationAgentEvent(path, event)
@@ -286,7 +304,7 @@ func writeNotificationAgentEvent(path string, event notificationAgentEvent) erro
 }
 
 func (m *Manager) startPendingNotificationAgents(ctx context.Context) error {
-	mode := m.Config.Orchestrator.TaskNotifications
+	mode := m.runtimeSnapshot().Orchestrator.TaskNotifications
 	if mode == config.TaskNotificationsOff {
 		return nil
 	}
@@ -312,9 +330,8 @@ func (m *Manager) startPendingNotificationAgents(ctx context.Context) error {
 		if json.Unmarshal(data, &event) != nil || event.State != "pending" || event.NextAttemptAt.After(now) {
 			continue
 		}
-		// task_notifications is restart-bound. A pending event follows the
-		// effective mode of the owner that is about to start its harness, not a
-		// stale mode persisted by a previous process.
+		// A pending event follows the newest accepted mode at admission, not the
+		// stale mode persisted when its task transition was first observed.
 		if event.Mode != mode {
 			event.Mode = mode
 			event.UpdatedAt = now
@@ -564,6 +581,9 @@ func (m *Manager) notificationAgentPrompt(event notificationAgentEvent, document
 	if !strings.Contains(prompt, command) {
 		prompt += "\n\nInvoke this fully prepared authorized send action with the concise message on standard input. Do not alter its origin, event key, outcome, or config path:\n\n```sh\n" + command + "\n```"
 	}
+	if !strings.Contains(prompt, "terminal protocol replies") {
+		prompt += "\n\nUse a non-PTY stdin facility when available. The CLI independently removes terminal protocol replies and unsafe control sequences before accepting the message; never interpolate notification prose into shell syntax."
+	}
 	if event.Mode == config.TaskNotificationsAlways && !strings.Contains(prompt, "you must send") {
 		prompt += "\n\nThis event is in `always` mode: you must send by invoking the prepared action unless it reports a real safety or authorization failure. Provider prose or silence does not send the notification."
 	}
@@ -624,45 +644,4 @@ func boundedProgress(body string, maxEntries, maxBytes int) string {
 		return "No progress entries have been recorded."
 	}
 	return result
-}
-
-func (m *Manager) removeLegacyNotificationWorkflowState() error {
-	var problems []error
-	for _, name := range []string{"notification-triage", "action-requests", "notification-activity"} {
-		path := m.Config.StatePath("runtime", name)
-		if filepath.Base(path) != name {
-			problems = append(problems, fmt.Errorf("refusing unsafe legacy notification path %q", path))
-			continue
-		}
-		if err := os.RemoveAll(path); err != nil {
-			problems = append(problems, err)
-		}
-	}
-	outboxDirectory := m.Config.StatePath("runtime", "outbox")
-	entries, err := os.ReadDir(outboxDirectory)
-	if err != nil && !os.IsNotExist(err) {
-		problems = append(problems, err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
-			continue
-		}
-		path := filepath.Join(outboxDirectory, entry.Name())
-		data, readErr := readFileLimit(path, 1<<20, "legacy notification outbox record")
-		if readErr != nil {
-			problems = append(problems, readErr)
-			continue
-		}
-		var legacy struct {
-			ActionRequestID string `json:"action_request_id"`
-			Kind            string `json:"kind"`
-		}
-		if json.Unmarshal(data, &legacy) != nil || (legacy.ActionRequestID == "" && legacy.Kind != "action_request" && legacy.Kind != "reminder") {
-			continue
-		}
-		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
-			problems = append(problems, removeErr)
-		}
-	}
-	return errors.Join(problems...)
 }

@@ -26,6 +26,6 @@ To add or change a topic:
 2. Classify the topic, keep sections concise, and add only resolvable topic or `topic#section` references.
 3. If the topic belongs in concise channel help, assign its short help ID/summary and keep `/help` focused.
 4. Update the matching README and CLI/configuration/architecture documentation and the nearest DOX contracts when ownership or behavior changes.
-5. Add or update catalog, output, prompt, and command-catalog tests. Run `go test ./...`, `go vet ./...`, `go build ./cmd/spynel`, `scripts/smoke.sh`, and `git diff --check` before release.
+5. Add or update catalog, output, prompt, and command-catalog tests. Run `go test ./...`, `go vet ./...`, `mkdir -p .tmp-bin && go build -o .tmp-bin/spynel ./cmd/spynel`, `scripts/smoke.sh`, and `git diff --check` before release.
 
 `Validate` rejects duplicate/invalid IDs and broken references. CLI tests must also ensure every documented command is present in the executable or shared slash-command catalog. Release review compares behavior, `/help`, prompts, repository documentation, and the embedded catalog so none becomes an isolated source of truth.

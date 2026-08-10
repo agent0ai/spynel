@@ -75,7 +75,7 @@ func TestNotifyDeliversAllOriginsWithStableEventIdentity(t *testing.T) {
 		if _, err := service.History.Append(channelName, conversation, history.Entry{Role: "user", Content: "known"}); err != nil {
 			t.Fatal(err)
 		}
-		id, err := service.Notify(context.Background(), origin, "complete")
+		id, err := service.Notify(context.Background(), origin, "\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1Rcomplete")
 		if err != nil {
 			t.Fatalf("%s: %v", origin, err)
 		}
@@ -92,6 +92,9 @@ func TestNotifyDeliversAllOriginsWithStableEventIdentity(t *testing.T) {
 	}
 	if len(router.calls) != 2 || !strings.Contains(router.calls[0], "telegram/TG-7/") || !strings.Contains(router.calls[1], "whatsapp/WA-15557654321/") {
 		t.Fatalf("remote calls = %#v", router.calls)
+	}
+	if strings.Contains(strings.Join(router.calls, "\n"), "rgb:0000") {
+		t.Fatalf("terminal replies reached remote delivery: %#v", router.calls)
 	}
 }
 
@@ -126,7 +129,7 @@ func TestAutomaticNotifyCommandUsesAuthorizedTransitionAndDeduplicates(t *testin
 	if err := os.WriteFile(filepath.Join(eventDirectory, "event-1.json"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	id, err := service.NotifyWithIdentity(context.Background(), "cli/local", "The report is ready.", "task-notification:event-1", "done")
+	id, err := service.NotifyWithIdentity(context.Background(), "cli/local", "\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1RThe report is ready.", "task-notification:event-1", "done")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -763,6 +766,47 @@ func TestSlashCommandsSendCreationPromptsToCommunicationAgent(t *testing.T) {
 	}
 }
 
+func TestCreationPromptsUseLiveRouteSettings(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	routes := append([]config.Route(nil), cfg.Orchestrator.Routes...)
+	routes[0].Source = ".spynel/live-task-prompts/todo"
+	routes[1].Source = ".spynel/live-goal-prompts/proposed"
+	routeValue, err := json.Marshal(routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ApplySettings(map[string]string{"orchestrator.routes": string(routeValue)}); err != nil {
+		t.Fatal(err)
+	}
+	next := service.Settings.Snapshot()
+	reloaded, err := config.Load(cfg.Path)
+	if err != nil || !reflect.DeepEqual(reloaded.Orchestrator.Routes, next.Orchestrator.Routes) {
+		t.Fatalf("saved routes were not reloaded into shared memory: disk=%#v snapshot=%#v err=%v", reloaded.Orchestrator.Routes, next.Orchestrator.Routes, err)
+	}
+	prompt, err := service.creationCommandPrompt(core.Message{Channel: "cli", Conversation: "live-routes"}, "task", "inspect live routes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range []string{next.Resolve(next.Orchestrator.Routes[0].Source), next.Resolve(next.Orchestrator.Routes[1].Source)} {
+		if !strings.Contains(prompt, source) {
+			t.Fatalf("creation prompt does not contain live route %q:\n%s", source, prompt)
+		}
+	}
+	for _, route := range cfg.Orchestrator.Routes[:2] {
+		if strings.Contains(prompt, cfg.Resolve(route.Source)) {
+			t.Fatalf("creation prompt retained process-start route %q", cfg.Resolve(route.Source))
+		}
+	}
+}
+
 func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
 	commands := SlashCommands()
 	if len(commands) == 0 {
@@ -873,6 +917,9 @@ func TestApplySettingsPublishesLiveHeartbeatConfiguration(t *testing.T) {
 
 	changed, err := service.ApplySettings(map[string]string{
 		"orchestrator.enabled":                    "off",
+		"orchestrator.interval_seconds":           "2",
+		"orchestrator.max_parallel":               "2",
+		"orchestrator.task_notifications":         "always",
 		"orchestrator.semantic_heartbeat_minutes": "30",
 	})
 	if err != nil {
@@ -1004,6 +1051,15 @@ func TestSharedHelpMetadataHasExactlyOneRoutedBody(t *testing.T) {
 	for name, count := range bodies {
 		if count != 1 || shared[name] != 1 {
 			t.Errorf("routed help topic %q has %d bodies and %d shared metadata records", name, count, shared[name])
+		}
+	}
+}
+
+func TestConfigurationHelpDocumentsOptionalEmptyAgentPrefixes(t *testing.T) {
+	body := helpFor("config")
+	for _, want := range []string{"Chat, developer, reviewer, and heartbeat prefixes default empty", "optional harness-native commands such as `/goal`", "separated from the original prompt by one ASCII space"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("configuration help missing %q:\n%s", want, body)
 		}
 	}
 }
@@ -1787,12 +1843,18 @@ func TestConfigurationCommandsPersistAcrossChannelsAndProtectOwnChannel(t *testi
 	if response := run("tui", "/config set workspace.history_max_messages 7"); !strings.Contains(response.Text, "history_max_messages") {
 		t.Fatalf("config setting response = %#v", response)
 	}
+	if response := run("telegram", `/config set harness.acp_args -a --param2 "value with spaces"`); !strings.Contains(response.Text, `-a --param2 "value with spaces"`) {
+		t.Fatalf("command-line ACP argument response = %#v", response)
+	}
+	if response := run("whatsapp", "/config set harness.acp_args \"unterminated"); !strings.Contains(response.Text, "harness.acp_args has an unmatched") {
+		t.Fatalf("malformed ACP argument response = %#v", response)
+	}
 
 	reloaded, err := config.Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reloaded.Channels.Telegram.Enabled || reloaded.Channels.Telegram.Token != "123:super-secret" || len(reloaded.Channels.Telegram.AllowedUsers) != 1 || reloaded.Channels.Telegram.AllowedUsers[0] != "42" || !reloaded.Channels.WhatsApp.Enabled || len(reloaded.Channels.WhatsApp.AllowedNumbers) != 1 || reloaded.Workspace.HistoryMaxMessages != 7 {
+	if !reloaded.Channels.Telegram.Enabled || reloaded.Channels.Telegram.Token != "123:super-secret" || len(reloaded.Channels.Telegram.AllowedUsers) != 1 || reloaded.Channels.Telegram.AllowedUsers[0] != "42" || !reloaded.Channels.WhatsApp.Enabled || len(reloaded.Channels.WhatsApp.AllowedNumbers) != 1 || reloaded.Workspace.HistoryMaxMessages != 7 || !reflect.DeepEqual(reloaded.Harness.ACPArgs, []string{"-a", "--param2", "value with spaces"}) {
 		t.Fatalf("configuration commands were not persisted: %#v", reloaded)
 	}
 	historyEntries, _, err := service.History.Entries("whatsapp", "settings")
@@ -1933,7 +1995,7 @@ func TestSandboxSettingReconfiguresHarnessWithoutWorkspaceConfinement(t *testing
 	}
 }
 
-func TestStartupSettingRegistersAndRollsBackTransactionally(t *testing.T) {
+func TestStartupSettingReloadsBeforeRegistrationErrorReturns(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
@@ -1950,14 +2012,14 @@ func TestStartupSettingRegistersAndRollsBackTransactionally(t *testing.T) {
 	}
 	manager.err = fmt.Errorf("registration denied")
 	if _, err := service.ApplySettings(map[string]string{"startup.enabled": "off"}); err == nil {
-		t.Fatal("failed startup removal unexpectedly persisted")
+		t.Fatal("failed startup removal did not report its OS error")
 	}
-	if !service.Settings.Snapshot().Startup.Enabled {
-		t.Fatal("startup setting was not rolled back after registration failure")
+	if service.Settings.Snapshot().Startup.Enabled {
+		t.Fatal("saved startup setting was not reloaded before the OS error returned")
 	}
 	reloaded, err := config.Load(config.PathForRoot(root))
-	if err != nil || !reloaded.Startup.Enabled {
-		t.Fatalf("persisted startup rollback = %#v, %v", reloaded.Startup, err)
+	if err != nil || reloaded.Startup.Enabled {
+		t.Fatalf("saved startup setting = %#v, %v", reloaded.Startup, err)
 	}
 }
 
@@ -2362,34 +2424,6 @@ func TestWhatsAppTimeoutReopensPairingAndStartOverRetries(t *testing.T) {
 	screenPtr, err := service.ScreenAction(context.Background(), "wizard:whatsapp:access", "next", values)
 	if err != nil || screenPtr == nil || screenPtr.Status != "Starting a fresh WhatsApp pairing session…" || len(manager.retries) != 1 {
 		t.Fatalf("start-over retry = %#v, calls %#v, err %v", screenPtr, manager.retries, err)
-	}
-}
-
-func TestChatPromptNeutralizesRetiredChannelOverridesInExistingTemplates(t *testing.T) {
-	root := t.TempDir()
-	if err := workspace.Init(root, false); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(config.PathForRoot(root))
-	if err != nil {
-		t.Fatal(err)
-	}
-	legacy := "Channel: {{CHANNEL}}\nProject binding: {{PROJECT}}\nChannel instructions: {{INSTRUCTIONS}}\nCustom {{PROJECT}} {{INSTRUCTIONS}}\n{{RECENT_HISTORY}}\n"
-	if err := os.MkdirAll(cfg.StatePath("prompts"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(cfg.StatePath("prompts", "chat.md"), []byte(legacy), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	service := New(cfg, newServiceHarness())
-	prompt, err := service.chatPrompt(core.Message{Channel: "telegram", Conversation: "TG-7"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, retired := range []string{"{{PROJECT}}", "{{INSTRUCTIONS}}", "Project binding:", "Channel instructions:"} {
-		if strings.Contains(prompt, retired) {
-			t.Fatalf("retired channel override %q remains in prompt: %q", retired, prompt)
-		}
 	}
 }
 

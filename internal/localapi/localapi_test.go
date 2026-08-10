@@ -74,6 +74,18 @@ func (h *apiHarness) Close() error { return nil }
 
 func TestClientStreamsIndependentTUIConversationsThroughOwner(t *testing.T) {
 	state := t.TempDir()
+	for relative, body := range map[string]string{
+		".spynel/tasks/waiting/open.md":  "not valid front matter",
+		".spynel/goals/proposed/open.md": "---\nid: goal\nstatus: proposed\n---\n# Goal\n",
+	} {
+		path := filepath.Join(state, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	election, server, target, cancel, done := startTestServer(t, state)
 	defer func() {
 		cancel()
@@ -118,7 +130,7 @@ func TestClientStreamsIndependentTUIConversationsThroughOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stateSnapshot.Title != "Spynel" || len(stateSnapshot.Connections) != 2 {
+	if stateSnapshot.Title != "Spynel" || len(stateSnapshot.Connections) != 2 || stateSnapshot.DurableWork != (core.DurableWorkCounts{Tasks: 1, Goals: 1}) || len(stateSnapshot.WorkDiagnostics) != 1 {
 		t.Fatalf("shared state = %#v", stateSnapshot)
 	}
 	_ = server

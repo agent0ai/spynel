@@ -48,12 +48,65 @@ func TestOrphanedClaimedTaskReceivesRecoveryLease(t *testing.T) {
 	if err != nil || len(leases) != 1 {
 		t.Fatalf("recovery leases = %#v, %v", leases, err)
 	}
-	if leases[0].Phase != phaseTaskImplementation || leases[0].RecoveryCount == 0 || fake.calls != 1 {
+	if leases[0].Phase != phaseTaskImplementation || leases[0].ClaimAttempt != 1 || leases[0].RecoveryCount == 0 || fake.calls != 1 {
 		t.Fatalf("orphan recovery = lease %#v, calls %d", leases[0], fake.calls)
 	}
 	recovered, err := ReadDocument(working)
 	if err != nil || !strings.Contains(recovered.Body, "Spynel started recovery attempt 1 for task implementation") {
 		t.Fatalf("recovery progress was not journaled: body=%q err=%v", recovered.Body, err)
+	}
+}
+
+func TestOrphanedNotifiedTaskKeepsTransitionIdentityThroughReconciliation(t *testing.T) {
+	cfg, fake, manager := workflowTestManager(t)
+	cfg.Orchestrator.TaskNotifications = config.TaskNotificationsAlways
+	manager.ApplyRuntimeConfig(cfg)
+	task, err := Create(cfg, "tasks", "recover and notify an interrupted claim", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := ReadDocument(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document.FrontMatter["notify"] = map[string]any{"enabled": true, "origin": "tui/local", "on": []any{"failed"}}
+	if err := WriteDocument(task, document); err != nil {
+		t.Fatal(err)
+	}
+	working := filepath.Join(filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[0].Source)), "working", filepath.Base(task))
+	if _, err := ClaimDocument(task, working, "working", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	failed := filepath.Join(filepath.Dir(filepath.Dir(working)), "failed", filepath.Base(working))
+	var settle sync.Once
+	fake.beforeEmit = func() {
+		settle.Do(func() {
+			if err := moveDocument(working, failed, "failed", time.Now().UTC()); err != nil {
+				t.Errorf("settle recovered task: %v", err)
+			}
+		})
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	entries, err := os.ReadDir(manager.notificationAgentDirectory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("notification events = %d, want 1", len(entries))
+	}
+	event, err := readNotificationAgentEvent(filepath.Join(manager.notificationAgentDirectory(), entries[0].Name()), strings.TrimSuffix(entries[0].Name(), ".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Transition != phaseTaskImplementation+":1" || event.TaskFile != failed {
+		t.Fatalf("recovered notification event = %#v", event)
 	}
 }
 
@@ -74,7 +127,7 @@ func TestJournaledClaimIsFinishedAfterRestart(t *testing.T) {
 	lease := Lease{
 		ID: claimKey, ClaimID: claimKey, DocumentType: "task", Route: "tasks", File: target, SourceFile: task,
 		SessionKey: phaseSessionKey("tasks", id, phaseTaskImplementation, 1), State: "claiming", Phase: phaseTaskImplementation,
-		StartedAt: now, HeartbeatAt: now,
+		ClaimAttempt: 1, StartedAt: now, HeartbeatAt: now,
 	}
 	if err := manager.saveLease(lease); err != nil {
 		t.Fatal(err)
@@ -152,166 +205,6 @@ func TestJournaledReviewClaimFinishesMetadataAfterRenameOnlyCrash(t *testing.T) 
 	}
 	if fake.calls != 1 {
 		t.Fatalf("review provider calls = %d, want 1", fake.calls)
-	}
-}
-
-func TestLegacyJournaledReviewClaimUsesSessionAttemptAfterFirstWriteCrash(t *testing.T) {
-	cfg, fake, manager := workflowTestManager(t)
-	task, err := Create(cfg, "tasks", "recover a legacy interrupted review write", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	document, err := ReadDocument(task)
-	if err != nil {
-		t.Fatal(err)
-	}
-	document.FrontMatter["status"] = "reviewing"
-	document.FrontMatter["attempt"] = 2 // Legacy generic claim polluted implementation attempt 1.
-	document.FrontMatter["review_attempt"] = 2
-	reviewing := filepath.Join(filepath.Dir(task), "..", "reviewing", filepath.Base(task))
-	if err := os.MkdirAll(filepath.Dir(reviewing), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteDocument(reviewing, document); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(task); err != nil {
-		t.Fatal(err)
-	}
-
-	id := documentID(document)
-	started := time.Now().UTC().Add(-time.Minute)
-	claimKey := leaseID("tasks:"+phaseTaskReview, id)
-	if err := manager.saveLease(Lease{
-		ID: claimKey, ClaimID: claimKey, DocumentType: "task", Route: "tasks", File: reviewing,
-		SourceFile: filepath.Join(filepath.Dir(task), "..", "review", filepath.Base(task)),
-		SessionKey: phaseSessionKey("tasks", id, phaseTaskReview, 3), State: "claiming", Phase: phaseTaskReview,
-		StartedAt: started, HeartbeatAt: started,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := manager.ScanOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	manager.Wait()
-	stored, err := ReadDocument(reviewing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.FrontMatter["status"] != "reviewing" || stored.FrontMatter["attempt"] != 1 || stored.FrontMatter["review_attempt"] != 3 {
-		t.Fatalf("legacy recovered review metadata = %#v", stored.FrontMatter)
-	}
-	if fake.calls != 1 {
-		t.Fatalf("legacy review provider calls = %d, want 1", fake.calls)
-	}
-}
-
-func TestLegacyJournaledReviewClaimRemovesPollutionAfterSecondWriteCrash(t *testing.T) {
-	cfg, fake, manager := workflowTestManager(t)
-	task, err := Create(cfg, "tasks", "recover a legacy completed review claim", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	document, err := ReadDocument(task)
-	if err != nil {
-		t.Fatal(err)
-	}
-	document.FrontMatter["status"] = "reviewing"
-	document.FrontMatter["attempt"] = 2
-	document.FrontMatter["review_attempt"] = 3
-	reviewing := filepath.Join(filepath.Dir(task), "..", "reviewing", filepath.Base(task))
-	if err := os.MkdirAll(filepath.Dir(reviewing), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteDocument(reviewing, document); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(task); err != nil {
-		t.Fatal(err)
-	}
-
-	id := documentID(document)
-	started := time.Now().UTC().Add(-time.Minute)
-	claimKey := leaseID("tasks:"+phaseTaskReview, id)
-	if err := manager.saveLease(Lease{
-		ID: claimKey, ClaimID: claimKey, DocumentType: "task", Route: "tasks", File: reviewing,
-		SourceFile: filepath.Join(filepath.Dir(task), "..", "review", filepath.Base(task)),
-		SessionKey: phaseSessionKey("tasks", id, phaseTaskReview, 3), State: "claiming", Phase: phaseTaskReview,
-		StartedAt: started, HeartbeatAt: started,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := manager.ScanOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	manager.Wait()
-	stored, err := ReadDocument(reviewing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.FrontMatter["attempt"] != 1 || stored.FrontMatter["review_attempt"] != 3 {
-		t.Fatalf("legacy completed claim metadata = %#v", stored.FrontMatter)
-	}
-	if stored.FrontMatter["_spynel_attempt_repair_claim"] != claimKey {
-		t.Fatalf("legacy repair marker = %#v", stored.FrontMatter["_spynel_attempt_repair_claim"])
-	}
-	if fake.calls != 1 {
-		t.Fatalf("legacy completed claim provider calls = %d, want 1", fake.calls)
-	}
-}
-
-func TestLegacyAttemptRepairReplayDoesNotDecrementTwice(t *testing.T) {
-	cfg, fake, manager := workflowTestManager(t)
-	task, err := Create(cfg, "tasks", "replay a persisted legacy attempt repair", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	document, err := ReadDocument(task)
-	if err != nil {
-		t.Fatal(err)
-	}
-	id := documentID(document)
-	claimKey := leaseID("tasks:"+phaseTaskReview, id)
-	document.FrontMatter["status"] = "reviewing"
-	document.FrontMatter["attempt"] = 1
-	document.FrontMatter["review_attempt"] = 3
-	document.FrontMatter["_spynel_attempt_repair_claim"] = claimKey
-	reviewing := filepath.Join(filepath.Dir(task), "..", "reviewing", filepath.Base(task))
-	if err := os.MkdirAll(filepath.Dir(reviewing), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := WriteDocument(reviewing, document); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(task); err != nil {
-		t.Fatal(err)
-	}
-
-	started := time.Now().UTC().Add(-time.Minute)
-	if err := manager.saveLease(Lease{
-		ID: claimKey, ClaimID: claimKey, DocumentType: "task", Route: "tasks", File: reviewing,
-		SourceFile: filepath.Join(filepath.Dir(task), "..", "review", filepath.Base(task)),
-		SessionKey: phaseSessionKey("tasks", id, phaseTaskReview, 3), State: "claiming", Phase: phaseTaskReview,
-		StartedAt: started, HeartbeatAt: started,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := manager.ScanOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	manager.Wait()
-	stored, err := ReadDocument(reviewing)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stored.FrontMatter["attempt"] != 1 || stored.FrontMatter["review_attempt"] != 3 || stored.FrontMatter["_spynel_attempt_repair_claim"] != claimKey {
-		t.Fatalf("replayed legacy repair metadata = %#v", stored.FrontMatter)
-	}
-	if fake.calls != 1 {
-		t.Fatalf("replayed legacy repair provider calls = %d, want 1", fake.calls)
 	}
 }
 
@@ -602,6 +495,93 @@ func TestGoalRoundSettlesIntoFreshGoalReviewAndContinuesToPlanning(t *testing.T)
 	}
 }
 
+func TestAdmittedGoalRoundKeepsTaskRouteAcrossLiveReplacement(t *testing.T) {
+	cfg, _, manager := workflowTestManager(t)
+	taskRoute := cfg.Orchestrator.Routes[0]
+	goalRoute := cfg.Orchestrator.Routes[1]
+	goal, err := Create(cfg, "goals", "preserve admitted task cohort", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	goalBase := filepath.Dir(cfg.Resolve(goalRoute.Source))
+	planning := filepath.Join(goalBase, "planning", filepath.Base(goal))
+	goalDocument, err := ClaimDocument(goal, planning, "planning", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	goalID := documentID(goalDocument)
+	task, err := CreateWithOptions(cfg, "tasks", "finish admitted cohort", "", CreateOptions{GoalID: goalID, GoalRound: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskDocument, err := ReadDocument(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	goalDocument.FrontMatter["round"] = 1
+	goalDocument.FrontMatter["round_task_ids"] = []any{documentID(taskDocument)}
+	goalDocument.FrontMatter["status"] = "active"
+	if err := WriteDocument(planning, goalDocument); err != nil {
+		t.Fatal(err)
+	}
+	active := filepath.Join(goalBase, "active", filepath.Base(goal))
+	if err := os.Rename(planning, active); err != nil {
+		t.Fatal(err)
+	}
+	lease := Lease{
+		ID: "admitted-goal-route", Route: "goals", RouteSnapshot: cloneRoute(goalRoute), RoutesSnapshot: cloneRoutes(cfg.Orchestrator.Routes),
+		File: planning, SessionKey: "orchestrator:goals:admitted-route", State: "awaiting_transition", Phase: phaseGoalPlanning,
+		ClaimAttempt: 1, StartedAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(),
+	}
+	if err := manager.saveLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	next := cfg
+	next.Orchestrator.Routes = cloneRoutes(cfg.Orchestrator.Routes)
+	next.Orchestrator.Routes[0].Source = ".spynel/replaced-goal-tasks/todo"
+	next.Orchestrator.Routes[0].Working = ".spynel/replaced-goal-tasks/working"
+	manager.ApplyRuntimeConfig(next)
+	customPrompt := filepath.Join(cfg.Root, "goal-route-generation-prompt.md")
+	if err := os.WriteFile(customPrompt, []byte("Task source: {{TASK_SOURCE}}\n\nLinked tasks:\n{{RELATED_TASKS}}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := manager.renderPrompt(goalRoute, Lease{File: active, RoutesSnapshot: lease.RoutesSnapshot}, customPrompt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, cfg.Resolve(taskRoute.Source)) || strings.Contains(prompt, next.Resolve(next.Orchestrator.Routes[0].Source)) {
+		t.Fatalf("capacity-delayed goal prompt crossed route generations:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, task) || strings.Contains(prompt, "No tasks are linked to the current round") {
+		t.Fatalf("capacity-delayed goal prompt lost admitted linked-task evidence:\n%s", prompt)
+	}
+	if err := manager.reconcileTransitions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	activated, err := ReadDocument(active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozenRoute, ok := roundTaskRoute(activated)
+	if !ok || frozenRoute.Source != taskRoute.Source {
+		t.Fatalf("active goal task route = %#v, %t", frozenRoute, ok)
+	}
+	taskDocument.FrontMatter["status"] = "done"
+	done := filepath.Join(filepath.Dir(cfg.Resolve(taskRoute.Source)), "done", filepath.Base(task))
+	if err := WriteDocument(task, taskDocument); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(task, done); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.advanceActiveGoals(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(goalBase, "review", filepath.Base(goal))); err != nil {
+		t.Fatalf("goal did not observe its frozen task cohort: %v", err)
+	}
+}
+
 func TestSettledGoalReviewIgnoresFutureCheckpointAcrossRestart(t *testing.T) {
 	for _, trigger := range []string{"all_round_tasks_settled", "all_round_tasks_settled_or_checkpoint"} {
 		t.Run(trigger, func(t *testing.T) {
@@ -662,7 +642,7 @@ func TestSettledGoalReviewIgnoresFutureCheckpointAcrossRestart(t *testing.T) {
 func TestTaskSettlementRequestsImmediateGoalReconsideration(t *testing.T) {
 	cfg, fake, manager := workflowTestManager(t)
 	cfg.Orchestrator.IntervalSec = 3600
-	manager.Config = cfg
+	manager.ApplyRuntimeConfig(cfg)
 	goal := writeActiveGoalRound(t, cfg, "all_round_tasks_settled", time.Now().Add(7*24*time.Hour), "todo")
 	document, err := ReadDocument(goal)
 	if err != nil {

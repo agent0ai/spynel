@@ -264,7 +264,7 @@ func (s *Service) NotifyWithIdentity(ctx context.Context, originText, text, even
 	} else if err := s.Orchestrator.AuthorizeNotificationAgentCommand(eventKey, outcome, originText); err != nil {
 		return "", err
 	}
-	entry, err := s.Orchestrator.Outbox.Enqueue(eventKey, outcome, originText, strings.TrimSpace(text))
+	entry, err := s.Orchestrator.Outbox.Enqueue(eventKey, outcome, originText, text)
 	if err != nil {
 		return "", err
 	}
@@ -454,9 +454,10 @@ func (s *Service) creationCommandPrompt(message core.Message, kind, userMessage 
 }
 
 func (s *Service) routeSource(name string) string {
-	for _, route := range s.Config.Orchestrator.Routes {
+	cfg := s.Settings.Snapshot()
+	for _, route := range cfg.Orchestrator.Routes {
 		if route.Name == name {
-			return s.Config.Resolve(route.Source)
+			return cfg.Resolve(route.Source)
 		}
 	}
 	return "(route not configured)"
@@ -473,26 +474,13 @@ func (s *Service) chatPrompt(message core.Message) (string, error) {
 		return "", err
 	}
 	prompt := string(data)
-	// Workspaces initialized before channel prompt overrides were retired may
-	// still carry the old, user-overridable template. Remove the complete stock
-	// lines first, then neutralize tokens in customized variants.
-	for _, retired := range []string{
-		"Project binding: {{PROJECT}}\r\n",
-		"Project binding: {{PROJECT}}\n",
-		"Channel instructions: {{INSTRUCTIONS}}\r\n",
-		"Channel instructions: {{INSTRUCTIONS}}\n",
-	} {
-		prompt = strings.ReplaceAll(prompt, retired, "")
-	}
-	prompt = strings.ReplaceAll(prompt, "{{PROJECT}}", "")
-	prompt = strings.ReplaceAll(prompt, "{{INSTRUCTIONS}}", "")
 	prompt = strings.ReplaceAll(prompt, "{{HISTORY_FILE}}", fullPath)
 	prompt = strings.ReplaceAll(prompt, "{{CHANNEL}}", message.Channel)
 	prompt = strings.ReplaceAll(prompt, "{{CONVERSATION}}", message.Conversation)
 	prompt = strings.ReplaceAll(prompt, "{{TASK_SOURCE}}", s.routeSource("tasks"))
 	prompt = strings.ReplaceAll(prompt, "{{GOAL_SOURCE}}", s.routeSource("goals"))
 	prompt = agentdocs.InjectPromptGuidance(prompt)
-	prompt = instructions.InjectChatGuidance(prompt)
+	prompt = instructions.EnsureChatGuidance(prompt)
 	// History is untrusted conversation data. Replace its placeholder only after
 	// every stock template token so placeholder-like history remains literal.
 	prompt = strings.ReplaceAll(prompt, "{{RECENT_HISTORY}}", recent)
@@ -1107,7 +1095,7 @@ func (s *Service) updateCommand(ctx context.Context, message core.Message, remai
 	if !result.CanAutoInstall {
 		return s.localReply(message, fmt.Sprintf("Run `%s`, then `/restart`. Updating in place is unavailable because this process was not launched by the npm wrapper.", result.Command), emit)
 	}
-	if err := s.localReply(message, fmt.Sprintf("Updating Spynel from %s to %s with npm, then restarting. Saved workspace state will be migrated on startup.", result.Current, result.Latest), emit); err != nil {
+	if err := s.localReply(message, fmt.Sprintf("Updating Spynel from %s to %s with npm, then restarting. Saved workspace state will remain in place.", result.Current, result.Latest), emit); err != nil {
 		return err
 	}
 	s.requestUpdate()
@@ -1303,7 +1291,7 @@ func FormatStatus(status StatusSnapshot) string {
 	for _, checkpoint := range status.ScheduledGoals {
 		reason := checkpoint.Reason
 		if reason == "" {
-			reason = "legacy checkpoint (no rationale recorded)"
+			reason = "no rationale recorded"
 		}
 		lines = append(lines, fmt.Sprintf("- Scheduled goal checkpoint: %s (`%s`) at %s — %s", emptyAs(checkpoint.Title, "untitled"), shortid.Display(checkpoint.ID), checkpoint.At.UTC().Format(time.RFC3339), reason))
 	}
@@ -1519,12 +1507,12 @@ var helpTopics = []struct {
 	{
 		name:        "extensions",
 		description: "Trusted project extensions and their hooks",
-		body:        "# Extensions\n\nExtensions are explicitly installed Git repositories that can run hooks around messages, harness calls, orchestration, and application-version transitions. Update hooks receive exact `from_version` and `to_version` values and must be retry-safe. Their directory and whether hooks are enabled are configured under `extensions` in `.spynel/config.yaml`.\n\n- `/extension list` lists installed extensions.\n- `/extension install <git-url> [name]` installs a repository you trust.\n- `/extension remove <name>` removes an installed extension.",
+		body:        "# Extensions\n\nExtensions are explicitly installed Git repositories that can run the supported message, harness, and task lifecycle hooks. Manifests using unknown hook names are rejected so dead configuration cannot be silently retained. Their directory and whether hooks are enabled are configured under `extensions` in `.spynel/config.yaml`.\n\n- `/extension list` lists installed extensions.\n- `/extension install <git-url> [name]` installs a repository you trust.\n- `/extension remove <name>` removes an installed extension.",
 	},
 	{
 		name:        "config",
 		description: ".spynel/config.yaml settings and path resolution",
-		body:        "# Configuration\n\n`.spynel/config.yaml` controls the workspace, harness, channels, speech processing, orchestration routes, and extensions. `/config` shows the shared settings, `/config get <key>` reads one value, and `/config set <key> <value>` atomically validates and persists a change from any channel. `/harness [name]` and `/model [name]` are concise selectors. `/theme [name]` previews/lists or selects a semantic palette from `.spynel/themes`. All harness settings live in the `harness` group. `harness.sandbox` accepts `danger-full-access`, `workspace-write`, or `read-only`; unrestricted access is the default. Chat, developer, reviewer, and heartbeat prefixes are outer-trimmed and separated from the original prompt by one ASCII space, with `/goal` as the default for every non-chat agent. `harness.reviews` accepts `skip-trivial`, `always`, or `never` for task reviews. Relative paths resolve from the workspace root, one directory above `.spynel`, so a project can be moved without rewriting local paths.",
+		body:        "# Configuration\n\n`.spynel/config.yaml` controls the workspace, harness, channels, speech processing, orchestration routes, and extensions. `/config` shows the shared settings, `/config get <key>` reads one value, and `/config set <key> <value>` atomically validates and persists a change from any channel. `/harness [name]` and `/model [name]` are concise selectors. `/theme [name]` previews/lists or selects a semantic palette from `.spynel/themes`. All harness settings live in the `harness` group. `harness.sandbox` accepts `danger-full-access`, `workspace-write`, or `read-only`; unrestricted access is the default. Chat, developer, reviewer, and heartbeat prefixes default empty; optional harness-native commands such as `/goal` are outer-trimmed and separated from the original prompt by one ASCII space. `harness.reviews` accepts `skip-trivial`, `always`, or `never` for task reviews. Relative paths resolve from the workspace root, one directory above `.spynel`, so a project can be moved without rewriting local paths.",
 	},
 	{
 		name:        "channels",

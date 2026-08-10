@@ -428,12 +428,13 @@ func (m *Manager) semanticHeartbeatPrompt(executionID string, now time.Time) (st
 	if err != nil {
 		return "", err
 	}
-	if len(m.Config.Orchestrator.Routes) > 128 {
+	cfg := m.runtimeSnapshot()
+	if len(cfg.Orchestrator.Routes) > 128 {
 		return "", errors.New("heartbeat route summary exceeds 128 routes")
 	}
-	routes := make([]string, 0, len(m.Config.Orchestrator.Routes))
+	routes := make([]string, 0, len(cfg.Orchestrator.Routes))
 	routeBytes := 0
-	for _, route := range m.Config.Orchestrator.Routes {
+	for _, route := range cfg.Orchestrator.Routes {
 		fieldBytes := len(route.Name) + len(route.Source) + len(route.Working) + len(route.StaleAfter)
 		if fieldBytes > 8<<10 || routeBytes+fieldBytes > maxHeartbeatRouteBytes {
 			return "", errors.New("heartbeat route summary exceeds bounded input limit")
@@ -719,18 +720,6 @@ func (m *Manager) endSemanticHeartbeatTerm(term uint64) {
 	}
 }
 
-func (m *Manager) authorizedSemanticOrigin(workflowID, proposed string) (Origin, bool) {
-	if strings.TrimSpace(workflowID) == "" {
-		return Origin{}, false
-	}
-	documents, err := m.semanticDocuments(map[string]bool{workflowID: true})
-	if err != nil {
-		return Origin{}, false
-	}
-	matched, exists := documents[workflowID]
-	return authorizedSemanticOriginFromDocument(matched.Document, exists, proposed)
-}
-
 func authorizedSemanticOriginFromDocument(document Document, exists bool, proposed string) (Origin, bool) {
 	if !exists {
 		return Origin{}, false
@@ -759,11 +748,12 @@ func (m *Manager) semanticDocuments(workflowIDs map[string]bool) (map[string]sem
 		return matched, nil
 	}
 	examined := 0
-	for routeIndex, route := range m.Config.Orchestrator.Routes {
+	cfg := m.runtimeSnapshot()
+	for routeIndex, route := range cfg.Orchestrator.Routes {
 		if routeIndex >= 128 {
 			return nil, errors.New("semantic workflow lookup exceeds route limit")
 		}
-		base := filepath.Dir(m.Config.Resolve(route.Source))
+		base := filepath.Dir(cfg.Resolve(route.Source))
 		for statusIndex, status := range route.AllowedNext {
 			if statusIndex >= 128 || examined >= 2048 {
 				return nil, errors.New("semantic workflow lookup exceeds entry limit")

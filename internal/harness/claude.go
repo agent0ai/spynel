@@ -796,11 +796,7 @@ func (c *Claude) loadSessions() error {
 	for key, value := range values {
 		var session claudeSession
 		if err := json.Unmarshal(value, &session); err != nil {
-			var legacy string
-			if legacyErr := json.Unmarshal(value, &legacy); legacyErr != nil {
-				return err
-			}
-			session.ID = legacy
+			return err
 		}
 		if strings.TrimSpace(session.ID) != "" {
 			c.sessions[key] = session

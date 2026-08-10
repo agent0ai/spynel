@@ -13,7 +13,7 @@ Use `/status` in any interface for the current owner, harness, channel, workflow
 - The public `npm install -g spynel` path is not available until the first public npm and GitHub release. For an authorized checkout, use the development steps in [getting started](getting-started.md).
 - Run `spynel` from the directory that should own the workspace. Its private configuration and state live in that directory's fixed `.spynel/` folder.
 - If a development install is not found, follow the exact PATH guidance printed by `scripts/install-dev.sh`, or choose a writable directory already on PATH with `--bin-dir`.
-- A legacy root `spynel.yaml` using the standard state location migrates automatically. A custom legacy state path must be moved to `.spynel` first.
+- The configuration must be `.spynel/config.yaml` and match the current schema. Unknown or obsolete fields fail validation with their source location.
 
 ## Coding harness
 

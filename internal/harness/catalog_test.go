@@ -31,16 +31,16 @@ func TestResolveCommandRejectsManualOrUnknownHarnesses(t *testing.T) {
 	if _, err := ResolveCommand("/tmp/custom", func(string) (string, error) { return "", nil }); err == nil {
 		t.Fatal("manual executable path was accepted as a harness")
 	}
-	command, err := ResolveCommand("claude", func(name string) (string, error) { return "/bin/" + name, nil })
+	command, err := ResolveCommand("claude-code", func(name string) (string, error) { return "/bin/" + name, nil })
 	if err != nil || command != "/bin/claude" {
-		t.Fatalf("Claude alias resolution = %q, %v", command, err)
+		t.Fatalf("Claude command resolution = %q, %v", command, err)
 	}
 }
 
 func TestACPProfilesResolveFixedAndCustomCommandsWithoutShellParsing(t *testing.T) {
-	definition, ok := Lookup("qwen")
+	definition, ok := Lookup("qwen-code")
 	if !ok || definition.Name != "qwen-code" || definition.Command != "qwen" {
-		t.Fatalf("Qwen ACP alias = %#v, %t", definition, ok)
+		t.Fatalf("Qwen ACP profile = %#v, %t", definition, ok)
 	}
 	arguments := CommandArgs("qwen-code", nil)
 	if len(arguments) != 2 || arguments[0] != "--acp" || arguments[1] != "--experimental-skills" {

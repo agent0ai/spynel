@@ -531,28 +531,6 @@ func TestImplementationReconciliationPreservesExistingReviewClaim(t *testing.T) 
 	}
 }
 
-func TestDirectCompletionNotificationDoesNotClaimReview(t *testing.T) {
-	document := Document{FrontMatter: map[string]any{
-		"title": "Service inventory", "review_required": false,
-		"notification_summary": map[string]any{
-			"verdict": "completed", "outcome": "Collected three service states.",
-			"evidence":     "Local status output only.",
-			"uncertainty":  "Remote health was not tested.",
-			"completed_at": "2026-08-08T12:00:00Z",
-		},
-	}}
-	message := FormatTaskNotification(document, "done", "task")
-	if want := "Recorded: Local status output only."; !strings.Contains(message, want) {
-		t.Fatalf("notification = %q", message)
-	}
-	if want := "Uncertainty: Remote health was not tested."; !strings.Contains(message, want) {
-		t.Fatalf("notification = %q", message)
-	}
-	if strings.Contains(message, "independently verified") || strings.Contains(message, "Verified:") {
-		t.Fatalf("direct completion claimed review: %q", message)
-	}
-}
-
 func TestDirectCompletionEvidenceValidation(t *testing.T) {
 	valid := map[string]any{
 		"verdict": "completed", "outcome": "Collected three service states.",
@@ -581,7 +559,7 @@ func TestDirectCompletionEvidenceValidation(t *testing.T) {
 			if test.mutate != nil {
 				test.mutate(summary)
 			}
-			document := Document{FrontMatter: map[string]any{"updated_at": test.updated, "notification_summary": summary}}
+			document := Document{FrontMatter: map[string]any{"updated_at": test.updated, "completion_summary": summary}}
 			if err := validateDirectCompletionEvidence(document); (err != nil) != test.wantErr {
 				t.Fatalf("validation error = %v, want error %v", err, test.wantErr)
 			}
@@ -632,71 +610,6 @@ func TestDirectCompletionHookFiresOnceAcrossRepeatReconciliation(t *testing.T) {
 	}
 	manager.Wait()
 	if err := manager.reconcileTransitions(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.reconcileTransitions(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	count, err := os.ReadFile(filepath.Join(extension, "completed.count"))
-	if err != nil || string(count) != "x" {
-		t.Fatalf("completion hook count = %q, %v", count, err)
-	}
-}
-
-func TestDirectCompletionRecoversLegacyPreInvocationFence(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("shell hook fixture")
-	}
-	root := t.TempDir()
-	if err := workspace.Init(root, false); err != nil {
-		t.Fatal(err)
-	}
-	cfg, _ := config.Load(config.PathForRoot(root))
-	route := cfg.Orchestrator.Routes[0]
-	extension := filepath.Join(cfg.Resolve(cfg.Extensions.Directory), "counter")
-	if err := os.MkdirAll(extension, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	manifest := "name: counter\nhooks:\n  task.completed: [\"./hook.sh\"]\n"
-	script := "#!/bin/sh\nprintf x >> completed.count\nprintf '%s\\n' '{}'\n"
-	if err := os.WriteFile(filepath.Join(extension, extensions.ManifestName), []byte(manifest), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(extension, "hook.sh"), []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	task, err := CreateWithOptions(cfg, "tasks", "collect restart status", "", CreateOptions{NoReview: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	name := filepath.Base(task)
-	fake := newFakeRecipient()
-	fake.beforeEmit = func() {
-		working := filepath.Join(cfg.Resolve(route.Working), name)
-		recordDirectCompletion(t, working, filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "done", name))
-	}
-	manager := New(cfg, fake, extensions.Runner{Directory: cfg.Resolve(cfg.Extensions.Directory), Timeout: time.Second})
-	if err := manager.ScanOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	manager.Wait()
-	leases, err := manager.loadLeases()
-	if err != nil || len(leases) != 1 {
-		t.Fatalf("leases = %#v, %v", leases, err)
-	}
-	data, err := os.ReadFile(manager.leasePath(leases[0].ID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-	// The old intent-only fence does not prove that a process was started.
-	raw["terminal_hook_started"] = true
-	raw["terminal_hooks_started"] = map[string]bool{"counter": true}
-	data, _ = json.Marshal(raw)
-	if err := os.WriteFile(manager.leasePath(leases[0].ID), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.reconcileTransitions(context.Background()); err != nil {
@@ -787,7 +700,7 @@ func recordDirectCompletion(t *testing.T, working, done string) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Truncate(time.Second)
-	document.FrontMatter["notification_summary"] = map[string]any{
+	document.FrontMatter["completion_summary"] = map[string]any{
 		"verdict": "completed", "outcome": "Collected the requested status.",
 		"evidence":     "Local status output only.",
 		"uncertainty":  "Remote health remains uncertain.",

@@ -2,13 +2,14 @@
 
 ## Purpose
 
-- Own initialized `.spynel` structure, embedded defaults, safe upgrades, and user-overridable workspace templates.
+- Own initialized `.spynel` structure, embedded workflow defaults, repair of missing current assets, and user-overridable workspace templates.
 
 ## Local Contracts
 
 - Create canonical private directories and configuration without following unsafe state or instruction symlinks; preserve user-edited prompts, themes, instructions, and contracts during upgrades.
-- Embed templates from `templates/` as source of truth for new workspaces and perform only explicit retry-safe migrations for legacy names and layouts. The exact retired stock JSON-triage notification prompt migrates to the current CLI-action prompt; any user-authored variation remains untouched.
-- Automatically managed speech models live in the operating-system user cache, not the workspace, except for safe copy-only legacy migration.
+- Embed current workflow templates from `templates/` as source of truth for new workspaces. General compatibility migrations and retired asset fixtures do not belong in this package. Upgrade makes one narrow validated atomic exception to remove the retired TUI launch preference; current-schema configurations remain untouched.
+- Delegate built-in palette assets to `internal/theme`; workspace initialization only asks that package to materialize editable copies.
+- Automatically managed speech models live in the operating-system user cache, not the workspace.
 
 ## Child DOX Index
 

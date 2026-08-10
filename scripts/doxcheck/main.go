@@ -57,12 +57,31 @@ func trackedDirectories(root string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list repository files: %w", err)
 	}
+	deletedCommand := exec.Command("git", "ls-files", "--deleted", "-z")
+	deletedCommand.Dir = root
+	deleted, err := deletedCommand.Output()
+	if err != nil {
+		return nil, fmt.Errorf("list deleted repository files: %w", err)
+	}
+	return trackedDirectoriesFromGit(out, deleted), nil
+}
+
+func trackedDirectoriesFromGit(tracked, deleted []byte) []string {
+	deletedPaths := make(map[string]bool)
+	for _, raw := range bytes.Split(deleted, []byte{0}) {
+		if len(raw) > 0 {
+			deletedPaths[filepath.ToSlash(string(raw))] = true
+		}
+	}
 	seen := map[string]bool{".": true}
-	for _, raw := range bytes.Split(out, []byte{0}) {
+	for _, raw := range bytes.Split(tracked, []byte{0}) {
 		if len(raw) == 0 {
 			continue
 		}
 		path := filepath.ToSlash(string(raw))
+		if deletedPaths[path] {
+			continue
+		}
 		dir := filepath.ToSlash(filepath.Dir(path))
 		for dir != "." {
 			seen[dir] = true
@@ -74,7 +93,7 @@ func trackedDirectories(root string) ([]string, error) {
 		dirs = append(dirs, dir)
 	}
 	sort.Strings(dirs)
-	return dirs, nil
+	return dirs
 }
 
 func validate(root string, dirs []string) []string {

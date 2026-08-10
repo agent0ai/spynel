@@ -145,7 +145,10 @@ func TestJobInfoShowsReviewLeaseAndMissingOptionalMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now().UTC().Add(-2 * time.Minute)
-	job := Job{ID: 4, SessionKey: "goal-session", Channel: "orchestrator", Conversation: "markdown", Kind: "goal", Route: "goals", DurableFile: path, StartedAt: started, Execution: JobRunning}
+	job := Job{
+		ID: 4, SessionKey: "goal-session", Channel: "orchestrator", Conversation: "markdown", Kind: "goal", Route: "goals",
+		DurableFile: path, StartedAt: started, Execution: JobRunning, LeaseState: "processing", LeasePhase: "goal_review", LeaseHeartbeatAt: time.Now().UTC().Add(-3 * time.Second),
+	}
 	lease := orchestrator.Lease{SessionKey: job.SessionKey, File: path, State: "processing", Phase: "goal_review", HeartbeatAt: time.Now().UTC().Add(-3 * time.Second)}
 
 	output := service.formatJobInfo(job, lease, true)
@@ -230,8 +233,9 @@ func TestJobInfoUsesCanonicalExecutionActivityReconnectRecoveryAndDetail(t *test
 		StartedAt: time.Now().UTC().Add(-time.Minute), Execution: JobReconnecting,
 		LastActivityAt: time.Now().UTC().Add(-5 * time.Second), ReconnectAttempt: 2, ReconnectTotal: 4,
 		RecoveryCount: 3, StatusDetail: "transport unavailable\x1b[31m", Route: "cli",
+		LeaseState: "processing", LeasePhase: "goal_planning", LeaseHeartbeatAt: time.Now().UTC().Add(-2 * time.Second),
 	}
-	lease := orchestrator.Lease{State: "processing", Phase: "goal_planning", HeartbeatAt: time.Now().UTC().Add(-2 * time.Second)}
+	lease := orchestrator.Lease{State: "ignored", Phase: "ignored", HeartbeatAt: time.Now().UTC()}
 	output := service.formatJobInfo(job, lease, true)
 	for _, want := range []string{"Execution status: reconnecting 2/4", "Health: degraded", "Last activity:", "Reconnect attempt: 2/4", "Recovery count: 3", "Detail: transport unavailable", "Phase: goal\\_planning", "Lease: processing"} {
 		if !strings.Contains(output, want) {
@@ -286,7 +290,7 @@ func TestJobInfoInspectionDoesNotOverwriteProviderReconnectState(t *testing.T) {
 	}
 	output := runJobCommand(t, service, "/job info 1")
 	job, _ := service.Runtime.Job(id)
-	if job.Execution != JobReconnecting || !strings.Contains(output, "Execution status: reconnecting 2/5") || !strings.Contains(output, "Lease: processing") {
+	if job.Execution != JobReconnecting || !strings.Contains(output, "Execution status: reconnecting 2/5") || strings.Contains(output, "Lease: processing") {
 		t.Fatalf("inspection changed canonical state: job=%#v output=%s", job, output)
 	}
 }

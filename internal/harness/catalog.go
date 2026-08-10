@@ -127,28 +127,7 @@ func Lookup(name string) (Definition, bool) {
 }
 
 func NormalizeName(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "claude", "claude_code", "claude-code":
-		return "claude-code"
-	case "pi-coding-agent", "pi_coding_agent":
-		return "pi"
-	case "qwen", "qwen_code", "qwen-code":
-		return "qwen-code"
-	case "kimi-cli", "kimi_cli":
-		return "kimi"
-	case "cursor-agent", "cursor_agent":
-		return "cursor"
-	case "gemini", "gemini_cli", "gemini-cli":
-		return "gemini-cli"
-	case "copilot", "github_copilot", "github-copilot", "github-copilot-cli":
-		return "github-copilot"
-	case "droid", "factory_droid", "factory-droid":
-		return "factory-droid"
-	case "custom-acp", "custom_acp":
-		return "acp"
-	default:
-		return strings.ToLower(strings.TrimSpace(value))
-	}
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 // Detect returns the first installed harness in catalog priority order.

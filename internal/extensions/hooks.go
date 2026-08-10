@@ -22,6 +22,14 @@ const (
 	maxHookStderr = 64 << 10
 )
 
+var supportedHooks = map[string]struct{}{
+	"message.received": {},
+	"harness.before":   {},
+	"harness.after":    {},
+	"task.claimed":     {},
+	"task.completed":   {},
+}
+
 type Manifest struct {
 	Name  string              `yaml:"name"`
 	Hooks map[string][]string `yaml:"hooks"`
@@ -89,20 +97,7 @@ func (r Runner) run(ctx context.Context, hook string, payload map[string]any, co
 		if completed[extension.id] {
 			continue
 		}
-		resolvedHook := hook
-		command := extension.manifest.Hooks[resolvedHook]
-		// Keep version-one extensions working while making harness.* the
-		// canonical terminology for new manifests and hook payloads.
-		if len(command) == 0 {
-			legacy := map[string]string{
-				"harness.before": "recipient.before",
-				"harness.after":  "recipient.after",
-			}[hook]
-			if legacy != "" {
-				resolvedHook = legacy
-				command = extension.manifest.Hooks[legacy]
-			}
-		}
+		command := extension.manifest.Hooks[hook]
 		if len(command) == 0 {
 			continue
 		}
@@ -111,11 +106,11 @@ func (r Runner) run(ctx context.Context, hook string, payload map[string]any, co
 			timeout = 30 * time.Second
 		}
 		hookCtx, cancel := context.WithTimeout(ctx, timeout)
-		input, _ := json.Marshal(HookInput{Hook: resolvedHook, Payload: result.Payload})
+		input, _ := json.Marshal(HookInput{Hook: hook, Payload: result.Payload})
 		cmd := exec.CommandContext(hookCtx, command[0], command[1:]...)
 		cmd.Dir = extension.root
 		cmd.Stdin = bytes.NewReader(input)
-		cmd.Env = append(os.Environ(), "SPYNEL_HOOK="+resolvedHook, "SPYNEL_EXTENSION="+extension.manifest.Name)
+		cmd.Env = append(os.Environ(), "SPYNEL_HOOK="+hook, "SPYNEL_EXTENSION="+extension.manifest.Name)
 		stdout := boundedBuffer{limit: maxHookStdout}
 		stderr := boundedBuffer{limit: maxHookStderr}
 		cmd.Stdout = &stdout
@@ -126,16 +121,16 @@ func (r Runner) run(ctx context.Context, hook string, payload map[string]any, co
 		}
 		cancel()
 		if r.Log != nil && stderr.Len() > 0 {
-			_, _ = fmt.Fprintf(r.Log, "extension=%s hook=%s stderr_truncated=%t stderr=%s\n", extension.manifest.Name, resolvedHook, stderr.truncated, stderr.String())
+			_, _ = fmt.Fprintf(r.Log, "extension=%s hook=%s stderr_truncated=%t stderr=%s\n", extension.manifest.Name, hook, stderr.truncated, stderr.String())
 		}
 		if err != nil {
 			if r.Log != nil {
-				_, _ = fmt.Fprintf(r.Log, "extension=%s hook=%s process_failed=%v stderr_present=%t\n", extension.manifest.Name, resolvedHook, err, stderr.Len() > 0)
+				_, _ = fmt.Fprintf(r.Log, "extension=%s hook=%s process_failed=%v stderr_present=%t\n", extension.manifest.Name, hook, err, stderr.Len() > 0)
 			}
-			return result, fmt.Errorf("extension %s hook %s failed: %w", extension.manifest.Name, resolvedHook, err)
+			return result, fmt.Errorf("extension %s hook %s failed: %w", extension.manifest.Name, hook, err)
 		}
 		if stdout.truncated {
-			return result, fmt.Errorf("extension %s hook %s exceeded %d-byte stdout limit", extension.manifest.Name, resolvedHook, maxHookStdout)
+			return result, fmt.Errorf("extension %s hook %s exceeded %d-byte stdout limit", extension.manifest.Name, hook, maxHookStdout)
 		}
 		var output HookOutput
 		if stdout.Len() > 0 {
@@ -151,7 +146,7 @@ func (r Runner) run(ctx context.Context, hook string, payload map[string]any, co
 		}
 		if onCompleted != nil {
 			if err := onCompleted(extension.id); err != nil {
-				return result, fmt.Errorf("record extension %s hook %s completion: %w", extension.manifest.Name, resolvedHook, err)
+				return result, fmt.Errorf("record extension %s hook %s completion: %w", extension.manifest.Name, hook, err)
 			}
 		}
 		if output.Cancel {
@@ -189,6 +184,11 @@ func (r Runner) discover() ([]discovered, error) {
 		}
 		if manifest.Name == "" {
 			manifest.Name = entry.Name()
+		}
+		for hook := range manifest.Hooks {
+			if _, ok := supportedHooks[hook]; !ok {
+				return nil, fmt.Errorf("extension %s declares unsupported hook %q", entry.Name(), hook)
+			}
 		}
 		result = append(result, discovered{id: entry.Name(), root: root, manifest: manifest})
 	}

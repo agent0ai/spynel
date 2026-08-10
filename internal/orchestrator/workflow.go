@@ -18,8 +18,6 @@ const (
 
 var taskSettledStatuses = map[string]bool{"done": true, "failed": true, "cancelled": true}
 
-func routeBase(source string) string { return filepath.Dir(source) }
-
 func statusPath(base, status, name string) string {
 	return filepath.Join(base, status, name)
 }

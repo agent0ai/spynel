@@ -71,6 +71,183 @@ func (f *fakeHarness) Send(_ context.Context, key, prompt string, emit core.Emit
 	return thread, false, nil
 }
 
+func TestLiveParallelLimitRaisesPromptlyAndLowersWithoutCancelling(t *testing.T) {
+	cfg := config.Default()
+	cfg.Orchestrator.MaxParallel = 1
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if !manager.acquireCapacity(ctx) {
+		t.Fatal("initial capacity was unavailable")
+	}
+	acquired := make(chan struct{})
+	go func() {
+		if manager.acquireCapacity(ctx) {
+			close(acquired)
+		}
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("limit one admitted overlapping work")
+	case <-time.After(25 * time.Millisecond):
+	}
+	cfg.Orchestrator.MaxParallel = 2
+	manager.ApplyRuntimeConfig(cfg)
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("raised limit did not admit waiting work promptly")
+	}
+	cfg.Orchestrator.MaxParallel = 1
+	manager.ApplyRuntimeConfig(cfg)
+	third := make(chan struct{})
+	go func() {
+		if manager.acquireCapacity(ctx) {
+			close(third)
+		}
+	}()
+	manager.releaseCapacity()
+	select {
+	case <-third:
+		t.Fatal("lowered limit admitted work while active count remained at the bound")
+	case <-time.After(25 * time.Millisecond):
+	}
+	manager.releaseCapacity()
+	select {
+	case <-third:
+	case <-time.After(time.Second):
+		t.Fatal("waiting work was not admitted after active work drained below the new bound")
+	}
+	manager.releaseCapacity()
+}
+
+func TestLiveScanIntervalResetsRunningSchedulerFromAcceptedChange(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Orchestrator.IntervalSec = 3600
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- manager.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		<-runDone
+	})
+	deadline := time.Now().Add(time.Second)
+	for {
+		manager.scanTimerMu.Lock()
+		running := manager.scanTimer != nil
+		manager.scanTimerMu.Unlock()
+		if running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("route scheduler did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cfg.Orchestrator.IntervalSec = 2
+	before := time.Now()
+	manager.ApplyRuntimeConfig(cfg)
+	after := time.Now()
+	manager.scanTimerMu.Lock()
+	next := manager.scanNext
+	manager.scanTimerMu.Unlock()
+	if next.Before(before.Add(2*time.Second)) || next.After(after.Add(2*time.Second)) {
+		t.Fatalf("next scan deadline %s was not measured from acceptance window [%s, %s]", next, before.Add(2*time.Second), after.Add(2*time.Second))
+	}
+	if got := manager.scanInterval(); got != 2*time.Second {
+		t.Fatalf("live scan interval = %s", got)
+	}
+}
+
+func TestStructuredRoutesApplyToNextScanWithoutRestart(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+	next := cfg
+	next.Orchestrator.Routes = append([]config.Route(nil), cfg.Orchestrator.Routes...)
+	next.Orchestrator.Routes[0].Source = ".spynel/live-routes/todo"
+	next.Orchestrator.Routes[0].Working = ".spynel/live-routes/working"
+	manager.ApplyRuntimeConfig(next)
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{next.Orchestrator.Routes[0].Source, next.Orchestrator.Routes[0].Working} {
+		if info, err := os.Stat(next.Resolve(path)); err != nil || !info.IsDir() {
+			t.Fatalf("live route directory %q: %v", path, err)
+		}
+	}
+}
+
+func TestInFlightRouteSnapshotReconcilesAfterLiveRouteReplacement(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := cfg.Orchestrator.Routes[0]
+	task, err := Create(cfg, route.Name, "preserve admitted route", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	working := filepath.Join(cfg.Resolve(route.Working), filepath.Base(task))
+	document, err := ClaimDocument(task, working, "working", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	document.FrontMatter["attempt"] = 1
+	if err := WriteDocument(working, document); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+	lease := Lease{
+		ID: "admitted-route", ClaimID: "admitted-route", DocumentType: "task", OwnerID: manager.ownerID,
+		Route: route.Name, RouteSnapshot: cloneRoute(route), File: working, SessionKey: "orchestrator:tasks:admitted-route",
+		State: "processing", Phase: phaseTaskImplementation, ClaimAttempt: 1, StartedAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(),
+	}
+	if err := manager.saveLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	oldBase := filepath.Dir(cfg.Resolve(route.Source))
+	done := filepath.Join(oldBase, "done", filepath.Base(task))
+	if err := os.Rename(working, done); err != nil {
+		t.Fatal(err)
+	}
+	next := cfg
+	next.Orchestrator.Routes = append([]config.Route(nil), cfg.Orchestrator.Routes...)
+	next.Orchestrator.Routes[0] = route
+	next.Orchestrator.Routes[0].Source = ".spynel/replaced-routes/todo"
+	next.Orchestrator.Routes[0].Working = ".spynel/replaced-routes/working"
+	next.Orchestrator.Routes[0].AllowedNext = []string{"waiting"}
+	manager.ApplyRuntimeConfig(next)
+	if err := manager.reconcileTransitions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	review := filepath.Join(oldBase, "review", filepath.Base(task))
+	if _, err := os.Stat(review); err != nil {
+		t.Fatalf("admitted route completion was not reconciled through its immutable snapshot: %v", err)
+	}
+	if manager.leaseExists(lease.ID) {
+		t.Fatal("reconciled admitted-route lease was retained")
+	}
+}
+
 func TestImplementationDoneMoveIsReconciledIntoIndependentReview(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {

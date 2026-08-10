@@ -148,6 +148,14 @@ type RuntimeStatus struct {
 	LiveBackgroundJobs int `json:"live_background_jobs"`
 }
 
+// DurableWorkCounts is the current nonterminal task and goal census used by
+// constrained live status surfaces. Detailed diagnostics remain on the
+// application shared-state boundary.
+type DurableWorkCounts struct {
+	Tasks int `json:"tasks"`
+	Goals int `json:"goals"`
+}
+
 const (
 	EventDelta  = "delta"
 	EventFinal  = "final"

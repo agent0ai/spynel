@@ -8,8 +8,9 @@
 
 - Keep channel/harness supervisors, histories, commands, hooks, configuration, startup registration, conversations, runtime logs, durable-work lists, and agent jobs behind the shared service boundary.
 - Protect shared state and job snapshots for concurrent readers; distinguish execution state, workflow phase, durable outcome, and evidence-based health. Text silence alone is never a stall signal.
+- Project the orchestrator's bounded authoritative nonterminal task/goal census and its bounded diagnostics into shared TUI state; do not derive durable work from jobs or histories.
 - Project live background activity from the process-local orchestrator job registry only. Starting, running, reconnecting, recovering, degraded, and audit executions are live; terminal, cancelling, finishing, error, and explicitly stalled records are not.
-- File-lock implementations remain platform-specific, captured logs remain bounded, and configuration changes use transactional validation and rollback paths.
+- File-lock implementations remain platform-specific, captured logs remain bounded, and configuration changes validate, save, reload the canonical file into shared memory, then invoke only required cached-runtime hooks.
 
 ## Child DOX Index
 

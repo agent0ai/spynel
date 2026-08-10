@@ -39,6 +39,7 @@ type pairingEvent struct{ event channel.PairingEvent }
 type noticeEvent struct{ notice channel.Notice }
 type titleEvent struct{ title string }
 type runtimeEvent struct{ status core.RuntimeStatus }
+type durableWorkEvent struct{ counts core.DurableWorkCounts }
 type themeEvent struct{ theme theme.Theme }
 type taskNotificationEvent struct{ notification channel.Notification }
 type notificationPauseMsg struct{ sequence uint64 }
@@ -132,6 +133,8 @@ type Options struct {
 	LoadThemes         func() ([]theme.Theme, error)
 	RuntimeEvents      <-chan core.RuntimeStatus
 	InitialRuntime     core.RuntimeStatus
+	DurableWorkEvents  <-chan core.DurableWorkCounts
+	InitialDurableWork core.DurableWorkCounts
 	SaveSettings       func(map[string]string) error
 	InitialScreen      *core.Screen
 	ScreenAction       func(context.Context, string, string, map[string]string) (*core.Screen, error)
@@ -202,6 +205,8 @@ type model struct {
 	titles                   <-chan string
 	runtimeEvents            <-chan core.RuntimeStatus
 	runtimeStatus            core.RuntimeStatus
+	durableWorkEvents        <-chan core.DurableWorkCounts
+	durableWork              core.DurableWorkCounts
 	connection               map[string]channel.ConnectionStatus
 	ignoreNextLF             bool
 	pendingMouse             string
@@ -427,6 +432,8 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 		titles:               options.TitleEvents,
 		runtimeEvents:        options.RuntimeEvents,
 		runtimeStatus:        options.InitialRuntime,
+		durableWorkEvents:    options.DurableWorkEvents,
+		durableWork:          options.InitialDurableWork,
 		saveSettings:         options.SaveSettings,
 		screenAction:         options.ScreenAction,
 		preparePaste:         preparePaste,
@@ -649,6 +656,8 @@ func (m model) waitEvent() tea.Cmd {
 			return themeEvent{theme: value}
 		case status := <-m.runtimeEvents:
 			return runtimeEvent{status: status}
+		case counts := <-m.durableWorkEvents:
+			return durableWorkEvent{counts: counts}
 		case <-m.ctx.Done():
 			return tea.Quit()
 		}
@@ -1123,6 +1132,9 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if command := m.syncLogoAnimation(); command != nil {
 			commands = append(commands, command)
 		}
+		commands = append(commands, m.waitEvent())
+	case durableWorkEvent:
+		m.durableWork = value.counts
 		commands = append(commands, m.waitEvent())
 	case screenSaveResult:
 		if m.screen == nil || m.screen.ID != value.screenID {
@@ -3029,8 +3041,10 @@ func (m model) headerView(width int) string {
 	segments := []string{
 		m.connectionSegment("telegram", "TG"),
 		m.connectionSegment("whatsapp", "WA"),
-		m.styles.status.Background(m.styles.header.GetBackground()).Render(runtimeCount(m.runtimeStatus.Jobs, "jobs")),
-		m.styles.status.Background(m.styles.header.GetBackground()).Render(runtimeCount(m.runtimeStatus.Logs, "logs")),
+		m.styles.status.Background(m.styles.header.GetBackground()).Render(runtimeCount(m.durableWork.Goals, "goal")),
+		m.styles.status.Background(m.styles.header.GetBackground()).Render(runtimeCount(m.durableWork.Tasks, "task")),
+		m.styles.status.Background(m.styles.header.GetBackground()).Render(runtimeCount(m.runtimeStatus.Jobs, "job")),
+		m.styles.status.Background(m.styles.header.GetBackground()).Render(runtimeCount(m.runtimeStatus.Logs, "log")),
 	}
 	right := strings.Join(segments, ribbon) + ribbon
 	// Preserve the workspace identity first; compact/truncate volatile status
@@ -3783,7 +3797,8 @@ func (m model) screenContent(height, width int) (string, int, int) {
 		separateWizardActions := strings.HasPrefix(m.screen.ID, "wizard:") && control.Kind == "action" && previousControlKind != "" && previousControlKind != "action"
 		separateDisclosure := control.Section == "" && control.Kind == "disclosure" && previousControlKind != ""
 		separateAdvancedControls := control.Section == "" && control.Advanced && previousControlKind == "disclosure"
-		if separateWizardLauncher || separateWizardActions || separateDisclosure || separateAdvancedControls {
+		separateInitializationActions := m.screen.Required && previousControlKind == "action" && control.Kind == "action"
+		if separateWizardLauncher || separateWizardActions || separateDisclosure || separateAdvancedControls || separateInitializationActions {
 			lines = appendBlankScreenRow(lines)
 		}
 		value := control.Value
@@ -4100,7 +4115,11 @@ func (m model) spynelLogo() string {
 	return "○○"
 }
 
-func runtimeCount(count int, label string) string {
+func runtimeCount(count int, singular string) string {
+	label := singular + "s"
+	if count == 1 {
+		label = singular
+	}
 	return core.CompactCount(count) + " " + label
 }
 

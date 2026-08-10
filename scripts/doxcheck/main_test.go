@@ -56,6 +56,15 @@ func TestValidateReportsCyclicIndex(t *testing.T) {
 	}
 }
 
+func TestTrackedDirectoriesExcludeWorktreeDeletions(t *testing.T) {
+	tracked := []byte("AGENTS.md\x00kept/AGENTS.md\x00kept/file.go\x00removed/AGENTS.md\x00removed/file.go\x00")
+	deleted := []byte("removed/AGENTS.md\x00removed/file.go\x00")
+	directories := trackedDirectoriesFromGit(tracked, deleted)
+	if strings.Join(directories, ",") != ".,kept" {
+		t.Fatalf("tracked directories = %v", directories)
+	}
+}
+
 func writeDOX(t *testing.T, root, dir, index string) {
 	t.Helper()
 	path := filepath.Join(root, dir)

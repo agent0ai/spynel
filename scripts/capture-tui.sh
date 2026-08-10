@@ -3,7 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-capture_dir=${1:-"$project_dir/.spynel-dev/tui-captures"}
+capture_dir=${1:-"$project_dir/.tmp-tui-captures"}
 case "$capture_dir" in
   /*) ;;
   *) capture_dir="$(pwd)/$capture_dir" ;;
@@ -13,7 +13,7 @@ ansi_dir="$capture_dir/ansi"
 if command -v go >/dev/null 2>&1; then
   go_bin=$(command -v go)
 else
-  go_bin="$project_dir/.spynel-dev/toolchains/go/bin/go"
+  go_bin="$project_dir/.tmp-toolchains/go/bin/go"
 fi
 if [ ! -x "$go_bin" ]; then
   echo "Go toolchain not found; run scripts/dev.sh build first" >&2

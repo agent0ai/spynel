@@ -46,7 +46,8 @@ func (s *WorkStatus) AddCountDiagnostic(value string) {
 func (m *Manager) WorkStatus() WorkStatus {
 	status := WorkStatus{}
 	diagnostics := make([]string, 0, maxStatusDiagnostics)
-	for _, route := range m.Config.Orchestrator.Routes {
+	cfg := m.runtimeSnapshot()
+	for _, route := range cfg.Orchestrator.Routes {
 		switch route.Name {
 		case "tasks":
 			status.TasksActive, status.TasksWaiting = m.countActiveRoute(route, map[string]bool{"done": true, "failed": true, "cancelled": true}, &diagnostics)
@@ -82,7 +83,7 @@ func (m *Manager) semanticHeartbeatSchedule() (string, time.Time) {
 }
 
 func (m *Manager) countActiveRoute(route config.Route, terminal map[string]bool, diagnostics *[]string) (int, int) {
-	base := filepath.Dir(m.Config.Resolve(route.Source))
+	base := filepath.Dir(m.runtimeSnapshot().Resolve(route.Source))
 	statuses := make(map[string]bool)
 	for _, value := range append([]string{filepath.Base(route.Source), filepath.Base(route.Working)}, route.AllowedNext...) {
 		value = strings.TrimSpace(value)

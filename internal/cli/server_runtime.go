@@ -266,6 +266,7 @@ type tuiStateEvents struct {
 	titles      chan string
 	themes      chan theme.Theme
 	runtime     chan core.RuntimeStatus
+	durableWork chan core.DurableWorkCounts
 }
 
 func startTUIStatePolling(ctx context.Context, client *localapi.Client, initial app.SharedState, themeDirectory string) tuiStateEvents {
@@ -274,6 +275,7 @@ func startTUIStatePolling(ctx context.Context, client *localapi.Client, initial 
 		pairings:    make(chan channel.PairingEvent, 4),
 		notices:     make(chan channel.Notice, 4), titles: make(chan string, 1),
 		themes: make(chan theme.Theme, 1), runtime: make(chan core.RuntimeStatus, 1),
+		durableWork: make(chan core.DurableWorkCounts, 1),
 	}
 	go func() {
 		previous := initial
@@ -289,38 +291,45 @@ func startTUIStatePolling(ctx context.Context, client *localapi.Client, initial 
 			if err != nil {
 				continue
 			}
-			if state.Title != previous.Title {
-				publishLatest(events.titles, state.Title)
-			}
-			if state.Theme != previous.Theme {
-				if values, err := theme.LoadDir(themeDirectory); err == nil {
-					if selected, ok := theme.Find(values, state.Theme); ok {
-						publishLatest(events.themes, selected)
-					}
-				}
-			}
-			previousConnections := connectionStateMap(previous.Connections)
-			for _, status := range state.Connections {
-				if old, ok := previousConnections[status.Name]; !ok || old != status {
-					publishLatest(events.connections, status)
-				}
-			}
-			previousPairings := pairingStateMap(previous.Pairings)
-			for _, pairing := range state.Pairings {
-				if old, ok := previousPairings[pairing.Name]; !ok || old != pairing {
-					publishLatest(events.pairings, pairing)
-				}
-			}
-			if state.Runtime != previous.Runtime {
-				publishLatest(events.runtime, state.Runtime)
-			}
-			if state.NoticeSequence != previous.NoticeSequence && state.Notice.Channel != "" {
-				publishLatest(events.notices, state.Notice)
-			}
+			publishTUIStateChanges(events, previous, state, themeDirectory)
 			previous = state
 		}
 	}()
 	return events
+}
+
+func publishTUIStateChanges(events tuiStateEvents, previous, state app.SharedState, themeDirectory string) {
+	if state.Title != previous.Title {
+		publishLatest(events.titles, state.Title)
+	}
+	if state.Theme != previous.Theme {
+		if values, err := theme.LoadDir(themeDirectory); err == nil {
+			if selected, ok := theme.Find(values, state.Theme); ok {
+				publishLatest(events.themes, selected)
+			}
+		}
+	}
+	previousConnections := connectionStateMap(previous.Connections)
+	for _, status := range state.Connections {
+		if old, ok := previousConnections[status.Name]; !ok || old != status {
+			publishLatest(events.connections, status)
+		}
+	}
+	previousPairings := pairingStateMap(previous.Pairings)
+	for _, pairing := range state.Pairings {
+		if old, ok := previousPairings[pairing.Name]; !ok || old != pairing {
+			publishLatest(events.pairings, pairing)
+		}
+	}
+	if state.Runtime != previous.Runtime {
+		publishLatest(events.runtime, state.Runtime)
+	}
+	if state.DurableWork != previous.DurableWork {
+		publishLatest(events.durableWork, state.DurableWork)
+	}
+	if state.NoticeSequence != previous.NoticeSequence && state.Notice.Channel != "" {
+		publishLatest(events.notices, state.Notice)
+	}
 }
 
 func connectionStateMap(values []channel.ConnectionStatus) map[string]channel.ConnectionStatus {
