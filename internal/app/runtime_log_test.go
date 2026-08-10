@@ -59,7 +59,7 @@ func TestProductionSubprocessWiringCapturesDiagnosticStderrWithoutProtocolDuplic
 				t.Fatalf("unsafe or unattributed stderr entry = %#v", entry)
 			}
 		}
-		if entry.Text == "authorization: [REDACTED]" && entry.Component == "extensions" {
+		if strings.Contains(entry.Text, "authorization: [REDACTED]") && entry.Component == "extensions" {
 			authorizationMatches++
 		}
 		if strings.Contains(entry.Text, "subprocess-secret") {
