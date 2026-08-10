@@ -2599,12 +2599,15 @@ func TestWelcomeScreenIsAutomaticOnceAndCommandPrintsAChannelAppropriateMessage(
 	if err != nil || first == nil || first.ID != "welcome" || first.Banner != core.SpynelASCII || len(first.Controls) != 0 || !first.Markdown {
 		t.Fatalf("first welcome = %#v, %v", first, err)
 	}
-	for _, want := range []string{"👋 Hey, I'm **Spynel**", "call me **Spy**", "classic, non-AI core", "external coding agents", "desk or phone", "ask when your input is needed", "👍", "- type `/help` if you ever feel lost", "- type `/telegram` to connect Telegram", "- type `/whatsapp` to connect WhatsApp"} {
+	for _, want := range []string{"👋 Hey, I'm **Spynel**", "call me **Spy**", "I handle tasks and orchestrate agents", "leave the rest to me", "ask me for updates anytime", "have me get things done", "👍", "- type `/help` if you ever feel lost", "- type `/config` for configuration", "- type `/telegram` to connect Telegram", "- type `/whatsapp` to connect WhatsApp"} {
 		if !strings.Contains(first.Subtitle, want) {
 			t.Fatalf("welcome message is missing %q: %q", want, first.Subtitle)
 		}
 	}
-	if !strings.Contains(first.Subtitle, "one assistant relationship.\nShare an objective") || strings.Contains(first.Subtitle, "one assistant relationship.\n\nShare an objective") {
+	if strings.Count(first.Subtitle, "- type `/config` for configuration") != 1 || !strings.Contains(first.Subtitle, "- type `/help` if you ever feel lost\n- type `/config` for configuration") {
+		t.Fatalf("welcome config hint count or order = %q", first.Subtitle)
+	}
+	if !strings.Contains(first.Subtitle, "leave the rest to me.\nFeel free") || strings.Contains(first.Subtitle, "leave the rest to me.\n\nFeel free") {
 		t.Fatalf("welcome intro spacing = %q", first.Subtitle)
 	}
 	second, err := service.InitialWelcome()
@@ -2616,7 +2619,7 @@ func TestWelcomeScreenIsAutomaticOnceAndCommandPrintsAChannelAppropriateMessage(
 	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "/welcome"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
-	if response.Kind != core.EventFinal || !response.Done || !response.Local || response.Screen != nil || !strings.HasPrefix(response.Text, core.SpynelLogoMarkdown) || !strings.Contains(response.Text, "**Spynel**") || !strings.Contains(response.Text, "**Spy**") || !strings.Contains(response.Text, "`/help`") || strings.Contains(response.Text, "`/telegram`") || !strings.Contains(response.Text, "`/whatsapp`") {
+	if response.Kind != core.EventFinal || !response.Done || !response.Local || response.Screen != nil || !strings.HasPrefix(response.Text, core.SpynelLogoMarkdown) || !strings.Contains(response.Text, "**Spynel**") || !strings.Contains(response.Text, "**Spy**") || !strings.Contains(response.Text, "`/help`") || strings.Count(response.Text, "- type `/config` for configuration") != 1 || !strings.Contains(response.Text, "- type `/help` if you ever feel lost\n- type `/config` for configuration") || strings.Contains(response.Text, "`/telegram`") || !strings.Contains(response.Text, "`/whatsapp`") {
 		t.Fatalf("manual TUI welcome = %#v", response)
 	}
 	recent, _, err := service.History.Recent("tui", "local", 100000)
@@ -2628,7 +2631,7 @@ func TestWelcomeScreenIsAutomaticOnceAndCommandPrintsAChannelAppropriateMessage(
 		if err := service.Handle(context.Background(), core.Message{Channel: channelName, Conversation: "remote", Text: "/welcome"}, func(event core.Event) { response = event }); err != nil {
 			t.Fatal(err)
 		}
-		if response.Kind != core.EventFinal || !response.Done || !response.Local || !strings.Contains(response.Text, "**Spynel**") || !strings.Contains(response.Text, "**Spy**") || !strings.Contains(response.Text, "`/help`") || strings.Contains(response.Text, core.SpynelASCII) || strings.Contains(response.Text, "`/telegram`") || strings.Contains(response.Text, "`/whatsapp`") || strings.Contains(response.Text, "Heads up") {
+		if response.Kind != core.EventFinal || !response.Done || !response.Local || !strings.Contains(response.Text, "**Spynel**") || !strings.Contains(response.Text, "**Spy**") || !strings.Contains(response.Text, "`/help`") || strings.Contains(response.Text, core.SpynelASCII) || strings.Contains(response.Text, "`/config`") || strings.Contains(response.Text, "`/telegram`") || strings.Contains(response.Text, "`/whatsapp`") || strings.Contains(response.Text, "Heads up") {
 			t.Fatalf("%s welcome = %#v", channelName, response)
 		}
 	}

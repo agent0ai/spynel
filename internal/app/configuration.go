@@ -80,11 +80,12 @@ func (s *Service) WelcomeScreen() core.Screen {
 func (s *Service) welcomeText(channelName string) string {
 	lines := []string{
 		"👋 Hey, I'm **Spynel** — you can call me **Spy**.", "",
-		"My classic, non-AI core organizes work for external coding agents through one assistant relationship.",
-		"Share an objective from your desk or phone; I'll coordinate the work and ask when your input is needed. 👍",
+		"I handle tasks and orchestrate agents. Just tell me your objectives and leave the rest to me.",
+		"Feel free to ask me for updates anytime or have me get things done. 👍",
 		"", "- type `/help` if you ever feel lost",
 	}
 	if channelName == "tui" {
+		lines = append(lines, "- type `/config` for configuration")
 		if s.connectionStatus("telegram").State != channel.ConnectionConnected {
 			lines = append(lines, "- type `/telegram` to connect Telegram")
 		}

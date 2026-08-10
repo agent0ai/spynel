@@ -144,7 +144,7 @@ func visualWelcomeModel() model {
 	value := visualBaseModel()
 	value.welcome = &core.Screen{
 		ID: "welcome", Banner: core.SpynelASCII,
-		Subtitle: "👋 Hey, I'm **Spynel** — you can call me **Spy**.\n\nMy classic, non-AI core organizes work for external coding agents through one assistant relationship.\nShare an objective from your desk or phone; I'll coordinate the work and ask when your input is needed. 👍\n\n- type `/help` if you ever feel lost\n- type `/whatsapp` to connect WhatsApp",
+		Subtitle: "👋 Hey, I'm **Spynel** — you can call me **Spy**.\n\nI handle tasks and orchestrate agents. Just tell me your objectives and leave the rest to me.\nFeel free to ask me for updates anytime or have me get things done. 👍\n\n- type `/help` if you ever feel lost\n- type `/config` for configuration\n- type `/whatsapp` to connect WhatsApp",
 		Markdown: true,
 	}
 	value.welcomeFocus = true
@@ -157,7 +157,7 @@ func visualManualWelcomeModel() model {
 	value := visualBaseModel()
 	value.transcript = []transcriptEntry{{
 		role: "assistant",
-		text: core.SpynelLogoMarkdown + "\n\n👋 Hey, I'm **Spynel** — you can call me **Spy**.\n\nMy classic, non-AI core organizes work for external coding agents through one assistant relationship.\nShare an objective from your desk or phone; I'll coordinate the work and ask when your input is needed. 👍\n\n- type `/help` if you ever feel lost\n- type `/whatsapp` to connect WhatsApp",
+		text: core.SpynelLogoMarkdown + "\n\n👋 Hey, I'm **Spynel** — you can call me **Spy**.\n\nI handle tasks and orchestrate agents. Just tell me your objectives and leave the rest to me.\nFeel free to ask me for updates anytime or have me get things done. 👍\n\n- type `/help` if you ever feel lost\n- type `/config` for configuration\n- type `/whatsapp` to connect WhatsApp",
 	}}
 	value.renderHistory()
 	value.viewport.GotoBottom()

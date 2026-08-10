@@ -89,7 +89,10 @@ npm install -g spynel
 spynel
 ```
 
-Run `spynel` from the directory you want to initialize as a Spynel workspace. This can be your existing work folder. If it is an uninitialized child of an existing Spynel workspace, startup asks whether to use the parent (the default), initialize the current folder, or exit before either workspace starts.
+Run `spynel` from the directory you want to initialize as a Spynel workspace. This can be your existing work folder. 
+
+Inside Spynel TUI, type `/configure` for configuration. Supported coding harnesses should be automatically detected and configured, so there's a good chance Spynel will work out of the box with no additional configuration.
+
 
 ## Documentation
 
