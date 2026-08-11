@@ -76,7 +76,7 @@ Spynel has three pillars:
 
 Spynel leverages coding harnesses rather than competing with them. Its deterministic core coordinates work; Codex, Claude Code or others provide inteligence and execution.
 
-It is for people who want the leverage of several coding agents without personallěy managing every session and handoff. The result should remain simple to operate, clear to inspect, and deliberate about quality.
+It is for people who want the leverage of several coding agents without personally managing every session and handoff. The result should remain simple to operate, clear to inspect, and deliberate about quality.
 
 **Simplicity. Leverage. Quality.**
 
