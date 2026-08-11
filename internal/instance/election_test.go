@@ -1,13 +1,127 @@
 package instance
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func testEnvironmentID(character string) string { return strings.Repeat(character, 64) }
+
+func TestEnvironmentIDIsStablePrivateAndEnvironmentScoped(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	first, err := EnvironmentID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := EnvironmentID()
+	if err != nil || second != first || !validEnvironmentID(first) {
+		t.Fatalf("stable environment ID = %q, %q, %v", first, second, err)
+	}
+	configDirectory, _ := os.UserConfigDir()
+	tokenPath := filepath.Join(configDirectory, "spynel", "environment-token")
+	token, err := os.ReadFile(tokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(first, strings.TrimSpace(string(token))) {
+		t.Fatal("published environment ID exposed its private source token")
+	}
+	info, err := os.Stat(tokenPath)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("environment token permissions = %v, %v", info, err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	separate, err := EnvironmentID()
+	if err != nil || separate == first {
+		t.Fatalf("separate configuration environment ID = %q, first %q, %v", separate, first, err)
+	}
+}
+
+func TestLeasePublishesEnvironmentAndLegacyOwnerRemainsFenced(t *testing.T) {
+	state := t.TempDir()
+	owner, err := NewWithEnvironmentID(state, testEnvironmentID("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 11, 5, 0, 0, 0, time.UTC)
+	owner.now = func() time.Time { return now }
+	token, _ := owner.NewToken()
+	lease, acquired, err := owner.TryAcquire("127.0.0.1:10001", token)
+	if err != nil || !acquired || lease.EnvironmentID != testEnvironmentID("a") {
+		t.Fatalf("environment lease = %#v, %t, %v", lease, acquired, err)
+	}
+
+	lease.EnvironmentID = "obsolete-or-invalid"
+	data, _ := json.Marshal(lease)
+	if err := os.WriteFile(owner.leasePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	contender, err := NewWithEnvironmentID(state, testEnvironmentID("b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contender.now = func() time.Time { return now }
+	legacy, err := contender.Current()
+	if err != nil || legacy.EnvironmentID != "" || contender.CanTakeOver(legacy) {
+		t.Fatalf("legacy lease safety = %#v, %v", legacy, err)
+	}
+	contenderToken, _ := contender.NewToken()
+	if _, acquired, err := contender.TryAcquire("127.0.0.1:10002", contenderToken); err != nil || acquired {
+		t.Fatalf("fresh legacy owner takeover = %t, %v", acquired, err)
+	}
+	contender.now = func() time.Time { return now.Add(StaleAfter) }
+	replacement, acquired, err := contender.TryAcquire("127.0.0.1:10002", contenderToken)
+	if err != nil || !acquired || replacement.EnvironmentID != testEnvironmentID("b") {
+		t.Fatalf("stale legacy replacement = %#v, %t, %v", replacement, acquired, err)
+	}
+}
+
+func TestRenewAndHandoffRestoreValidatedEnvironmentID(t *testing.T) {
+	state := t.TempDir()
+	owner, err := NewWithEnvironmentID(state, testEnvironmentID("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 11, 5, 0, 0, 0, time.UTC)
+	owner.now = func() time.Time { return now }
+	token, _ := owner.NewToken()
+	lease, acquired, err := owner.TryAcquire("127.0.0.1:10001", token)
+	if err != nil || !acquired {
+		t.Fatalf("owner acquire = %#v, %t, %v", lease, acquired, err)
+	}
+
+	lease.EnvironmentID = "damaged"
+	data, _ := json.Marshal(lease)
+	if err := os.WriteFile(owner.leasePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(HeartbeatInterval)
+	renewed, owned, err := owner.Renew(token)
+	if err != nil || !owned || renewed.EnvironmentID != testEnvironmentID("a") {
+		t.Fatalf("renewed environment = %#v, %t, %v", renewed, owned, err)
+	}
+
+	target, err := NewWithEnvironmentID(state, testEnvironmentID("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewed.EnvironmentID = ""
+	data, _ = json.Marshal(renewed)
+	if err := os.WriteFile(owner.leasePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(HeartbeatInterval)
+	handoff, handedOff, err := owner.Handoff(token, target.ID())
+	if err != nil || !handedOff || handoff.EnvironmentID != testEnvironmentID("a") {
+		t.Fatalf("handoff environment = %#v, %t, %v", handoff, handedOff, err)
+	}
+}
 
 func TestOnlyOneConcurrentContenderAcquiresLease(t *testing.T) {
 	state := t.TempDir()
@@ -180,7 +294,7 @@ func TestRenewalKeepsLeaseFreshAndReleaseIsImmediate(t *testing.T) {
 	}
 	now = now.Add(HeartbeatInterval)
 	lease, owned, err := election.Renew(token)
-	if err != nil || !owned || !lease.HeartbeatAt.Equal(now) {
+	if err != nil || !owned || !lease.HeartbeatAt.Equal(now) || !validEnvironmentID(lease.EnvironmentID) {
 		t.Fatalf("renew = %#v, %t, %v", lease, owned, err)
 	}
 	if err := election.Release(token); err != nil {
@@ -270,7 +384,7 @@ func TestTargetedHandoffFencesOwnerAndExcludesOtherContenders(t *testing.T) {
 		t.Fatalf("owner acquire = %t, %v", acquired, err)
 	}
 	handoff, handedOff, err := owner.Handoff(ownerToken, target.ID())
-	if err != nil || !handedOff || handoff.HandoffTo != target.ID() || handoff.HandoffAt != now {
+	if err != nil || !handedOff || handoff.HandoffTo != target.ID() || handoff.HandoffAt != now || !validEnvironmentID(handoff.EnvironmentID) {
 		t.Fatalf("handoff = %#v, %t, %v", handoff, handedOff, err)
 	}
 	if _, owned, err := owner.Renew(ownerToken); err != nil || owned {

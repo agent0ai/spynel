@@ -23,6 +23,7 @@ import (
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
+	"github.com/agent0ai/spynel/internal/instructions"
 	"github.com/agent0ai/spynel/internal/orchestrator"
 	"github.com/agent0ai/spynel/internal/updater"
 	"github.com/agent0ai/spynel/internal/workspace"
@@ -98,7 +99,7 @@ func TestNotifyDeliversAllOriginsWithStableEventIdentity(t *testing.T) {
 	}
 }
 
-func TestAutomaticNotifyCommandUsesAuthorizedTransitionAndDeduplicates(t *testing.T) {
+func TestAutomaticNotifyCommandUsesAuthoritativeTransitionActionAndDeduplicates(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
@@ -123,19 +124,18 @@ func TestAutomaticNotifyCommandUsesAuthorizedTransitionAndDeduplicates(t *testin
 	}
 	event := map[string]any{
 		"id": "event-1", "task_id": "task-1", "outcome": "done", "task_file": taskFile,
-		"transition": "task_implementation:1", "origin": "cli/local", "mode": "always", "state": "pending",
+		"transition": "task_implementation:1", "origin": "cli/local", "mode": "always", "state": "invoked", "attempts": 1,
 	}
 	data, _ := json.Marshal(event)
 	if err := os.WriteFile(filepath.Join(eventDirectory, "event-1.json"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	id, err := service.NotifyWithIdentity(context.Background(), "cli/local", "\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1RThe report is ready.", "task-notification:event-1", "done")
+	_, err := service.NotifyWithIdentity(context.Background(), "cli/local", "\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1RThe report is ready.", "task-notification:event-1", "done")
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := service.NotifyWithIdentity(context.Background(), "cli/local", "Changed retry wording.", "task-notification:event-1", "done")
-	if err != nil || again != id {
-		t.Fatalf("retry identity = %q, %v; want %q", again, err, id)
+	if again, err := service.NotifyWithIdentity(context.Background(), "cli/local", "Changed retry wording.", "task-notification:event-1", "done"); err == nil || again != "" {
+		t.Fatalf("incompatible retry identity = %q, %v; want rejection", again, err)
 	}
 	if _, err := service.NotifyWithIdentity(context.Background(), "cli/other", "redirect", "task-notification:event-1", "done"); err == nil {
 		t.Fatal("automatic command redirected its authorized origin")
@@ -157,7 +157,7 @@ func TestAutomaticNotifyCommandUsesAuthorizedTransitionAndDeduplicates(t *testin
 	}
 }
 
-func TestNotificationDeclineRequiresAuthorizedDecideEvent(t *testing.T) {
+func TestNotificationActionJournalRequiresAuthorizedInvokedEvent(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
@@ -181,16 +181,16 @@ func TestNotificationDeclineRequiresAuthorizedDecideEvent(t *testing.T) {
 	}
 	event := map[string]any{
 		"id": "event-1", "task_id": "task-1", "outcome": "done", "task_file": taskFile,
-		"transition": "task_implementation:1", "origin": "cli/local", "mode": "decide", "state": "pending",
+		"transition": "task_implementation:1", "origin": "cli/local", "mode": "decide", "state": "invoked", "attempts": 1,
 	}
 	data, _ := json.Marshal(event)
 	if err := os.WriteFile(filepath.Join(eventDirectory, "event-1.json"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.DeclineNotification("cli/other", "task-notification:event-1", "done"); err == nil {
-		t.Fatal("decline redirected its authorized origin")
+	if err := service.JournalNotificationAction("cli/other", "task-notification:event-1", "done", "skipped", "already known"); err == nil {
+		t.Fatal("audit action redirected its authorized origin")
 	}
-	if err := service.DeclineNotification("cli/local", "task-notification:event-1", "done"); err != nil {
+	if err := service.JournalNotificationAction("cli/local", "task-notification:event-1", "done", "skipped", "already known"); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(eventDirectory, "event-1.json"))
@@ -198,8 +198,8 @@ func TestNotificationDeclineRequiresAuthorizedDecideEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	var saved map[string]any
-	if json.Unmarshal(data, &saved) != nil || saved["state"] != "declined" {
-		t.Fatalf("declined event = %#v", saved)
+	if json.Unmarshal(data, &saved) != nil || saved["journal_kind"] != "skipped" || saved["journaled"] != true {
+		t.Fatalf("journaled event = %#v", saved)
 	}
 }
 
@@ -247,6 +247,27 @@ func TestTaskCommandDelegatesCreationPolicyToCommunicationAgent(t *testing.T) {
 	prompts := harness.prompts["chat:cli:deploy"]
 	if len(prompts) != 1 || !strings.Contains(prompts[0], "explicitly invoked `/task`") || !strings.Contains(prompts[0], "ship it") || !strings.Contains(prompts[0], "origin `cli/deploy`") || !strings.Contains(prompts[0], "review_required") || !strings.Contains(prompts[0], "cancelled") {
 		t.Fatalf("task creation prompt = %#v", prompts)
+	}
+}
+
+func TestRenderedChatPromptIncludesFrameworkTranscriptionGuidanceOnceWithPreservedOverride(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	if err := os.WriteFile(cfg.StatePath("prompts", "chat.md"), []byte("preserved custom prompt\n\n{{RECENT_HISTORY}}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	harness := newServiceHarness()
+	service := New(cfg, harness)
+	if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "speech", Text: "question"}, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	prompt := harness.prompts["chat:cli:speech"][0]
+	marker := "Speech transcription can render Spynel"
+	if !strings.Contains(prompt, "preserved custom prompt") || strings.Count(prompt, marker) != 1 {
+		t.Fatalf("rendered custom chat prompt omitted or duplicated framework transcription guidance:\n%s", prompt)
 	}
 }
 
@@ -515,7 +536,7 @@ func TestEveryChatTransportFreshLoadsTheSameChatInstructionsAtPromptEnd(t *testi
 			t.Fatal(err)
 		}
 		prompt := harness.prompts["chat:"+channelName+":memory"][0]
-		if !strings.Contains(prompt, "\n"+instruction+"\n</workspace_owner_persistent_instructions>") || !strings.Contains(prompt, "the chat agent from .spynel/instructions/agent-chat.md") || !strings.HasSuffix(prompt, "The precedence stated above still applies to every imported rule.") {
+		if strings.Count(prompt, instructions.ScopeDisciplineGuidance) != 1 || !strings.Contains(prompt, "\n"+instruction+"\n</workspace_owner_persistent_instructions>") || !strings.Contains(prompt, "the chat agent from .spynel/instructions/agent-chat.md") || !strings.HasSuffix(prompt, "The precedence stated above still applies to every imported rule.") {
 			t.Fatalf("%s prompt omitted final fresh chat instructions:\n%s", channelName, prompt)
 		}
 	}
@@ -1020,6 +1041,19 @@ func TestCommunicationPromptGetsOneCallableDocsGuidance(t *testing.T) {
 	}
 	if strings.Count(prompt, " docs <topic>") != 1 || strings.Contains(prompt, "{{SPYNEL_DOCS_GUIDANCE}}") || !strings.Contains(prompt, "AGENTS.md") {
 		t.Fatalf("communication guidance is missing, duplicated, or unresolved:\n%s", prompt)
+	}
+	if err := os.WriteFile(cfg.StatePath("prompts", "chat.md"), []byte("CUSTOM CHAT {{RECENT_HISTORY}}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	harness := newServiceHarness()
+	service = New(cfg, harness)
+	message := core.Message{Channel: "cli", Conversation: "custom-scope", Text: "Follow the explicit user request."}
+	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	rendered := harness.prompts["chat:cli:custom-scope"][0]
+	if !strings.Contains(rendered, "CUSTOM CHAT") || strings.Count(rendered, instructions.ScopeDisciplineGuidance) != 1 {
+		t.Fatalf("custom communication prompt omitted exact-once scope discipline:\n%s", rendered)
 	}
 }
 

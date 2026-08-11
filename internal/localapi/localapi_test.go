@@ -2,6 +2,8 @@ package localapi
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +22,88 @@ import (
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/shortid"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
+func environmentID(character string) string { return strings.Repeat(character, 64) }
+
+func TestForeignLoopbackFailsBeforeDialAndDoesNotPermitTakeover(t *testing.T) {
+	state := t.TempDir()
+	owner, err := instance.NewWithEnvironmentID(state, environmentID("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _ := owner.NewToken()
+	lease, acquired, err := owner.TryAcquire("127.0.0.1:12345", token)
+	if err != nil || !acquired {
+		t.Fatalf("owner lease = %#v, %t, %v", lease, acquired, err)
+	}
+	contender, err := instance.NewWithEnvironmentID(state, environmentID("b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dials atomic.Int32
+	client := NewClient(contender)
+	client.HTTP.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		dials.Add(1)
+		return nil, errors.New("must not dial")
+	})
+	started := time.Now()
+	if _, err := client.WaitReady(context.Background()); !errors.Is(err, ErrForeignLoopback) || !strings.Contains(err.Error(), "another host/container environment") {
+		t.Fatalf("foreign loopback error = %v", err)
+	}
+	if dials.Load() != 0 || time.Since(started) > time.Second {
+		t.Fatalf("foreign loopback dials = %d, elapsed = %s", dials.Load(), time.Since(started))
+	}
+	current, err := contender.Current()
+	if err != nil || contender.CanTakeOver(current) || current.InstanceID != owner.ID() {
+		t.Fatalf("foreign fresh lease was not fenced: %#v, %v", current, err)
+	}
+}
+
+func TestUnknownEnvironmentReadinessIsBoundedAndRedacted(t *testing.T) {
+	state := t.TempDir()
+	owner, err := instance.NewWithEnvironmentID(state, environmentID("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _ := owner.NewToken()
+	lease, acquired, err := owner.TryAcquire("127.0.0.1:12345", token)
+	if err != nil || !acquired {
+		t.Fatalf("owner lease = %#v, %t, %v", lease, acquired, err)
+	}
+	lease.EnvironmentID = "invalid-old-value"
+	data, _ := json.Marshal(lease)
+	if err := os.WriteFile(filepath.Join(state, "runtime", "primary.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	contender, err := instance.NewWithEnvironmentID(state, environmentID("b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attempts atomic.Int32
+	client := NewClient(contender)
+	client.ReadyTimeout = 40 * time.Millisecond
+	client.HTTP.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts.Add(1)
+		return nil, errors.New("secret-token /private/workspace refused")
+	})
+	_, err = client.WaitReady(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "lacks a current environment identifier") || strings.Contains(err.Error(), "secret-token") || strings.Contains(err.Error(), "/private/workspace") {
+		t.Fatalf("bounded unknown-owner error = %v", err)
+	}
+	if attempts.Load() == 0 {
+		t.Fatal("unknown environment did not receive its bounded compatibility attempt")
+	}
+	current, currentErr := contender.Current()
+	if currentErr != nil || contender.CanTakeOver(current) {
+		t.Fatalf("unknown fresh owner became takeover-eligible: %#v, %v", current, currentErr)
+	}
+}
 
 type apiHarness struct {
 	mu      sync.Mutex

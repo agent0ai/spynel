@@ -88,21 +88,18 @@ func runNotifyCommand(args []string, version string) error {
 	stdin := flags.Bool("stdin", false, "read the notification from standard input")
 	eventKey := flags.String("event-key", "", "stable internal notification identity")
 	outcome := flags.String("outcome", "", "task transition outcome for the stable identity")
-	decline := flags.Bool("decline", false, "record an authorized decide-mode no-send action")
+	journal := flags.String("journal", "", "record an authorized skipped or failed notification action")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	text := ""
 	var err error
-	if *decline {
-		if *stdin || len(flags.Args()) != 0 {
-			return errors.New("--decline cannot be combined with notification text or --stdin")
-		}
-	} else {
-		text, err = cliMessageText(flags.Args(), *stdin, os.Stdin)
-		if err != nil {
-			return fmt.Errorf("usage: spynel notify [--config PATH] --origin CHANNEL/CONVERSATION [--stdin] <message>: %w", err)
-		}
+	text, err = cliMessageText(flags.Args(), *stdin, os.Stdin)
+	if err != nil {
+		return fmt.Errorf("usage: spynel notify [--config PATH] --origin CHANNEL/CONVERSATION [--stdin] <message>: %w", err)
+	}
+	if *journal != "" && *journal != "skipped" && *journal != "failed" {
+		return errors.New("--journal must be skipped or failed")
 	}
 	if strings.TrimSpace(*origin) == "" {
 		return errors.New("--origin is required")
@@ -117,8 +114,8 @@ func runNotifyCommand(args []string, version string) error {
 	if client, active, clientErr := activeWorkspaceClient(ctx, cfg); clientErr != nil {
 		return clientErr
 	} else if active {
-		if *decline {
-			err = client.DeclineNotification(ctx, *origin, *eventKey, *outcome)
+		if *journal != "" {
+			err = client.JournalNotificationAction(ctx, *origin, *eventKey, *outcome, *journal, text)
 		} else {
 			id, err = client.NotifyWithIdentity(ctx, *origin, text, *eventKey, *outcome)
 		}
@@ -128,8 +125,8 @@ func runNotifyCommand(args []string, version string) error {
 			return buildErr
 		}
 		defer service.Close()
-		if *decline {
-			err = service.DeclineNotification(*origin, *eventKey, *outcome)
+		if *journal != "" {
+			err = service.JournalNotificationAction(*origin, *eventKey, *outcome, *journal, text)
 		} else {
 			id, err = service.NotifyWithIdentity(ctx, *origin, text, *eventKey, *outcome)
 		}
@@ -137,8 +134,8 @@ func runNotifyCommand(args []string, version string) error {
 	if err != nil {
 		return err
 	}
-	if *decline {
-		fmt.Println("notification declined")
+	if *journal != "" {
+		fmt.Println("notification action journaled")
 	} else {
 		fmt.Println("queued notification " + id)
 	}

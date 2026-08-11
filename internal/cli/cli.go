@@ -534,6 +534,8 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 		return err
 	}
 	client := localapi.NewClient(election)
+	connectionStatus := newStartupConnectionStatus(os.Stderr, launchTUI && hadHealthyPrimary && terminalOutput(os.Stderr))
+	connectionStatus.connecting()
 	ready := make(chan struct {
 		state app.SharedState
 		err   error
@@ -549,11 +551,16 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 	select {
 	case result := <-ready:
 		if result.err != nil {
+			connectionStatus.failed(result.err)
 			return serverResult(result.err)
 		}
+		connectionStatus.connected()
 		shared = result.state
 	case err := <-ownerResult:
 		ownerFinished = true
+		if err != nil {
+			connectionStatus.failed(err)
+		}
 		return serverResult(err)
 	case <-ctx.Done():
 		return serverResult(nil)
@@ -630,6 +637,44 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 		ownerFinished = true
 		return serverResult(err)
 	}
+}
+
+type startupConnectionStatus struct {
+	output  io.Writer
+	enabled bool
+}
+
+func newStartupConnectionStatus(output io.Writer, enabled bool) startupConnectionStatus {
+	return startupConnectionStatus{output: output, enabled: enabled}
+}
+
+func (s startupConnectionStatus) connecting() {
+	if s.enabled {
+		fmt.Fprintln(s.output, "Connecting to the existing Spynel primary…")
+	}
+}
+
+func (s startupConnectionStatus) connected() {
+	if s.enabled {
+		fmt.Fprintln(s.output, "Connected to the existing Spynel primary.")
+	}
+}
+
+func (s startupConnectionStatus) failed(err error) {
+	if s.enabled {
+		detail := "connection failed; review the error below and retry or exit"
+		if errors.Is(err, localapi.ErrForeignLoopback) {
+			detail = "the workspace primary is active in another host/container environment, so its loopback API is unreachable here; stop that primary or run Spynel in the same environment, then retry"
+		} else if errors.Is(err, localapi.ErrReadinessTimeout) {
+			detail = "the existing primary did not become reachable within the bounded startup interval; review the error below, then retry or exit"
+		}
+		fmt.Fprintln(s.output, "Could not connect to the existing Spynel primary: "+detail)
+	}
+}
+
+func terminalOutput(file *os.File) bool {
+	info, err := file.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 func shouldResumeTUIHistory(hadHealthyPrimary bool, lease instance.Lease, instanceID string) bool {

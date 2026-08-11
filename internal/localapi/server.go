@@ -54,7 +54,7 @@ type notifyRequest struct {
 	Message  string `json:"message"`
 	EventKey string `json:"event_key,omitempty"`
 	Outcome  string `json:"outcome,omitempty"`
-	Decline  bool   `json:"decline,omitempty"`
+	Journal  string `json:"journal,omitempty"`
 }
 type notifyResponse struct {
 	ID string `json:"id"`
@@ -155,12 +155,12 @@ func (s *Server) notify(response http.ResponseWriter, request *http.Request) {
 		http.Error(response, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if input.Decline {
-		if err := s.Service.DeclineNotification(input.Origin, input.EventKey, input.Outcome); err != nil {
+	if input.Journal != "" {
+		if err := s.Service.JournalNotificationAction(input.Origin, input.EventKey, input.Outcome, input.Journal, input.Message); err != nil {
 			writeError(response, err)
 			return
 		}
-		writeJSON(response, http.StatusAccepted, notifyResponse{ID: "declined"})
+		writeJSON(response, http.StatusAccepted, notifyResponse{ID: "journaled"})
 		return
 	}
 	id, err := s.Service.NotifyWithIdentity(request.Context(), input.Origin, input.Message, input.EventKey, input.Outcome)

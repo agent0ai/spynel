@@ -16,6 +16,7 @@ import (
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/instructions"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
 
@@ -1058,6 +1059,9 @@ func TestSemanticHeartbeatUsesWorkspacePromptOverride(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "\nheartbeat-only-rule\n</workspace_owner_persistent_instructions>") || !strings.HasSuffix(prompt, "The precedence stated above still applies to every imported rule.") {
 		t.Fatalf("heartbeat instructions were not the final prompt section: %q", prompt)
+	}
+	if strings.Count(prompt, instructions.ScopeDisciplineGuidance) != 1 {
+		t.Fatalf("heartbeat scope discipline is missing or duplicated: %q", prompt)
 	}
 }
 

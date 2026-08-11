@@ -4,6 +4,7 @@ package instance
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -11,59 +12,141 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/fsx"
 )
 
 const (
-	HeartbeatInterval = 5 * time.Second
-	StaleAfter        = 30 * time.Second
-	RetryInterval     = time.Second
-	HandoffTimeout    = 10 * time.Second
+	HeartbeatInterval     = 5 * time.Second
+	StaleAfter            = 30 * time.Second
+	RetryInterval         = time.Second
+	HandoffTimeout        = 10 * time.Second
+	environmentTokenBytes = 32
 )
 
 // Lease is the atomically published rendezvous record for the current
 // workspace server. Token authenticates loopback clients and also fences a
 // former owner whose process-local instance ID somehow survives a restart.
 type Lease struct {
-	InstanceID  string    `json:"instance_id"`
-	PID         int       `json:"pid"`
-	Endpoint    string    `json:"endpoint"`
-	Token       string    `json:"token"`
-	StartedAt   time.Time `json:"started_at"`
-	HeartbeatAt time.Time `json:"heartbeat_at"`
-	HandoffTo   string    `json:"handoff_to,omitempty"`
-	HandoffAt   time.Time `json:"handoff_at,omitempty"`
+	InstanceID    string    `json:"instance_id"`
+	PID           int       `json:"pid"`
+	Endpoint      string    `json:"endpoint"`
+	EnvironmentID string    `json:"environment_id"`
+	Token         string    `json:"token"`
+	StartedAt     time.Time `json:"started_at"`
+	HeartbeatAt   time.Time `json:"heartbeat_at"`
+	HandoffTo     string    `json:"handoff_to,omitempty"`
+	HandoffAt     time.Time `json:"handoff_at,omitempty"`
 }
 
 // Election serializes lease compare-and-replace operations with a short-held
 // operating-system file lock. The lease itself is never held open, so another
 // process can replace a stale owner even when that owner is alive but stalled.
 type Election struct {
-	leasePath string
-	lockPath  string
-	id        string
-	pid       int
-	now       func() time.Time
+	leasePath     string
+	lockPath      string
+	id            string
+	pid           int
+	now           func() time.Time
+	environmentID string
 }
 
 func New(stateDirectory string) (*Election, error) {
+	environmentID, err := EnvironmentID()
+	if err != nil {
+		return nil, err
+	}
+	return NewWithEnvironmentID(stateDirectory, environmentID)
+}
+
+// NewWithEnvironmentID constructs an election participant with an injected
+// connectivity identity. It is primarily useful for deterministic topology
+// tests that simulate a shared bind mount across host/container boundaries.
+func NewWithEnvironmentID(stateDirectory, environmentID string) (*Election, error) {
+	if !validEnvironmentID(environmentID) {
+		return nil, errors.New("environment ID must be 64 lowercase hexadecimal characters")
+	}
 	id, err := randomHex(16)
 	if err != nil {
 		return nil, fmt.Errorf("create instance ID: %w", err)
 	}
 	runtimeDirectory := filepath.Join(stateDirectory, "runtime")
 	return &Election{
-		leasePath: filepath.Join(runtimeDirectory, "primary.json"),
-		lockPath:  filepath.Join(runtimeDirectory, "primary.lock"),
-		id:        id,
-		pid:       os.Getpid(),
-		now:       func() time.Time { return time.Now().UTC() },
+		leasePath:     filepath.Join(runtimeDirectory, "primary.json"),
+		lockPath:      filepath.Join(runtimeDirectory, "primary.lock"),
+		id:            id,
+		pid:           os.Getpid(),
+		now:           func() time.Time { return time.Now().UTC() },
+		environmentID: environmentID,
 	}, nil
 }
 
-func (e *Election) ID() string { return e.id }
+func (e *Election) ID() string            { return e.id }
+func (e *Election) EnvironmentID() string { return e.environmentID }
+
+// EnvironmentID returns a non-secret digest of a private random token stored
+// in the operating system's per-user configuration directory. This models the
+// supported loopback-connectivity boundary: ordinary processes for one local
+// installation share it, while a host and its containers (and normally two
+// containers) use different configuration homes. It deliberately does not use
+// hostnames, paths, MAC addresses, machine IDs, boot IDs, or Linux namespace
+// inode values.
+func EnvironmentID() (string, error) {
+	directory, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("locate environment identity directory: %w", err)
+	}
+	path := filepath.Join(directory, "spynel", "environment-token")
+	token, err := readEnvironmentToken(path)
+	if errors.Is(err, os.ErrNotExist) {
+		data := make([]byte, environmentTokenBytes)
+		if _, randomErr := rand.Read(data); randomErr != nil {
+			return "", fmt.Errorf("create environment identity: %w", randomErr)
+		}
+		candidate := hex.EncodeToString(data)
+		if createErr := fsx.AtomicCreateFile(path, []byte(candidate+"\n"), 0o600); createErr != nil && !errors.Is(createErr, os.ErrExist) {
+			return "", fmt.Errorf("persist environment identity: %w", createErr)
+		}
+		token, err = readEnvironmentToken(path)
+	}
+	if err != nil {
+		return "", fmt.Errorf("read environment identity: %w", err)
+	}
+	digest := sha256.Sum256([]byte("spynel-loopback-environment-v1\x00" + token))
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func readEnvironmentToken(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return "", errors.New("environment identity token must be a private regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	token := strings.TrimSpace(string(data))
+	if len(token) != environmentTokenBytes*2 {
+		return "", errors.New("environment identity token is invalid")
+	}
+	if _, err := hex.DecodeString(token); err != nil || token != strings.ToLower(token) {
+		return "", errors.New("environment identity token is invalid")
+	}
+	return token, nil
+}
+
+func validEnvironmentID(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
 
 // NewToken returns a fresh secret for one ownership term. A process that loses
 // and later regains ownership uses a different token and endpoint.
@@ -101,7 +184,7 @@ func (e *Election) TryAcquire(endpoint, token string) (Lease, bool, error) {
 			}
 		}
 		result = Lease{
-			InstanceID: e.id, PID: e.pid, Endpoint: endpoint, Token: token,
+			InstanceID: e.id, PID: e.pid, Endpoint: endpoint, EnvironmentID: e.environmentID, Token: token,
 			StartedAt: now, HeartbeatAt: now,
 		}
 		if err := e.writeLease(result); err != nil {
@@ -135,6 +218,10 @@ func (e *Election) Renew(token string) (Lease, bool, error) {
 		if stale(current, now) {
 			return nil
 		}
+		// A matching owner term is authoritative for this process. Restore the
+		// validated local identifier if an older or externally damaged record was
+		// normalized to the legacy/unknown form while reading it.
+		current.EnvironmentID = e.environmentID
 		current.HeartbeatAt = now
 		if err := e.writeLease(current); err != nil {
 			return err
@@ -172,6 +259,7 @@ func (e *Election) Handoff(token, targetID string) (Lease, bool, error) {
 		if stale(current, now) {
 			return nil
 		}
+		current.EnvironmentID = e.environmentID
 		current.HeartbeatAt = now
 		current.HandoffTo = targetID
 		current.HandoffAt = now
@@ -260,6 +348,13 @@ func (e *Election) readLease() (Lease, error) {
 	}
 	if (lease.HandoffTo == "") != lease.HandoffAt.IsZero() {
 		return Lease{}, errors.New("primary lease handoff is incomplete")
+	}
+	// Missing or invalid environment IDs identify an older/incompatible owner,
+	// not an ownerless workspace. Preserve its endpoint and heartbeat so a fresh
+	// lease remains fenced and clients can make only a bounded compatibility
+	// attempt. Every lease written by this version contains a validated ID.
+	if !validEnvironmentID(lease.EnvironmentID) {
+		lease.EnvironmentID = ""
 	}
 	return lease, nil
 }

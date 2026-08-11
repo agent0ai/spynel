@@ -261,15 +261,16 @@ func (s *Service) NotifyWithIdentity(ctx context.Context, originText, text, even
 		outcome = "manual"
 	} else if outcome == "" {
 		return "", errors.New("notification outcome is required with event identity")
-	} else if err := s.Orchestrator.AuthorizeNotificationAgentCommand(eventKey, outcome, originText); err != nil {
-		return "", err
 	}
-	entry, err := s.Orchestrator.Outbox.Enqueue(eventKey, outcome, originText, text)
-	if err != nil {
-		return "", err
-	}
+	var entry orchestrator.OutboxEntry
 	if strings.HasPrefix(eventKey, "task-notification:") {
-		if err := s.Orchestrator.JournalNotificationAgentCommand(eventKey, outcome, originText, entry.Message); err != nil {
+		entry, err = s.Orchestrator.EnqueueNotificationAgentCommand(eventKey, outcome, originText, text)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		entry, err = s.Orchestrator.Outbox.Enqueue(eventKey, outcome, originText, text)
+		if err != nil {
 			return "", err
 		}
 	}
@@ -279,7 +280,7 @@ func (s *Service) NotifyWithIdentity(ctx context.Context, originText, text, even
 	return entry.ID, nil
 }
 
-func (s *Service) DeclineNotification(originText, eventKey, outcome string) error {
+func (s *Service) JournalNotificationAction(originText, eventKey, outcome, kind, detail string) error {
 	origin, err := orchestrator.ParseOrigin(originText)
 	if err != nil {
 		return err
@@ -288,9 +289,9 @@ func (s *Service) DeclineNotification(originText, eventKey, outcome string) erro
 		return err
 	}
 	if eventKey == "" || outcome == "" {
-		return errors.New("notification event identity and outcome are required to decline")
+		return errors.New("notification event identity and outcome are required to journal an action")
 	}
-	return s.Orchestrator.DeclineNotificationAgentCommand(eventKey, outcome, originText)
+	return s.Orchestrator.JournalNotificationAgentAction(eventKey, outcome, originText, kind, detail)
 }
 
 func (s *Service) Start(ctx context.Context) error {
@@ -418,6 +419,7 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 func (s *Service) prepareChatHarnessPrompt(prompt string) (string, error) {
 	harnessSettings := s.Settings.Snapshot().Harness
 	prompt = strings.TrimRight(prompt, "\r\n") + "\n\n" + orchestrator.TaskReviewModeInstruction(harnessSettings.Reviews)
+	prompt = instructions.InjectScopeDiscipline(prompt)
 	prompt, err := instructions.Append(prompt, s.Config.StatePath(), instructions.Chat)
 	if err != nil {
 		return "", err

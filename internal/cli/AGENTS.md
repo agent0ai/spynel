@@ -11,6 +11,7 @@
 - Keep `docs` offline and workspace-independent, and keep notification actions bound to validated persisted transition events.
 - Canonicalize bare interactive launch context before configuration discovery. An uninitialized child may enter its discovered parent or initialize locally only through the required pre-election choice; explicit and noninteractive commands retain deterministic non-prompting discovery.
 - Poll owner shared state for TUI runtime and durable-work changes, coalesce each stream to its newest value, and leave bounded work diagnostics off the visual header.
+- When an interactive TUI start observed an existing fresh primary, print one pre-alternate-screen connecting line followed by success or a sanitized actionable failure. Keep first-owner, headless, remote-channel, redirected, and automation startup output unchanged.
 
 ## Child DOX Index
 

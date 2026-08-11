@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -19,9 +20,17 @@ import (
 	"github.com/agent0ai/spynel/internal/instance"
 )
 
+const ReadinessTimeout = 10 * time.Second
+
+var ErrForeignLoopback = errors.New("workspace primary uses a foreign loopback environment")
+var ErrReadinessTimeout = errors.New("workspace primary readiness timed out")
+
 type Client struct {
 	Election *instance.Election
 	HTTP     *http.Client
+	// ReadyTimeout bounds only startup/readiness polling. Long message streams
+	// continue to use their caller context without a package deadline.
+	ReadyTimeout time.Duration
 }
 
 func NewClient(election *instance.Election) *Client {
@@ -34,22 +43,41 @@ func NewClient(election *instance.Election) *Client {
 	// failure before the server can return its first event or final status.
 	transport.ResponseHeaderTimeout = 0
 	return &Client{
-		Election: election,
-		HTTP:     &http.Client{Transport: transport},
+		Election:     election,
+		HTTP:         &http.Client{Transport: transport},
+		ReadyTimeout: ReadinessTimeout,
 	}
 }
 
 func (c *Client) WaitReady(ctx context.Context) (app.SharedState, error) {
+	timeout := c.ReadyTimeout
+	if timeout <= 0 {
+		timeout = ReadinessTimeout
+	}
+	readyContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	var lastErr error
 	for {
-		state, err := c.State(ctx)
+		state, err := c.State(readyContext)
 		if err == nil {
 			return state, nil
 		}
+		if errors.Is(err, ErrForeignLoopback) {
+			return app.SharedState{}, err
+		}
+		lastErr = err
 		select {
-		case <-ctx.Done():
-			return app.SharedState{}, ctx.Err()
+		case <-readyContext.Done():
+			if ctx.Err() != nil {
+				return app.SharedState{}, ctx.Err()
+			}
+			lease, leaseErr := c.Election.Current()
+			if leaseErr == nil && lease.EnvironmentID == "" {
+				return app.SharedState{}, fmt.Errorf("%w: workspace primary did not become reachable within %s; its lease lacks a current environment identifier, so stop or upgrade the existing primary before retrying (the fresh owner was not replaced)", ErrReadinessTimeout, timeout)
+			}
+			return app.SharedState{}, fmt.Errorf("%w: workspace primary did not become reachable over its loopback API within %s (last condition: %s); retry after checking that the existing primary is healthy or exit it cleanly", ErrReadinessTimeout, timeout, sanitizedReadinessCondition(lastErr))
 		case <-ticker.C:
 		}
 	}
@@ -122,8 +150,8 @@ func (c *Client) NotifyWithIdentity(ctx context.Context, origin, message, eventK
 	return result.ID, nil
 }
 
-func (c *Client) DeclineNotification(ctx context.Context, origin, eventKey, outcome string) error {
-	body, err := json.Marshal(notifyRequest{Origin: origin, EventKey: eventKey, Outcome: outcome, Decline: true})
+func (c *Client) JournalNotificationAction(ctx context.Context, origin, eventKey, outcome, kind, detail string) error {
+	body, err := json.Marshal(notifyRequest{Origin: origin, Message: detail, EventKey: eventKey, Outcome: outcome, Journal: kind})
 	if err != nil {
 		return err
 	}
@@ -251,6 +279,9 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 	if err != nil {
 		return nil, err
 	}
+	if lease.EnvironmentID != "" && lease.EnvironmentID != c.Election.EnvironmentID() {
+		return nil, fmt.Errorf("%w: the workspace primary is active in another host/container environment, so its loopback API is unreachable here; stop that primary or run Spynel in the same environment, then retry", ErrForeignLoopback)
+	}
 	request, err := http.NewRequestWithContext(ctx, method, base+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -260,6 +291,36 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 		request.Header.Set("Content-Type", "application/json")
 	}
 	return c.HTTP.Do(request)
+}
+
+func sanitizedReadinessCondition(err error) string {
+	if err == nil {
+		return "not ready"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "request timed out"
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return "owner lease was unavailable"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return "connection timed out"
+		}
+		return "connection was refused or unavailable"
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "unauthorized") || strings.Contains(text, "forbidden"):
+		return "authentication was rejected"
+	case strings.Contains(text, "endpoint is not loopback"), strings.Contains(text, "invalid workspace server endpoint"):
+		return "owner endpoint was invalid"
+	case strings.Contains(text, "decode"), strings.Contains(text, "json"):
+		return "owner response was invalid"
+	default:
+		return "owner API was unavailable"
+	}
 }
 
 func loopbackURL(endpoint string) (string, error) {

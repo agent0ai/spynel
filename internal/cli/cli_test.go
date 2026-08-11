@@ -530,7 +530,7 @@ func TestNotifyCommandUsesDurableHistoryWithoutHarness(t *testing.T) {
 	}
 }
 
-func TestNotificationAgentPreparedCLIActionsSendOrExplicitlyDecline(t *testing.T) {
+func TestNotificationAgentPreparedCLIActionsSendSkipOrFail(t *testing.T) {
 	setup := func(t *testing.T) (config.Config, string) {
 		t.Helper()
 		root := t.TempDir()
@@ -559,7 +559,7 @@ func TestNotificationAgentPreparedCLIActionsSendOrExplicitlyDecline(t *testing.T
 		}
 		event := map[string]any{
 			"id": "event-1", "task_id": "task-1", "outcome": "done", "task_file": taskFile,
-			"transition": "task_implementation:1", "origin": "cli/alerts", "mode": "decide", "state": "pending",
+			"transition": "task_implementation:1", "origin": "cli/alerts", "mode": "decide", "state": "invoked", "attempts": 1,
 		}
 		data, _ := json.Marshal(event)
 		if err := os.WriteFile(filepath.Join(eventDirectory, "event-1.json"), data, 0o600); err != nil {
@@ -579,7 +579,7 @@ func TestNotificationAgentPreparedCLIActionsSendOrExplicitlyDecline(t *testing.T
 			t.Fatal(err)
 		}
 		data, _ := os.ReadFile(eventPath)
-		if strings.Contains(string(data), `"state":"declined"`) || !strings.Contains(string(data), `"journaled": true`) {
+		if !strings.Contains(string(data), `"journal_kind": "sent"`) || !strings.Contains(string(data), `"journaled": true`) {
 			t.Fatalf("send did not record its transition-specific journal receipt: %s", data)
 		}
 		document, err := orchestrator.ReadDocument(filepath.Join(cfg.StatePath("tasks", "done"), "task.md"))
@@ -588,30 +588,30 @@ func TestNotificationAgentPreparedCLIActionsSendOrExplicitlyDecline(t *testing.T
 		}
 	})
 
-	t.Run("decline", func(t *testing.T) {
+	t.Run("skip", func(t *testing.T) {
 		cfg, eventPath := setup(t)
-		args := []string{"--config", cfg.Path, "--origin", "cli/alerts", "--event-key", "task-notification:event-1", "--outcome", "done", "--decline"}
+		args := []string{"--config", cfg.Path, "--origin", "cli/alerts", "--event-key", "task-notification:event-1", "--outcome", "done", "--journal", "skipped", "The user already has the result."}
 		if err := runNotifyCommand(args, "test"); err != nil {
 			t.Fatal(err)
 		}
 		data, err := os.ReadFile(eventPath)
-		if err != nil || !strings.Contains(string(data), `"state": "declined"`) {
-			t.Fatalf("decline event = %s, %v", data, err)
+		if err != nil || !strings.Contains(string(data), `"journal_kind": "skipped"`) {
+			t.Fatalf("skip event = %s, %v", data, err)
 		}
 		entries, err := os.ReadDir(cfg.StatePath("runtime", "outbox"))
 		if err == nil && len(entries) != 0 {
-			t.Fatalf("decline queued %d outbox entries", len(entries))
+			t.Fatalf("skip queued %d outbox entries", len(entries))
 		}
 	})
 
 	t.Run("failed action", func(t *testing.T) {
 		cfg, eventPath := setup(t)
-		args := []string{"--config", cfg.Path, "--origin", "cli/other", "--event-key", "task-notification:event-1", "--outcome", "done", "--decline"}
+		args := []string{"--config", cfg.Path, "--origin", "cli/other", "--event-key", "task-notification:event-1", "--outcome", "done", "--journal", "failed", "authorization failed"}
 		if err := runNotifyCommand(args, "test"); err == nil {
-			t.Fatal("redirected decline unexpectedly succeeded")
+			t.Fatal("redirected audit unexpectedly succeeded")
 		}
 		data, err := os.ReadFile(eventPath)
-		if err != nil || !strings.Contains(string(data), `"state":"pending"`) {
+		if err != nil || !strings.Contains(string(data), `"state":"invoked"`) {
 			t.Fatalf("failed action event = %s, %v", data, err)
 		}
 	})
@@ -1277,6 +1277,38 @@ func TestTUIStartupResumesHistoryOnlyForInitialElectionWinner(t *testing.T) {
 	conversation, err = selectTUIConversation(store, "secondary", false)
 	if err != nil || conversation != "local-secondary" {
 		t.Fatalf("secondary conversation = %q, %v", conversation, err)
+	}
+}
+
+func TestStartupConnectionStatusIsVisibleBoundedAndOptional(t *testing.T) {
+	var output bytes.Buffer
+	status := newStartupConnectionStatus(&output, true)
+	status.connecting()
+	status.connected()
+	want := "Connecting to the existing Spynel primary…\nConnected to the existing Spynel primary.\n"
+	if output.String() != want {
+		t.Fatalf("successful startup status = %q", output.String())
+	}
+
+	output.Reset()
+	status.failed(fmt.Errorf("%w: another host/container environment; bearer-secret", localapi.ErrForeignLoopback))
+	if !strings.Contains(output.String(), "another host/container environment") || strings.Contains(output.String(), "bearer-secret") {
+		t.Fatalf("foreign startup status = %q", output.String())
+	}
+
+	output.Reset()
+	status.failed(errors.New("open /private/workspace: credential-secret"))
+	if strings.Contains(output.String(), "/private/workspace") || strings.Contains(output.String(), "credential-secret") || !strings.Contains(output.String(), "retry or exit") {
+		t.Fatalf("sanitized startup status = %q", output.String())
+	}
+
+	output.Reset()
+	disabled := newStartupConnectionStatus(&output, false)
+	disabled.connecting()
+	disabled.connected()
+	disabled.failed(errors.New("ignored"))
+	if output.Len() != 0 {
+		t.Fatalf("nonterminal startup output = %q", output.String())
 	}
 }
 

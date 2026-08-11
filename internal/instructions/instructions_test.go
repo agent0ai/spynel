@@ -177,7 +177,38 @@ func TestMissingFileHasDeterministicEmptySection(t *testing.T) {
 
 func TestEnsureChatGuidanceAppendsCurrentContractOnce(t *testing.T) {
 	custom := EnsureChatGuidance("custom chat prompt")
-	if !strings.Contains(custom, chatGuidanceMarker) || strings.Count(EnsureChatGuidance(custom), chatGuidanceMarker) != 1 {
+	if !strings.Contains(custom, chatGuidanceMarker) || strings.Count(EnsureChatGuidance(custom), chatGuidanceMarker) != 1 || strings.Count(EnsureChatGuidance(custom), chatTranscriptionGuidanceMarker) != 1 {
 		t.Fatalf("chat guidance was missing or duplicated: %q", custom)
+	}
+}
+
+func TestEnsureChatGuidanceCoversContextualSpynelTranscriptions(t *testing.T) {
+	prompt := EnsureChatGuidance("preserved custom chat prompt with " + chatGuidanceMarker)
+	for _, test := range []struct {
+		input       string
+		context     string
+		interpretAs string
+	}{
+		{input: "spinal", context: "the Spynel framework", interpretAs: "Spynel"},
+		{input: "spinel", context: "the Spynel framework", interpretAs: "Spynel"},
+		{input: "spy nell", context: "the Spynel framework", interpretAs: "Spynel"},
+		{input: "spinal", context: "a medical reference", interpretAs: "literal meaning"},
+	} {
+		if !strings.Contains(prompt, "`"+test.input+"`") || !strings.Contains(prompt, test.context) || !strings.Contains(prompt, test.interpretAs) {
+			t.Errorf("guidance does not cover %#v:\n%s", test, prompt)
+		}
+	}
+}
+
+func TestInjectScopeDisciplineIsExactOnceAndPreservesPrecedence(t *testing.T) {
+	prompt := InjectScopeDiscipline("Custom prompt with an explicit user request and safety contract.")
+	prompt = InjectScopeDiscipline(prompt)
+	if strings.Count(prompt, ScopeDisciplineGuidance) != 1 {
+		t.Fatalf("scope discipline was missing or duplicated: %q", prompt)
+	}
+	for _, required := range []string{"explicit user instructions", "safety", "authorization", "lifecycle", "independent-review", "evidence", "data-handling"} {
+		if !strings.Contains(ScopeDisciplineGuidance, required) {
+			t.Fatalf("scope discipline omitted precedence for %q: %q", required, ScopeDisciplineGuidance)
+		}
 	}
 }

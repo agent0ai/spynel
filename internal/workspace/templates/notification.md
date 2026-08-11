@@ -16,17 +16,23 @@ The authorized destination is fixed in this fully prepared command:
 {{COMMAND}}
 ```
 
-In `decide` mode, a deliberate no-send must be recorded by invoking this separate prepared command:
+If you decide not to send in `decide` mode, record the concise reason with this separate prepared audit command:
 
 ```sh
-{{DECLINE_COMMAND}}
+{{SKIP_COMMAND}}
+```
+
+If a concrete safety, authorization, or action failure prevents sending, record it without secrets:
+
+```sh
+{{FAILURE_COMMAND}}
 ```
 
 `MESSAGE_TEXT` is supplied on standard input. Invoke the command directly with your tool's non-PTY stdin facility when available; do not interpolate the message into shell syntax, alter the origin, event key, outcome, or config path, and do not add credentials. The CLI independently removes terminal protocol replies and control sequences before accepting the message.
 
-In `decide` mode, sending is optional. Send only when a concise user-facing notification is useful; otherwise invoke the prepared decline command. Provider silence alone is not a decision and remains retryable. In `always` mode, you must send unless the command reports a real safety or authorization failure. Lead with the practical outcome in natural language. Keep the message concise and omit filesystem paths, task IDs, transcripts, secrets, and orchestration details.
+In `decide` mode, use your judgment exactly once: send only when a concise user-facing notification is useful, otherwise record the skip reason. In `always` mode, invoke the send command unless a concrete safety or authorization failure makes that impossible, then record that failure. Lead with the practical outcome in natural language. Keep all text concise and omit filesystem paths, task IDs, transcripts, secrets, and orchestration details.
 
-The prepared send action atomically journals its transition-specific success in the task's `## Progress` using the environment's current UTC time and the safe message. Do not edit the task file directly. A retry may find the message already queued and journaled; the stable command identity makes both effects safe.
+Invoke exactly one prepared action. Each action atomically journals its transition-specific result in the task's `## Progress` using the environment's current UTC time. A send records the safe exact message; a skip records its reason; a failure records the concrete cause. Do not edit the task file directly. The framework ignores your final output, silence, and completion status and will not invoke you again. Durable outbox delivery may retry only after a send has been queued.
 
 Do not return JSON or any other structured result. Your final prose is non-authoritative and may be ignored.
 

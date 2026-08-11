@@ -63,7 +63,7 @@ orchestrator:
   interval_seconds: 10
   # Higher-level agent audit; 0 disables it. Changes take effect live.
   semantic_heartbeat_minutes: 15
-  # off, decide (agent must send or explicitly decline), or always (agent must send).
+  # off, decide (agent sends or records a skip once), or always (agent sends unless safely impossible).
   task_notifications: decide
   max_parallel: 4
   routes:
