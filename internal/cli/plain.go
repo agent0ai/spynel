@@ -17,6 +17,7 @@ import (
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/history"
+	"github.com/agent0ai/spynel/internal/instance"
 )
 
 const (
@@ -254,7 +255,28 @@ func runFrameworkMessageMode(configPath, conversation, text, version string, opt
 		return err
 	}
 	defer service.Close()
-	if err := runMessageWithOutput(ctx, service.Handle, conversation, text, options); err != nil {
+	runLocal := func() error {
+		return runMessageWithOutput(ctx, service.Handle, conversation, text, options)
+	}
+	if isCleanupCommand(text) {
+		ran, fenceErr := runOwnerlessCleanup(cfg, runLocal)
+		if fenceErr != nil {
+			return fenceErr
+		}
+		if !ran {
+			// Ownership may have been published after the first discovery. Join
+			// that owner when it is healthy; a stale lease fails closed instead
+			// of allowing a separate process-local cleanup service to proceed.
+			if client, active, clientErr := activeWorkspaceClient(ctx, cfg); clientErr != nil {
+				return clientErr
+			} else if active {
+				return runMessageWithOutput(ctx, client.Handle, conversation, text, options)
+			}
+			return errors.New("cleanup is temporarily unavailable while workspace ownership changes; retry shortly")
+		}
+		return nil
+	}
+	if err := runLocal(); err != nil {
 		return err
 	}
 	select {
@@ -263,6 +285,19 @@ func runFrameworkMessageMode(configPath, conversation, text, version string, opt
 	default:
 		return nil
 	}
+}
+
+func isCleanupCommand(text string) bool {
+	fields := strings.Fields(text)
+	return len(fields) > 0 && strings.EqualFold(fields[0], "/cleanup")
+}
+
+func runOwnerlessCleanup(cfg config.Config, action func() error) (bool, error) {
+	election, err := instance.New(cfg.StatePath())
+	if err != nil {
+		return false, err
+	}
+	return election.RunWhileNoPrimaryLease(action)
 }
 
 func runStatusCLICommand(args []string, version string, output io.Writer) error {

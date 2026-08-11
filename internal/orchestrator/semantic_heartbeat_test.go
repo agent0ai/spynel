@@ -235,6 +235,62 @@ func TestSemanticHeartbeatPublishesOwnedDeadlineAndClearsItAtHandoff(t *testing.
 	manager.Wait()
 }
 
+func TestManualSemanticHeartbeatSharesNonOverlapAndPostponesTimedRun(t *testing.T) {
+	target := &heartbeatHarness{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	manager := newHeartbeatManager(t, target)
+	base := time.Date(2026, 8, 8, 14, 0, 0, 0, time.UTC)
+	manager.heartbeatNow = func() time.Time { return base }
+	manager.heartbeatTicks = make(chan time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { manager.runSemanticHeartbeat(ctx); close(done) }()
+	until := time.Now().Add(time.Second)
+	for !manager.heartbeatSchedulerActive.Load() {
+		if time.Now().After(until) {
+			t.Fatal("heartbeat scheduler did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	started, err := manager.TriggerSemanticHeartbeat(context.Background())
+	if err != nil || !started {
+		t.Fatalf("manual heartbeat start = %v, %v", started, err)
+	}
+	select {
+	case <-target.entered:
+	case <-time.After(time.Second):
+		t.Fatal("manual heartbeat did not enter provider")
+	}
+	started, err = manager.TriggerSemanticHeartbeat(context.Background())
+	if err != nil || started {
+		t.Fatalf("overlapping manual heartbeat = %v, %v", started, err)
+	}
+	target.mu.Lock()
+	if target.calls != 1 {
+		t.Fatalf("overlapping heartbeat calls = %d", target.calls)
+	}
+	target.mu.Unlock()
+
+	completedAt := base.Add(9 * time.Minute)
+	base = completedAt
+	close(target.release)
+	until = time.Now().Add(time.Second)
+	want := completedAt.Add(time.Duration(manager.Config.Orchestrator.SemanticHeartbeatMinutes) * time.Minute)
+	for {
+		status := manager.WorkStatus()
+		if status.HeartbeatState == "scheduled" && status.NextHeartbeatAt.Equal(want) {
+			break
+		}
+		if time.Now().After(until) {
+			t.Fatalf("manual completion did not postpone timed heartbeat: %#v want=%s", status, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	manager.Wait()
+}
+
 func TestSemanticHeartbeatSuccessorUsesTerminalReleaseNotDelayedHandling(t *testing.T) {
 	target := &heartbeatHarness{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	manager := newHeartbeatManager(t, target)

@@ -81,6 +81,7 @@ func TestVisualCapture(t *testing.T) {
 
 func visualWorkspaceChoiceModel() model {
 	value := newRequiredActionModel(context.Background(), ParentWorkspaceScreen("/workspace/spynel/example", "/workspace"), func(_, _ string) error { return nil })
+	value.version = headerVersion("1.2.3")
 	next, _ := value.Update(tea.WindowSizeMsg{Width: 120, Height: 34})
 	return next.(model)
 }
@@ -88,6 +89,7 @@ func visualWorkspaceChoiceModel() model {
 func visualInitializationModel() model {
 	value := newInitializationModel(context.Background(), "/workspace/fresh-project", func() error { return nil })
 	value.title = "API workspace"
+	value.version = headerVersion("1.2.3")
 	value.runtimeStatus = visualBaseModel().runtimeStatus
 	next, _ := value.Update(tea.WindowSizeMsg{Width: 120, Height: 34})
 	value = next.(model)
@@ -304,6 +306,7 @@ func visualPaddingYieldGeometryModel() model {
 func visualBaseModel() model {
 	value := testModel()
 	value.title = "API workspace"
+	value.version = headerVersion("1.2.3")
 	value.connection = connectionMap([]channel.ConnectionStatus{
 		{Name: "telegram", State: channel.ConnectionConnected},
 		{Name: "whatsapp", State: channel.ConnectionConnecting},

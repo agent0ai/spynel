@@ -5,10 +5,11 @@ const fs = require("fs");
 const http = require("http");
 const https = require("https");
 const path = require("path");
-const readline = require("readline/promises");
+const readline = require("readline");
 const pkg = require("../package.json");
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+const STARTUP_PROMPT_TIMEOUT_MS = 10_000;
 const DEFAULT_REGISTRY_URL = "https://registry.npmjs.org/spynel/latest";
 const MAX_RESPONSE_BYTES = 64 * 1024;
 
@@ -163,18 +164,77 @@ function runNPMUpdate(options = {}) {
 async function promptForStartupUpdate(result, options = {}) {
   const input = options.input || process.stdin;
   const output = options.output || process.stdout;
+  if (!input.isTTY || !output.isTTY) return false;
+
   const invocation = npmInvocation(options.packageRoot);
-  const terminal = readline.createInterface({ input, output });
-  try {
-    const answer = await terminal.question(`Spynel ${result.latest} is available (installed ${result.current}). Run ${invocation.display} now? [y/N] `);
-    return /^(y|yes)$/i.test(answer.trim());
-  } finally {
-    terminal.close();
-  }
+  const environment = options.environment || process.env;
+  const timeoutMs = options.timeoutMs || STARTUP_PROMPT_TIMEOUT_MS;
+  const tickMs = options.tickMs || 1_000;
+  const countdownUnitMs = options.countdownUnitMs || 1_000;
+  const styled = environment.NO_COLOR === undefined && environment.TERM !== "dumb";
+  const cursorControl = options.cursorControl !== false && environment.TERM !== "dumb";
+  const bold = value => styled ? `\x1b[1m${value}\x1b[22m` : value;
+  const muted = value => styled ? `\x1b[2m${value}\x1b[22m` : value;
+  const terminal = readline.createInterface({ input, output, terminal: true });
+  const deadline = Date.now() + timeoutMs;
+  let lastRemaining = Math.ceil(timeoutMs / countdownUnitMs);
+  let firstPrompt = true;
+  let settled = false;
+
+  output.write(`\n⬆️  New version ${result.latest} available — current is ${result.current}\n`);
+  const renderPrompt = (remaining, ending = "") => {
+    const suffix = ending || `skipping in ${remaining}…`;
+    const line = `${bold("Update now")}? [Y]es / [N]o  ${muted(suffix)}`;
+    if (cursorControl) {
+      terminal.setPrompt(line);
+      terminal.prompt(!firstPrompt);
+    } else {
+      if (!firstPrompt) output.write("\n");
+      output.write(line);
+    }
+    firstPrompt = false;
+  };
+  renderPrompt(lastRemaining);
+
+  return new Promise(resolve => {
+    let interval;
+    let timeout;
+    const finish = (update, ending) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(interval);
+      clearTimeout(timeout);
+      terminal.close();
+      if (cursorControl) {
+        readline.cursorTo(output, 0);
+        readline.clearLine(output, 0);
+        output.write(`${bold("Update now")}? [Y]es / [N]o  ${muted(ending)}`);
+      } else {
+        renderPrompt(0, ending);
+      }
+      output.write("\n");
+      resolve(update);
+    };
+    terminal.once("line", answer => {
+      const normalized = answer.trim().toLowerCase();
+      finish(normalized === "y" || normalized === "yes", normalized === "y" || normalized === "yes" ? `running ${invocation.display}…` : "skipping.");
+    });
+    terminal.once("SIGINT", () => finish(false, "skipping."));
+    terminal.once("close", () => finish(false, "skipping."));
+    interval = setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / countdownUnitMs));
+      if (remaining !== lastRemaining && remaining > 0) {
+        lastRemaining = remaining;
+        renderPrompt(remaining);
+      }
+    }, tickMs);
+    timeout = setTimeout(() => finish(false, "timed out; skipping."), timeoutMs);
+  });
 }
 
 module.exports = {
   DEFAULT_TIMEOUT_MS,
+  STARTUP_PROMPT_TIMEOUT_MS,
   checkForUpdate,
   compareVersions,
   npmInvocation,

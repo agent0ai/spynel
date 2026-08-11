@@ -287,7 +287,7 @@ func discoverBareWorkspace(launchRoot string) (bareWorkspaceDiscovery, error) {
 }
 
 func runBareInteractive(version string) error {
-	return runBareInteractiveWithRuntime(version, defaultBareInteractiveRuntime())
+	return runBareInteractiveWithRuntime(version, defaultBareInteractiveRuntime(version))
 }
 
 type bareInteractiveRuntime struct {
@@ -300,15 +300,19 @@ type bareInteractiveRuntime struct {
 	startServer              func(string, bool, string, []string) error
 }
 
-func defaultBareInteractiveRuntime() bareInteractiveRuntime {
+func defaultBareInteractiveRuntime(version string) bareInteractiveRuntime {
 	return bareInteractiveRuntime{
 		canonicalLaunchDirectory: canonicalLaunchDirectory,
 		discoverWorkspace:        discoverBareWorkspace,
-		runInitialization:        tui.RunInitialization,
-		runParentChoice:          tui.RunParentWorkspaceChoice,
-		initializeWorkspace:      workspace.Init,
-		changeDirectory:          os.Chdir,
-		startServer:              runServer,
+		runInitialization: func(ctx context.Context, root string, initialize func() error) (bool, error) {
+			return tui.RunInitializationWithVersion(ctx, root, version, initialize)
+		},
+		runParentChoice: func(ctx context.Context, launchRoot, parentRoot string, initialize func() error) (tui.WorkspaceChoice, error) {
+			return tui.RunParentWorkspaceChoiceWithVersion(ctx, launchRoot, parentRoot, version, initialize)
+		},
+		initializeWorkspace: workspace.Init,
+		changeDirectory:     os.Chdir,
+		startServer:         runServer,
 	}
 }
 
@@ -583,6 +587,17 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 		if err != nil {
 			return serverResult(fmt.Errorf("select startup TUI history: %w", err))
 		}
+		// Admit the selected conversation before reading it. Cleanup serializes
+		// this registration with its protection snapshot and deletion, so a
+		// history cannot disappear between startup selection and live ownership.
+		if err := client.RegisterLiveTUI(ctx, conversation); err != nil {
+			return serverResult(fmt.Errorf("register live TUI conversation: %w", err))
+		}
+		defer func() {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			defer cancel()
+			_ = client.UnregisterLiveTUI(cleanupCtx)
+		}()
 		initialHistory, _, err := histories.RecentEntries("tui", conversation, initialTUIHistoryMessages, initialTUIHistoryChars)
 		if err != nil {
 			return serverResult(fmt.Errorf("load TUI history: %w", err))
@@ -599,6 +614,7 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 		notificationEvents := watchTaskNotifications(ctx, histories.Path("tui", conversation))
 		err = tui.Run(ctx, shared.Title, client.Handle, app.SlashCommands(), initialHistory, tui.Options{
 			Conversation: conversation,
+			Version:      version,
 			Attachments:  cfg.StatePath("attachments"),
 			TitlePath:    cfg.StatePath("tui-title"),
 			TitleEvents:  stateEvents.titles,
@@ -627,6 +643,7 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 			InitialScreen: initialScreen,
 			ScreenAction:  client.ScreenAction,
 			Diagnostic:    client.Diagnostic,
+			RegisterLive:  client.RegisterLiveTUI,
 		})
 		return serverResult(err)
 	}

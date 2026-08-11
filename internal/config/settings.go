@@ -41,6 +41,7 @@ func Settings(cfg Config) []Setting {
 		{Key: "harness.acp_command", Section: "harness", Description: "Executable name or absolute path for the custom ACP stdio agent", Value: cfg.Harness.ACPCommand, Advanced: true},
 		{Key: "harness.acp_args", Section: "harness", Description: "Command-line arguments for custom ACP (quotes and escapes group values; no shell expansion)", Value: cfg.ACPArgsText(), Advanced: true},
 		{Key: "workspace.attachment_max_mb", Section: "config", Description: "Maximum downloaded attachment size", Value: strconv.Itoa(cfg.Workspace.AttachmentMaxMB), Advanced: true},
+		{Key: "workspace.cleanup_retention_days", Section: "config", Description: "Age in whole days before automatic conversation cleanup and terminal-task archiving", Value: strconv.Itoa(cfg.Workspace.CleanupRetentionDays), Advanced: true},
 		{Key: "channels.tui.title", Section: "config", Description: "Default TUI title", Value: cfg.Channels.TUI.Title, Advanced: true},
 		{Key: "channels.tui.theme", Section: "config", Description: "Active color theme from .spynel/themes", Value: cfg.Channels.TUI.Theme, Advanced: true},
 		{Key: "orchestrator.enabled", Section: "config", Description: "Run Markdown task and goal routes", Value: formatBool(cfg.Orchestrator.Enabled), Choices: []string{"on", "off"}, Advanced: true},
@@ -156,6 +157,8 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Workspace.HistoryMaxMessages, err = parseInteger(0)
 	case "workspace.history_char_limit":
 		cfg.Workspace.HistoryCharLimit, err = parseInteger(0)
+	case "workspace.cleanup_retention_days":
+		cfg.Workspace.CleanupRetentionDays, err = parseInteger(1)
 	case "harness.name":
 		cfg.Harness.Name = harness.NormalizeName(value)
 	case "harness.model":

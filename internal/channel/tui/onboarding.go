@@ -67,12 +67,19 @@ func ParentWorkspaceScreen(launchRoot, parentRoot string) core.Screen {
 // RunParentWorkspaceChoice presents the pre-startup workspace decision. The
 // initialize callback runs only after that action is explicitly selected.
 func RunParentWorkspaceChoice(ctx context.Context, launchRoot, parentRoot string, initialize func() error) (WorkspaceChoice, error) {
+	return RunParentWorkspaceChoiceWithVersion(ctx, launchRoot, parentRoot, "", initialize)
+}
+
+// RunParentWorkspaceChoiceWithVersion presents the pre-startup workspace
+// decision with the same embedded build identity as the main TUI.
+func RunParentWorkspaceChoiceWithVersion(ctx context.Context, launchRoot, parentRoot, version string, initialize func() error) (WorkspaceChoice, error) {
 	m := newRequiredActionModel(ctx, ParentWorkspaceScreen(launchRoot, parentRoot), func(screenID, action string) error {
 		if screenID == "workspace-choice" && action == string(WorkspaceChoiceInitializeHere) {
 			return initialize()
 		}
 		return nil
 	})
+	m.version = headerVersion(version)
 	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
 	final, err := program.Run()
 	if err != nil {
@@ -93,7 +100,14 @@ func RunParentWorkspaceChoice(ctx context.Context, launchRoot, parentRoot string
 // RunInitialization presents the initialization screen and returns true only
 // after the initialize action succeeds.
 func RunInitialization(ctx context.Context, root string, initialize func() error) (bool, error) {
+	return RunInitializationWithVersion(ctx, root, "", initialize)
+}
+
+// RunInitializationWithVersion presents setup with the same embedded build
+// identity as the main TUI.
+func RunInitializationWithVersion(ctx context.Context, root, version string, initialize func() error) (bool, error) {
 	m := newInitializationModel(ctx, root, initialize)
+	m.version = headerVersion(version)
 	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
 	final, err := program.Run()
 	if err != nil {

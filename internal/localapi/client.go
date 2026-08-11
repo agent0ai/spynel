@@ -130,6 +130,32 @@ func (c *Client) State(ctx context.Context) (app.SharedState, error) {
 	return state, nil
 }
 
+func (c *Client) RegisterLiveTUI(ctx context.Context, conversation string) error {
+	body, err := json.Marshal(liveTUIRequest{InstanceID: c.Election.ID(), Conversation: conversation})
+	if err != nil {
+		return err
+	}
+	response, err := c.request(ctx, http.MethodPost, "/v1/tui-live", body)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	return responseError(response)
+}
+
+func (c *Client) UnregisterLiveTUI(ctx context.Context) error {
+	body, err := json.Marshal(liveTUIRequest{InstanceID: c.Election.ID()})
+	if err != nil {
+		return err
+	}
+	response, err := c.request(ctx, http.MethodDelete, "/v1/tui-live", body)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	return responseError(response)
+}
+
 func (c *Client) NotifyWithIdentity(ctx context.Context, origin, message, eventKey, outcome string) (string, error) {
 	body, err := json.Marshal(notifyRequest{Origin: origin, Message: message, EventKey: eventKey, Outcome: outcome})
 	if err != nil {
@@ -213,7 +239,7 @@ func (c *Client) InitialScreen(ctx context.Context, hasHistory, forceWelcome boo
 }
 
 func (c *Client) ScreenAction(ctx context.Context, screenID, action string, values map[string]string) (*core.Screen, error) {
-	body, err := json.Marshal(screenActionRequest{ScreenID: screenID, Action: action, Values: values})
+	body, err := json.Marshal(screenActionRequest{InstanceID: c.Election.ID(), ScreenID: screenID, Action: action, Values: values})
 	if err != nil {
 		return nil, err
 	}

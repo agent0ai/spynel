@@ -67,6 +67,7 @@ type Manager struct {
 	JobExecutionUpdated         func(id int, status core.ExecutionStatus)
 	JobFinished                 func(id int)
 	AuthorizeNotificationOrigin func(Origin) error
+	Cleanup                     func(context.Context, int) (string, error)
 	notificationDecisionTimeout time.Duration
 	notificationMu              sync.Mutex
 	notificationRunning         map[string]bool
@@ -101,10 +102,12 @@ type Manager struct {
 	heartbeatProviderDone       chan struct{}
 	heartbeatProviderReleasedAt time.Time
 	heartbeatRunningTerm        atomic.Uint64
+	heartbeatSchedulerActive    atomic.Bool
 	primaryOwned                atomic.Bool
 	orchestratorEnabled         atomic.Bool
 	heartbeatMinutes            atomic.Int64
 	heartbeatConfigChanged      chan struct{}
+	heartbeatManual             chan heartbeatManualRequest
 	heartbeatConfigAcceptedAt   atomic.Int64
 	heartbeatConfigGeneration   atomic.Uint64
 	heartbeatAppliedGeneration  atomic.Uint64
@@ -115,6 +118,8 @@ type Manager struct {
 	heartbeatOwned              bool
 	heartbeatOwnedTerm          uint64
 	heartbeatNext               time.Time
+	cleanupDays                 atomic.Int64
+	cleanupTicks                <-chan time.Time
 	claimDocument               func(source, target, status, attemptField string, now time.Time) (Document, error)
 }
 
@@ -140,6 +145,7 @@ func (m *Manager) ApplyRuntimeConfig(cfg config.Config) {
 	m.runtimeConfig = cfg
 	m.runtimeConfigMu.Unlock()
 	m.harnessPolicy.Store(cfg.Harness)
+	m.cleanupDays.Store(int64(cfg.Workspace.CleanupRetentionDays))
 	wasEnabled := m.orchestratorEnabled.Load()
 	heartbeatChanged := previous.Orchestrator.Enabled != cfg.Orchestrator.Enabled || previous.Orchestrator.SemanticHeartbeatMinutes != cfg.Orchestrator.SemanticHeartbeatMinutes
 	if heartbeatChanged {
@@ -227,11 +233,13 @@ func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Ma
 		capacityChanged:        make(chan struct{}, 1),
 		scanTimerChanged:       make(chan struct{}, 1),
 		heartbeatConfigChanged: make(chan struct{}, 1),
+		heartbeatManual:        make(chan heartbeatManualRequest),
 		heartbeatNow:           time.Now, heartbeatTimeout: 5 * time.Minute,
 		notificationRunning: map[string]bool{},
 	}
 	manager.orchestratorEnabled.Store(cfg.Orchestrator.Enabled)
 	manager.heartbeatMinutes.Store(int64(cfg.Orchestrator.SemanticHeartbeatMinutes))
+	manager.cleanupDays.Store(int64(cfg.Workspace.CleanupRetentionDays))
 	manager.harnessPolicy.Store(cfg.Harness)
 	return manager
 }
@@ -250,6 +258,12 @@ func (m *Manager) Run(ctx context.Context) error {
 		m.runSemanticHeartbeat(ctx)
 	}()
 	defer func() { <-heartbeatDone }()
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		m.runAutomaticCleanup(ctx)
+	}()
+	defer func() { <-cleanupDone }()
 	timer := m.startScanTimer()
 	defer m.stopScanTimer(timer)
 	for {
@@ -270,6 +284,38 @@ func (m *Manager) Run(ctx context.Context) error {
 			if err := m.scanScheduled(ctx, generation); err != nil {
 				m.log("orchestrator scan: " + err.Error())
 			}
+		}
+	}
+}
+
+const automaticCleanupCadence = 8 * time.Hour
+
+func (m *Manager) runAutomaticCleanup(ctx context.Context) {
+	var ticker *time.Ticker
+	ticks := m.cleanupTicks
+	if ticks == nil {
+		ticker = time.NewTicker(automaticCleanupCadence)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticks:
+			if !m.primaryOwned.Load() || m.Cleanup == nil {
+				continue
+			}
+			days := int(m.cleanupDays.Load())
+			if days <= 0 {
+				continue
+			}
+			result, err := m.Cleanup(ctx, days)
+			if err != nil {
+				m.log("automatic cleanup skipped or failed: " + err.Error())
+				continue
+			}
+			m.log("automatic cleanup: " + result)
 		}
 	}
 }

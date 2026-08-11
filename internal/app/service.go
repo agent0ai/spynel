@@ -46,31 +46,36 @@ type Service struct {
 	Startup         interface {
 		Sync(config.Config, bool) error
 	}
-	Updates          *updater.Manager
-	configurationMu  sync.Mutex
-	instanceMu       sync.RWMutex
-	primaryInstance  string
-	titleMu          sync.Mutex
-	titleChanges     chan string
-	themeChanges     chan theme.Theme
-	connectionMu     sync.RWMutex
-	connections      map[string]channel.ConnectionStatus
-	pairingMu        sync.RWMutex
-	pairing          map[string]channel.PairingEvent
-	pairingEvents    chan channel.PairingEvent
-	noticeMu         sync.RWMutex
-	noticeSequence   uint64
-	lastNotice       channel.Notice
-	noticeEvents     chan channel.Notice
-	restartRequests  chan struct{}
-	updateRequests   chan struct{}
-	primaryRequests  chan string
-	primaryRequestMu sync.Mutex
-	primaryRequested bool
-	streamMu         sync.Mutex
-	readJobDocument  func(string) (orchestrator.Document, error)
-	streamText       map[string]string
-	telegramIdentity *telegram.IdentityStore
+	Updates             *updater.Manager
+	configurationMu     sync.Mutex
+	instanceMu          sync.RWMutex
+	primaryInstance     string
+	cleanupNotBefore    time.Time
+	titleMu             sync.Mutex
+	titleChanges        chan string
+	themeChanges        chan theme.Theme
+	connectionMu        sync.RWMutex
+	connections         map[string]channel.ConnectionStatus
+	pairingMu           sync.RWMutex
+	pairing             map[string]channel.PairingEvent
+	pairingEvents       chan channel.PairingEvent
+	noticeMu            sync.RWMutex
+	noticeSequence      uint64
+	lastNotice          channel.Notice
+	noticeEvents        chan channel.Notice
+	restartRequests     chan struct{}
+	updateRequests      chan struct{}
+	primaryRequests     chan string
+	primaryRequestMu    sync.Mutex
+	primaryRequested    bool
+	streamMu            sync.Mutex
+	liveTUIMu           sync.Mutex
+	liveTUI             map[string]map[string]time.Time
+	cleanupHistoryStep  func(string)
+	resumeAdmissionStep func(string)
+	readJobDocument     func(string) (orchestrator.Document, error)
+	streamText          map[string]string
+	telegramIdentity    *telegram.IdentityStore
 }
 
 func New(cfg config.Config, target harness.Harness) *Service {
@@ -110,9 +115,11 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 		updateRequests:   make(chan struct{}, 1),
 		primaryRequests:  make(chan string, 1),
 		streamText:       map[string]string{},
+		liveTUI:          map[string]map[string]time.Time{},
 		telegramIdentity: telegram.NewIdentityStore(cfg.StatePath("runtime", "telegram-identities.json")),
 		readJobDocument:  readBoundedJobDocument,
 	}
+	manager.Cleanup = service.runAutomaticCleanup
 	manager.Log = func(message string) { runtime.LogEvent("info", "orchestrator", "lifecycle", message) }
 	manager.JobStarted = func(lease orchestrator.Lease, description string, firstAssignedAt time.Time, providerIterations, implementationAttempts int) int {
 		kind := lease.DocumentType
@@ -301,10 +308,31 @@ func (s *Service) Start(ctx context.Context) error {
 // SetPrimaryInstanceID records the workspace server owner for shared status
 // output. Loopback clients separately identify the process making a request.
 func (s *Service) SetPrimaryInstanceID(id string) {
+	id = strings.TrimSpace(id)
 	s.instanceMu.Lock()
+	if id != "" && id != s.primaryInstance {
+		// A fresh owner has no process-local view of leases registered with its
+		// predecessor. Fence destructive cleanup long enough for every live TUI
+		// to renew before this owner can use its rebuilt lease set.
+		s.cleanupNotBefore = time.Now().UTC().Add(liveTUILeaseDuration)
+	} else if id == "" {
+		s.cleanupNotBefore = time.Time{}
+	}
 	s.primaryInstance = id
 	s.instanceMu.Unlock()
-	s.Orchestrator.SetPrimaryOwned(strings.TrimSpace(id) != "")
+	s.Orchestrator.SetPrimaryOwned(id != "")
+}
+
+// FenceCleanupForLiveTUIReadmission restarts the owner-transition safety
+// window immediately before the local API begins accepting client renewals.
+// Primary construction can perform slower startup work after election, so the
+// fence must be anchored to API availability rather than election alone.
+func (s *Service) FenceCleanupForLiveTUIReadmission() {
+	s.instanceMu.Lock()
+	if s.primaryInstance != "" {
+		s.cleanupNotBefore = time.Now().UTC().Add(liveTUILeaseDuration)
+	}
+	s.instanceMu.Unlock()
 }
 
 func (s *Service) primaryInstanceID() string {
@@ -630,10 +658,23 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 	case "welcome":
 		return s.localReply(message, s.welcomeMessage(message.Channel), emit)
 	case "new":
-		if err := s.Harness.ResetSession(sessionKey(message)); err != nil {
-			return s.localReply(message, "Cannot start a new thread: "+err.Error(), emit)
+		if message.Channel != "tui" {
+			return s.localReply(message, "Starting a separate conversation with /new is available in the TUI; this channel keeps its stable conversation identity.", emit)
 		}
-		return s.localReply(message, "A new harness thread will be created for the next message. This channel history remains on disk.", emit)
+		id, err := shortid.New()
+		if err != nil {
+			return fmt.Errorf("allocate new conversation: %w", err)
+		}
+		conversation := "new-" + id
+		if _, err := s.History.Ensure("tui", conversation); err != nil {
+			return fmt.Errorf("create new conversation: %w", err)
+		}
+		screen := s.WelcomeScreen()
+		screen.Conversation = conversation
+		if emit != nil {
+			emit(core.Event{Kind: core.EventScreen, Screen: &screen, Local: true})
+		}
+		return nil
 	case "status":
 		status, err := s.statusText(message)
 		if err != nil {
@@ -699,34 +740,6 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 			emit(core.Event{Kind: core.EventFinal, Text: "Conversation history and harness thread cleared.", Clear: true, Done: true, Local: true})
 		}
 		return nil
-	case "steer":
-		if remainder == "" {
-			return s.localReply(message, "Usage: /steer <message>", emit)
-		}
-		if !s.Harness.IsActive(sessionKey(message)) {
-			return s.localReply(message, "There is no active turn. Send the message normally to start a turn.", emit)
-		}
-		key := sessionKey(message)
-		job, ok := s.Runtime.JobForSession(key)
-		if !ok {
-			job.ID = s.Runtime.BeginJob(key, message.Channel, message.Conversation, remainder)
-		}
-		prompt, err := s.prepareChatHarnessPrompt(remainder)
-		if err != nil {
-			return err
-		}
-		activity := newChatActivityEmitter(emit)
-		activity.start()
-		threadID, _, err := s.Harness.Send(ctx, key, prompt, s.wrapEmit(message, job.ID, activity.emit))
-		if err != nil {
-			activity.stop()
-			s.Runtime.EndJob(job.ID)
-			return err
-		}
-		if emit != nil {
-			emit(core.Event{Kind: core.EventStatus, Text: "Steered active turn", ThreadID: threadID})
-		}
-		return nil
 	case "stop":
 		stopped, err := s.Harness.Interrupt(ctx, sessionKey(message))
 		if err != nil {
@@ -765,17 +778,50 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 			return err
 		}
 		return s.dispatchHarnessPrompt(ctx, message, prompt, emit)
-	case "run":
-		if err := s.Orchestrator.ScanOnce(ctx); err != nil {
-			return err
-		}
-		return s.localReply(message, "Orchestrator scan started.", emit)
+	case "trigger":
+		return s.triggerCommand(ctx, message, remainder, emit)
+	case "cleanup":
+		return s.cleanupCommand(message, remainder, emit)
 	case "extension", "extensions":
 		return s.extensionCommand(ctx, message, remainder, emit)
 	case "quit", "exit":
 		return s.localReply(message, "/quit exits an interactive TUI only; it does not stop the Telegram or WhatsApp server.", emit)
 	default:
 		return s.localReply(message, "Unknown command /"+command+". Use /help.", emit)
+	}
+}
+
+func (s *Service) triggerCommand(ctx context.Context, message core.Message, remainder string, emit core.Emit) error {
+	process := strings.ToLower(strings.TrimSpace(remainder))
+	switch process {
+	case "":
+		return s.localReply(message, "Triggerable processes:\n- `orchestrator` — scan durable task and goal routes now\n- `heartbeat` — run one semantic workflow audit when idle", emit)
+	case "orchestrator":
+		if !s.Settings.Snapshot().Orchestrator.Enabled {
+			return s.localReply(message, "Orchestrator triggering is disabled by configuration.", emit)
+		}
+		if s.primaryInstanceID() == "" {
+			return s.localReply(message, "Orchestrator triggering is unavailable because this process is not the elected primary.", emit)
+		}
+		if err := s.Orchestrator.ScanOnce(ctx); err != nil {
+			return s.localReply(message, "Orchestrator pass failed: "+err.Error(), emit)
+		}
+		return s.localReply(message, "Orchestrator pass completed.", emit)
+	case "heartbeat":
+		cfg := s.Settings.Snapshot()
+		if !cfg.Orchestrator.Enabled || cfg.Orchestrator.SemanticHeartbeatMinutes == 0 {
+			return s.localReply(message, "Semantic heartbeat is disabled by configuration.", emit)
+		}
+		started, err := s.Orchestrator.TriggerSemanticHeartbeat(ctx)
+		if err != nil {
+			return s.localReply(message, "Semantic heartbeat is unavailable: "+err.Error(), emit)
+		}
+		if !started {
+			return s.localReply(message, "Semantic heartbeat is already running.", emit)
+		}
+		return s.localReply(message, "Semantic heartbeat started.", emit)
+	default:
+		return s.localReply(message, "Unknown triggerable process `"+process+"`. Use `/trigger` to list processes.", emit)
 	}
 }
 
@@ -1458,8 +1504,7 @@ var slashCommands = []core.SlashCommand{
 	{Value: "/whatsapp off", Usage: "/whatsapp off", Description: "Disable WhatsApp"},
 	{Value: "/whatsapp set ", Usage: "/whatsapp set <key> <value>", Description: "Persist a WhatsApp setting"},
 	{Value: "/title ", Usage: "/title <name>", Description: "Rename and persist this TUI window"},
-	{Value: "/new", Usage: "/new", Description: "Start a new harness thread for this channel"},
-	{Value: "/steer ", Usage: "/steer <message>", Description: "Explicitly steer the active harness turn"},
+	{Value: "/new", Usage: "/new", Description: "Start a distinct TUI conversation and preserve this one"},
 	{Value: "/stop", Usage: "/stop", Description: "Stop the active execution for this conversation"},
 	{Value: "/restart", Usage: "/restart", Description: "Restart Spynel and restore saved state"},
 	{Value: "/update", Usage: "/update", Description: "Check npm for a newer Spynel release"},
@@ -1471,16 +1516,19 @@ var slashCommands = []core.SlashCommand{
 	{Value: "/log search ", Usage: "/log search <text>", Description: "Search captured runtime logs"},
 	{Value: "/log clear", Usage: "/log clear", Description: "Clear captured runtime logs"},
 	{Value: "/jobs", Usage: "/jobs", Description: "List running agent jobs"},
-	{Value: "/tasks", Usage: "/tasks [view] [options]", Description: "List open tasks or select a semantic view"},
-	{Value: "/goals", Usage: "/goals [view] [options]", Description: "List open goals or select a semantic view"},
 	{Value: "/job info ", Usage: "/job info <number>", Description: "Show safe details and durable progress for a running job"},
 	{Value: "/job message ", Usage: "/job message <number> <text>", Description: "Guide a running orchestrator job without replacing it"},
 	{Value: "/job ping ", Usage: "/job ping <number>", Description: "Request a durable progress update from a running job"},
 	{Value: "/job kill ", Usage: "/job kill <number>", Description: "Stop a running agent job by number"},
+	{Value: "/tasks", Usage: "/tasks [view] [options]", Description: "List open tasks or select a semantic view"},
+	{Value: "/goals", Usage: "/goals [view] [options]", Description: "List open goals or select a semantic view"},
 	{Value: "/clear", Usage: "/clear", Description: "Clear this conversation's history and harness thread"},
 	{Value: "/task ", Usage: "/task <request>", Description: "Ask the communication agent to create or refine a finite task"},
 	{Value: "/goal ", Usage: "/goal <objective>", Description: "Ask the communication agent to create or refine a measurable goal"},
-	{Value: "/run", Usage: "/run", Description: "Trigger an orchestrator scan"},
+	{Value: "/trigger", Usage: "/trigger [process]", Description: "List or start a triggerable background process"},
+	{Value: "/trigger orchestrator", Usage: "/trigger orchestrator", Description: "Request an immediate safe orchestrator pass"},
+	{Value: "/trigger heartbeat", Usage: "/trigger heartbeat", Description: "Start the semantic heartbeat when idle"},
+	{Value: "/cleanup ", Usage: "/cleanup [days]", Description: "Remove old conversations and archive old terminal tasks"},
 	{Value: "/extension list", Usage: "/extension list", Description: "List installed project extensions"},
 	{Value: "/extension install ", Usage: "/extension install URL", Description: "Install a trusted Git extension"},
 	{Value: "/extension remove ", Usage: "/extension remove NAME", Description: "Remove an installed extension"},
@@ -1519,12 +1567,12 @@ var helpTopics = []struct {
 	{
 		name:        "channels",
 		description: "The TUI, Telegram, and WhatsApp",
-		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, instance, and orchestrator indicators. From an idle local TUI, `/primary` safely hands workspace ownership to that TUI instance. Use `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to start a fresh harness thread without erasing channel history. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/update` checks npm with a ten-second deadline, and `/update install` lets a supervising npm launcher update after shutdown and then restart. `/log` shows bounded runtime output. `/jobs` lists accessible active executions; `/tasks` and `/goals` list open durable work by default with bounded semantic views. `/job info <number>` shows safe bounded details and durable progress, `/job message <number> <text>` sends nonterminal guidance through the existing job session, `/job ping <number>` requests a durable progress update, and `/job kill <number>` stops one.",
+		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, instance, and orchestrator indicators. From an idle local TUI, `/primary` safely hands workspace ownership to that TUI instance. Use `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to switch the TUI to a distinct conversation while preserving the prior one for `/resume`. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/update` checks npm with a ten-second deadline, and `/update install` lets a supervising npm launcher update after shutdown and then restart. `/log` shows bounded runtime output. `/jobs` lists accessible active executions; `/tasks` and `/goals` list open durable work by default with bounded semantic views. `/job info <number>` shows safe bounded details and durable progress, `/job message <number> <text>` sends nonterminal guidance through the existing job session, `/job ping <number>` requests a durable progress update, and `/job kill <number>` stops one.",
 	},
 	{
 		name:        "workflows",
 		description: "Durable tasks, goals, and orchestrator scans",
-		body:        "# Workflows\n\nA task is one finite, independently verifiable objective. `/task <request>` sends a dedicated creation directive and your request to the communication agent, which creates or refines a complete task in `todo`. `harness.reviews` defaults to `skip-trivial`, where review is chosen by expected risk reduction versus latency and cost: broad, high-risk, hard-to-reverse, or materially uncertain work normally requires it; read-only work and minor localized reversible changes may complete directly with proportionate verification, evidence, and residual uncertainty. `always` forces every task through review and `never` forces the direct-evidence path.\n\nA goal is a long-term or multi-round outcome with measurable success criteria. `/goal <objective>` asks the communication agent to create or refine it in `proposed`. A leased planner creates finite task rounds under the configured task-review mode, the goal remains unleased in `active` while they run, and a fresh mandatory goal outcome review decides against the bar whether to finish, wait, abandon, or plan another round. Finished tasks never complete a goal automatically.\n\n`/tasks` and `/goals` list all open durable work by default without a harness. Choose `recent`, `active`, `review`, `waiting`, `done`, `failed`, or `all`; `failed` groups failed/cancelled tasks or abandoned goals. Add `--days`, `--limit`, and `--detail` as needed. Use `/run` to trigger an orchestrator scan immediately. Claimed `working`, `planning`, and `reviewing` documents have persisted leases and are recovered after crashes.",
+		body:        "# Workflows\n\nA task is one finite, independently verifiable objective. `/task <request>` sends a dedicated creation directive and your request to the communication agent, which creates or refines a complete task in `todo`. `harness.reviews` defaults to `skip-trivial`, where review is chosen by expected risk reduction versus latency and cost: broad, high-risk, hard-to-reverse, or materially uncertain work normally requires it; read-only work and minor localized reversible changes may complete directly with proportionate verification, evidence, and residual uncertainty. `always` forces every task through review and `never` forces the direct-evidence path.\n\nA goal is a long-term or multi-round outcome with measurable success criteria. `/goal <objective>` asks the communication agent to create or refine it in `proposed`. A leased planner creates finite task rounds under the configured task-review mode, the goal remains unleased in `active` while they run, and a fresh mandatory goal outcome review decides against the bar whether to finish, wait, abandon, or plan another round. Finished tasks never complete a goal automatically.\n\n`/tasks` and `/goals` list all open durable work by default without a harness. Choose `recent`, `active`, `review`, `waiting`, `done`, `failed`, or `all`; `failed` groups failed/cancelled tasks or abandoned goals. Add `--days`, `--limit`, and `--detail` as needed. `/trigger` lists manual processes; `/trigger orchestrator` requests an immediate safe pass and `/trigger heartbeat` starts an audit only when idle. `/cleanup [days]` removes old conversations and archives old terminal tasks, defaulting to seven days. Claimed `working`, `planning`, and `reviewing` documents have persisted leases and are recovered after crashes.",
 	},
 }
 

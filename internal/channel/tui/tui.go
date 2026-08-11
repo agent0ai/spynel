@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -117,6 +118,7 @@ type diagnosticResultMsg struct{}
 
 type Options struct {
 	Conversation       string
+	Version            string
 	Attachments        string
 	TitlePath          string
 	ConnectionEvents   <-chan channel.ConnectionStatus
@@ -139,11 +141,30 @@ type Options struct {
 	InitialScreen      *core.Screen
 	ScreenAction       func(context.Context, string, string, map[string]string) (*core.Screen, error)
 	Diagnostic         func(context.Context, string, string) error
+	RegisterLive       func(context.Context, string) error
+	UnregisterLive     func(context.Context) error
 }
 
 type transcriptEntry struct {
 	role string
 	text string
+}
+
+type liveConversationTracker struct {
+	mu           sync.RWMutex
+	conversation string
+}
+
+func (t *liveConversationTracker) Set(conversation string) {
+	t.mu.Lock()
+	t.conversation = conversation
+	t.mu.Unlock()
+}
+
+func (t *liveConversationTracker) Get() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.conversation
 }
 
 type composerToken struct {
@@ -165,6 +186,7 @@ type model struct {
 	ctx                      context.Context
 	handler                  channel.Handler
 	title                    string
+	version                  string
 	input                    textarea.Model
 	inputWidth               int
 	composerRows             int
@@ -213,6 +235,7 @@ type model struct {
 	width                    int
 	height                   int
 	conversation             string
+	liveConversation         *liveConversationTracker
 	welcome                  *core.Screen
 	welcomeFocus             bool
 	historyCache             []string
@@ -378,6 +401,8 @@ var unsafeAttachmentName = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 
 var mouseReportEscape = regexp.MustCompile(`\[[<>][0-9]+;[0-9]+;[0-9]+[Mm]`)
 
+var semanticBuildVersion = regexp.MustCompile(`^(?:v)?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
+
 func Run(ctx context.Context, title string, handler channel.Handler, commands []core.SlashCommand, initialHistory []history.Entry, options Options) error {
 	// Capability probing is unreliable across docker exec and nested PTYs.
 	// Spynel's supported terminals understand 24-bit SGR; selecting it
@@ -407,9 +432,28 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 	if conversation == "" {
 		conversation = "local"
 	}
+	liveCtx, cancelLive := context.WithCancel(ctx)
+	defer cancelLive()
+	if options.RegisterLive != nil {
+		if err := options.RegisterLive(ctx, conversation); err != nil {
+			return fmt.Errorf("register live TUI conversation: %w", err)
+		}
+		defer func() {
+			cancelLive()
+			if options.UnregisterLive != nil {
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+				defer cancel()
+				_ = options.UnregisterLive(cleanupCtx)
+			}
+		}()
+	}
+	liveConversation := &liveConversationTracker{conversation: conversation}
+	if options.RegisterLive != nil {
+		go renewLiveTUI(liveCtx, options.RegisterLive, liveConversation.Get)
+	}
 	initialTranscript := transcriptFromHistory(initialHistory)
 	m := model{
-		ctx: ctx, handler: handler, title: resolvedTitle, input: input,
+		ctx: ctx, handler: handler, title: resolvedTitle, version: headerVersion(options.Version), input: input,
 		viewport: viewport.New(80, 20), events: make(chan core.Event, 256), composerRows: minComposerHeight,
 		logoSpinner:          newLogoSpinner(),
 		logoTick:             scheduleLogoTick,
@@ -441,7 +485,7 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 		now:                  time.Now,
 		diagnostic:           options.Diagnostic,
 		connection:           connectionMap(options.InitialConnections),
-		status:               "Ready", conversation: conversation,
+		status:               "Ready", conversation: conversation, liveConversation: liveConversation,
 		initialHistoryScroll: len(initialTranscript) > 0,
 	}
 	if options.InitialScreen != nil {
@@ -454,6 +498,19 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
 	_, err = program.Run()
 	return err
+}
+
+func renewLiveTUI(ctx context.Context, register func(context.Context, string) error, conversation func() string) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = register(ctx, conversation())
+		}
+	}
 }
 
 func styleComposer(input *textarea.Model, styles uiStyles) {
@@ -3044,17 +3101,34 @@ func (m model) headerView(width int) string {
 		m.styles.status.Background(m.styles.header.GetBackground()).Render(runtimeCount(m.runtimeStatus.Jobs, "job")),
 		m.styles.status.Background(m.styles.header.GetBackground()).Render(runtimeCount(m.runtimeStatus.Logs, "log")),
 	}
-	right := strings.Join(segments, ribbon) + ribbon
 	// Preserve the workspace identity first; compact/truncate volatile status
 	// on narrow terminals instead of squeezing every title into an ellipsis.
 	leftWidth := min(lipgloss.Width(left), max(12, width*2/5))
 	left = ansi.Truncate(left, leftWidth, "…")
 	rightWidth := max(1, width-lipgloss.Width(left)-2)
+	right := strings.Join(segments, ribbon) + ribbon
+	if m.version != "" {
+		version := m.styles.status.Background(m.styles.header.GetBackground()).Render(m.version)
+		withVersion := strings.Join(append(append([]string(nil), segments...), version), ribbon) + ribbon
+		// The version is the lowest-priority status item. Omit it instead of
+		// displacing or rendering a misleading partial version on narrow rows.
+		if lipgloss.Width(withVersion) <= rightWidth {
+			right = withVersion
+		}
+	}
 	right = ansi.Truncate(right, rightWidth, "…")
 	gapWidth := max(2, width-lipgloss.Width(left)-lipgloss.Width(right))
 	gap := m.styles.headerFill.Render(strings.Repeat("▀", gapWidth))
 	content := left + gap + right
 	return fillLine(m.styles.header, content, width)
+}
+
+func headerVersion(value string) string {
+	value = strings.TrimSpace(value)
+	if !semanticBuildVersion.MatchString(value) {
+		return ""
+	}
+	return "v" + strings.TrimPrefix(value, "v")
 }
 
 func (m model) footerView(hint string, width int) string {
@@ -3256,6 +3330,16 @@ func trueColorBackgroundSGR(background lipgloss.TerminalColor) string {
 func (m *model) openScreen(screen core.Screen) {
 	m.dialog = nil
 	if screen.ID == "welcome" {
+		if screen.Conversation != "" {
+			m.conversation = screen.Conversation
+			if m.liveConversation != nil {
+				m.liveConversation.Set(screen.Conversation)
+			}
+			m.transcript = nil
+			m.initialHistoryScroll = false
+			m.resetResponse()
+			m.working = false
+		}
 		copyScreen := screen
 		copyScreen.Controls = nil
 		m.welcome = &copyScreen
@@ -3275,6 +3359,9 @@ func (m *model) openScreen(screen core.Screen) {
 	}
 	if screen.ID == "chat" && screen.Conversation != "" {
 		m.conversation = screen.Conversation
+		if m.liveConversation != nil {
+			m.liveConversation.Set(screen.Conversation)
+		}
 		m.welcome = nil
 		m.welcomeFocus = false
 		m.transcript = make([]transcriptEntry, 0, len(screen.Transcript))

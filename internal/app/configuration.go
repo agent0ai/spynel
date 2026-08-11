@@ -975,7 +975,7 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	if themeChanged {
 		s.publishTheme(selectedTheme)
 	}
-	if !reflect.DeepEqual(previous.Orchestrator, next.Orchestrator) {
+	if !reflect.DeepEqual(previous.Orchestrator, next.Orchestrator) || previous.Workspace.CleanupRetentionDays != next.Workspace.CleanupRetentionDays {
 		s.Orchestrator.ApplyRuntimeConfig(next)
 	} else if harnessAgentPolicyChanged(previous.Harness, next.Harness) {
 		s.Orchestrator.ApplyHarnessConfig(next.Harness)

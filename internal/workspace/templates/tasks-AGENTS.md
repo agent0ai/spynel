@@ -16,6 +16,7 @@ Default statuses:
 - `done`: requested outcome completed under its review policy; independently reviewed acceptance is distinguished from permitted direct low-risk completion.
 - `failed`: processing cannot continue; document evidence and recovery options.
 - `cancelled`: deliberately stopped without completion; document the authority and reason.
+- `archive`: cold history populated only by retention cleanup from an old terminal folder. It is not a lifecycle transition available to agents and is excluded from ordinary workflows.
 
 An agent must update the document before moving it. Do not silently declare success in chat while leaving the durable task stale.
 

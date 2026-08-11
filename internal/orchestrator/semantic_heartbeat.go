@@ -59,6 +59,31 @@ type semanticHeartbeatState struct {
 	LastAudit semanticAuditDiagnostic         `json:"last_audit"`
 }
 
+type heartbeatManualRequest struct {
+	result chan bool
+}
+
+// TriggerSemanticHeartbeat asks the primary scheduler to start one audit. The
+// scheduler is the single admission point for timed and manual runs, so both
+// share the provider non-overlap fence and fixed-delay rescheduling.
+func (m *Manager) TriggerSemanticHeartbeat(ctx context.Context) (bool, error) {
+	if !m.primaryOwned.Load() || !m.heartbeatSchedulerActive.Load() {
+		return false, errors.New("semantic heartbeat scheduler is unavailable")
+	}
+	result := make(chan bool, 1)
+	select {
+	case m.heartbeatManual <- heartbeatManualRequest{result: result}:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	select {
+	case started := <-result:
+		return started, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
 type semanticFindingState struct {
 	FirstSeen    time.Time `json:"first_seen"`
 	LastSeen     time.Time `json:"last_seen"`
@@ -74,6 +99,8 @@ type semanticAuditDiagnostic struct {
 }
 
 func (m *Manager) runSemanticHeartbeat(ctx context.Context) {
+	m.heartbeatSchedulerActive.Store(true)
+	defer m.heartbeatSchedulerActive.Store(false)
 	var (
 		term        uint64
 		termActive  bool
@@ -185,6 +212,39 @@ func (m *Manager) runSemanticHeartbeat(ctx context.Context) {
 		m.heartbeatAppliedGeneration.Store(generation)
 	}
 	configure()
+	startAudit := func() bool {
+		if auditActive || m.semanticHeartbeatProviderInFlight() || !termActive || !m.orchestratorEnabled.Load() || m.heartbeatMinutes.Load() <= 0 {
+			return false
+		}
+		m.heartbeatCommit.Lock()
+		defer m.heartbeatCommit.Unlock()
+		if m.heartbeatTerm != term || auditActive || m.semanticHeartbeatProviderInFlight() || !m.orchestratorEnabled.Load() || m.heartbeatMinutes.Load() <= 0 {
+			return false
+		}
+		stopTimer()
+		m.setSemanticHeartbeatScheduleForTerm(true, time.Time{}, term)
+		auditActive = true
+		m.jobs.Add(1)
+		go func(runCtx context.Context, runTerm uint64) {
+			defer m.jobs.Done()
+			providerStarted := m.runSemanticHeartbeatOnceForTerm(runCtx, runTerm)
+			completedAt := time.Time{}
+			if providerStarted {
+				var ok bool
+				completedAt, ok = m.waitForSemanticHeartbeatProviderRelease(ctx)
+				if !ok {
+					return
+				}
+			} else {
+				completedAt = m.semanticHeartbeatNow()
+			}
+			select {
+			case auditDone <- completedAt:
+			default:
+			}
+		}(auditCtx, term)
+		return true
+	}
 	defer func() {
 		stopTimer()
 		stopTerm()
@@ -198,39 +258,13 @@ func (m *Manager) runSemanticHeartbeat(ctx context.Context) {
 			if m.heartbeatConfigGeneration.Load() != m.heartbeatAppliedGeneration.Load() {
 				configure()
 			}
+		case request := <-m.heartbeatManual:
+			request.result <- startAudit()
 		case <-ticks:
 			if !armed || auditActive {
 				continue
 			}
-			m.heartbeatCommit.Lock()
-			if m.heartbeatTerm != term || !m.orchestratorEnabled.Load() || m.heartbeatMinutes.Load() <= 0 {
-				m.heartbeatCommit.Unlock()
-				stopTimer()
-				continue
-			}
-			stopTimer()
-			m.setSemanticHeartbeatScheduleForTerm(true, time.Time{}, term)
-			auditActive = true
-			m.jobs.Add(1)
-			go func(runCtx context.Context, runTerm uint64) {
-				defer m.jobs.Done()
-				providerStarted := m.runSemanticHeartbeatOnceForTerm(runCtx, runTerm)
-				completedAt := time.Time{}
-				if providerStarted {
-					var ok bool
-					completedAt, ok = m.waitForSemanticHeartbeatProviderRelease(ctx)
-					if !ok {
-						return
-					}
-				} else {
-					completedAt = m.semanticHeartbeatNow()
-				}
-				select {
-				case auditDone <- completedAt:
-				default:
-				}
-			}(auditCtx, term)
-			m.heartbeatCommit.Unlock()
+			_ = startAudit()
 		case completedAt := <-auditDone:
 			auditActive = false
 			if termActive && m.orchestratorEnabled.Load() && m.heartbeatMinutes.Load() > 0 {

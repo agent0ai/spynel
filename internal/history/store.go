@@ -44,6 +44,12 @@ type Conversation struct {
 	Preview      string
 }
 
+type CleanupResult struct {
+	Removed   int
+	Protected int
+	Failed    int
+}
+
 type Store struct {
 	root string
 	mu   sync.Mutex
@@ -93,6 +99,25 @@ func (s *Store) Append(channel, conversation string, entry Entry) (string, error
 		return "", err
 	}
 	return path, file.Sync()
+}
+
+// Ensure creates an empty durable conversation without adding a synthetic
+// message. It is used when a UI switches identity before the first user turn.
+func (s *Store) Ensure(channel, conversation string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if os.IsExist(err) {
+		return path, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return path, file.Close()
 }
 
 func (s *Store) DeliveryState(channel, conversation, eventID string) (string, error) {
@@ -577,6 +602,77 @@ func (s *Store) Clear(channel, conversation string) error {
 		return nil
 	}
 	return err
+}
+
+// RemoveOlderThan removes durable conversations whose last valid entry time
+// (falling back to file modification time for empty histories) is strictly
+// before cutoff. Protected keys use "channel\x00conversation".
+func (s *Store) RemoveOlderThan(cutoff time.Time, protected map[string]bool) CleanupResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := CleanupResult{}
+	rootInfo, err := os.Lstat(s.root)
+	if os.IsNotExist(err) {
+		return result
+	}
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		result.Failed++
+		return result
+	}
+	channels, err := os.ReadDir(s.root)
+	if os.IsNotExist(err) {
+		return result
+	}
+	if err != nil {
+		result.Failed++
+		return result
+	}
+	for _, channelEntry := range channels {
+		if !channelEntry.IsDir() {
+			continue
+		}
+		channelName := channelEntry.Name()
+		directory := filepath.Join(s.root, channelName)
+		files, err := os.ReadDir(directory)
+		if err != nil {
+			result.Failed++
+			continue
+		}
+		for _, entry := range files {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".jsonl" {
+				continue
+			}
+			conversation := strings.TrimSuffix(entry.Name(), ".jsonl")
+			if protected[channelName+"\x00"+conversation] {
+				result.Protected++
+				continue
+			}
+			path := filepath.Join(directory, entry.Name())
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() {
+				result.Failed++
+				continue
+			}
+			updated := info.ModTime()
+			recent, err := readRecentEntries(path, 1, 4096)
+			if err != nil {
+				result.Failed++
+				continue
+			}
+			if len(recent) > 0 && !recent[0].At.IsZero() {
+				updated = recent[0].At
+			}
+			if !updated.Before(cutoff) {
+				continue
+			}
+			if err := os.Remove(path); err != nil {
+				result.Failed++
+				continue
+			}
+			result.Removed++
+		}
+	}
+	return result
 }
 
 func readEntries(path string) ([]Entry, error) {

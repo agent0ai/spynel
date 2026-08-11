@@ -23,6 +23,7 @@ This directory is durable state owned jointly by the user, Spynel, and dispatche
 
 - `config.yaml` owns validated user configuration for the workspace.
 - `tasks/` owns finite work items and their queue, claim, review, waiting, and terminal folders.
+- `tasks/archive/` is cold retention history: cleanup alone moves old terminal tasks there unchanged, and ordinary dispatch, review, recovery, status, notification, and goal-settlement workflows exclude it.
 - `goals/` owns proposed, planning, active, review, waiting, and terminal long-term outcomes.
 - `prompts/` owns user-overridable channel, slash-command creation, task implementation/review, goal planning/review, recovery, notification, and semantic-heartbeat lead messages.
 - `instructions/` owns persistent, workspace-scoped standing behavior for the five agent roles.

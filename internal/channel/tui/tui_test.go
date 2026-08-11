@@ -1754,6 +1754,53 @@ func TestHeaderShowsRuntimeStatusAndFooterOnlyShowsControls(t *testing.T) {
 	}
 }
 
+func TestHeaderShowsMeaningfulBuildVersionAsFinalOptionalItem(t *testing.T) {
+	m := testModel()
+	m.width = 120
+	m.version = headerVersion("1.2.3-beta.1+build.7")
+	header := ansi.Strip(strings.Split(m.View(), "\n")[0])
+	if strings.Count(header, "v1.2.3-beta.1+build.7") != 1 || !strings.HasSuffix(header, "v1.2.3-beta.1+build.7▀▀") {
+		t.Fatalf("build version is not the final unique header item: %q", header)
+	}
+
+	for _, value := range []string{"", "dev", "unknown", "v", "1.2", "version 1.2.3", "1.2.3-", "1.2.3-alpha..1"} {
+		m.version = headerVersion(value)
+		if m.version != "" {
+			t.Fatalf("non-meaningful build version %q normalized to %q", value, m.version)
+		}
+		if header := ansi.Strip(strings.Split(m.View(), "\n")[0]); strings.Contains(header, "dev") || strings.Contains(header, "unknown") || strings.Contains(header, "version ") {
+			t.Fatalf("non-meaningful build version %q leaked into header: %q", value, header)
+		}
+	}
+	if got := headerVersion("v2.3.4"); got != "v2.3.4" {
+		t.Fatalf("prefixed build version = %q, want v2.3.4", got)
+	}
+}
+
+func TestWelcomeScreenCanSwitchToDistinctConversation(t *testing.T) {
+	m := testModel()
+	m.conversation = "prior"
+	m.transcript = []transcriptEntry{{role: "assistant", text: "old"}}
+	m.openScreen(core.Screen{ID: "welcome", Conversation: "new-12345678", Title: "Welcome"})
+	if m.conversation != "new-12345678" || m.welcome == nil || len(m.transcript) != 0 || m.working {
+		t.Fatalf("new welcome state = conversation=%q welcome=%#v transcript=%#v working=%v", m.conversation, m.welcome, m.transcript, m.working)
+	}
+}
+
+func TestHeaderOmitsBuildVersionBeforeDisplacingStatusOnNarrowRows(t *testing.T) {
+	m := testModel()
+	m.width = 42
+	m.title = "Workspace"
+	m.version = headerVersion("123.456.789")
+	header := ansi.Strip(strings.Split(m.View(), "\n")[0])
+	if strings.Contains(header, "123.456.789") {
+		t.Fatalf("narrow header retained low-priority build version: %q", header)
+	}
+	if width := lipgloss.Width(header); width > m.width {
+		t.Fatalf("narrow header width = %d, want <= %d: %q", width, m.width, header)
+	}
+}
+
 func TestHeaderKeepsLogoAndTitleAccent(t *testing.T) {
 	styles := stylesFor(theme.Default())
 	if got, want := styles.title.GetForeground(), lipgloss.Color(theme.Default().Colors.Primary); got != want {

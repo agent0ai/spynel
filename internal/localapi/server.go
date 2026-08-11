@@ -37,9 +37,10 @@ type streamEnvelope struct {
 }
 
 type screenActionRequest struct {
-	ScreenID string            `json:"screen_id"`
-	Action   string            `json:"action"`
-	Values   map[string]string `json:"values"`
+	InstanceID string            `json:"instance_id"`
+	ScreenID   string            `json:"screen_id"`
+	Action     string            `json:"action"`
+	Values     map[string]string `json:"values"`
 }
 
 type screenResponse struct {
@@ -68,11 +69,19 @@ type diagnosticRequest struct {
 	Event   string `json:"event"`
 	Message string `json:"message"`
 }
+type liveTUIRequest struct {
+	InstanceID   string `json:"instance_id"`
+	Conversation string `json:"conversation"`
+}
 
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if s.Service == nil || s.Token == "" {
 		return errors.New("local API requires a service and token")
 	}
+	// The owner may have spent an unbounded interval starting its harness and
+	// channels after election. Anchor the cleanup fence to the point when live
+	// TUI clients can actually renew, before accepting any request.
+	s.Service.FenceCleanupForLiveTUIReadmission()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", s.authorize(s.health))
 	mux.HandleFunc("GET /v1/state", s.authorize(s.state))
@@ -85,6 +94,8 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	mux.HandleFunc("POST /v1/notify", s.authorize(s.notify))
 	mux.HandleFunc("POST /v1/notification-ack", s.authorize(s.notificationAck))
 	mux.HandleFunc("POST /v1/diagnostic", s.authorize(s.diagnostic))
+	mux.HandleFunc("POST /v1/tui-live", s.authorize(s.liveTUI))
+	mux.HandleFunc("DELETE /v1/tui-live", s.authorize(s.liveTUI))
 	serverContext, cancelServer := context.WithCancel(ctx)
 	defer cancelServer()
 	server := &http.Server{
@@ -112,6 +123,24 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) liveTUI(response http.ResponseWriter, request *http.Request) {
+	var input liveTUIRequest
+	if err := decodeJSON(request.Body, &input); err != nil {
+		http.Error(response, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if request.Method == http.MethodDelete {
+		s.Service.UnregisterLiveTUI(input.InstanceID)
+		response.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := s.Service.RegisterLiveTUI(input.InstanceID, input.Conversation, time.Now().UTC()); err != nil {
+		http.Error(response, err.Error(), http.StatusBadRequest)
+		return
+	}
+	response.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) diagnostic(response http.ResponseWriter, request *http.Request) {
@@ -240,11 +269,20 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 		http.Error(response, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if message.Channel == "tui" {
+		if err := s.Service.RegisterLiveTUI(message.InstanceID, message.Conversation, time.Now().UTC()); err != nil {
+			http.Error(response, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	response.Header().Set("Content-Type", "application/x-ndjson")
 	response.Header().Set("X-Content-Type-Options", "nosniff")
 	flusher, _ := response.(http.Flusher)
 	events := make(chan core.Event, 256)
 	emit := func(event core.Event) {
+		if message.Channel == "tui" && event.Screen != nil && event.Screen.Conversation != "" {
+			_ = s.Service.RegisterLiveTUI(message.InstanceID, event.Screen.Conversation, time.Now().UTC())
+		}
 		select {
 		case events <- event:
 		case <-request.Context().Done():
@@ -303,7 +341,7 @@ func (s *Server) screenAction(response http.ResponseWriter, request *http.Reques
 		http.Error(response, err.Error(), http.StatusBadRequest)
 		return
 	}
-	screen, err := s.Service.ScreenAction(request.Context(), input.ScreenID, input.Action, input.Values)
+	screen, err := s.Service.ScreenActionForInstance(request.Context(), input.InstanceID, input.ScreenID, input.Action, input.Values)
 	if err != nil {
 		writeError(response, err)
 		return

@@ -271,7 +271,7 @@ func TestRenderedChatPromptIncludesFrameworkTranscriptionGuidanceOnceWithPreserv
 	}
 }
 
-func TestChatAgentPrefixAppliesToOrdinaryAndExplicitSteerMessages(t *testing.T) {
+func TestChatAgentPrefixAppliesToOrdinaryActiveTurnFollowups(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
@@ -292,18 +292,18 @@ func TestChatAgentPrefixAppliesToOrdinaryAndExplicitSteerMessages(t *testing.T) 
 	if got := target.prompts[key][0]; !strings.HasPrefix(got, "/ultrathink ") || !strings.Contains(got, "Configured task review mode: skip-trivial") || !strings.Contains(got, "ordinary chat rule") {
 		t.Fatalf("ordinary chat prompt = %q", got)
 	}
-	if err := os.WriteFile(instructionPath, []byte("fresh steer chat rule"), 0o600); err != nil {
+	if err := os.WriteFile(instructionPath, []byte("fresh followup chat rule"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	target.mu.Lock()
 	target.active[key] = true
 	target.mu.Unlock()
-	message.Text = "/steer follow up"
+	message.Text = "follow up"
 	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
 		t.Fatal(err)
 	}
-	if got := target.prompts[key][1]; !strings.HasPrefix(got, "/ultrathink follow up\n\n") || !strings.Contains(got, "Configured task review mode: skip-trivial") || !strings.Contains(got, "the chat agent from .spynel/instructions/agent-chat.md") || !strings.Contains(got, "fresh steer chat rule") || strings.Contains(got, "ordinary chat rule") || !strings.HasSuffix(got, "The precedence stated above still applies to every imported rule.") {
-		t.Fatalf("steer prompt = %q", got)
+	if got := target.prompts[key][1]; !strings.HasPrefix(got, "/ultrathink ") || !strings.Contains(got, "user: follow up") || !strings.Contains(got, "Configured task review mode: skip-trivial") || !strings.Contains(got, "the chat agent from .spynel/instructions/agent-chat.md") || !strings.Contains(got, "fresh followup chat rule") || strings.Contains(got, "ordinary chat rule") || !strings.HasSuffix(got, "The precedence stated above still applies to every imported rule.") {
+		t.Fatalf("followup prompt = %q", got)
 	}
 }
 
@@ -837,7 +837,8 @@ func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
 	statusFound := false
 	tasksFound := false
 	goalsFound := false
-	for _, command := range commands {
+	jobsIndex, firstJobIndex, lastJobIndex, tasksIndex := -1, -1, -1, -1
+	for index, command := range commands {
 		if !strings.Contains(commandHelp, command.Usage) || !strings.Contains(commandHelp, command.Description) {
 			t.Fatalf("command help does not contain %#v", command)
 		}
@@ -849,6 +850,19 @@ func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
 		}
 		if command.Value == "/tasks" {
 			tasksFound = true
+			tasksIndex = index
+		}
+		if command.Value == "/jobs" {
+			jobsIndex = index
+		}
+		if strings.HasPrefix(command.Value, "/job ") {
+			if firstJobIndex < 0 {
+				firstJobIndex = index
+			}
+			lastJobIndex = index
+		}
+		if command.Value == "/steer " || command.Value == "/run" {
+			t.Fatalf("retired command remains public: %#v", command)
 		}
 		if command.Value == "/goals" {
 			goalsFound = true
@@ -863,11 +877,51 @@ func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
 	if !tasksFound || !goalsFound {
 		t.Fatalf("slash command catalog is missing base durable-work commands: tasks=%v goals=%v", tasksFound, goalsFound)
 	}
+	if firstJobIndex != jobsIndex+1 || tasksIndex != lastJobIndex+1 {
+		t.Fatalf("job command block is not directly after /jobs: jobs=%d first=%d last=%d tasks=%d", jobsIndex, firstJobIndex, lastJobIndex, tasksIndex)
+	}
 
 	original := commands[0].Value
 	commands[0].Value = "/mutated"
 	if SlashCommands()[0].Value != original {
 		t.Fatal("SlashCommands returned mutable catalog storage")
+	}
+}
+
+func TestTriggerCommandListsProcessesAndReportsClearUnavailableOutcomes(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	service := New(cfg, newServiceHarness())
+	run := func(command string) string {
+		var response core.Event
+		if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "triggers", Text: command}, func(event core.Event) { response = event }); err != nil {
+			t.Fatal(err)
+		}
+		return response.Text
+	}
+	if got := run("/trigger"); !strings.Contains(got, "`orchestrator`") || !strings.Contains(got, "`heartbeat`") {
+		t.Fatalf("trigger list = %q", got)
+	}
+	if got := run("/trigger unknown"); !strings.Contains(got, "Unknown triggerable process") {
+		t.Fatalf("unknown trigger = %q", got)
+	}
+	if got := run("/trigger orchestrator"); !strings.Contains(got, "not the elected primary") {
+		t.Fatalf("offline orchestrator = %q", got)
+	}
+	if got := run("/trigger heartbeat"); !strings.Contains(got, "unavailable") {
+		t.Fatalf("offline heartbeat = %q", got)
+	}
+	cfg.Orchestrator.SemanticHeartbeatMinutes = 0
+	disabled := New(cfg, newServiceHarness())
+	var response core.Event
+	if err := disabled.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "triggers", Text: "/trigger heartbeat"}, func(event core.Event) { response = event }); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(response.Text, "disabled") {
+		t.Fatalf("disabled heartbeat = %q", response.Text)
 	}
 }
 
@@ -2668,6 +2722,39 @@ func TestWelcomeScreenIsAutomaticOnceAndCommandPrintsAChannelAppropriateMessage(
 		if response.Kind != core.EventFinal || !response.Done || !response.Local || !strings.Contains(response.Text, "**Spynel**") || !strings.Contains(response.Text, "**Spy**") || !strings.Contains(response.Text, "`/help`") || strings.Contains(response.Text, core.SpynelASCII) || strings.Contains(response.Text, "`/config`") || strings.Contains(response.Text, "`/telegram`") || strings.Contains(response.Text, "`/whatsapp`") || strings.Contains(response.Text, "Heads up") {
 			t.Fatalf("%s welcome = %#v", channelName, response)
 		}
+	}
+}
+
+func TestNewCommandCreatesDistinctTUIConversationAndPreservesPriorHistory(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	service := New(cfg, newServiceHarness())
+	if _, err := service.History.Append("tui", "prior", history.Entry{Role: "assistant", Content: "keep this"}); err != nil {
+		t.Fatal(err)
+	}
+	var response core.Event
+	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "prior", Text: "/new"}, func(event core.Event) { response = event }); err != nil {
+		t.Fatal(err)
+	}
+	if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != "welcome" || !strings.HasPrefix(response.Screen.Conversation, "new-") || response.Screen.Conversation == "prior" {
+		t.Fatalf("new conversation response = %#v", response)
+	}
+	if _, err := os.Stat(service.History.Path("tui", response.Screen.Conversation)); err != nil {
+		t.Fatalf("new conversation was not made durable: %v", err)
+	}
+	entries, _, err := service.History.RecentEntries("tui", "prior", 10, 1000)
+	if err != nil || len(entries) != 2 || entries[0].Content != "keep this" || entries[1].Content != "/new" {
+		t.Fatalf("prior history changed: %#v, %v", entries, err)
+	}
+	response = core.Event{}
+	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "TG-7", Text: "/new"}, func(event core.Event) { response = event }); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(response.Text, "available in the TUI") {
+		t.Fatalf("remote /new response = %#v", response)
 	}
 }
 

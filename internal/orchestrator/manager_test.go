@@ -725,3 +725,39 @@ func TestTransportOnlyDoneStatusDoesNotEndOrchestratorProviderTurn(t *testing.T)
 		t.Fatalf("transport-only done changed lease state to %q", leases[0].State)
 	}
 }
+
+func TestAutomaticCleanupRunsOnlyForPrimaryAndUsesLiveRetention(t *testing.T) {
+	cfg := config.Default()
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+	ticks := make(chan time.Time, 3)
+	manager.cleanupTicks = ticks
+	called := make(chan int, 1)
+	manager.Cleanup = func(_ context.Context, days int) (string, error) {
+		called <- days
+		return "complete", nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { manager.runAutomaticCleanup(ctx); close(done) }()
+	ticks <- time.Now()
+	select {
+	case days := <-called:
+		t.Fatalf("secondary ran automatic cleanup with %d days", days)
+	case <-time.After(20 * time.Millisecond):
+	}
+	manager.SetPrimaryOwned(true)
+	next := cfg
+	next.Workspace.CleanupRetentionDays = 45
+	manager.ApplyRuntimeConfig(next)
+	ticks <- time.Now()
+	select {
+	case days := <-called:
+		if days != 45 {
+			t.Fatalf("automatic cleanup retention = %d, want 45", days)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("primary did not run automatic cleanup")
+	}
+	cancel()
+	<-done
+}

@@ -4,10 +4,11 @@ const assert = require("assert");
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
+const stream = require("stream");
 const { resolve } = require("./platform");
 const { install, validateArchiveEntries, validateExtractedTree } = require("./install");
 const { prepareRelease, releaseMetadata, rewriteReadme } = require("./prepare-release");
-const { checkForUpdate, compareVersions, shouldCheckAtStartup } = require("./update");
+const { STARTUP_PROMPT_TIMEOUT_MS, checkForUpdate, compareVersions, promptForStartupUpdate, shouldCheckAtStartup } = require("./update");
 const pkg = require("../package.json");
 
 assert.deepStrictEqual(resolve("linux", "x64"), { os: "linux", arch: "amd64", ext: "tar.gz" });
@@ -80,6 +81,7 @@ assert.strictEqual(shouldCheckAtStartup(["serve", "--automatic-startup"], { isTT
 assert.strictEqual(shouldCheckAtStartup(["version"], { isTTY: true }, { isTTY: true }, {}), false);
 assert.strictEqual(shouldCheckAtStartup([], { isTTY: true }, { isTTY: true }, {}), true);
 assert.strictEqual(shouldCheckAtStartup([], { isTTY: false }, { isTTY: true }, {}), false);
+assert.strictEqual(STARTUP_PROMPT_TIMEOUT_MS, 10_000);
 
 async function listen(server) {
   await new Promise((accept, reject) => {
@@ -121,6 +123,67 @@ async function main() {
   } finally {
     await close(stalled);
   }
+
+  const update = { current: "0.4.0", latest: "0.5.0", available: true };
+  const prompt = async (answer, options = {}) => {
+    const { answerDelayMs = 0, ...promptOptions } = options;
+    const input = new stream.PassThrough();
+    const output = new stream.PassThrough();
+    input.isTTY = true;
+    output.isTTY = true;
+    output.columns = 100;
+    let rendered = "";
+    output.on("data", chunk => { rendered += chunk.toString("utf8"); });
+    const result = promptForStartupUpdate(update, {
+      input,
+      output,
+      environment: { TERM: "dumb" },
+      timeoutMs: 100,
+      tickMs: 5,
+      countdownUnitMs: 10,
+      ...promptOptions,
+    });
+    if (answer !== null) setTimeout(() => input.write(`${answer}\n`), answerDelayMs);
+    return { accepted: await result, rendered };
+  };
+  assert.strictEqual((await prompt("yes")).accepted, true);
+  assert.strictEqual((await prompt("n")).accepted, false);
+  assert.strictEqual((await prompt("unrelated input")).accepted, false);
+  const timedOut = await prompt(null);
+  assert.strictEqual(timedOut.accepted, false);
+  assert(timedOut.rendered.startsWith("\n⬆️  New version 0.5.0 available — current is 0.4.0\n"));
+  assert(timedOut.rendered.includes("Update now? [Y]es / [N]o"));
+  assert(timedOut.rendered.includes("skipping in 10…"));
+  assert(timedOut.rendered.includes("skipping in 9…"));
+  assert(timedOut.rendered.includes("timed out; skipping."));
+  const partialInput = new stream.PassThrough();
+  const partialOutput = new stream.PassThrough();
+  partialInput.isTTY = true;
+  partialOutput.isTTY = true;
+  partialOutput.columns = 100;
+  let partialRendered = "";
+  partialOutput.on("data", chunk => { partialRendered += chunk.toString("utf8"); });
+  const partialResult = promptForStartupUpdate(update, {
+    input: partialInput,
+    output: partialOutput,
+    environment: { TERM: "xterm" },
+    timeoutMs: 100,
+    tickMs: 5,
+    countdownUnitMs: 10,
+  });
+  setTimeout(() => partialInput.write("x"), 5);
+  assert.strictEqual(await partialResult, false);
+  assert(partialRendered.includes("skipping in 9…"));
+  assert(partialRendered.includes("skipping in 1…"));
+  assert(partialRendered.endsWith("timed out; skipping.\x1b[22m\n"));
+  assert.strictEqual((await prompt("yes", { answerDelayMs: 120 })).accepted, false);
+  const styledPrompt = await prompt("no", { environment: { TERM: "xterm" }, cursorControl: false });
+  assert(styledPrompt.rendered.includes("\x1b[1mUpdate now\x1b[22m"));
+  assert(styledPrompt.rendered.includes("\x1b[2mskipping in 10…\x1b[22m"));
+  assert.strictEqual(await promptForStartupUpdate(update, {
+    input: { isTTY: false },
+    output: { isTTY: true },
+  }), false);
   console.log("npm launcher, update check, and native target mapping are valid");
 }
 

@@ -15,7 +15,7 @@
 - Bound archive and checksum downloads, refuse secure-to-insecure redirects, verify release checksums, reject absolute or traversal archive paths, and reject links, special files, oversized trees, or excessive entry counts after extraction.
 - Do not run the Go program during package installation.
 - Extract and validate downloads in sibling staging state, then replace `npm/vendor/` as one directory so a failed install retains the prior runtime whenever npm itself permits rollback.
-- Proactive registry checks have a ten-second total deadline and run only before interactive TUI starts. Skip them for plain commands and `--automatic-startup`; never let registry failure prevent Spynel from starting.
+- Proactive registry checks have a ten-second total deadline and run only before interactive TUI starts. When an update is found, present the available/current versions and an explicit styled yes/no offer with a live ten-second countdown; timeout, EOF, interruption, and unrelated answers skip safely. Skip checks and prompts for noninteractive starts, plain commands, and `--automatic-startup`; never let registry failure prevent Spynel from starting.
 - The launcher supervises explicit update requests from the Go process, runs the appropriate local or global `npm update` only after that executable exits, and starts the resulting binary with npm installation metadata in its environment.
 
 ## Child DOX Index

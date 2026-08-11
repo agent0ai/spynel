@@ -69,6 +69,9 @@ func TestDefaultIsValidAndRoutesAreExtensible(t *testing.T) {
 	if cfg.Orchestrator.SemanticHeartbeatMinutes != 15 {
 		t.Fatalf("semantic heartbeat default = %d, want 15", cfg.Orchestrator.SemanticHeartbeatMinutes)
 	}
+	if cfg.Workspace.CleanupRetentionDays != 30 {
+		t.Fatalf("cleanup retention default = %d, want 30", cfg.Workspace.CleanupRetentionDays)
+	}
 	if got := strings.Join(cfg.Orchestrator.Routes[0].AllowedNext, ","); got != "todo,working,review,reviewing,waiting,done,failed,cancelled" {
 		t.Fatalf("task workflow statuses = %q", got)
 	}
@@ -139,6 +142,16 @@ func TestSemanticHeartbeatValidationSupportsExplicitDisable(t *testing.T) {
 		cfg.Orchestrator.SemanticHeartbeatMinutes = invalid
 		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "semantic_heartbeat_minutes") {
 			t.Fatalf("invalid semantic heartbeat %d produced %v", invalid, err)
+		}
+	}
+}
+
+func TestCleanupRetentionValidationRequiresBoundedPositiveWholeDays(t *testing.T) {
+	for _, invalid := range []int{-1, 0, 36501} {
+		cfg := Default()
+		cfg.Workspace.CleanupRetentionDays = invalid
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "cleanup_retention_days") {
+			t.Fatalf("invalid cleanup retention %d produced %v", invalid, err)
 		}
 	}
 }

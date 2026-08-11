@@ -99,6 +99,17 @@ func decodeConversation(value string) (string, string, error) {
 }
 
 func (s *Service) ScreenAction(ctx context.Context, screenID, action string, values map[string]string) (*core.Screen, error) {
+	return s.screenAction(ctx, "", screenID, action, values)
+}
+
+// ScreenActionForInstance admits conversation-changing actions for one
+// authenticated TUI instance. Resume branch creation and live registration
+// share cleanup's mutex so the branch cannot be deleted before it is exposed.
+func (s *Service) ScreenActionForInstance(ctx context.Context, instanceID, screenID, action string, values map[string]string) (*core.Screen, error) {
+	return s.screenAction(ctx, instanceID, screenID, action, values)
+}
+
+func (s *Service) screenAction(ctx context.Context, instanceID, screenID, action string, values map[string]string) (*core.Screen, error) {
 	if screen, handled, err := s.configurationScreenAction(ctx, screenID, action, values); handled {
 		return screen, err
 	}
@@ -106,6 +117,13 @@ func (s *Service) ScreenAction(ctx context.Context, screenID, action string, val
 		return screen, err
 	}
 	if screenID == "resume" && strings.HasPrefix(action, "resume:") {
+		if instanceID != "" {
+			if err := validateLiveTUIIdentity(instanceID, "pending-resume"); err != nil {
+				return nil, err
+			}
+			s.liveTUIMu.Lock()
+			defer s.liveTUIMu.Unlock()
+		}
 		channelName, conversation, err := decodeConversation(strings.TrimPrefix(action, "resume:"))
 		if err != nil {
 			return nil, err
@@ -113,6 +131,12 @@ func (s *Service) ScreenAction(ctx context.Context, screenID, action string, val
 		branch, path, err := s.History.Branch(channelName, conversation)
 		if err != nil {
 			return nil, err
+		}
+		if instanceID != "" {
+			if s.resumeAdmissionStep != nil {
+				s.resumeAdmissionStep("branched")
+			}
+			s.registerLiveTUILocked(instanceID, branch, time.Now().UTC())
 		}
 		entries, _, err := s.History.RecentEntries("tui", branch, resumeDisplayMessages, resumeDisplayCharacter)
 		if err != nil {

@@ -10,6 +10,7 @@
 - Embed current workflow templates from `templates/` as source of truth for new workspaces. General compatibility migrations and retired asset fixtures do not belong in this package. Upgrade makes one narrow validated atomic exception to remove the retired TUI launch preference; current-schema configurations remain untouched.
 - Delegate built-in palette assets to `internal/theme`; workspace initialization only asks that package to materialize editable copies.
 - Automatically managed speech models live in the operating-system user cache, not the workspace.
+- Create `.spynel/tasks/archive` as cold history without adding it to configured routes or ordinary workflow status sets.
 
 ## Child DOX Index
 

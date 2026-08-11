@@ -19,6 +19,7 @@ import (
 	"github.com/agent0ai/spynel/internal/app"
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/shortid"
 )
@@ -179,6 +180,12 @@ func TestClientStreamsIndependentTUIConversationsThroughOwner(t *testing.T) {
 		_ = election.Release(lease.Token)
 	}()
 	client := NewClient(election)
+	if err := client.RegisterLiveTUI(context.Background(), "idle-live"); err != nil {
+		t.Fatalf("register live TUI: %v", err)
+	}
+	if err := client.UnregisterLiveTUI(context.Background()); err != nil {
+		t.Fatalf("unregister live TUI: %v", err)
+	}
 
 	conversations := []string{"local-primary", "local-secondary"}
 	var wait sync.WaitGroup
@@ -219,6 +226,53 @@ func TestClientStreamsIndependentTUIConversationsThroughOwner(t *testing.T) {
 		t.Fatalf("shared state = %#v", stateSnapshot)
 	}
 	_ = server
+}
+
+func TestResumeScreenActionRegistersBranchThroughOwner(t *testing.T) {
+	state := t.TempDir()
+	election, server, _, cancel, done := startTestServer(t, state)
+	defer func() {
+		cancel()
+		<-done
+		lease, _ := election.Current()
+		_ = election.Release(lease.Token)
+	}()
+	client := NewClient(election)
+	old := time.Now().UTC().Add(-8 * 24 * time.Hour)
+	if _, err := server.Service.History.Append("telegram", "old-source", history.Entry{At: old, Role: "assistant", Content: "old answer"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var picker core.Event
+	if err := client.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "picker", Text: "/resume"}, func(event core.Event) {
+		picker = event
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if picker.Screen == nil {
+		t.Fatalf("resume picker = %#v", picker)
+	}
+	var action string
+	for _, control := range picker.Screen.Controls {
+		if strings.Contains(control.Value, "old-source") {
+			action = control.Key
+			break
+		}
+	}
+	if action == "" {
+		t.Fatalf("old source missing from picker: %#v", picker.Screen.Controls)
+	}
+	chat, err := client.ScreenAction(context.Background(), "resume", action, nil)
+	if err != nil || chat == nil || chat.Conversation == "" {
+		t.Fatalf("resume action = %#v, %v", chat, err)
+	}
+
+	if err := client.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "cleanup-invoker", Text: "/cleanup 7"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(server.Service.History.Path("tui", chat.Conversation)); err != nil {
+		t.Fatalf("owner-admitted resume branch was removed: %v", err)
+	}
 }
 
 func TestServerRejectsMissingToken(t *testing.T) {

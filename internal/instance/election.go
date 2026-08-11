@@ -23,6 +23,7 @@ const (
 	StaleAfter            = 30 * time.Second
 	RetryInterval         = time.Second
 	HandoffTimeout        = 10 * time.Second
+	OwnerlessCleanupGrace = time.Minute
 	environmentTokenBytes = 32
 )
 
@@ -45,12 +46,17 @@ type Lease struct {
 // operating-system file lock. The lease itself is never held open, so another
 // process can replace a stale owner even when that owner is alive but stalled.
 type Election struct {
-	leasePath     string
-	lockPath      string
-	id            string
-	pid           int
-	now           func() time.Time
-	environmentID string
+	leasePath        string
+	releaseFencePath string
+	lockPath         string
+	id               string
+	pid              int
+	now              func() time.Time
+	environmentID    string
+}
+
+type releaseFence struct {
+	ReleasedAt time.Time `json:"released_at"`
 }
 
 func New(stateDirectory string) (*Election, error) {
@@ -74,12 +80,13 @@ func NewWithEnvironmentID(stateDirectory, environmentID string) (*Election, erro
 	}
 	runtimeDirectory := filepath.Join(stateDirectory, "runtime")
 	return &Election{
-		leasePath:     filepath.Join(runtimeDirectory, "primary.json"),
-		lockPath:      filepath.Join(runtimeDirectory, "primary.lock"),
-		id:            id,
-		pid:           os.Getpid(),
-		now:           func() time.Time { return time.Now().UTC() },
-		environmentID: environmentID,
+		leasePath:        filepath.Join(runtimeDirectory, "primary.json"),
+		releaseFencePath: filepath.Join(runtimeDirectory, "primary-release.json"),
+		lockPath:         filepath.Join(runtimeDirectory, "primary.lock"),
+		id:               id,
+		pid:              os.Getpid(),
+		now:              func() time.Time { return time.Now().UTC() },
+		environmentID:    environmentID,
 	}, nil
 }
 
@@ -273,8 +280,11 @@ func (e *Election) Handoff(token, targetID string) (Lease, bool, error) {
 	return result, handedOff, err
 }
 
-// Release removes only this exact ownership term. It is safe to call after a
-// takeover because it cannot delete the successor's record.
+// Release removes only this exact ownership term. It first records a durable
+// transition fence so destructive ownerless work cannot enter the short gap
+// before an already-running secondary publishes and rebuilds live-client
+// protection. It is safe to call after a takeover because it cannot delete the
+// successor's record.
 func (e *Election) Release(token string) error {
 	return e.withLock(func() error {
 		current, err := e.readLease()
@@ -286,6 +296,9 @@ func (e *Election) Release(token string) error {
 		}
 		if current.InstanceID != e.id || current.Token != token {
 			return nil
+		}
+		if err := e.writeReleaseFence(e.now()); err != nil {
+			return fmt.Errorf("persist primary release fence: %w", err)
 		}
 		if err := os.Remove(e.leasePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -304,6 +317,41 @@ func (e *Election) Current() (Lease, error) {
 }
 
 func (e *Election) IsStale(lease Lease) bool { return stale(lease, e.now()) }
+
+// RunWhileNoPrimaryLease holds the ownership mutation boundary while action
+// runs, but only when no primary lease exists at all. This is deliberately
+// stricter than takeover eligibility: destructive ownerless work must fail
+// closed around a stale or malformed lease and during the durable grace period
+// after a clean release because a former owner or an already-running secondary
+// may still have live-client state that is not represented by the current
+// process.
+//
+// Holding the election lock for the action prevents a new primary from being
+// published until the ownerless operation has finished. The returned boolean
+// reports whether action ran.
+func (e *Election) RunWhileNoPrimaryLease(action func() error) (bool, error) {
+	ran := false
+	err := e.withLock(func() error {
+		_, err := e.readLease()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect primary lease before ownerless operation: %w", err)
+		}
+		fence, fenceErr := e.readReleaseFence()
+		if fenceErr == nil {
+			if e.now().Before(fence.ReleasedAt.Add(OwnerlessCleanupGrace)) {
+				return nil
+			}
+		} else if !errors.Is(fenceErr, os.ErrNotExist) {
+			return fmt.Errorf("inspect primary release fence before ownerless operation: %w", fenceErr)
+		}
+		ran = true
+		return action()
+	})
+	return ran, err
+}
 
 // CanTakeOver reports whether this contender should attempt a serialized
 // acquisition now. Targeted handoffs bypass the ordinary stale wait; other
@@ -365,6 +413,29 @@ func (e *Election) writeLease(lease Lease) error {
 		return err
 	}
 	return fsx.AtomicWriteFile(e.leasePath, append(data, '\n'), 0o600)
+}
+
+func (e *Election) readReleaseFence() (releaseFence, error) {
+	data, err := os.ReadFile(e.releaseFencePath)
+	if err != nil {
+		return releaseFence{}, err
+	}
+	var fence releaseFence
+	if err := json.Unmarshal(data, &fence); err != nil {
+		return releaseFence{}, fmt.Errorf("decode primary release fence: %w", err)
+	}
+	if fence.ReleasedAt.IsZero() {
+		return releaseFence{}, errors.New("primary release fence is incomplete")
+	}
+	return fence, nil
+}
+
+func (e *Election) writeReleaseFence(releasedAt time.Time) error {
+	data, err := json.MarshalIndent(releaseFence{ReleasedAt: releasedAt.UTC()}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return fsx.AtomicWriteFile(e.releaseFencePath, append(data, '\n'), 0o600)
 }
 
 func randomHex(size int) (string, error) {

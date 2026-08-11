@@ -96,6 +96,8 @@ spynel command [--config PATH] [--conversation NAME] [--json] NAME [ARGUMENTS...
 
 `command` routes a non-visual slash command through the shared application handler. It joins the live owner when present; an offline framework command does not start a coding harness merely to read or mutate deterministic Spynel state. Common commands also have direct aliases:
 
+`/trigger` lists triggerable processes. `/trigger orchestrator` performs an immediate serialized route pass, while `/trigger heartbeat` starts the primary semantic audit only if one is not already active. `/cleanup [days]` runs safe retention with a seven-day default; it uses strict whole-day validation and reports removed conversations, archived terminal tasks, protected items, and failures. `/new` is TUI-only because it switches the active durable conversation identity and shows that new conversation's normal welcome screen; the prior conversation remains available through `/resume`.
+
 ```bash
 spynel jobs
 spynel tasks

@@ -1203,6 +1203,130 @@ func TestCLIJoinsWorkspaceOwnerAndStrictlySteersActiveConversation(t *testing.T)
 	}
 }
 
+func TestOwnerlessCLICleanupFencesConcurrentPrimaryStartup(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	old := time.Now().UTC().Add(-8 * 24 * time.Hour)
+	if _, err := service.History.Append("cli", "old-ownerless", history.Entry{At: old, Role: "assistant", Content: "old"}); err != nil {
+		t.Fatal(err)
+	}
+
+	inside := make(chan struct{})
+	allowCleanup := make(chan struct{})
+	cleanupDone := make(chan error, 1)
+	go func() {
+		ran, runErr := runOwnerlessCleanup(cfg, func() error {
+			close(inside)
+			<-allowCleanup
+			return runMessageWithOutput(context.Background(), service.Handle, "manual", "/cleanup 7", messageRunOptions{Output: &bytes.Buffer{}})
+		})
+		if runErr == nil && !ran {
+			runErr = errors.New("fallback cleanup did not run")
+		}
+		cleanupDone <- runErr
+	}()
+	<-inside
+
+	owner, err := instance.New(cfg.StatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := owner.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerDone := make(chan error, 1)
+	go func() {
+		_, acquired, acquireErr := owner.TryAcquire("127.0.0.1:10001", token)
+		if acquireErr == nil && !acquired {
+			acquireErr = errors.New("concurrent primary was not acquired")
+		}
+		ownerDone <- acquireErr
+	}()
+	select {
+	case err := <-ownerDone:
+		t.Fatalf("primary started before fallback cleanup completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowCleanup)
+	if err := <-cleanupDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(service.History.Path("cli", "old-ownerless")); !os.IsNotExist(err) {
+		t.Fatalf("eligible history remains after fenced cleanup: %v", err)
+	}
+	if err := <-ownerDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOwnerlessCLICleanupWaitsForIdleSecondaryAfterOwnerRelease(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := buildService(cfg, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	old := time.Now().UTC().Add(-8 * 24 * time.Hour)
+	if _, err := service.History.Append("tui", "idle-secondary", history.Entry{At: old, Role: "assistant", Content: "still open"}); err != nil {
+		t.Fatal(err)
+	}
+
+	owner, err := instance.New(cfg.StatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondary, err := instance.New(cfg.StatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerToken, _ := owner.NewToken()
+	if _, acquired, err := owner.TryAcquire("127.0.0.1:10001", ownerToken); err != nil || !acquired {
+		t.Fatalf("owner acquire = %t, %v", acquired, err)
+	}
+	if err := owner.Release(ownerToken); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupCalled := false
+	ran, err := runOwnerlessCleanup(cfg, func() error {
+		cleanupCalled = true
+		return runMessageWithOutput(context.Background(), service.Handle, "manual", "/cleanup 7", messageRunOptions{Output: &bytes.Buffer{}})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran || cleanupCalled {
+		t.Fatalf("fallback cleanup crossed owner-release gap: ran=%t called=%t", ran, cleanupCalled)
+	}
+	if _, err := os.Stat(service.History.Path("tui", "idle-secondary")); err != nil {
+		t.Fatalf("idle secondary history was removed: %v", err)
+	}
+
+	secondaryToken, _ := secondary.NewToken()
+	if _, acquired, err := secondary.TryAcquire("127.0.0.1:10002", secondaryToken); err != nil || !acquired {
+		t.Fatalf("secondary acquire = %t, %v", acquired, err)
+	}
+}
+
 func TestRunMessageCompletesWhenFollowUpReleasesItsEmitter(t *testing.T) {
 	handler := func(_ context.Context, _ core.Message, emit core.Emit) error {
 		emit(core.Event{Kind: core.EventStatus, Done: true})

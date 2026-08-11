@@ -2,6 +2,7 @@ package instance
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -358,6 +359,185 @@ func TestCurrentDoesNotWaitForElectionMutationLock(t *testing.T) {
 		locked = false
 		<-result
 		t.Fatal("lease discovery waited for the election mutation lock")
+	}
+}
+
+func TestOwnerlessOperationSerializesPrimaryPublication(t *testing.T) {
+	state := t.TempDir()
+	cleanup, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := owner.NewToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inside := make(chan struct{})
+	release := make(chan struct{})
+	cleanupDone := make(chan error, 1)
+	go func() {
+		ran, runErr := cleanup.RunWhileNoPrimaryLease(func() error {
+			close(inside)
+			<-release
+			return nil
+		})
+		if runErr == nil && !ran {
+			runErr = errors.New("ownerless operation did not run")
+		}
+		cleanupDone <- runErr
+	}()
+	<-inside
+
+	ownerDone := make(chan error, 1)
+	go func() {
+		_, acquired, acquireErr := owner.TryAcquire("127.0.0.1:10001", token)
+		if acquireErr == nil && !acquired {
+			acquireErr = errors.New("primary was not acquired")
+		}
+		ownerDone <- acquireErr
+	}()
+	select {
+	case err := <-ownerDone:
+		t.Fatalf("primary publication crossed ownerless operation: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	if err := <-cleanupDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-ownerDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOwnerlessOperationFailsClosedWhenAnyPrimaryLeaseExists(t *testing.T) {
+	state := t.TempDir()
+	owner, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	owner.now = func() time.Time { return start }
+	token, _ := owner.NewToken()
+	if _, acquired, err := owner.TryAcquire("127.0.0.1:10001", token); err != nil || !acquired {
+		t.Fatalf("acquire = %t, %v", acquired, err)
+	}
+	cleanup.now = func() time.Time { return start.Add(StaleAfter) }
+	called := false
+	ran, err := cleanup.RunWhileNoPrimaryLease(func() error {
+		called = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran || called {
+		t.Fatalf("ownerless operation ran beside stale lease: ran=%t called=%t", ran, called)
+	}
+}
+
+func TestOwnerlessOperationWaitsThroughCleanReleaseFailoverGap(t *testing.T) {
+	state := t.TempDir()
+	owner, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondary, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	owner.now = func() time.Time { return start }
+	secondary.now = func() time.Time { return start.Add(RetryInterval) }
+	cleanup.now = func() time.Time { return start.Add(RetryInterval / 2) }
+	token, _ := owner.NewToken()
+	if _, acquired, err := owner.TryAcquire("127.0.0.1:10001", token); err != nil || !acquired {
+		t.Fatalf("owner acquire = %t, %v", acquired, err)
+	}
+	if err := owner.Release(token); err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	ran, err := cleanup.RunWhileNoPrimaryLease(func() error {
+		called = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran || called {
+		t.Fatalf("ownerless operation crossed release failover gap: ran=%t called=%t", ran, called)
+	}
+
+	secondaryToken, _ := secondary.NewToken()
+	if _, acquired, err := secondary.TryAcquire("127.0.0.1:10002", secondaryToken); err != nil || !acquired {
+		t.Fatalf("secondary acquire = %t, %v", acquired, err)
+	}
+}
+
+func TestOwnerlessOperationRunsAfterCleanReleaseGraceExpires(t *testing.T) {
+	state := t.TempDir()
+	owner, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	owner.now = func() time.Time { return start }
+	token, _ := owner.NewToken()
+	if _, acquired, err := owner.TryAcquire("127.0.0.1:10001", token); err != nil || !acquired {
+		t.Fatalf("owner acquire = %t, %v", acquired, err)
+	}
+	if err := owner.Release(token); err != nil {
+		t.Fatal(err)
+	}
+	cleanup.now = func() time.Time { return start.Add(OwnerlessCleanupGrace) }
+	called := false
+	ran, err := cleanup.RunWhileNoPrimaryLease(func() error {
+		called = true
+		return nil
+	})
+	if err != nil || !ran || !called {
+		t.Fatalf("expired release fence = ran %t, called %t, err %v", ran, called, err)
+	}
+}
+
+func TestOwnerlessOperationFailsClosedForMalformedReleaseFence(t *testing.T) {
+	state := t.TempDir()
+	cleanup, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cleanup.releaseFencePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cleanup.releaseFencePath, []byte("not-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	ran, err := cleanup.RunWhileNoPrimaryLease(func() error {
+		called = true
+		return nil
+	})
+	if err == nil || ran || called {
+		t.Fatalf("malformed release fence = ran %t, called %t, err %v", ran, called, err)
 	}
 }
 

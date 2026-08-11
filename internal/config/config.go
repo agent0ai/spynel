@@ -47,9 +47,10 @@ type Config struct {
 }
 
 type Workspace struct {
-	HistoryMaxMessages int `yaml:"history_max_messages"`
-	HistoryCharLimit   int `yaml:"history_char_limit"`
-	AttachmentMaxMB    int `yaml:"attachment_max_mb"`
+	HistoryMaxMessages   int `yaml:"history_max_messages"`
+	HistoryCharLimit     int `yaml:"history_char_limit"`
+	AttachmentMaxMB      int `yaml:"attachment_max_mb"`
+	CleanupRetentionDays int `yaml:"cleanup_retention_days"`
 }
 
 // Harness contains the user-facing coding-harness choices. Built-in
@@ -212,7 +213,7 @@ func (e Extensions) Timeout() time.Duration {
 func Default() Config {
 	return Config{
 		Version:   1,
-		Workspace: Workspace{HistoryMaxMessages: 50, HistoryCharLimit: 12000, AttachmentMaxMB: 100},
+		Workspace: Workspace{HistoryMaxMessages: 50, HistoryCharLimit: 12000, AttachmentMaxMB: 100, CleanupRetentionDays: 30},
 		Harness: Harness{
 			Name: "", Model: "", Sandbox: "danger-full-access",
 			Reviews: TaskReviewsSkipTrivial,
@@ -399,6 +400,9 @@ func (c Config) Validate() error {
 	}
 	if c.Workspace.AttachmentMaxMB <= 0 {
 		problems = append(problems, "workspace.attachment_max_mb must be positive")
+	}
+	if c.Workspace.CleanupRetentionDays <= 0 || c.Workspace.CleanupRetentionDays > 36500 {
+		problems = append(problems, "workspace.cleanup_retention_days must be between 1 and 36500")
 	}
 	if strings.TrimSpace(c.Channels.TUI.Theme) == "" {
 		problems = append(problems, "channels.tui.theme is required")

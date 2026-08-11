@@ -52,6 +52,7 @@ func TestSetSettingParsesSharedCommandValues(t *testing.T) {
 		value string
 	}{
 		{"workspace.history_max_messages", "24"},
+		{"workspace.cleanup_retention_days", "45"},
 		{"harness.name", "claude-code"},
 		{"harness.sandbox", "danger-full-access"},
 		{"channels.tui.theme", "catppuccin-latte"},
@@ -66,7 +67,7 @@ func TestSetSettingParsesSharedCommandValues(t *testing.T) {
 			t.Fatalf("set %s: %v", test.key, err)
 		}
 	}
-	if cfg.Workspace.HistoryMaxMessages != 24 || cfg.Harness.Name != "claude-code" || cfg.Harness.Sandbox != "danger-full-access" || cfg.Channels.TUI.Theme != "catppuccin-latte" || len(cfg.Channels.Telegram.AllowedUsers) != 2 || cfg.Channels.WhatsApp.Mode != "dedicated" || cfg.Speech.Language != "fr" || cfg.Orchestrator.IntervalSec != 15 || cfg.Orchestrator.SemanticHeartbeatMinutes != 30 || cfg.Extensions.HookTimeout != "45s" {
+	if cfg.Workspace.HistoryMaxMessages != 24 || cfg.Workspace.CleanupRetentionDays != 45 || cfg.Harness.Name != "claude-code" || cfg.Harness.Sandbox != "danger-full-access" || cfg.Channels.TUI.Theme != "catppuccin-latte" || len(cfg.Channels.Telegram.AllowedUsers) != 2 || cfg.Channels.WhatsApp.Mode != "dedicated" || cfg.Speech.Language != "fr" || cfg.Orchestrator.IntervalSec != 15 || cfg.Orchestrator.SemanticHeartbeatMinutes != 30 || cfg.Extensions.HookTimeout != "45s" {
 		t.Fatalf("unexpected config after settings: %#v", cfg)
 	}
 }

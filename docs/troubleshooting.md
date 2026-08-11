@@ -33,7 +33,7 @@ Use `/status` in any interface for the current owner, harness, channel, workflow
 
 ## Updates, speech, and automation
 
-- Automatic npm update checks occur only for interactive npm-launched starts. `/update` reports availability explicitly; `/update install` requires an npm-supervised owner. Development and release-archive binaries report that npm updates are unavailable.
+- Automatic npm update checks occur only for interactive npm-launched starts. When a new version is available, the startup offer shows both versions and skips automatically after a ten-second countdown unless you answer Yes; No or any other answer also skips safely. `/update` reports availability explicitly; `/update install` requires an npm-supervised owner. Development and release-archive binaries report that npm updates are unavailable.
 - Speech accepts WAV, FLAC, MP3, and Telegram/WhatsApp Ogg/Opus voice notes. M4A/AAC, WebM, and other formats return an unsupported-format error. First supported use downloads a checksum-pinned model into the operating system's per-user cache unless `speech.model_dir` is configured.
 - Plain CLI flags precede positional command arguments. Add `--stream` for text deltas or `--json` for NDJSON events; default `send` output is only the final assistant message.
 

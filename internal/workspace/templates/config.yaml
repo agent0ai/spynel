@@ -3,6 +3,7 @@ version: 1
 workspace:
   history_max_messages: 50
   history_char_limit: 12000
+  cleanup_retention_days: 30
   attachment_max_mb: 100
 
 harness:
