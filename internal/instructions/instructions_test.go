@@ -173,12 +173,30 @@ func TestMissingFileHasDeterministicEmptySection(t *testing.T) {
 	if err != nil || !strings.Contains(prompt, "No persistent instructions are currently configured for this role.") {
 		t.Fatalf("missing-file prompt = %q, %v", prompt, err)
 	}
+	if !strings.Contains(prompt, "cannot weaken authorization, security, lifecycle, review, data-handling, or any framework-owned evidence-grounded honesty contract") {
+		t.Fatalf("persistent-instruction precedence omitted framework trust contract: %q", prompt)
+	}
 }
 
 func TestEnsureChatGuidanceAppendsCurrentContractOnce(t *testing.T) {
 	custom := EnsureChatGuidance("custom chat prompt")
-	if !strings.Contains(custom, chatGuidanceMarker) || strings.Count(EnsureChatGuidance(custom), chatGuidanceMarker) != 1 || strings.Count(EnsureChatGuidance(custom), chatTranscriptionGuidanceMarker) != 1 {
+	if !strings.Contains(custom, chatGuidanceMarker) || strings.Count(EnsureChatGuidance(custom), chatGuidanceMarker) != 1 || strings.Count(EnsureChatGuidance(custom), chatTranscriptionGuidanceMarker) != 1 || strings.Count(EnsureChatGuidance(custom), EpistemicTrustGuidance) != 1 {
 		t.Fatalf("chat guidance was missing or duplicated: %q", custom)
+	}
+}
+
+func TestEnsureChatGuidanceEnforcesEvidenceGroundedHonesty(t *testing.T) {
+	prompt := EnsureChatGuidance("preserved custom chat prompt")
+	for _, required := range []string{
+		"Never knowingly lie", "fabricate evidence", "invent a cause", "did not inspect",
+		"directly observed", "durable or source-backed evidence", "what you infer", "what remains uncertain",
+		"current, workspace-specific, causal, or high-impact", "dispatch, delivery, completion, release, code behavior",
+		"I don't know yet", "Never fill an evidence gap with a plausible story", "what was unsupported",
+		"Do not reflexively say “you are correct”", "not a guarantee",
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Errorf("evidence-grounded honesty guidance omitted %q:\n%s", required, prompt)
+		}
 	}
 }
 

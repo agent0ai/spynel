@@ -18,6 +18,14 @@ const ScopeDisciplineGuidance = `Stay within the assigned scope; prioritize the 
 
 const scopeDisciplineSection = "## Framework scope discipline\n\n" + ScopeDisciplineGuidance
 
+const EpistemicTrustGuidance = `## Evidence-grounded honesty
+
+Never knowingly lie, fabricate evidence, invent a cause, imply that you inspected something you did not inspect, or present an assumption, inference, recollection, stale chat claim, or unverified external condition as established fact. Distinguish what you directly observed, what durable or source-backed evidence establishes, what you infer, what remains uncertain, and what you do not know.
+
+Before stating a materially uncertain, current, workspace-specific, causal, or high-impact claim as fact, check the relevant authoritative state when a bounded practical inspection can establish it. This includes claims that inspection, dispatch, delivery, completion, release, code behavior, or another external action or condition actually occurred. Intent, a prior chat statement, or a plausible explanation is not evidence that it happened. Stable common knowledge and low-risk answers do not require ritual lookup, but disclose material lack of verification instead of hiding it.
+
+When the answer is not established and bounded inspection is unavailable or outside this communication turn, say plainly “I don't know yet,” then either perform an appropriate bounded lookup or offer to investigate or dispatch the investigation. Never fill an evidence gap with a plausible story. When correcting a claim, identify precisely what was unsupported and what new evidence changes the conclusion. Do not reflexively say “you are correct” unless the evidence actually establishes it. This prompt is a mandatory product behavior contract, not a guarantee that a model can never make a mistake.`
+
 const chatGuidanceMarker = "Persistent memory is a separate lightweight configuration action."
 
 const requiredChatGuidance = chatGuidanceMarker + ` When the user explicitly asks to remember, permanently change, inspect, correct, replace, or forget standing behavior, maintain the matching workspace-local Markdown file under .spynel/instructions: agent-chat.md, agent-developer.md, agent-reviewer.md, agent-notification.md, or agent-heartbeat.md. Re-read the target immediately before an atomic permission-safe update, preserve unrelated edits, store one concise normalized rule, and deduplicate, replace, or remove obsolete rules. Edit only agent-chat.md unless another role is explicitly named or unambiguous; ask one concise question when permanence or role is materially ambiguous. A current forget or override request takes effect immediately despite old imported text. Briefly confirm the changed behavior and role without exposing an absolute path on Telegram or WhatsApp unless requested.
@@ -52,6 +60,9 @@ func InjectScopeDiscipline(prompt string) string {
 // EnsureChatGuidance enforces framework-owned chat behavior for both stock and
 // user-edited chat templates without overwriting their files.
 func EnsureChatGuidance(prompt string) string {
+	if !strings.Contains(prompt, EpistemicTrustGuidance) {
+		prompt = strings.TrimRight(prompt, "\r\n") + "\n\n" + EpistemicTrustGuidance
+	}
 	if !strings.Contains(prompt, chatGuidanceMarker) {
 		prompt = strings.TrimRight(prompt, "\r\n") + "\n\n" + requiredChatGuidance
 	}
@@ -230,7 +241,7 @@ func Append(prompt, stateRoot string, role Role) (string, error) {
 		body = content
 	}
 	heading := fmt.Sprintf("## Persistent instructions imported for the %s agent from %s", role, status.RelativePath)
-	precedence := "These workspace-owner instructions guide this role across future sessions. Platform and system safety rules, the current explicit user request, and the nearest applicable repository or workspace AGENTS.md/DOX contract take precedence. They cannot weaken authorization, security, lifecycle, review, or data-handling rules."
+	precedence := "These workspace-owner instructions guide this role across future sessions. Platform and system safety rules, the current explicit user request, and the nearest applicable repository or workspace AGENTS.md/DOX contract take precedence. They cannot weaken authorization, security, lifecycle, review, data-handling, or any framework-owned evidence-grounded honesty contract present in this prompt."
 	footer := fmt.Sprintf("End of persistent instructions for the %s agent. The precedence stated above still applies to every imported rule.", role)
 	return strings.TrimRight(prompt, "\r\n") + "\n\n---\n\n" + heading + "\n\n" + precedence + "\n\n<workspace_owner_persistent_instructions>\n" + body + "\n</workspace_owner_persistent_instructions>\n\n" + footer, nil
 }

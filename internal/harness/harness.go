@@ -46,6 +46,15 @@ type ModelProvider interface {
 	Models(context.Context) ([]Model, error)
 }
 
+// ModelDispatcher snapshots a forward-looking model selection independently
+// from the adapter instance. Supervisor takes this snapshot at dispatch
+// admission so a concurrent configuration commit has one deterministic order:
+// admitted work keeps its snapshot and later work receives the new model.
+type ModelDispatcher interface {
+	SendWithModel(context.Context, string, string, string, core.Emit) (threadID string, steered bool, err error)
+	SetModel(string)
+}
+
 // Availability is implemented by runtime supervisors that can remain usable
 // for configuration even when their selected harness executable is missing.
 type Availability interface {

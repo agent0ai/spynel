@@ -880,7 +880,7 @@ func (s *Service) selectionScreenAction(ctx context.Context, screenID, action st
 		}
 		return &core.Screen{ActionMessage: harnessSelectionMessage(selected)}, true, nil
 	}
-	return nil, true, nil
+	return &core.Screen{ActionMessage: fmt.Sprintf("Saved `harness.model` = `%s`. It will apply to subsequent harness turns.", selected)}, true, nil
 }
 
 func (s *Service) setSetting(message core.Message, key, value string, emit core.Emit) error {
@@ -897,6 +897,9 @@ func (s *Service) setSetting(message core.Message, key, value string, emit core.
 	}
 	setting := changed[0]
 	response := fmt.Sprintf("Saved `%s` = `%s`.", setting.Key, setting.Value)
+	if setting.Key == "harness.model" {
+		response += " It will apply to subsequent harness turns."
+	}
 	if setting.Restart {
 		response += " Restart Spynel to apply this extension change."
 	}
@@ -935,7 +938,11 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		}
 	}
 	unchanged := reflect.DeepEqual(previous, next)
-	harnessChanged := harnessRuntimeChanged(previous.Harness, next.Harness)
+	modelChanged := previous.Harness.Model != next.Harness.Model
+	modelCommitter, canCommitModel := s.Harness.(interface {
+		CommitModel(string, func() error) error
+	})
+	harnessChanged := harnessRuntimeChanged(previous.Harness, next.Harness) || modelChanged && !canCommitModel
 	startupChanged := previous.Startup.Enabled != next.Startup.Enabled
 	if harnessChanged {
 		if err := s.reconfigureHarness(next); err != nil {
@@ -948,10 +955,20 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		}
 		return changed, nil
 	}
-	reloaded, err := s.Settings.Update(func(current *config.Config) error {
-		*current = next
-		return nil
-	})
+	var reloaded config.Config
+	update := func() error {
+		var updateErr error
+		reloaded, updateErr = s.Settings.Update(func(current *config.Config) error {
+			*current = next
+			return nil
+		})
+		return updateErr
+	}
+	if modelChanged && canCommitModel && !harnessChanged {
+		err = modelCommitter.CommitModel(next.Harness.Model, update)
+	} else {
+		err = update()
+	}
 	if err != nil {
 		var rollback error
 		if harnessChanged {
@@ -1038,7 +1055,7 @@ func wrapRollback(component string, err error) error {
 }
 
 func harnessRuntimeChanged(previous, next config.Harness) bool {
-	if previous.Name != next.Name || previous.Model != next.Model || previous.Sandbox != next.Sandbox {
+	if previous.Name != next.Name || previous.Sandbox != next.Sandbox {
 		return true
 	}
 	if previous.Name != "acp" && next.Name != "acp" {

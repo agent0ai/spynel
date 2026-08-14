@@ -222,13 +222,26 @@ func (a *ACP) Start(parent context.Context) error {
 }
 
 func (a *ACP) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	a.mu.Lock()
+	model := a.config.Model
+	a.mu.Unlock()
+	return a.SendWithModel(ctx, key, prompt, model, emit)
+}
+
+func (a *ACP) SetModel(model string) {
+	a.mu.Lock()
+	a.config.Model = model
+	a.mu.Unlock()
+}
+
+func (a *ACP) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", false, errors.New("harness prompt is empty")
 	}
 	lock := a.lockForKey(key)
 	lock.Lock()
 	defer lock.Unlock()
-	session, err := a.ensureSession(ctx, key)
+	session, err := a.ensureSession(ctx, key, model)
 	if err != nil {
 		return "", false, err
 	}
@@ -392,14 +405,16 @@ func (a *ACP) Close() error {
 	return nil
 }
 
-func (a *ACP) ensureSession(ctx context.Context, key string) (acpSession, error) {
+func (a *ACP) ensureSession(ctx context.Context, key, model string) (acpSession, error) {
 	a.mu.Lock()
 	if a.closed || a.ctx == nil {
 		a.mu.Unlock()
 		return acpSession{}, errors.New("ACP harness is not running")
 	}
+	cfg := a.config
+	cfg.Model = model
 	session := a.sessions[key]
-	if session.Policy != a.sessionPolicy() {
+	if session.Policy != acpSessionPolicy(cfg) {
 		session = acpSession{}
 		delete(a.sessions, key)
 		delete(a.live, key)
@@ -411,7 +426,7 @@ func (a *ACP) ensureSession(ctx context.Context, key string) (acpSession, error)
 	caps := a.caps
 	a.mu.Unlock()
 
-	params := map[string]any{"cwd": a.config.Cwd, "mcpServers": []any{}}
+	params := map[string]any{"cwd": cfg.Cwd, "mcpServers": []any{}}
 	method := "session/new"
 	if session.ID != "" {
 		params["sessionId"] = session.ID
@@ -445,10 +460,10 @@ func (a *ACP) ensureSession(ctx context.Context, key string) (acpSession, error)
 	if session.ID == "" {
 		return acpSession{}, errors.New("ACP session response omitted sessionId")
 	}
-	if err := a.applySessionOptions(ctx, session.ID, setup.ConfigOptions, usedMethod == "session/new"); err != nil {
+	if err := a.applySessionOptions(ctx, session.ID, setup.ConfigOptions, usedMethod == "session/new", cfg); err != nil {
 		return acpSession{}, err
 	}
-	session.Policy = a.sessionPolicy()
+	session.Policy = acpSessionPolicy(cfg)
 	a.mu.Lock()
 	a.sessions[key] = session
 	a.live[key] = true
@@ -465,8 +480,8 @@ func capabilityPresent(value json.RawMessage) bool {
 	return trimmed != "" && trimmed != "null" && trimmed != "false"
 }
 
-func (a *ACP) applySessionOptions(ctx context.Context, sessionID string, options []acpConfigOption, requireModel bool) error {
-	modelSet := strings.TrimSpace(a.config.Model) == ""
+func (a *ACP) applySessionOptions(ctx context.Context, sessionID string, options []acpConfigOption, requireModel bool, cfg HarnessConfig) error {
+	modelSet := strings.TrimSpace(cfg.Model) == ""
 	effortSet := false
 	for _, option := range options {
 		value := ""
@@ -475,12 +490,12 @@ func (a *ACP) applySessionOptions(ctx context.Context, sessionID string, options
 			if modelSet {
 				continue
 			}
-			value = strings.TrimSpace(a.config.Model)
+			value = strings.TrimSpace(cfg.Model)
 		case "thought_level":
 			if effortSet {
 				continue
 			}
-			value = strings.TrimSpace(a.config.Effort)
+			value = strings.TrimSpace(cfg.Effort)
 		}
 		if value == "" || option.Type != "select" {
 			continue
@@ -832,12 +847,12 @@ func (a *ACP) lockForKey(key string) *sync.Mutex {
 	return lock
 }
 
-func (a *ACP) sessionPolicy() string {
-	arguments, _ := json.Marshal(a.config.Args)
-	environment, _ := json.Marshal(a.config.Env)
+func acpSessionPolicy(cfg HarnessConfig) string {
+	arguments, _ := json.Marshal(cfg.Args)
+	environment, _ := json.Marshal(cfg.Env)
 	return strings.Join([]string{
-		a.config.Command, string(arguments), string(environment), a.config.Cwd, a.config.Model, a.config.Effort,
-		a.config.Sandbox, strconv.FormatBool(a.config.Network),
+		cfg.Command, string(arguments), string(environment), cfg.Cwd, cfg.Model, cfg.Effort,
+		cfg.Sandbox, strconv.FormatBool(cfg.Network),
 	}, "\x1f")
 }
 

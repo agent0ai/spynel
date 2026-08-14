@@ -51,7 +51,10 @@ type serviceHarness struct {
 
 type heldServiceHarness struct {
 	*serviceHarness
-	emits map[string]core.Emit
+	emits           map[string]core.Emit
+	models          map[string][]string
+	configuredModel string
+	closed          bool
 }
 
 type failingServiceHarness struct {
@@ -163,6 +166,34 @@ func TestTaskCommandDelegatesCreationPolicyToCommunicationAgent(t *testing.T) {
 	prompts := harness.prompts["chat:cli:deploy"]
 	if len(prompts) != 1 || !strings.Contains(prompts[0], "explicitly invoked `/task`") || !strings.Contains(prompts[0], "ship it") || !strings.Contains(prompts[0], "origin `cli/deploy`") || !strings.Contains(prompts[0], "review_required") || !strings.Contains(prompts[0], "cancelled") {
 		t.Fatalf("task creation prompt = %#v", prompts)
+	}
+}
+
+func TestCreationPromptsRetainFrameworkEvidenceGroundedHonestyWithCustomChatPrompt(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	if err := os.WriteFile(cfg.StatePath("prompts", "chat.md"), []byte("preserved custom chat prompt\n\n{{RECENT_HISTORY}}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	harness := newServiceHarness()
+	service := New(cfg, harness)
+	for _, test := range []struct {
+		kind         string
+		conversation string
+	}{
+		{kind: "task", conversation: "trust-task"},
+		{kind: "goal", conversation: "trust-goal"},
+	} {
+		if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: test.conversation, Sender: "cli", Text: "/" + test.kind + " verify this"}, func(core.Event) {}); err != nil {
+			t.Fatal(err)
+		}
+		prompt := harness.prompts["chat:cli:"+test.conversation][0]
+		if !strings.Contains(prompt, "preserved custom chat prompt") || strings.Count(prompt, instructions.EpistemicTrustGuidance) != 1 || !strings.Contains(prompt, "explicitly invoked `/"+test.kind+"`") {
+			t.Errorf("/%s prompt omitted custom content, creation directive, or exact-once trust contract:\n%s", test.kind, prompt)
+		}
 	}
 }
 
@@ -315,12 +346,33 @@ func (m *fakeStartupManager) Sync(_ config.Config, enabled bool) error {
 }
 
 func newHeldServiceHarness() *heldServiceHarness {
-	return &heldServiceHarness{serviceHarness: newServiceHarness(), emits: map[string]core.Emit{}}
+	return &heldServiceHarness{serviceHarness: newServiceHarness(), emits: map[string]core.Emit{}, models: map[string][]string{}}
 }
 
-func (r *heldServiceHarness) Send(_ context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+func (r *heldServiceHarness) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	r.mu.Lock()
+	model := r.configuredModel
+	r.mu.Unlock()
+	return r.SendWithModel(ctx, key, prompt, model, emit)
+}
+
+func (r *heldServiceHarness) SetModel(model string) {
+	r.mu.Lock()
+	r.configuredModel = model
+	r.mu.Unlock()
+}
+
+func (r *heldServiceHarness) Close() error {
+	r.mu.Lock()
+	r.closed = true
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *heldServiceHarness) SendWithModel(_ context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
 	r.mu.Lock()
 	r.prompts[key] = append(r.prompts[key], prompt)
+	r.models[key] = append(r.models[key], model)
 	thread := r.threads[key]
 	if thread == "" {
 		thread = "thread-" + key
@@ -2360,7 +2412,7 @@ func TestHarnessAndModelCommandsUseSharedSettings(t *testing.T) {
 	if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != "model" || len(response.Screen.Controls) != 3 || !response.Screen.SaveDisabled || response.Screen.InitialControl != "select:opus" || response.Screen.Controls[0].Key != "select:" || response.Screen.Controls[1].Kind != "action" {
 		t.Fatalf("/model response = %#v", response)
 	}
-	if next, err := service.ScreenAction(context.Background(), "model", "select:sonnet", nil); err != nil || next != nil || service.Settings.Snapshot().Harness.Model != "sonnet" {
+	if next, err := service.ScreenAction(context.Background(), "model", "select:sonnet", nil); err != nil || next == nil || !strings.Contains(next.ActionMessage, "subsequent harness turns") || service.Settings.Snapshot().Harness.Model != "sonnet" {
 		t.Fatalf("model screen selection = %#v, %v, config %#v", next, err, service.Settings.Snapshot().Harness)
 	}
 	response = core.Event{}
@@ -2370,6 +2422,66 @@ func TestHarnessAndModelCommandsUseSharedSettings(t *testing.T) {
 	if !strings.Contains(response.Text, "claude-code") || !strings.Contains(response.Text, "codex") || !strings.Contains(response.Text, "/harness <name>") {
 		t.Fatalf("remote /harness response = %#v", response)
 	}
+}
+
+func TestModelCommandPersistsDuringActiveHarnessTurnForNextDispatch(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	path := config.PathForRoot(root)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "codex"
+	cfg.Harness.Model = "model-old"
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	target := newHeldServiceHarness()
+	target.configuredModel = "model-old"
+	registry := harness.NewRegistry()
+	registry.Register("codex", func(harness.HarnessConfig) (harness.Harness, error) { return target, nil })
+	supervisor := harness.NewSupervisor(registry, harness.HarnessConfig{Name: "codex", Model: "model-old"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, supervisor)
+	if _, _, err := supervisor.Send(context.Background(), "active", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	var response core.Event
+	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "TG-7", Text: "/model gpt-5.6-sol"}, func(event core.Event) { response = event }); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(response.Text, "Saved `harness.model` = `gpt-5.6-sol`") || !strings.Contains(response.Text, "subsequent harness turns") {
+		t.Fatalf("model response = %#v", response)
+	}
+	reloaded, err := config.Load(path)
+	if err != nil || reloaded.Harness.Model != "gpt-5.6-sol" {
+		t.Fatalf("persisted model = %q, %v", reloaded.Harness.Model, err)
+	}
+	if !supervisor.IsActive("active") || target.closed {
+		t.Fatalf("active turn was disturbed: active=%t closed=%t", supervisor.IsActive("active"), target.closed)
+	}
+	target.mu.Lock()
+	activeModels := append([]string(nil), target.models["active"]...)
+	target.mu.Unlock()
+	if !reflect.DeepEqual(activeModels, []string{"model-old"}) {
+		t.Fatalf("active model snapshots = %#v", activeModels)
+	}
+	target.finish("active")
+	if _, _, err := supervisor.Send(context.Background(), "next", "subsequent", nil); err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	nextModels := append([]string(nil), target.models["next"]...)
+	target.mu.Unlock()
+	if !reflect.DeepEqual(nextModels, []string{"gpt-5.6-sol"}) {
+		t.Fatalf("subsequent model snapshots = %#v", nextModels)
+	}
+	target.finish("next")
 }
 
 func TestInactiveCustomACPFieldsDoNotReconfigureAnotherHarness(t *testing.T) {

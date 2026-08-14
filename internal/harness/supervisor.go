@@ -76,6 +76,36 @@ func (s *Supervisor) HarnessConfig() HarnessConfig {
 	return s.config
 }
 
+// CommitModel atomically orders persistence and future dispatch snapshots.
+// It deliberately does not replace the running harness: already-admitted work
+// retains the model captured by its dispatch, while snapshots taken after the
+// commit returns observe model.
+func (s *Supervisor) CommitModel(model string, commit func() error) error {
+	s.operationMu.Lock()
+	defer s.operationMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("harness supervisor is closed")
+	}
+	if s.current != nil {
+		if _, ok := s.current.(ModelDispatcher); !ok {
+			return errors.New("the active harness does not support forward-looking model changes")
+		}
+	}
+	if commit == nil {
+		return errors.New("model configuration commit is unavailable")
+	}
+	if err := commit(); err != nil {
+		return err
+	}
+	s.config.Model = model
+	if target, ok := s.current.(ModelDispatcher); ok {
+		target.SetModel(model)
+	}
+	return nil
+}
+
 func (s *Supervisor) Start(ctx context.Context) error {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
@@ -261,6 +291,7 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 		return "", false, err
 	}
 	wasActive := target.IsActive(key)
+	model := s.config.Model
 	logicalActive := s.active[key] > 0
 	if (!wasActive && logicalActive) || (wasActive && followUpMode(target) == FollowUpQueue) {
 		threadID := target.ThreadID(key)
@@ -278,7 +309,7 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 	wrapper := s.executionEmit(key, target, emit)
 	s.controlEmit[key] = wrapper
 	s.mu.Unlock()
-	threadID, steered, err := target.Send(ctx, key, prompt, wrapper)
+	threadID, steered, err := sendWithModel(target, ctx, key, prompt, model, wrapper)
 	if err != nil {
 		if wasActive && steered {
 			// The active turn finished during the failed steering attempt. Retry
@@ -405,6 +436,13 @@ func followUpMode(target Harness) FollowUpMode {
 		return FollowUpQueue
 	}
 	return FollowUpSteer
+}
+
+func sendWithModel(target Harness, ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+	if dispatcher, ok := target.(ModelDispatcher); ok {
+		return dispatcher.SendWithModel(ctx, key, prompt, model, emit)
+	}
+	return target.Send(ctx, key, prompt, emit)
 }
 
 func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) core.Emit {
@@ -600,6 +638,7 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 	}
 	s.mu.RLock()
 	validStart = !s.closed && s.active[key] > 0 && s.controlGeneration[key] == next.generation
+	model := s.config.Model
 	s.mu.RUnlock()
 	if !validStart {
 		return
@@ -640,7 +679,7 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 	for _, release := range next.release {
 		release(core.Event{Kind: core.EventStatus, Text: "Response continued on a newer queued message", ThreadID: threadID, Done: true})
 	}
-	threadID, _, err := target.Send(ctx, key, next.prompt, wrapper)
+	threadID, _, err := sendWithModel(target, ctx, key, next.prompt, model, wrapper)
 	if err != nil {
 		wrapper(core.Event{Kind: core.EventError, Text: "queued follow-up failed: " + err.Error(), ThreadID: threadID, Done: true})
 		return

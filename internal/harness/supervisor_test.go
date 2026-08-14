@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,8 @@ type supervisorHarness struct {
 	active           map[string]bool
 	emits            map[string]core.Emit
 	prompts          map[string][]string
+	models           map[string][]string
+	configuredModel  string
 	closed           bool
 	resetKeys        []string
 	isActiveEntered  chan struct{}
@@ -73,7 +76,18 @@ func (r *supervisorHarness) Close() error {
 	r.mu.Unlock()
 	return nil
 }
-func (r *supervisorHarness) Send(_ context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+func (r *supervisorHarness) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	r.mu.Lock()
+	model := r.configuredModel
+	r.mu.Unlock()
+	return r.SendWithModel(ctx, key, prompt, model, emit)
+}
+func (r *supervisorHarness) SetModel(model string) {
+	r.mu.Lock()
+	r.configuredModel = model
+	r.mu.Unlock()
+}
+func (r *supervisorHarness) SendWithModel(_ context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
 	r.mu.Lock()
 	if r.active[key] && r.refuseSteer {
 		r.mu.Unlock()
@@ -83,6 +97,10 @@ func (r *supervisorHarness) Send(_ context.Context, key, prompt string, emit cor
 		r.prompts = map[string][]string{}
 	}
 	r.prompts[key] = append(r.prompts[key], prompt)
+	if r.models == nil {
+		r.models = map[string][]string{}
+	}
+	r.models[key] = append(r.models[key], model)
 	r.active[key] = true
 	r.emits[key] = emit
 	r.mu.Unlock()
@@ -229,6 +247,91 @@ func TestSupervisorSelectionCannotRaceHarnessSwap(t *testing.T) {
 		t.Fatal("active old target was closed")
 	}
 	oldTarget.finish("chat")
+}
+
+func TestSupervisorCommitsModelDuringActiveTurnAndUsesItForQueuedContinuation(t *testing.T) {
+	target := &supervisorHarness{name: "codex", followUp: FollowUpQueue, active: map[string]bool{}, emits: map[string]core.Emit{}, configuredModel: "model-old"}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex", Model: "model-old"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "chat", "active", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, queued, err := supervisor.Send(context.Background(), "chat", "continuation", nil); err != nil || !queued {
+		t.Fatalf("queue continuation = %t, %v", queued, err)
+	}
+	committed := false
+	if err := supervisor.CommitModel("model-new", func() error { committed = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !committed || target.closed || !supervisor.IsActive("chat") {
+		t.Fatalf("active turn changed during model commit: committed=%t closed=%t active=%t", committed, target.closed, supervisor.IsActive("chat"))
+	}
+	target.finish("chat")
+	waitSupervisorState(t, func() bool {
+		target.mu.Lock()
+		defer target.mu.Unlock()
+		return len(target.models["chat"]) == 2
+	})
+	target.mu.Lock()
+	models := append([]string(nil), target.models["chat"]...)
+	target.mu.Unlock()
+	if !reflect.DeepEqual(models, []string{"model-old", "model-new"}) {
+		t.Fatalf("dispatch model snapshots = %#v", models)
+	}
+	target.finish("chat")
+}
+
+func TestSupervisorOrdersDispatchSnapshotBeforeRacingModelCommit(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}, configuredModel: "model-old", isActiveEntered: entered, isActiveRelease: release}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex", Model: "model-old"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	sent := make(chan error, 1)
+	go func() {
+		_, _, err := supervisor.Send(context.Background(), "chat", "racing dispatch", nil)
+		sent <- err
+	}()
+	<-entered
+	committed := make(chan error, 1)
+	go func() { committed <- supervisor.CommitModel("model-new", func() error { return nil }) }()
+	select {
+	case err := <-committed:
+		t.Fatalf("model commit escaped dispatch snapshot fence: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-committed; err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	models := append([]string(nil), target.models["chat"]...)
+	target.mu.Unlock()
+	if !reflect.DeepEqual(models, []string{"model-old"}) {
+		t.Fatalf("pre-commit dispatch model snapshots = %#v", models)
+	}
+	target.finish("chat")
+	if _, _, err := supervisor.Send(context.Background(), "next", "after commit", nil); err != nil {
+		t.Fatal(err)
+	}
+	target.mu.Lock()
+	nextModels := append([]string(nil), target.models["next"]...)
+	target.mu.Unlock()
+	if !reflect.DeepEqual(nextModels, []string{"model-new"}) {
+		t.Fatalf("post-commit dispatch model snapshots = %#v", nextModels)
+	}
+	target.finish("next")
 }
 
 func TestSupervisorReconfiguresOnlyWhenIdle(t *testing.T) {

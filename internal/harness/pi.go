@@ -150,13 +150,26 @@ func (p *Pi) Start(parent context.Context) error {
 }
 
 func (p *Pi) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	p.mu.Lock()
+	model := p.config.Model
+	p.mu.Unlock()
+	return p.SendWithModel(ctx, key, prompt, model, emit)
+}
+
+func (p *Pi) SetModel(model string) {
+	p.mu.Lock()
+	p.config.Model = model
+	p.mu.Unlock()
+}
+
+func (p *Pi) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", false, errors.New("harness prompt is empty")
 	}
 	lock := p.lockForKey(key)
 	lock.Lock()
 	defer lock.Unlock()
-	process, err := p.ensureProcess(ctx, key)
+	process, err := p.ensureProcess(ctx, key, model)
 	if err != nil {
 		return "", false, err
 	}
@@ -344,7 +357,10 @@ func (p *Pi) Close() error {
 }
 
 func (p *Pi) Models(ctx context.Context) ([]Model, error) {
-	process, err := p.startProcess(ctx, "", piSession{}, true)
+	p.mu.Lock()
+	model := p.config.Model
+	p.mu.Unlock()
+	process, err := p.startProcess(ctx, "", piSession{}, true, model)
 	if err != nil {
 		return nil, err
 	}
@@ -386,23 +402,33 @@ func (p *Pi) Models(ctx context.Context) ([]Model, error) {
 	return models, nil
 }
 
-func (p *Pi) ensureProcess(ctx context.Context, key string) (*piProcess, error) {
+func (p *Pi) ensureProcess(ctx context.Context, key, model string) (*piProcess, error) {
 	p.mu.Lock()
 	if p.closed || p.ctx == nil {
 		p.mu.Unlock()
 		return nil, errors.New("Pi harness is not running")
 	}
 	if process := p.processes[key]; process != nil {
+		process.mu.Lock()
+		active := process.active != nil
+		policyMatches := process.session.Policy == p.sessionPolicyLocked(model)
+		process.mu.Unlock()
+		if active || policyMatches {
+			p.mu.Unlock()
+			return process, nil
+		}
+		delete(p.processes, key)
 		p.mu.Unlock()
-		return process, nil
+		process.close()
+		p.mu.Lock()
 	}
 	session := p.sessions[key]
-	if session.Policy != p.sessionPolicy() {
+	if session.Policy != p.sessionPolicyLocked(model) {
 		session = piSession{}
 		delete(p.sessions, key)
 	}
 	p.mu.Unlock()
-	process, err := p.startProcess(ctx, key, session, false)
+	process, err := p.startProcess(ctx, key, session, false, model)
 	if err != nil {
 		return nil, err
 	}
@@ -422,10 +448,12 @@ func (p *Pi) ensureProcess(ctx context.Context, key string) (*piProcess, error) 
 	return process, nil
 }
 
-func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ephemeral bool) (*piProcess, error) {
+func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ephemeral bool, model string) (*piProcess, error) {
 	p.mu.Lock()
 	baseContext := p.ctx
 	closed := p.closed
+	cfg := p.config
+	cfg.Model = model
 	p.mu.Unlock()
 	if ephemeral {
 		baseContext = ctx
@@ -438,9 +466,9 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 	if ephemeral {
 		args = append(args, "--no-session")
 	} else {
-		sessionDir := filepath.Join(filepath.Dir(p.config.SessionsFile), "pi-sessions")
-		if p.config.SessionsFile == "" {
-			sessionDir = filepath.Join(p.config.Cwd, ".spynel", "runtime", "pi-sessions")
+		sessionDir := filepath.Join(filepath.Dir(cfg.SessionsFile), "pi-sessions")
+		if cfg.SessionsFile == "" {
+			sessionDir = filepath.Join(cfg.Cwd, ".spynel", "runtime", "pi-sessions")
 		}
 		if err := os.MkdirAll(sessionDir, 0o700); err != nil {
 			cancel()
@@ -453,17 +481,17 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 			}
 		}
 	}
-	if p.config.Model != "" {
-		args = append(args, "--model", p.config.Model)
+	if cfg.Model != "" {
+		args = append(args, "--model", cfg.Model)
 	}
-	if p.config.Effort != "" {
-		args = append(args, "--thinking", p.config.Effort)
+	if cfg.Effort != "" {
+		args = append(args, "--thinking", cfg.Effort)
 	}
-	if p.config.Sandbox == "read-only" {
+	if cfg.Sandbox == "read-only" {
 		args = append(args, "--tools", "read,grep,find,ls")
 	}
-	command := exec.CommandContext(processContext, p.config.Command, args...)
-	command.Dir = p.config.Cwd
+	command := exec.CommandContext(processContext, cfg.Command, args...)
+	command.Dir = cfg.Cwd
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -474,8 +502,8 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 		cancel()
 		return nil, err
 	}
-	if p.config.Stderr != nil {
-		command.Stderr = p.config.Stderr
+	if cfg.Stderr != nil {
+		command.Stderr = cfg.Stderr
 	}
 	if err := command.Start(); err != nil {
 		cancel()
@@ -487,14 +515,14 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 	data, err := process.call(ctx, map[string]any{"type": "get_state"}, nil)
 	if err != nil {
 		process.close()
-		return nil, fmt.Errorf("Pi executable %q failed RPC get_state negotiation: %w", p.config.Command, err)
+		return nil, fmt.Errorf("Pi executable %q failed RPC get_state negotiation: %w", cfg.Command, err)
 	}
 	var state piState
 	if err := json.Unmarshal(data, &state); err != nil || (!ephemeral && (state.SessionID == "" || state.SessionFile == "")) {
 		process.close()
-		return nil, fmt.Errorf("Pi executable %q returned an incompatible get_state result with missing sessionId or sessionFile", p.config.Command)
+		return nil, fmt.Errorf("Pi executable %q returned an incompatible get_state result with missing sessionId or sessionFile", cfg.Command)
 	}
-	process.session = piSession{ID: state.SessionID, Path: state.SessionFile, Policy: p.sessionPolicy()}
+	process.session = piSession{ID: state.SessionID, Path: state.SessionFile, Policy: piSessionPolicy(cfg)}
 	if _, err := process.call(ctx, map[string]any{"type": "set_steering_mode", "mode": "all"}, nil); err != nil {
 		process.close()
 		return nil, fmt.Errorf("configure Pi steering queue: %w", err)
@@ -859,8 +887,14 @@ func (p *Pi) lockForKey(key string) *sync.Mutex {
 	return lock
 }
 
-func (p *Pi) sessionPolicy() string {
-	return strings.Join([]string{p.config.Command, p.config.Cwd, p.config.Model, p.config.Effort, p.config.Sandbox}, "\x1f")
+func (p *Pi) sessionPolicyLocked(model string) string {
+	cfg := p.config
+	cfg.Model = model
+	return piSessionPolicy(cfg)
+}
+
+func piSessionPolicy(cfg HarnessConfig) string {
+	return strings.Join([]string{cfg.Command, cfg.Cwd, cfg.Model, cfg.Effort, cfg.Sandbox}, "\x1f")
 }
 
 func (p *Pi) loadSessions() error {

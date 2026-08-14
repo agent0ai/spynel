@@ -247,13 +247,26 @@ func (c *Codex) Start(parent context.Context) error {
 }
 
 func (c *Codex) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	c.mu.Lock()
+	model := c.config.Model
+	c.mu.Unlock()
+	return c.SendWithModel(ctx, key, prompt, model, emit)
+}
+
+func (c *Codex) SetModel(model string) {
+	c.mu.Lock()
+	c.config.Model = model
+	c.mu.Unlock()
+}
+
+func (c *Codex) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", false, errors.New("harness prompt is empty")
 	}
 	lock := c.lockForKey(key)
 	lock.Lock()
 	defer lock.Unlock()
-	threadID, err := c.ensureThread(ctx, key)
+	threadID, err := c.ensureThread(ctx, key, model)
 	if err != nil {
 		return "", false, err
 	}
@@ -295,8 +308,8 @@ func (c *Codex) Send(ctx context.Context, key, prompt string, emit core.Emit) (s
 		"approvalPolicy": c.config.ApprovalPolicy,
 		"sandboxPolicy":  c.sandboxPolicy(),
 	}
-	if c.config.Model != "" {
-		params["model"] = c.config.Model
+	if model != "" {
+		params["model"] = model
 	}
 	if c.config.Effort != "" {
 		params["effort"] = c.config.Effort
@@ -384,7 +397,7 @@ func (c *Codex) Steer(ctx context.Context, key, prompt string, emit core.Emit, b
 	return threadID, nil
 }
 
-func (c *Codex) ensureThread(ctx context.Context, key string) (string, error) {
+func (c *Codex) ensureThread(ctx context.Context, key, model string) (string, error) {
 	c.mu.Lock()
 	threadID := c.session[key]
 	loaded := c.loaded[threadID]
@@ -420,8 +433,8 @@ func (c *Codex) ensureThread(ctx context.Context, key string) (string, error) {
 		"sandbox":        c.threadSandbox(),
 		"serviceName":    "spynel",
 	}
-	if c.config.Model != "" {
-		params["model"] = c.config.Model
+	if model != "" {
+		params["model"] = model
 	}
 	result, err := c.call(ctx, "thread/start", params)
 	if err != nil {

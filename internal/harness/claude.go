@@ -251,7 +251,9 @@ func (c *Claude) Models(context.Context) ([]Model, error) {
 		{ID: "opus[1m]", DisplayName: "Opus (1M)", Description: "Opus with extended context", Efforts: allEfforts},
 		{ID: "opusplan", DisplayName: "Opus Plan", Description: "Opus for planning and Sonnet for execution", Efforts: allEfforts},
 	}
+	c.mu.Lock()
 	configured := strings.TrimSpace(c.config.Model)
+	c.mu.Unlock()
 	if configured != "" {
 		found := false
 		for index := range models {
@@ -268,6 +270,19 @@ func (c *Claude) Models(context.Context) ([]Model, error) {
 }
 
 func (c *Claude) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	c.mu.Lock()
+	model := c.config.Model
+	c.mu.Unlock()
+	return c.SendWithModel(ctx, key, prompt, model, emit)
+}
+
+func (c *Claude) SetModel(model string) {
+	c.mu.Lock()
+	c.config.Model = model
+	c.mu.Unlock()
+}
+
+func (c *Claude) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", false, errors.New("harness prompt is empty")
 	}
@@ -308,6 +323,7 @@ func (c *Claude) Send(ctx context.Context, key, prompt string, emit core.Emit) (
 		}
 		baseContext := c.ctx
 		cfg := c.config
+		cfg.Model = model
 		previousSession := c.resumeSessionLocked(key, cfg)
 		c.mu.Unlock()
 		return c.startTurn(ctx, baseContext, key, prompt, previousSession, cfg, emit)

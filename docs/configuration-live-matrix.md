@@ -5,7 +5,7 @@ Every setting below is exposed by the shared typed catalog used by the TUI, slas
 | Setting | Prior behavior | Runtime owner and final effect | Validation / application | Verification boundary |
 | --- | --- | --- | --- | --- |
 | `harness.name` | Live, idle-only | Harness supervisor replaces the adapter before commit | Old harness restored if persistence fails | harness supervisor and service tests |
-| `harness.model` | Live, idle-only | Harness supervisor applies the next-session model before commit | Old harness restored if persistence fails | harness/model service tests |
+| `harness.model` | Live, active-safe | Persistence commit and provider-dispatch snapshot share one supervisor fence; admitted turns keep their model and later dispatches use the new value | No runtime model publication if persistence fails | active-turn, continuation, and dispatch-race tests |
 | `harness.sandbox` | Live, idle-only | Harness supervisor applies provider policy before commit | Old harness restored if persistence fails | harness policy tests |
 | `harness.reviews` | Live | Application and orchestrator read the accepted policy for the next decision | Validation/persistence is all-or-nothing | review-policy tests |
 | `harness.chat_agent_prefix` | Live | Application snapshots it immediately before chat dispatch | Validation/persistence is all-or-nothing | prompt-prefix tests |

@@ -192,6 +192,32 @@ func TestFrameworkPromptsEncodeRiskProportionateReview(t *testing.T) {
 	}
 }
 
+func TestInitializedChatPromptContainsEvidenceGroundedHonestyContract(t *testing.T) {
+	root := t.TempDir()
+	if err := Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	embedded, err := Template("chat.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialized, err := os.ReadFile(filepath.Join(root, ".spynel", "prompts", "chat.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for source, data := range map[string][]byte{
+		"embedded":    embedded,
+		"initialized": initialized,
+	} {
+		text := string(data)
+		for _, required := range []string{"Never knowingly lie", "fabricate evidence", "I don't know yet", "dispatch, delivery, completion, release", "not a guarantee"} {
+			if !strings.Contains(text, required) {
+				t.Errorf("%s chat prompt omitted %q", source, required)
+			}
+		}
+	}
+}
+
 func TestUpgradeAddsReviewAssetsWithoutOverwritingPrompts(t *testing.T) {
 	root := t.TempDir()
 	if err := Init(root, false); err != nil {
