@@ -7,7 +7,7 @@ Each initialized Spynel workspace has five owner-editable Markdown files:
 | Chat | `.spynel/instructions/agent-chat.md` | TUI, Telegram, WhatsApp, and CLI communication turns |
 | Developer | `.spynel/instructions/agent-developer.md` | Task implementation, goal planning, and recovery |
 | Reviewer | `.spynel/instructions/agent-reviewer.md` | Independent task and goal review |
-| Notification | `.spynel/instructions/agent-notification.md` | Enabled notification-decision sessions |
+| Notification | `.spynel/instructions/agent-notification.md` | Direct task notification-agent jobs |
 | Heartbeat | `.spynel/instructions/agent-heartbeat.md` | Semantic workflow audits |
 
 These files are standing workspace-owner preferences, not base prompts. Base prompt templates remain in `.spynel/prompts/`; repository and workspace contracts remain in `AGENTS.md`; tasks, goals, histories, and global harness configuration retain their existing responsibilities. Instructions never cross workspace boundaries.

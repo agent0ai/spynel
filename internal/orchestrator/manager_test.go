@@ -57,7 +57,7 @@ func (f *fakeHarness) Send(_ context.Context, key, prompt string, emit core.Emit
 		f.threads[key] = thread
 	}
 	f.mu.Unlock()
-	if f.beforeEmit != nil {
+	if f.beforeEmit != nil && !strings.HasPrefix(key, "orchestrator:notification:") {
 		f.beforeEmit()
 	}
 	if f.events != nil {
@@ -277,13 +277,13 @@ func TestImplementationDoneMoveIsReconciledIntoIndependentReview(t *testing.T) {
 	started := 0
 	finished := 0
 	var attempts []int
-	manager.JobStarted = func(lease Lease, description string, _ time.Time, _ int, implementationAttempts int) int {
+	manager.JobStarted = func(lease Lease, description string, _ time.Time, _ int, implementationAttempts int) (int, error) {
 		if lease.SessionKey == "" || description == "" {
 			t.Errorf("empty orchestrator job metadata: %q %q", lease.SessionKey, description)
 		}
 		attempts = append(attempts, implementationAttempts)
 		started++
-		return 7
+		return 7, nil
 	}
 	manager.JobFinished = func(id int) {
 		if id != 7 {
@@ -345,10 +345,19 @@ func TestProviderCompletionRemainsAwaitingTransitionUntilDurableMove(t *testing.
 	started, finished := 0, 0
 	var states []string
 	var providerStates []string
-	manager.JobStarted = func(Lease, string, time.Time, int, int) int { started++; return 11 }
+	manager.JobStarted = func(lease Lease, _ string, _ time.Time, _, _ int) (int, error) {
+		if lease.DocumentType == "notification" {
+			return 12, nil
+		}
+		started++
+		return 11, nil
+	}
 	manager.JobUpdated = func(_ int, lease Lease) { states = append(states, lease.State) }
 	manager.JobExecutionUpdated = func(_ int, status core.ExecutionStatus) { providerStates = append(providerStates, status.State) }
 	manager.JobFinished = func(id int) {
+		if id == 12 {
+			return
+		}
 		if id != 11 {
 			t.Errorf("finished ID=%d", id)
 		}
@@ -534,7 +543,7 @@ func TestReviewTransitionAcceptRejectAndSelfReviewGuard(t *testing.T) {
 			route := cfg.Orchestrator.Routes[0]
 			reviewDir := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "review")
 			path := filepath.Join(filepath.Dir(reviewDir), "reviewing", "review.md")
-			doc := Document{FrontMatter: map[string]any{"id": "review-id", "title": "review", "status": "reviewing", "created_at": time.Now().UTC().Format(time.RFC3339), "updated_at": time.Now().UTC().Format(time.RFC3339), "notify": map[string]any{"enabled": false}}, Body: "# review\n"}
+			doc := Document{FrontMatter: map[string]any{"id": "review-id", "title": "review", "status": "reviewing", "created_at": time.Now().UTC().Format(time.RFC3339), "updated_at": time.Now().UTC().Format(time.RFC3339), "review_attempt": 1, "notify": map[string]any{"enabled": false}}, Body: "# review\n"}
 			if err := WriteDocument(path, doc); err != nil {
 				t.Fatal(err)
 			}
@@ -544,7 +553,7 @@ func TestReviewTransitionAcceptRejectAndSelfReviewGuard(t *testing.T) {
 				implementer = thread
 			}
 			manager := New(cfg, newFakeRecipient(), extensions.Runner{Directory: filepath.Join(root, "missing")})
-			lease := Lease{ID: "lease", Route: "tasks", File: path, SessionKey: "review-session", Phase: phaseTaskReview, ThreadID: thread, ImplementerThread: implementer, StartedAt: time.Now(), HeartbeatAt: time.Now()}
+			lease := Lease{ID: "lease", Route: "tasks", File: path, SessionKey: "review-session", Phase: phaseTaskReview, ClaimAttempt: 1, ThreadID: thread, ImplementerThread: implementer, StartedAt: time.Now(), HeartbeatAt: time.Now()}
 			if err := manager.saveLease(lease); err != nil {
 				t.Fatal(err)
 			}
@@ -666,13 +675,19 @@ func TestPrepareControlContinuationRevalidatesLeaseOwnerAndDurableState(t *testi
 	if err != nil || current.State != "processing" {
 		t.Fatalf("continued lease = %#v, %v", current, err)
 	}
-	manager.MarkControlCancellation(lease.SessionKey)
+	firstReservation := manager.MarkControlCancellation(lease.SessionKey)
+	secondReservation := manager.MarkControlCancellation(lease.SessionKey)
 	if manager.PrepareControlContinuation(lease, "control") {
 		t.Fatal("cancelled control was allowed to continue")
 	}
-	manager.mu.Lock()
-	delete(manager.controlCancelled, lease.ID)
-	manager.mu.Unlock()
+	manager.RestoreControlCancellation(firstReservation)
+	if manager.PrepareControlContinuation(lease, "control") {
+		t.Fatal("one rollback cleared another cancellation reservation")
+	}
+	manager.RestoreControlCancellation(secondReservation)
+	if !manager.ControlStillValid(lease, "control") {
+		t.Fatal("all rejected cancellation reservations did not restore control")
+	}
 	if err := WriteDocument(path, Document{FrontMatter: map[string]any{"id": "replacement", "status": "working"}, Body: "# Replacement\n"}); err != nil {
 		t.Fatal(err)
 	}
@@ -760,4 +775,34 @@ func TestAutomaticCleanupRunsOnlyForPrimaryAndUsesLiveRetention(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+func TestTaskNotificationDecisionCoversTerminalAndActionableWaitingTransitions(t *testing.T) {
+	now := time.Date(2026, time.August, 13, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		status string
+		wakeAt string
+		want   bool
+	}{
+		{name: "done", status: "done", want: true},
+		{name: "failed", status: "failed", want: true},
+		{name: "cancelled", status: "cancelled", want: true},
+		{name: "unscheduled waiting", status: "waiting", want: true},
+		{name: "malformed waiting schedule", status: "waiting", wakeAt: "not-a-time", want: true},
+		{name: "due waiting schedule", status: "waiting", wakeAt: now.Format(time.RFC3339), want: true},
+		{name: "future waiting schedule", status: "waiting", wakeAt: now.Add(time.Minute).Format(time.RFC3339), want: false},
+		{name: "working", status: "working", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			document := Document{FrontMatter: map[string]any{}}
+			if test.wakeAt != "" {
+				document.FrontMatter["wake_at"] = test.wakeAt
+			}
+			if got := requiresTaskNotificationDecision(document, test.status, now); got != test.want {
+				t.Fatalf("requiresTaskNotificationDecision(%q, wake_at=%q) = %v, want %v", test.status, test.wakeAt, got, test.want)
+			}
+		})
+	}
 }

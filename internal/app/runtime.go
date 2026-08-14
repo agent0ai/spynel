@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -25,6 +26,7 @@ const (
 	maxJobDescription   = 80
 	maxJobStatusDetail  = 160
 	jobActivityInterval = 15 * time.Second
+	maxJobNumber        = 9999
 )
 
 type JobExecutionState string
@@ -61,15 +63,22 @@ type LogEntry struct {
 }
 
 type Job struct {
-	ID                     int
+	ID                     int    // process-local execution handle
+	Number                 int    // durable user-facing workspace reference
+	StableID               string // private collision-proof archive identity
+	Generation             uint64
 	SessionKey             string
 	Channel                string
 	Conversation           string
 	Description            string
+	Provider               string
+	WorkID                 string
+	ParentID               string
 	StartedAt              time.Time
 	FirstAssignedAt        time.Time
 	ProviderIterations     int
 	ImplementationAttempts int
+	PhaseAttempt           int
 	Durable                bool
 	Kind                   string
 	Route                  string
@@ -94,18 +103,25 @@ type JobDetails struct {
 	FirstAssignedAt        time.Time
 	ProviderIterations     int
 	ImplementationAttempts int
+	PhaseAttempt           int
+	Provider               string
+	WorkID                 string
+	ParentID               string
+	Phase                  string
 }
 
 // Runtime owns the bounded retained operational-log view and interruptible
 // process-local jobs. Its update channel keeps only the newest counts for the TUI.
 type Runtime struct {
-	mu        sync.Mutex
-	logs      []LogEntry
-	logStart  int
-	jobs      map[int]Job
-	bySession map[string]int
-	nextJobID int
-	updates   chan core.RuntimeStatus
+	mu               sync.Mutex
+	logs             []LogEntry
+	logStart         int
+	jobs             map[int]Job
+	byNumber         map[int]int
+	bySession        map[string]int
+	jobCancellations map[string]jobCancellationReservation
+	nextJobID        int
+	updates          chan core.RuntimeStatus
 
 	writerMu  sync.Mutex
 	partial   []byte
@@ -115,15 +131,23 @@ type Runtime struct {
 	persist      *runtimeLogPersistence
 	persistDone  chan struct{}
 	logEventHook func() // test-only scheduling hook at the memory/disk boundary
+	archive      *JobArchive
 	Now          func() time.Time
+}
+
+type jobCancellationReservation struct {
+	count    int
+	previous Job
 }
 
 func NewRuntime() *Runtime {
 	return &Runtime{
-		jobs:      map[int]Job{},
-		bySession: map[string]int{},
-		updates:   make(chan core.RuntimeStatus, 1),
-		Now:       time.Now,
+		jobs:             map[int]Job{},
+		byNumber:         map[int]int{},
+		bySession:        map[string]int{},
+		jobCancellations: map[string]jobCancellationReservation{},
+		updates:          make(chan core.RuntimeStatus, 1),
+		Now:              time.Now,
 	}
 }
 
@@ -145,6 +169,14 @@ func NewRuntimeAt(directory, instance string) *Runtime {
 	}
 	r.LogEvent("info", "runtime", "session_start", "Spynel runtime session started")
 	return r
+}
+
+// ConfigureJobArchive attaches the workspace-local archive after configuration
+// resolution. It is intentionally independent from the process runtime log.
+func (r *Runtime) ConfigureJobArchive(directory string) {
+	r.mu.Lock()
+	r.archive = newJobArchive(directory)
+	r.mu.Unlock()
 }
 
 func (r *Runtime) capturePersistenceFailures() {
@@ -275,6 +307,15 @@ func (r *Runtime) BeginJob(sessionKey, channel, conversation, description string
 }
 
 func (r *Runtime) BeginJobWithDetails(sessionKey, channel, conversation, description string, details JobDetails) int {
+	id, err := r.TryBeginJobWithDetails(sessionKey, channel, conversation, description, details)
+	r.reportJobArchiveError("admit", err)
+	return id
+}
+
+// TryBeginJobWithDetails admits a job only after its durable user-facing
+// number has been allocated. Callers that would start provider work must use
+// this error-returning boundary so an unavailable counter fails closed.
+func (r *Runtime) TryBeginJobWithDetails(sessionKey, channel, conversation, description string, details JobDetails) (int, error) {
 	r.mu.Lock()
 	if id, ok := r.bySession[sessionKey]; ok {
 		job := r.jobs[id]
@@ -292,10 +333,22 @@ func (r *Runtime) BeginJobWithDetails(sessionKey, channel, conversation, descrip
 			r.publishLocked()
 		}
 		r.mu.Unlock()
-		return id
+		return id, nil
+	}
+	now := r.Now().UTC()
+	archive := r.archive
+	stableID := newStableJobID(now)
+	generation := uint64(0)
+	number := r.nextJobID%maxJobNumber + 1
+	if archive != nil {
+		var err error
+		number, generation, stableID, err = archive.allocate(now, details.WorkID, details.Kind, details.Phase, details.PhaseAttempt)
+		if err != nil {
+			r.mu.Unlock()
+			return 0, fmt.Errorf("allocate durable job number: %w", err)
+		}
 	}
 	r.nextJobID++
-	now := r.Now().UTC()
 	description = strings.Join(strings.Fields(description), " ")
 	if runes := []rune(description); len(runes) > maxJobDescription {
 		description = string(runes[:maxJobDescription-1]) + "…"
@@ -310,28 +363,40 @@ func (r *Runtime) BeginJobWithDetails(sessionKey, channel, conversation, descrip
 		iterations = 1
 	}
 	job := Job{
-		ID: r.nextJobID, SessionKey: sessionKey, Channel: channel,
+		ID: r.nextJobID, Number: number, StableID: stableID, Generation: generation, SessionKey: sessionKey, Channel: channel,
 		Conversation: conversation, Description: description, StartedAt: now,
-		FirstAssignedAt: firstAssignedAt, ProviderIterations: iterations, ImplementationAttempts: max(0, details.ImplementationAttempts), Durable: durable,
+		Provider: details.Provider, WorkID: details.WorkID, ParentID: details.ParentID,
+		FirstAssignedAt: firstAssignedAt, ProviderIterations: iterations, ImplementationAttempts: max(0, details.ImplementationAttempts), PhaseAttempt: max(0, details.PhaseAttempt), Durable: durable,
 		Kind: details.Kind, Route: details.Route, DurableFile: details.DurableFile,
-		Execution: JobStarting, Health: JobHealthHealthy, LastActivityAt: now, StateChangedAt: now,
+		LeasePhase: details.Phase, Execution: JobStarting, Health: JobHealthHealthy, LastActivityAt: now, StateChangedAt: now,
+	}
+	if archive != nil {
+		persistedID, err := archive.begin(job)
+		if err != nil {
+			r.mu.Unlock()
+			return 0, fmt.Errorf("persist durable job archive: %w", err)
+		}
+		job.StableID = persistedID
 	}
 	r.jobs[job.ID] = job
+	if currentID, ok := r.byNumber[job.Number]; !ok || newerJobGeneration(job, r.jobs[currentID]) {
+		r.byNumber[job.Number] = job.ID
+	}
 	r.bySession[sessionKey] = job.ID
 	r.publishLocked()
 	r.mu.Unlock()
-	r.LogEvent("info", "jobs", "job_started", fmt.Sprintf("job_id=%d channel=%s kind=%s", job.ID, logField(job.Channel, "unknown"), logField(job.Kind, "chat")))
-	return job.ID
+	r.LogEvent("info", "jobs", "job_started", fmt.Sprintf("job_id=%d channel=%s kind=%s", job.Number, logField(job.Channel, "unknown"), logField(job.Kind, "chat")))
+	return job.ID, nil
 }
 
 // UpdateJobDurableTiming applies only non-regressing durable observations to
 // an active job, allowing controls and guarded continuations to refresh the
-// same process-local job number without resetting its current execution age.
+// same process-local execution handle without resetting its current execution age.
 func (r *Runtime) UpdateJobDurableTiming(id int, firstAssignedAt time.Time, providerIterations int) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	job, ok := r.jobs[id]
 	if !ok || !job.Durable {
+		r.mu.Unlock()
 		return false
 	}
 	changed := false
@@ -347,18 +412,23 @@ func (r *Runtime) UpdateJobDurableTiming(id int, firstAssignedAt time.Time, prov
 		r.jobs[id] = job
 		r.publishLocked()
 	}
+	archive := r.archive
+	r.mu.Unlock()
+	if changed && archive != nil {
+		r.reportJobArchiveError("update", archive.update(job))
+	}
 	return true
 }
 
-// UpdateJob applies a lifecycle update only to the still-active numeric job.
-// Numeric IDs are never reused, so late provider/recovery events cannot mutate
-// a newer turn on a persistent harness session. Activity-only updates are
+// UpdateJob applies a lifecycle update only to the still-active private
+// execution handle. Handles are never reused in a process, so late events
+// cannot mutate a newer generation after its public number wraps. Activity-only updates are
 // throttled and do not publish TUI count/status notifications.
 func (r *Runtime) UpdateJob(id int, status core.ExecutionStatus) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	job, ok := r.jobs[id]
 	if !ok {
+		r.mu.Unlock()
 		return false
 	}
 	at := status.At.UTC()
@@ -369,7 +439,7 @@ func (r *Runtime) UpdateJob(id int, status core.ExecutionStatus) bool {
 	if state == "" {
 		state = job.Execution
 	}
-	if executionStateIsTerminal(job.Execution) && !executionStateIsTerminal(state) {
+	if job.Execution == JobCancelling || executionStateIsTerminal(job.Execution) && !executionStateIsTerminal(state) {
 		state = job.Execution
 	}
 	detail := boundJobStatusDetail(status.Detail)
@@ -378,11 +448,13 @@ func (r *Runtime) UpdateJob(id int, status core.ExecutionStatus) bool {
 			job.LastActivityAt = at
 			r.jobs[id] = job
 		}
+		r.mu.Unlock()
 		return true
 	}
 	material := state != job.Execution || detail != job.StatusDetail ||
 		status.ReconnectAttempt != job.ReconnectAttempt || status.ReconnectTotal != job.ReconnectTotal
 	if !material && !job.LastActivityAt.IsZero() && at.Sub(job.LastActivityAt) < jobActivityInterval {
+		r.mu.Unlock()
 		return true
 	}
 	job.Execution = state
@@ -400,6 +472,83 @@ func (r *Runtime) UpdateJob(id int, status core.ExecutionStatus) bool {
 	if material {
 		r.publishLocked()
 	}
+	archive := r.archive
+	r.mu.Unlock()
+	if archive != nil {
+		r.reportJobArchiveError("update", archive.update(job))
+	}
+	return true
+}
+
+// ReserveJobCancellation atomically snapshots the original live state, counts
+// this interrupt request, and publishes cancelling before the provider can
+// synchronously emit its terminal event. Concurrent callers share the first
+// snapshot so one rejected request cannot roll back another accepted request.
+func (r *Runtime) ReserveJobCancellation(id int) (Job, bool) {
+	r.mu.Lock()
+	job, ok := r.jobs[id]
+	if !ok {
+		r.mu.Unlock()
+		return Job{}, false
+	}
+	reservation := r.jobCancellations[job.StableID]
+	if reservation.count == 0 {
+		reservation.previous = job
+	}
+	reservation.count++
+	r.jobCancellations[job.StableID] = reservation
+	job.Execution = JobCancelling
+	job.Health = healthFromExecution(JobCancelling)
+	now := r.Now().UTC()
+	job.LastActivityAt = now
+	job.StateChangedAt = now
+	r.jobs[job.ID] = job
+	r.publishLocked()
+	archive := r.archive
+	r.mu.Unlock()
+	if archive != nil {
+		r.reportJobArchiveError("update", archive.update(job))
+	}
+	return job, true
+}
+
+// RestoreJobAfterFailedCancellation releases one interrupt reservation. The
+// original state is restored only after every concurrent request for the same
+// stable job has failed and the provider has not already finalized the job.
+func (r *Runtime) RestoreJobAfterFailedCancellation(job Job) bool {
+	r.mu.Lock()
+	current, ok := r.jobs[job.ID]
+	reservation, reserved := r.jobCancellations[job.StableID]
+	if !ok || current.StableID != job.StableID || !reserved || reservation.count < 1 {
+		r.mu.Unlock()
+		return false
+	}
+	reservation.count--
+	if reservation.count > 0 {
+		r.jobCancellations[job.StableID] = reservation
+		r.mu.Unlock()
+		return false
+	}
+	delete(r.jobCancellations, job.StableID)
+	if current.Execution != JobCancelling {
+		r.mu.Unlock()
+		return false
+	}
+	previous := reservation.previous
+	current.Execution = previous.Execution
+	current.Health = previous.Health
+	current.StatusDetail = previous.StatusDetail
+	current.LastActivityAt = previous.LastActivityAt
+	current.StateChangedAt = previous.StateChangedAt
+	current.ReconnectAttempt = previous.ReconnectAttempt
+	current.ReconnectTotal = previous.ReconnectTotal
+	r.jobs[current.ID] = current
+	r.publishLocked()
+	archive := r.archive
+	r.mu.Unlock()
+	if archive != nil {
+		r.reportJobArchiveError("update", archive.update(current))
+	}
 	return true
 }
 
@@ -408,9 +557,9 @@ func (r *Runtime) UpdateJob(id int, status core.ExecutionStatus) bool {
 // lock, so a concurrent reconnect signal cannot be overwritten.
 func (r *Runtime) SetJobRunningIfStarting(id int) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	job, ok := r.jobs[id]
 	if !ok || job.Execution != JobStarting {
+		r.mu.Unlock()
 		return false
 	}
 	now := time.Now().UTC()
@@ -420,6 +569,11 @@ func (r *Runtime) SetJobRunningIfStarting(id int) bool {
 	job.StateChangedAt = now
 	r.jobs[id] = job
 	r.publishLocked()
+	archive := r.archive
+	r.mu.Unlock()
+	if archive != nil {
+		r.reportJobArchiveError("update", archive.update(job))
+	}
 	return true
 }
 
@@ -455,16 +609,20 @@ func executionStateIsTerminal(state JobExecutionState) bool {
 
 func (r *Runtime) UpdateJobFromLease(id int, state, phase, detail string, heartbeat time.Time, recoveryCount int) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	job, ok := r.jobs[id]
 	if !ok {
+		r.mu.Unlock()
 		return false
 	}
 	heartbeat = heartbeat.UTC()
 	if !heartbeat.IsZero() && !job.LeaseHeartbeatAt.IsZero() && heartbeat.Before(job.LeaseHeartbeatAt) {
+		r.mu.Unlock()
 		return true
 	}
 	execution := executionFromLeaseState(state)
+	if job.Kind == "heartbeat" && state == "working" {
+		execution = JobAudit
+	}
 	staleExecution := !heartbeat.IsZero() && heartbeat.Before(job.StateChangedAt) && job.Execution != JobStarting
 	// A processing lease confirms ownership, but only the provider can confirm
 	// that a reported reconnect or explicit watchdog stall has cleared.
@@ -506,6 +664,11 @@ func (r *Runtime) UpdateJobFromLease(id int, state, phase, detail string, heartb
 	if material {
 		r.publishLocked()
 	}
+	archive := r.archive
+	r.mu.Unlock()
+	if archive != nil {
+		r.reportJobArchiveError("update", archive.update(job))
+	}
 	return true
 }
 
@@ -513,7 +676,7 @@ func executionFromLeaseState(state string) JobExecutionState {
 	switch state {
 	case "claiming":
 		return JobStarting
-	case "processing":
+	case "processing", "working", "acting":
 		return JobRunning
 	case "recovering":
 		return JobRecovering
@@ -554,10 +717,36 @@ func (r *Runtime) EndJob(id int) {
 		return
 	}
 	delete(r.jobs, id)
+	if r.byNumber[job.Number] == id {
+		delete(r.byNumber, job.Number)
+	}
 	delete(r.bySession, job.SessionKey)
+	delete(r.jobCancellations, job.StableID)
 	r.publishLocked()
+	archive := r.archive
 	r.mu.Unlock()
-	r.LogEvent("info", "jobs", "job_finished", fmt.Sprintf("job_id=%d channel=%s kind=%s duration=%s", job.ID, logField(job.Channel, "unknown"), logField(job.Kind, "chat"), time.Since(job.StartedAt).Round(time.Millisecond)))
+	if archive != nil {
+		r.reportJobArchiveError("finish", archive.finish(job, r.Now().UTC()))
+	}
+	r.LogEvent("info", "jobs", "job_finished", fmt.Sprintf("job_id=%d channel=%s kind=%s duration=%s", job.Number, logField(job.Channel, "unknown"), logField(job.Kind, "chat"), time.Since(job.StartedAt).Round(time.Millisecond)))
+}
+
+// RecordJobEvent captures the provider-neutral terminal stream without
+// interpreting its text or using it for any workflow decision.
+func (r *Runtime) RecordJobEvent(id int, event core.Event) {
+	r.mu.Lock()
+	job, ok := r.jobs[id]
+	archive := r.archive
+	r.mu.Unlock()
+	if ok && archive != nil {
+		r.reportJobArchiveError("event", archive.event(job.StableID, r.Now().UTC(), event))
+	}
+}
+
+func (r *Runtime) reportJobArchiveError(operation string, err error) {
+	if err != nil {
+		r.LogEvent("error", "job_archive", operation+"_failed", err.Error())
+	}
 }
 
 func (r *Runtime) JobForSession(sessionKey string) (Job, bool) {
@@ -578,6 +767,17 @@ func (r *Runtime) Job(id int) (Job, bool) {
 	return job, ok
 }
 
+func (r *Runtime) JobByNumber(number int) (Job, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id, ok := r.byNumber[number]
+	if !ok {
+		return Job{}, false
+	}
+	job, ok := r.jobs[id]
+	return job, ok
+}
+
 func (r *Runtime) Jobs() []Job {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -587,6 +787,64 @@ func (r *Runtime) Jobs() []Job {
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].ID < jobs[j].ID })
 	return jobs
+}
+
+// NumericJobs returns only jobs that are currently addressable through their
+// public number. An older recovered generation may remain active for archive
+// continuity after wraparound, but it must not appear beside (or later replace)
+// the newer generation selected by that number.
+func (r *Runtime) NumericJobs() []Job {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	jobs := make([]Job, 0, len(r.byNumber))
+	for _, id := range r.byNumber {
+		if job, ok := r.jobs[id]; ok {
+			jobs = append(jobs, job)
+		}
+	}
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].ID < jobs[j].ID })
+	return jobs
+}
+
+func newerJobGeneration(candidate, current Job) bool {
+	if candidate.Generation != current.Generation {
+		return candidate.Generation > current.Generation
+	}
+	return candidate.ID > current.ID
+}
+
+func (r *Runtime) RecentArchivedJobs(limit int) ([]JobArchiveSummary, error) {
+	r.mu.Lock()
+	archive := r.archive
+	r.mu.Unlock()
+	if archive == nil {
+		return nil, nil
+	}
+	return archive.recent(limit)
+}
+
+func (r *Runtime) ArchivedJob(ref any) (JobArchiveSummary, string, error) {
+	r.mu.Lock()
+	archive := r.archive
+	r.mu.Unlock()
+	if archive == nil {
+		return JobArchiveSummary{}, "", os.ErrNotExist
+	}
+	return archive.get(ref)
+}
+
+func (r *Runtime) CleanupArchivedJobs(cutoff time.Time) (int, int64, int, int) {
+	r.mu.Lock()
+	archive := r.archive
+	live := make(map[string]bool, len(r.jobs))
+	for _, job := range r.jobs {
+		live[job.StableID] = true
+	}
+	r.mu.Unlock()
+	if archive == nil {
+		return 0, 0, 0, 0
+	}
+	return archive.cleanup(cutoff.UTC(), live)
 }
 
 func (r *Runtime) Logs() []LogEntry {
@@ -914,11 +1172,12 @@ func formatJobsAt(jobs []Job, now time.Time) string {
 	}
 	lines := []string{"# Jobs", ""}
 	for _, job := range jobs {
-		description := job.Description
-		origin := job.Channel + "/" + job.Conversation
+		description := "conversation"
+		origin := job.Channel
 		if job.DurableFile != "" {
 			description = filepath.Base(job.DurableFile)
-			origin = "orchestrator/markdown"
+		} else if job.Kind != "" && job.Kind != "conversation" {
+			description = job.Description
 		}
 		started := job.StartedAt
 		if job.Durable && !job.FirstAssignedAt.IsZero() && !job.FirstAssignedAt.After(now) {
@@ -929,12 +1188,19 @@ func formatJobsAt(jobs []Job, now time.Time) string {
 			counters += fmt.Sprintf(" %d↻", job.ImplementationAttempts)
 		}
 		lines = append(lines,
-			fmt.Sprintf("- **Job %d** %s  ", job.ID, safeJobText(description, maxJobDescription)),
+			fmt.Sprintf("- **Job %d** %s  ", publicJobNumber(job), safeJobText(description, maxJobDescription)),
 			fmt.Sprintf("  %s %s · %s · %s", shortDuration(now.Sub(started)), counters, formatExecutionStatus(job), safeJobText(origin, maxJobMetadataRunes)),
 		)
 	}
 	lines = append(lines, "", "Use `/job info <number>` to inspect a job.", "Use `/job kill <number>` to stop a job.")
 	return strings.Join(lines, "\n")
+}
+
+func publicJobNumber(job Job) int {
+	if job.Number > 0 {
+		return job.Number
+	}
+	return job.ID
 }
 
 func formatExecutionStatus(job Job) string {

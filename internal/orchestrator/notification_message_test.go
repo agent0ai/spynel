@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -58,11 +57,12 @@ func TestMalformedSummaryDoesNotBlockNotificationAgentScheduling(t *testing.T) {
 	if err := manager.completeTransition(context.Background(), config.Route{Name: "tasks"}, Lease{ID: "lease", Phase: phaseTaskImplementation, ClaimAttempt: 1}, "done", path); err != nil {
 		t.Fatal(err)
 	}
-	if harness.calls != 0 {
-		t.Fatalf("terminal transition synchronously called notification harness %d times", harness.calls)
-	}
-	entries, err := os.ReadDir(manager.notificationAgentDirectory())
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("terminal notification agent was not scheduled: %v, %d", err, len(entries))
+	manager.Wait()
+	harness.mu.Lock()
+	calls := harness.calls
+	prompts := append([]string(nil), harness.prompts...)
+	harness.mu.Unlock()
+	if calls != 1 || len(prompts) != 1 || !strings.Contains(prompts[0], "Terminal transition") {
+		t.Fatalf("terminal notification agent was not scheduled with task evidence: calls=%d prompts=%d", calls, len(prompts))
 	}
 }

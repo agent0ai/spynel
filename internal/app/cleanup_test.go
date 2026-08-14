@@ -88,6 +88,39 @@ func TestCleanupUsesLastUpdateStrictCutoffAndArchivesOnlyTerminalTasks(t *testin
 	}
 }
 
+func TestCleanupRemovesRetiredNotificationRuntimeArtifacts(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"notification-agents", "notification-agent-locks"} {
+		directory := cfg.StatePath("runtime", name)
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, "retired.json"), []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(cfg, newServiceHarness())
+	result, err := service.runCleanup(7, "", "", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RemovedObsoleteState != 2 || result.Failed != 0 {
+		t.Fatalf("cleanup result = %#v", result)
+	}
+	for _, name := range []string{"notification-agents", "notification-agent-locks"} {
+		if _, err := os.Stat(cfg.StatePath("runtime", name)); !os.IsNotExist(err) {
+			t.Fatalf("obsolete runtime artifact %q remains: %v", name, err)
+		}
+	}
+}
+
 func TestCleanupKeepsSettledTasksLinkedToNonterminalGoals(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {

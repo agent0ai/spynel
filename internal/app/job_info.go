@@ -23,13 +23,80 @@ const (
 	maxJobDocumentBytes   = 2 << 20
 )
 
-func (s *Service) jobInfoCommand(message core.Message, id int, emit core.Emit) error {
-	job, ok := s.Runtime.Job(id)
-	if !ok {
-		return s.localReply(message, fmt.Sprintf("Job %d is not running; it may be unknown or already finished. Use /jobs to list running jobs.", id), emit)
+func (s *Service) jobsRecentCommand(message core.Message, emit core.Emit) error {
+	items, err := s.Runtime.RecentArchivedJobs(jobArchiveRecentLimit)
+	if err != nil {
+		return s.localReply(message, "Recent job archives are unavailable: "+err.Error(), emit)
 	}
-	if err := s.authorizeJobAccess(message, job); err != nil {
-		return s.localReply(message, fmt.Sprintf("Job %d is not available to this conversation.", id), emit)
+	if len(items) == 0 {
+		return s.localReply(message, "# Recent jobs\n\nNo archived jobs are available.", emit)
+	}
+	lines := []string{"# Recent jobs", "", fmt.Sprintf("Showing %d newest archived jobs by number.", len(items)), ""}
+	for _, item := range items {
+		when := item.StartedAt.UTC().Format(time.RFC3339)
+		if !item.EndedAt.IsZero() {
+			when = item.EndedAt.UTC().Format(time.RFC3339)
+		}
+		lines = append(lines, fmt.Sprintf("- **Job %d** %s  ", item.Number, safeJobText(item.Title, maxJobMetadataRunes)), fmt.Sprintf("  %s · %s · %s", when, safeJobText(item.State, 80), safeJobText(item.Origin, 80)))
+	}
+	lines = append(lines, "", "Use `/job info <number>` for metadata or `/job output <number>` for the newest output tail.")
+	return s.localReply(message, strings.Join(lines, "\n"), emit)
+}
+
+func (s *Service) archivedJobInfoCommand(message core.Message, number int, emit core.Emit) error {
+	item, _, err := s.Runtime.ArchivedJob(number)
+	if err != nil {
+		return s.localReply(message, fmt.Sprintf("Job %d was not found. Use `/jobs` or `/jobs recent`.", number), emit)
+	}
+	lines := []string{fmt.Sprintf("# Job %d", item.Number), "", "- Title: " + safeJobText(item.Title, maxJobMetadataRunes), "- Type: " + safeJobText(item.Kind, 80), "- Origin: " + safeJobText(item.Origin, 80), "- State: " + safeJobText(item.State, 80), "- Started: " + item.StartedAt.UTC().Format(time.RFC3339Nano)}
+	if item.Provider != "" {
+		lines = append(lines, "- Provider: "+safeJobText(item.Provider, 80))
+	}
+	if item.WorkID != "" {
+		lines = append(lines, "- Work ID: "+safeJobText(item.WorkID, maxJobMetadataRunes))
+	}
+	if item.ParentID != "" {
+		lines = append(lines, "- Parent: "+safeJobText(item.ParentID, maxJobMetadataRunes))
+	}
+	if item.Phase != "" {
+		lines = append(lines, "- Phase: "+safeJobText(item.Phase, 80))
+	}
+	if !item.EndedAt.IsZero() {
+		lines = append(lines, "- Ended: "+item.EndedAt.UTC().Format(time.RFC3339Nano), "- Duration: "+item.EndedAt.Sub(item.StartedAt).Round(time.Millisecond).String())
+	}
+	lines = append(lines, "", fmt.Sprintf("Use `/job output %d` to inspect its bounded captured event stream.", item.Number))
+	return s.localReply(message, strings.Join(lines, "\n"), emit)
+}
+
+func (s *Service) jobOutputCommand(message core.Message, number int, tailBytes int, emit core.Emit) error {
+	var ref any = number
+	if job, ok := s.Runtime.JobByNumber(number); ok {
+		ref = job.StableID
+	}
+	item, output, err := s.Runtime.ArchivedJob(ref)
+	if err != nil {
+		return s.localReply(message, fmt.Sprintf("Job output %d was not found. Use `/jobs` or `/jobs recent`.", number), emit)
+	}
+	originalBytes := len(output)
+	if len(output) > tailBytes {
+		start := len(output) - tailBytes
+		for start < len(output) && output[start]&0xc0 == 0x80 {
+			start++
+		}
+		output = output[start:]
+		output = "[EARLIER OUTPUT OMITTED]\n" + output
+	}
+	if strings.TrimSpace(output) == "" {
+		output = "No captured provider output yet."
+	}
+	header := fmt.Sprintf("# Job output %d\n\nState: %s · showing newest %d of %d captured bytes.\n", item.Number, safeJobText(item.State, 80), min(originalBytes, tailBytes), originalBytes)
+	return s.localReply(message, header+output, emit)
+}
+
+func (s *Service) jobInfoCommand(message core.Message, id int, emit core.Emit) error {
+	job, ok := s.Runtime.JobByNumber(id)
+	if !ok {
+		return s.archivedJobInfoCommand(message, id, emit)
 	}
 
 	lease, hasLease := s.Orchestrator.LeaseForSession(job.SessionKey)
@@ -37,22 +104,11 @@ func (s *Service) jobInfoCommand(message core.Message, id int, emit core.Emit) e
 
 	// Durable reads and harness completion can race. Never present a stale job
 	// as active after it has left the process-local registry.
-	current, stillRunning := s.Runtime.Job(id)
+	current, stillRunning := s.Runtime.Job(job.ID)
 	if !stillRunning || current.SessionKey != job.SessionKey {
 		return s.localReply(message, fmt.Sprintf("Job %d finished while its details were being read. Use /jobs to list running jobs.", id), emit)
 	}
 	return s.localReply(message, text, emit)
-}
-
-func (s *Service) accessibleJobs(message core.Message) []Job {
-	jobs := s.Runtime.Jobs()
-	visible := jobs[:0]
-	for _, job := range jobs {
-		if s.authorizeJobAccess(message, job) == nil {
-			visible = append(visible, job)
-		}
-	}
-	return visible
 }
 
 func (s *Service) formatJobInfo(job Job, lease orchestrator.Lease, hasLease bool) string {
@@ -67,7 +123,7 @@ func (s *Service) formatJobInfo(job Job, lease orchestrator.Lease, hasLease bool
 	}
 
 	lines := []string{
-		fmt.Sprintf("# Job %d", job.ID), "",
+		fmt.Sprintf("# Job %d", publicJobNumber(job)), "",
 		"- Kind: " + safeJobText(kind, maxJobMetadataRunes),
 		"- Route: " + safeJobText(route, maxJobMetadataRunes),
 		"- Execution status: " + safeJobText(formatExecutionStatus(job), maxJobMetadataRunes),

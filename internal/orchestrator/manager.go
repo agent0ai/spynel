@@ -57,28 +57,26 @@ type ScheduledCheckpoint struct {
 }
 
 type Manager struct {
-	Config                      config.Config
-	Harness                     harness.Harness
-	Hooks                       extensions.Runner
-	Log                         func(string)
-	JobStarted                  func(lease Lease, description string, firstAssignedAt time.Time, providerIterations, implementationAttempts int) int
-	JobUpdated                  func(id int, lease Lease)
-	JobTimingUpdated            func(id int, firstAssignedAt time.Time, providerIterations int)
-	JobExecutionUpdated         func(id int, status core.ExecutionStatus)
-	JobFinished                 func(id int)
-	AuthorizeNotificationOrigin func(Origin) error
-	Cleanup                     func(context.Context, int) (string, error)
-	notificationDecisionTimeout time.Duration
-	notificationMu              sync.Mutex
-	notificationRunning         map[string]bool
-	runtimeConfigMu             sync.RWMutex
-	runtimeConfig               config.Config
+	Config                   config.Config
+	Harness                  harness.Harness
+	Hooks                    extensions.Runner
+	Log                      func(string)
+	JobStarted               func(lease Lease, description string, firstAssignedAt time.Time, providerIterations, implementationAttempts int) (int, error)
+	JobUpdated               func(id int, lease Lease)
+	JobTimingUpdated         func(id int, firstAssignedAt time.Time, providerIterations int)
+	JobExecutionUpdated      func(id int, status core.ExecutionStatus)
+	JobEvent                 func(id int, event core.Event)
+	JobFinished              func(id int)
+	Cleanup                  func(context.Context, int) (string, error)
+	notificationAgentTimeout time.Duration
+	runtimeConfigMu          sync.RWMutex
+	runtimeConfig            config.Config
 
 	mu                          sync.Mutex
 	scanMu                      sync.Mutex
 	inflight                    map[string]bool
 	runtimeJobs                 map[string]int
-	controlCancelled            map[string]bool
+	controlCancelled            map[string]int
 	jobs                        sync.WaitGroup
 	capacityMu                  sync.Mutex
 	capacityActive              int
@@ -181,12 +179,6 @@ func (m *Manager) ApplyRuntimeConfig(cfg config.Config) {
 			m.requestScan()
 		}
 	}
-	if previous.Orchestrator.TaskNotifications != cfg.Orchestrator.TaskNotifications {
-		// Reconcile durable pending events under the newest accepted mode now.
-		// Running agents remain fenced by their persisted event and authorization
-		// rechecks; off makes their prepared action fail closed.
-		m.requestScan()
-	}
 	if cfg.Orchestrator.Enabled && !wasEnabled {
 		m.requestScan()
 	}
@@ -226,7 +218,7 @@ func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Ma
 		parallel = 1
 	}
 	manager := &Manager{
-		Config: cfg, runtimeConfig: cfg, Harness: target, Hooks: hooks, inflight: map[string]bool{}, runtimeJobs: map[string]int{}, controlCancelled: map[string]bool{}, capacityLimit: parallel,
+		Config: cfg, runtimeConfig: cfg, Harness: target, Hooks: hooks, inflight: map[string]bool{}, runtimeJobs: map[string]int{}, controlCancelled: map[string]int{}, capacityLimit: parallel,
 		Outbox:                 &Outbox{Directory: cfg.StatePath("runtime", "outbox")},
 		ownerID:                fmt.Sprintf("%d-%d-%s", os.Getpid(), time.Now().UTC().UnixNano(), randomSuffix()),
 		scanNow:                make(chan struct{}, 1),
@@ -235,7 +227,6 @@ func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Ma
 		heartbeatConfigChanged: make(chan struct{}, 1),
 		heartbeatManual:        make(chan heartbeatManualRequest),
 		heartbeatNow:           time.Now, heartbeatTimeout: 5 * time.Minute,
-		notificationRunning: map[string]bool{},
 	}
 	manager.orchestratorEnabled.Store(cfg.Orchestrator.Enabled)
 	manager.heartbeatMinutes.Store(int64(cfg.Orchestrator.SemanticHeartbeatMinutes))
@@ -514,9 +505,6 @@ func (m *Manager) scanOnce(ctx context.Context) error {
 	}
 	if err := m.Outbox.Process(ctx); err != nil {
 		m.log("notification delivery deferred: " + err.Error())
-	}
-	if err := m.startPendingNotificationAgents(ctx); err != nil {
-		m.log("notification agent recovery deferred: " + err.Error())
 	}
 	return nil
 }
@@ -825,12 +813,19 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 					implementationAttempts = numberValue(document.FrontMatter["attempt"])
 				}
 			}
-			jobID = m.JobStarted(lease, filepath.Base(lease.File), firstAssignedAt, providerIterations, implementationAttempts)
+			jobID, err = m.JobStarted(lease, filepath.Base(lease.File), firstAssignedAt, providerIterations, implementationAttempts)
+			if err != nil {
+				m.recordError(lease, err)
+				return
+			}
 			m.setRuntimeJob(lease.ID, jobID)
 		}
 		finish := func() { m.finishRuntimeJob(lease.ID) }
 		emit := func(event core.Event) {
 			terminal := event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError)
+			if jobID > 0 && m.JobEvent != nil {
+				m.JobEvent(jobID, event)
+			}
 			// Runtime job bookkeeping is process-local and must not depend on
 			// the durable lease still existing. A fast agent can move its task,
 			// then a concurrent recovery scan can remove the obsolete lease
@@ -866,6 +861,12 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 		}
 		threadID, steered, err := m.Harness.Send(ctx, lease.SessionKey, prompt, emit)
 		if err != nil {
+			if jobID > 0 && m.JobEvent != nil {
+				m.JobEvent(jobID, core.Event{Kind: core.EventError, Text: err.Error(), Done: true})
+			}
+			if jobID > 0 && m.JobExecutionUpdated != nil {
+				m.JobExecutionUpdated(jobID, core.ExecutionStatus{State: "error", Detail: err.Error()})
+			}
 			finish()
 			m.recordError(lease, err)
 			return
@@ -1140,26 +1141,7 @@ func (m *Manager) completeTransition(ctx context.Context, route config.Route, le
 	if err != nil {
 		return err
 	}
-	policy, err := NotificationFromDocument(document)
-	if err != nil {
-		m.log("invalid notification metadata in " + path + ": " + err.Error())
-		policy = NotificationPolicy{}
-	}
 	runtimeCfg := m.runtimeSnapshot()
-	if policy.Enabled && policy.Outcomes[status] && runtimeCfg.Orchestrator.TaskNotifications != config.TaskNotificationsOff {
-		id, _ := document.FrontMatter["id"].(string)
-		if id == "" {
-			id = lease.ID
-		}
-		transition, transitionErr := notificationTransitionID(lease)
-		if transitionErr != nil {
-			return transitionErr
-		}
-		if err := m.scheduleTaskNotificationForRoute(id, status, transition, path, route, policy); err != nil {
-			m.log("notification agent schedule failed: " + err.Error())
-			return fmt.Errorf("persist task notification event: %w", err)
-		}
-	}
 	if runtimeCfg.Extensions.Enabled {
 		if lease.TerminalHooksCompleted == nil {
 			lease.TerminalHooksCompleted = map[string]bool{}
@@ -1180,7 +1162,26 @@ func (m *Manager) completeTransition(ctx context.Context, route config.Route, le
 			return hookErr
 		}
 	}
+	if requiresTaskNotificationDecision(document, status, time.Now().UTC()) {
+		m.startTaskNotificationAgent(ctx, lease, status, path)
+	}
 	return nil
+}
+
+func requiresTaskNotificationDecision(document Document, status string, now time.Time) bool {
+	switch status {
+	case "done", "failed", "cancelled":
+		return true
+	case "waiting":
+		wakeAt := strings.TrimSpace(stringField(document, "wake_at"))
+		if wakeAt == "" {
+			return true
+		}
+		due, err := time.Parse(time.RFC3339, wakeAt)
+		return err != nil || !due.After(now)
+	default:
+		return false
+	}
 }
 
 func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
@@ -2016,20 +2017,37 @@ func (m *Manager) ControlStillValid(expected Lease, expectedDocumentID string) b
 // MarkControlCancellation fences automatic control continuation before a job
 // interrupt races the provider's terminal event. It is process-local: a later
 // owner may still use ordinary durable stale recovery for unfinished work.
-func (m *Manager) MarkControlCancellation(sessionKey string) {
+func (m *Manager) MarkControlCancellation(sessionKey string) string {
 	lease, ok := m.LeaseForSession(sessionKey)
 	if !ok {
+		return ""
+	}
+	m.mu.Lock()
+	m.controlCancelled[lease.ID]++
+	m.mu.Unlock()
+	return lease.ID
+}
+
+// RestoreControlCancellation releases one cancellation reservation after the
+// provider rejects the matching interrupt. Counting reservations prevents one
+// failed concurrent request from clearing another accepted cancellation.
+func (m *Manager) RestoreControlCancellation(leaseID string) {
+	if leaseID == "" {
 		return
 	}
 	m.mu.Lock()
-	m.controlCancelled[lease.ID] = true
+	if m.controlCancelled[leaseID] <= 1 {
+		delete(m.controlCancelled, leaseID)
+	} else {
+		m.controlCancelled[leaseID]--
+	}
 	m.mu.Unlock()
 }
 
 func (m *Manager) isControlCancelled(leaseID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.controlCancelled[leaseID]
+	return m.controlCancelled[leaseID] > 0
 }
 
 func (m *Manager) recordError(lease Lease, err error) {

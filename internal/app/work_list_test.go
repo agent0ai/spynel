@@ -191,6 +191,56 @@ func TestWorkflowListCommandsUseSharedApplicationContractAcrossChannels(t *testi
 	}
 }
 
+func TestTaskAndGoalListingsIgnoreConversationAndNotificationOrigin(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the relative-age field stable while the interfaces are invoked
+	// sequentially; production formatting clamps future skew to zero.
+	now := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second).Format(time.RFC3339)
+	writeWorkflowListFixture(t, cfg, "tasks", "waiting", "global-task.md", map[string]any{
+		"id": "global-task", "title": "Global task", "status": "waiting", "review_required": true,
+		"created_at": now, "updated_at": now,
+		"notify": map[string]any{"enabled": true, "origin": "telegram/TG-private", "on": []any{"waiting"}},
+	}, "## Progress\n\n- Waiting for input.\n")
+	writeWorkflowListFixture(t, cfg, "goals", "active", "global-goal.md", map[string]any{
+		"id": "global-goal", "title": "Global goal", "status": "active", "created_at": now, "updated_at": now,
+		"notify": map[string]any{"enabled": true, "origin": "whatsapp/WA-private", "on": []any{"done"}},
+	}, "## Progress\n\n- Round is active.\n")
+	service := New(cfg, newServiceHarness())
+	callers := []core.Message{
+		{Channel: "tui", Conversation: "local"},
+		{Channel: "telegram", Conversation: "TG-other"},
+		{Channel: "whatsapp", Conversation: "WA-other"},
+		{Channel: "cli", Conversation: "automation"},
+	}
+	for _, command := range []string{"/tasks all --detail", "/goals all --detail"} {
+		var expected string
+		for _, caller := range callers {
+			caller.Text = command
+			var response core.Event
+			if err := service.Handle(context.Background(), caller, func(event core.Event) { response = event }); err != nil {
+				t.Fatal(err)
+			}
+			if expected == "" {
+				expected = response.Text
+			} else if response.Text != expected {
+				t.Fatalf("%s %s listing differs from global workspace output:\n%s\n--- want ---\n%s", caller.Channel, command, response.Text, expected)
+			}
+		}
+		for _, private := range []string{"TG-private", "WA-private"} {
+			if strings.Contains(expected, private) {
+				t.Fatalf("%s exposed notification routing metadata %q:\n%s", command, private, expected)
+			}
+		}
+	}
+}
+
 func TestWorkflowListShowsBoundedUnavailableDocumentWarnings(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {

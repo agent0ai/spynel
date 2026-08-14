@@ -164,7 +164,7 @@ func TestDurableTimingSurvivesContinuationAndJobNumberReplacement(t *testing.T) 
 		t.Fatalf("continuation job ID = %d, want %d", continued, id)
 	}
 	runtime.UpdateJobDurableTiming(id, first.Add(time.Hour), 1)
-	if output := formatJobsAt(runtime.Jobs(), now); !strings.Contains(output, "3h27m 2▶ 4↻ · starting · orchestrator/markdown") {
+	if output := formatJobsAt(runtime.Jobs(), now); !strings.Contains(output, "3h27m 2▶ 4↻ · starting · orchestrator") {
 		t.Fatalf("durable continuation timing = %s", output)
 	}
 	runtime.EndJob(id)
@@ -233,6 +233,7 @@ func TestJobExecutionCancellationFailureAndReconnectExhaustion(t *testing.T) {
 	cancelID := runtime.BeginJob("cancel", "tui", "local", "cancel")
 	runtime.UpdateJob(cancelID, core.ExecutionStatus{State: "cancelling"})
 	runtime.UpdateJob(cancelID, core.ExecutionStatus{State: "running"})
+	runtime.UpdateJob(cancelID, core.ExecutionStatus{State: "finishing"})
 	if job, _ := runtime.Job(cancelID); job.Execution != JobCancelling {
 		t.Fatalf("cancelling regressed: %#v", job)
 	}
@@ -242,6 +243,30 @@ func TestJobExecutionCancellationFailureAndReconnectExhaustion(t *testing.T) {
 	job, _ := runtime.Job(failID)
 	if job.Execution != JobError || strings.Contains(job.StatusDetail, "secret") || strings.Contains(job.StatusDetail, "/private/") || !strings.Contains(job.StatusDetail, "[REDACTED]") || !strings.Contains(job.StatusDetail, "[PATH]") {
 		t.Fatalf("failed job detail/state = %#v", job)
+	}
+}
+
+func TestConcurrentCancellationRollbackPreservesAcceptedReservation(t *testing.T) {
+	runtime := NewRuntime()
+	id := runtime.BeginJob("cancel", "tui", "local", "cancel")
+	runtime.UpdateJob(id, core.ExecutionStatus{State: "running"})
+	first, ok := runtime.ReserveJobCancellation(id)
+	if !ok {
+		t.Fatal("first cancellation reservation failed")
+	}
+	second, ok := runtime.ReserveJobCancellation(id)
+	if !ok {
+		t.Fatal("second cancellation reservation failed")
+	}
+	if runtime.RestoreJobAfterFailedCancellation(second) {
+		t.Fatal("one failed request restored state while another cancellation remained reserved")
+	}
+	if current, live := runtime.Job(id); !live || current.Execution != JobCancelling {
+		t.Fatalf("accepted concurrent cancellation was rolled back: %#v, live=%t", current, live)
+	}
+	runtime.EndJob(id)
+	if runtime.RestoreJobAfterFailedCancellation(first) {
+		t.Fatal("finished job restored a stale cancellation reservation")
 	}
 }
 
@@ -379,11 +404,11 @@ func TestJobsUseStableTwoLineMarkdownForEveryOrigin(t *testing.T) {
 	}
 	got := formatJobsAt(jobs, now)
 	wants := []string{
-		"- **Job 1** hello \\*world\\*  \n  1m 1▶ · running · tui/local-a",
-		"- **Job 2** cli work  \n  2m 1▶ · starting · cli/build",
-		"- **Job 3** tg  \n  3m 1▶ · reconnecting 1 · telegram/42",
-		"- **Job 4** wa  \n  4m 1▶ · recovering · whatsapp/1555",
-		"- **Job 5** task \\[x\\] (1).md  \n  3h27m 2▶ 4↻ · audit running · orchestrator/markdown",
+		"- **Job 1** conversation  \n  1m 1▶ · running · tui",
+		"- **Job 2** conversation  \n  2m 1▶ · starting · cli",
+		"- **Job 3** conversation  \n  3m 1▶ · reconnecting 1 · telegram",
+		"- **Job 4** conversation  \n  4m 1▶ · recovering · whatsapp",
+		"- **Job 5** task \\[x\\] (1).md  \n  3h27m 2▶ 4↻ · audit running · orchestrator",
 	}
 	for _, want := range wants {
 		if !strings.Contains(got, want) {
@@ -402,7 +427,12 @@ func TestJobsUseStableTwoLineMarkdownForEveryOrigin(t *testing.T) {
 	if strings.Contains(got, "\x1b") || strings.Contains(got, "/private/") {
 		t.Fatalf("jobs output leaked unsafe content: %q", got)
 	}
-	long := formatJobsAt([]Job{{ID: 6, Description: strings.Repeat("雪", 120) + "\x1b]0;owned\aTAIL", Channel: "tui", Conversation: "local", StartedAt: now, Execution: JobRunning}}, now)
+	for _, forbidden := range []string{"hello", "world", "local-a", "build", "1555", "/42"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("jobs output exposed conversation detail %q: %q", forbidden, got)
+		}
+	}
+	long := formatJobsAt([]Job{{ID: 6, Kind: "diagnostic", Description: strings.Repeat("雪", 120) + "\x1b]0;owned\aTAIL", Channel: "orchestrator", Conversation: "local", StartedAt: now, Execution: JobRunning}}, now)
 	if strings.Contains(long, "TAIL") || strings.Contains(long, "\x1b") || !strings.Contains(long, "…  \n") {
 		t.Fatalf("long/control-bearing description was not safely bounded: %q", long)
 	}

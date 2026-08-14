@@ -156,8 +156,8 @@ func (c *Client) UnregisterLiveTUI(ctx context.Context) error {
 	return responseError(response)
 }
 
-func (c *Client) NotifyWithIdentity(ctx context.Context, origin, message, eventKey, outcome string) (string, error) {
-	body, err := json.Marshal(notifyRequest{Origin: origin, Message: message, EventKey: eventKey, Outcome: outcome})
+func (c *Client) Notify(ctx context.Context, origin, message string) (string, error) {
+	body, err := json.Marshal(notifyRequest{Origin: origin, Message: message})
 	if err != nil {
 		return "", err
 	}
@@ -174,19 +174,6 @@ func (c *Client) NotifyWithIdentity(ctx context.Context, origin, message, eventK
 		return "", err
 	}
 	return result.ID, nil
-}
-
-func (c *Client) JournalNotificationAction(ctx context.Context, origin, eventKey, outcome, kind, detail string) error {
-	body, err := json.Marshal(notifyRequest{Origin: origin, Message: detail, EventKey: eventKey, Outcome: outcome, Journal: kind})
-	if err != nil {
-		return err
-	}
-	response, err := c.request(ctx, http.MethodPost, "/v1/notify", body)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	return responseError(response)
 }
 
 func (c *Client) AckNotification(ctx context.Context, origin, id string, afterChars int) error {

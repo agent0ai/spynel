@@ -9,6 +9,7 @@
 - Keep topic and section IDs stable, content classified and bounded, and text/JSON output deterministic under the documented record and size limits.
 - Never read workspace state, environment values, histories, credentials, or arbitrary files; content is compiled from `content.go` and prompt guidance from `prompt.go`.
 - Synchronize behavior facts with user documentation, CLI examples, and tests for pagination, search, formatting, and bounds.
+- Keep notification guidance on the concrete `--workdir`, exact `--origin`, and `--message` form used by task agents; do not teach task agents destination placeholders or stdin composition.
 - Keep the primary-election topic explicit about environment-identity detection, bounded legacy readiness, fresh-owner fencing, and the absence of cross-host/container transport support.
 
 ## Child DOX Index

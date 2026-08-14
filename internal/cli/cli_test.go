@@ -26,7 +26,6 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/localapi"
-	"github.com/agent0ai/spynel/internal/orchestrator"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
 
@@ -530,91 +529,54 @@ func TestNotifyCommandUsesDurableHistoryWithoutHarness(t *testing.T) {
 	}
 }
 
-func TestNotificationAgentPreparedCLIActionsSendSkipOrFail(t *testing.T) {
-	setup := func(t *testing.T) (config.Config, string) {
-		t.Helper()
-		root := t.TempDir()
-		if err := workspace.Init(root, false); err != nil {
-			t.Fatal(err)
-		}
-		cfg, err := config.Load(config.PathForRoot(root))
-		if err != nil {
-			t.Fatal(err)
-		}
-		store := history.New(cfg.StatePath("history"))
-		if _, err := store.Append("cli", "alerts", history.Entry{Role: "user", Content: "known"}); err != nil {
-			t.Fatal(err)
-		}
-		taskFile := filepath.Join(cfg.StatePath("tasks", "done"), "task.md")
-		document := orchestrator.Document{FrontMatter: map[string]any{
-			"id": "task-1", "title": "Report", "status": "done", "attempt": 1,
-			"notify": map[string]any{"enabled": true, "origin": "cli/alerts", "on": []any{"done"}},
-		}, Body: "# Report\n\n## Progress\n\n- Complete.\n"}
-		if err := orchestrator.WriteDocument(taskFile, document); err != nil {
-			t.Fatal(err)
-		}
-		eventDirectory := cfg.StatePath("runtime", "notification-agents")
-		if err := os.MkdirAll(eventDirectory, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		event := map[string]any{
-			"id": "event-1", "task_id": "task-1", "outcome": "done", "task_file": taskFile,
-			"transition": "task_implementation:1", "origin": "cli/alerts", "mode": "decide", "state": "invoked", "attempts": 1,
-		}
-		data, _ := json.Marshal(event)
-		if err := os.WriteFile(filepath.Join(eventDirectory, "event-1.json"), data, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return cfg, filepath.Join(eventDirectory, "event-1.json")
+func TestNotifyCommandSupportsConcreteAgentArguments(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
 	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	store := history.New(cfg.StatePath("history"))
+	if _, err := store.Append("cli", "alerts", history.Entry{Role: "user", Content: "known"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runNotifyCommand([]string{"--workdir", root, "--origin", "cli/alerts", "--message", "concrete delivery"}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := store.RecentEntries("cli", "alerts", 10, 1000)
+	if err != nil || len(entries) != 2 || entries[1].Content != "concrete delivery" {
+		t.Fatalf("concrete notification history = %#v, %v", entries, err)
+	}
+}
 
-	t.Run("send", func(t *testing.T) {
-		cfg, eventPath := setup(t)
-		args := []string{"--config", cfg.Path, "--origin", "cli/alerts", "--event-key", "task-notification:event-1", "--outcome", "done", "report ready"}
-		if err := runNotifyCommand(args, "test"); err != nil {
-			t.Fatal(err)
+func TestNotifyMessageRejectsEmptyStdinAndAmbiguousInputs(t *testing.T) {
+	if _, err := notificationMessageText(nil, true, false, "", strings.NewReader("")); err == nil || !strings.Contains(err.Error(), "standard input is empty") {
+		t.Fatalf("historical empty-stdin failure = %v", err)
+	}
+	text, err := notificationMessageText(nil, false, true, "Hello there", strings.NewReader(""))
+	if err != nil || text != "Hello there" {
+		t.Fatalf("generated --message path = %q, %v", text, err)
+	}
+	for _, test := range []struct {
+		args       []string
+		stdin      bool
+		messageSet bool
+		message    string
+	}{
+		{args: []string{"positional"}, messageSet: true, message: "flag"},
+		{stdin: true, messageSet: true, message: "flag"},
+		{messageSet: true, message: "   "},
+	} {
+		if _, err := notificationMessageText(test.args, test.stdin, test.messageSet, test.message, strings.NewReader("stdin")); err == nil {
+			t.Fatalf("ambiguous notification input accepted: %#v", test)
 		}
-		outboxID := orchestrator.NotificationOutboxID("task-notification:event-1", "done")
-		if _, err := os.Stat(filepath.Join(cfg.StatePath("runtime", "outbox"), outboxID+".json")); err != nil {
-			t.Fatal(err)
-		}
-		data, _ := os.ReadFile(eventPath)
-		if !strings.Contains(string(data), `"journal_kind": "sent"`) || !strings.Contains(string(data), `"journaled": true`) {
-			t.Fatalf("send did not record its transition-specific journal receipt: %s", data)
-		}
-		document, err := orchestrator.ReadDocument(filepath.Join(cfg.StatePath("tasks", "done"), "task.md"))
-		if err != nil || !strings.Contains(document.Body, "Sent the user a notification: report ready") {
-			t.Fatalf("send journal = %#v, %v", document.Body, err)
-		}
-	})
+	}
+}
 
-	t.Run("skip", func(t *testing.T) {
-		cfg, eventPath := setup(t)
-		args := []string{"--config", cfg.Path, "--origin", "cli/alerts", "--event-key", "task-notification:event-1", "--outcome", "done", "--journal", "skipped", "The user already has the result."}
-		if err := runNotifyCommand(args, "test"); err != nil {
-			t.Fatal(err)
-		}
-		data, err := os.ReadFile(eventPath)
-		if err != nil || !strings.Contains(string(data), `"journal_kind": "skipped"`) {
-			t.Fatalf("skip event = %s, %v", data, err)
-		}
-		entries, err := os.ReadDir(cfg.StatePath("runtime", "outbox"))
-		if err == nil && len(entries) != 0 {
-			t.Fatalf("skip queued %d outbox entries", len(entries))
-		}
-	})
-
-	t.Run("failed action", func(t *testing.T) {
-		cfg, eventPath := setup(t)
-		args := []string{"--config", cfg.Path, "--origin", "cli/other", "--event-key", "task-notification:event-1", "--outcome", "done", "--journal", "failed", "authorization failed"}
-		if err := runNotifyCommand(args, "test"); err == nil {
-			t.Fatal("redirected audit unexpectedly succeeded")
-		}
-		data, err := os.ReadFile(eventPath)
-		if err != nil || !strings.Contains(string(data), `"state":"invoked"`) {
-			t.Fatalf("failed action event = %s, %v", data, err)
-		}
-	})
+func TestNotifyCommandRejectsWorkdirConfigCombination(t *testing.T) {
+	err := runNotifyCommand([]string{"--workdir", "/workspace", "--config", "/workspace/.spynel/config.yaml", "--origin", "tui/local", "--message", "no"}, "test")
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("workdir/config conflict = %v", err)
+	}
 }
 
 func newHeldCLIHarness() *heldCLIHarness {
@@ -1152,7 +1114,7 @@ func TestCLIJoinsWorkspaceOwnerAndStrictlySteersActiveConversation(t *testing.T)
 	if err := runFrameworkMessageMode(cfg.Path, "inspect", "/jobs", "test", messageRunOptions{Output: &jobsOutput}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(jobsOutput.String(), "1▶ · running · cli/active") || strings.Contains(jobsOutput.String(), "↻") || !strings.Contains(jobsOutput.String(), "Use `/job info <number>`") || !strings.Contains(jobsOutput.String(), "Use `/job kill <number>`") {
+	if !strings.Contains(jobsOutput.String(), "conversation") || !strings.Contains(jobsOutput.String(), "1▶ · running · cli") || strings.Contains(jobsOutput.String(), "cli/active") || strings.Contains(jobsOutput.String(), "start the work") || strings.Contains(jobsOutput.String(), "↻") || !strings.Contains(jobsOutput.String(), "Use `/job info <number>`") || !strings.Contains(jobsOutput.String(), "Use `/job kill <number>`") {
 		t.Fatalf("plain CLI live jobs output = %q", jobsOutput.String())
 	}
 	jobs := service.Runtime.Jobs()
@@ -1197,6 +1159,20 @@ func TestCLIJoinsWorkspaceOwnerAndStrictlySteersActiveConversation(t *testing.T)
 	}
 	if firstOutput.String() != "" || followupOutput.String() != "follow-up complete\n" {
 		t.Fatalf("CLI outputs = first %q, follow-up %q", firstOutput.String(), followupOutput.String())
+	}
+	var recentOutput bytes.Buffer
+	if err := runFrameworkMessageMode(cfg.Path, "inspect", "/jobs recent", "test", messageRunOptions{Output: &recentOutput}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(recentOutput.String(), fmt.Sprintf("Job %d", jobs[0].Number)) || strings.Contains(recentOutput.String(), jobs[0].StableID) || strings.Contains(recentOutput.String(), "start the work") {
+		t.Fatalf("plain CLI archived jobs output = %q", recentOutput.String())
+	}
+	var archivedOutput bytes.Buffer
+	if err := runFrameworkMessageMode(cfg.Path, "inspect", fmt.Sprintf("/job output %d", jobs[0].Number), "test", messageRunOptions{Output: &archivedOutput}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(archivedOutput.String(), "follow-up complete") || !strings.Contains(archivedOutput.String(), fmt.Sprintf("Job output %d", jobs[0].Number)) || strings.Contains(archivedOutput.String(), jobs[0].StableID) {
+		t.Fatalf("plain CLI archived job output = %q", archivedOutput.String())
 	}
 	if err := runMessageMode(cfg.Path, "active", "too late", "test", messageRunOptions{FollowupOnly: true, Output: &bytes.Buffer{}}); err == nil || !strings.Contains(err.Error(), "no active execution") {
 		t.Fatalf("inactive follow-up error = %v", err)

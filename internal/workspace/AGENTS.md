@@ -11,6 +11,7 @@
 - Delegate built-in palette assets to `internal/theme`; workspace initialization only asks that package to materialize editable copies.
 - Automatically managed speech models live in the operating-system user cache, not the workspace.
 - Create `.spynel/tasks/archive` as cold history without adding it to configured routes or ordinary workflow status sets.
+- Create `.spynel/jobs` as private inspection-only job history; it is not a workflow route or authority source.
 
 ## Child DOX Index
 

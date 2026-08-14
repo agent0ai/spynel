@@ -1173,7 +1173,8 @@ Usage:
     --stdin                      Read the message body from standard input
     --attach PATH                Copy and attach a file (repeatable)
   spynel followup [flags] TEXT   Steer an active server-side CLI conversation
-  spynel notify --origin O TEXT Queue a proactive assistant notification
+  spynel notify --workdir PATH --origin O --message TEXT
+                                Queue a proactive assistant notification
   spynel conversations list     List disk-backed conversations
   spynel conversations show     Read a bounded conversation tail
   spynel conversations resume   Branch any saved conversation into CLI

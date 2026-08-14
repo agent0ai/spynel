@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -177,8 +178,11 @@ func TestNeverReviewModeAllowsExistingReviewRequiredTaskDirectCompletion(t *test
 	cfg.Harness.Reviews = config.TaskReviewsNever
 	name := filepath.Base(task)
 	target := newFakeRecipient()
+	var complete sync.Once
 	target.beforeEmit = func() {
-		recordDirectCompletion(t, filepath.Join(cfg.Resolve(route.Working), name), filepath.Join(base, "done", name))
+		complete.Do(func() {
+			recordDirectCompletion(t, filepath.Join(cfg.Resolve(route.Working), name), filepath.Join(base, "done", name))
+		})
 	}
 	manager := New(cfg, target, extensions.Runner{Directory: filepath.Join(root, "missing")})
 	if err := manager.ScanOnce(context.Background()); err != nil {
@@ -312,17 +316,10 @@ func TestReviewedAndDirectTaskCompletion(t *testing.T) {
 				}
 			}
 			if test.noReview {
-				entries, err := os.ReadDir(manager.notificationAgentDirectory())
-				if err != nil || len(entries) != 1 {
-					t.Fatalf("direct completion notification agent entries = %d, %v", len(entries), err)
-				}
 				if err := manager.reconcileTransitions(context.Background()); err != nil {
 					t.Fatal(err)
 				}
-				again, _ := os.ReadDir(manager.notificationAgentDirectory())
-				if len(again) != 1 {
-					t.Fatalf("direct completion duplicated notification: %d", len(again))
-				}
+				manager.Wait()
 			}
 		})
 	}

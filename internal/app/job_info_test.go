@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -102,7 +103,7 @@ func TestJobInfoShowsAllowlistedMarkdownMetadataAndBoundedNewestProgress(t *test
 	})
 
 	list := formatJobs(service.Runtime.Jobs())
-	if !strings.Contains(list, "2▶ 2↻ · starting · orchestrator/markdown") {
+	if !strings.Contains(list, "2▶ 2↻ · starting · orchestrator") {
 		t.Fatalf("job list counters do not match durable snapshot:\n%s", list)
 	}
 	output := runJobCommand(t, service, "/job info 1")
@@ -117,6 +118,39 @@ func TestJobInfoShowsAllowlistedMarkdownMetadataAndBoundedNewestProgress(t *test
 		}
 	}
 	service.Runtime.EndJob(id)
+}
+
+func TestDurableJobsListGloballyAcrossInterfacesWithoutNotificationOrigin(t *testing.T) {
+	service := newJobInfoService(t)
+	path := filepath.Join(t.TempDir(), "global.md")
+	document := orchestrator.Document{FrontMatter: map[string]any{
+		"id": "global", "title": "Global work", "status": "working",
+		"notify": map[string]any{"enabled": true, "origin": "telegram/TG-private", "on": []any{"done"}},
+	}, Body: "# Global\n"}
+	if err := orchestrator.WriteDocument(path, document); err != nil {
+		t.Fatal(err)
+	}
+	service.Runtime.BeginJobWithDetails("orchestrator:global", "orchestrator", "markdown", "global.md", JobDetails{Kind: "task", Route: "tasks", DurableFile: path})
+	var expected string
+	for _, caller := range []core.Message{
+		{Channel: "tui", Conversation: "local", Text: "/jobs"},
+		{Channel: "telegram", Conversation: "TG-other", Text: "/jobs"},
+		{Channel: "whatsapp", Conversation: "WA-other", Text: "/jobs"},
+		{Channel: "cli", Conversation: "automation", Text: "/jobs"},
+	} {
+		var response core.Event
+		if err := service.Handle(context.Background(), caller, func(event core.Event) { response = event }); err != nil {
+			t.Fatal(err)
+		}
+		if expected == "" {
+			expected = response.Text
+		} else if response.Text != expected {
+			t.Fatalf("%s durable jobs output differs:\n%s\n--- want ---\n%s", caller.Channel, response.Text, expected)
+		}
+	}
+	if !strings.Contains(expected, "global.md") || strings.Contains(expected, "TG-private") {
+		t.Fatalf("durable jobs projection is incomplete or private:\n%s", expected)
+	}
 }
 
 func TestJobInfoUsesTaskWaitingStateWithoutNotificationResponseState(t *testing.T) {
@@ -197,7 +231,7 @@ func TestJobInfoHandlesNonMarkdownMalformedAndUnknownJobs(t *testing.T) {
 		command string
 		want    string
 	}{
-		{"/job info", "Usage:"}, {"/job info nope", "must be positive"}, {"/job info 99", "unknown or already finished"}, {"/job inspect 1", "Usage:"},
+		{"/job info", "Usage:"}, {"/job info nope", "from 1 to 9999"}, {"/job info 99", "was not found"}, {"/job inspect 1", "Usage:"},
 	} {
 		if output := runJobCommand(t, service, test.command); !strings.Contains(output, test.want) || !strings.Contains(output, "/jobs") {
 			t.Fatalf("%s = %q, want %q", test.command, output, test.want)
@@ -223,6 +257,58 @@ func TestJobInfoProgressEntriesAndOutputAreBounded(t *testing.T) {
 	}
 	if total > maxJobProgressTotal {
 		t.Fatalf("progress total = %d", total)
+	}
+}
+
+func TestArchivedJobCommandsRejectMismatchedEmbeddedIdentityAndCleanupRemovesOldRecord(t *testing.T) {
+	service := newJobInfoService(t)
+	service.Runtime.Now = func() time.Time {
+		return time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	}
+	id := service.Runtime.BeginJob("identity", "cli", "private", "conversation")
+	service.Runtime.RecordJobEvent(id, core.Event{Kind: core.EventFinal, Text: "must not resolve under another identity", Done: true})
+	job, ok := service.Runtime.Job(id)
+	if !ok {
+		t.Fatal("job was not started")
+	}
+	service.Runtime.EndJob(id)
+
+	path := service.Config.StatePath("jobs", job.StableID+".md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mismatchedID := "j-20260801T120000Z-deadbeef"
+	if mismatchedID == job.StableID {
+		mismatchedID = "j-20260801T120000Z-feedface"
+	}
+	corrupt := strings.Replace(string(data), "id: \""+job.StableID+"\"", "id: \""+mismatchedID+"\"", 1)
+	if corrupt == string(data) {
+		t.Fatal("archive identity was not replaced")
+	}
+	if err := os.WriteFile(path, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if output := runJobCommand(t, service, "/jobs recent"); !strings.Contains(output, "No archived jobs are available") || strings.Contains(output, mismatchedID) {
+		t.Fatalf("recent jobs exposed mismatched archive:\n%s", output)
+	}
+	for _, command := range []string{"/job info " + strconv.Itoa(job.Number), "/job output " + strconv.Itoa(job.Number)} {
+		if output := runJobCommand(t, service, command); !strings.Contains(output, "not found") || strings.Contains(output, mismatchedID) {
+			t.Fatalf("%s resolved mismatched archive:\n%s", command, output)
+		}
+	}
+
+	old := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	removed, removedBytes, protected, failed := service.Runtime.CleanupArchivedJobs(old.Add(8 * 24 * time.Hour))
+	if removed != 1 || removedBytes <= 0 || protected != 0 || failed != 0 {
+		t.Fatalf("cleanup = removed %d bytes %d protected %d failed %d", removed, removedBytes, protected, failed)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("mismatched archive remains after cleanup: %v", err)
 	}
 }
 
@@ -295,19 +381,69 @@ func TestJobInfoInspectionDoesNotOverwriteProviderReconnectState(t *testing.T) {
 	}
 }
 
+func TestArchivedJobCommandsPreserveLiveStateAndMarkRestartInterruption(t *testing.T) {
+	service := newJobInfoService(t)
+	id := service.Runtime.BeginJobWithDetails("orchestrator:archive-state", "orchestrator", "markdown", "task.md", JobDetails{Kind: "task", Route: "tasks"})
+	service.Runtime.UpdateJob(id, core.ExecutionStatus{State: "reconnecting", ReconnectAttempt: 2, ReconnectTotal: 5})
+	service.Runtime.RecordJobEvent(id, core.Event{Kind: core.EventStatus, Text: "provider reconnect pending"})
+	job, ok := service.Runtime.Job(id)
+	if !ok {
+		t.Fatal("live job disappeared")
+	}
+
+	for _, command := range []string{"/job info 1", "/job output 1"} {
+		output := runJobCommand(t, service, command)
+		if !strings.Contains(output, "reconnecting") || strings.Contains(output, "interrupted") {
+			t.Fatalf("%s discarded exact live state:\n%s", command, output)
+		}
+	}
+
+	restarted := New(service.Config, newServiceHarness())
+	output := runJobCommand(t, restarted, "/job info "+strconv.Itoa(job.Number))
+	if !strings.Contains(output, "State: interrupted") || strings.Contains(output, "reconnecting") {
+		t.Fatalf("restart did not classify the unfinished archive safely:\n%s", output)
+	}
+}
+
+func TestCompletedJobKillReportsLiveOnlySemantics(t *testing.T) {
+	service := newJobInfoService(t)
+	handle := service.Runtime.BeginJob("completed-kill", "cli", "private", "conversation")
+	job, _ := service.Runtime.Job(handle)
+	service.Runtime.EndJob(handle)
+	output := runJobCommand(t, service, "/job kill "+strconv.Itoa(job.Number))
+	if !strings.Contains(output, "completed and cannot be killed") || !strings.Contains(output, "only for live jobs") {
+		t.Fatalf("completed kill response = %q", output)
+	}
+}
+
 func TestJobInfoIsInSharedCommandCatalog(t *testing.T) {
 	foundInfo := false
 	foundKill := false
 	foundMessage := false
 	foundPing := false
-	for _, command := range SlashCommands() {
+	foundOutput := false
+	foundRecent := false
+	jobsIndex := -1
+	recentIndex := -1
+	for index, command := range SlashCommands() {
+		if command.Usage == "/jobs" {
+			jobsIndex = index
+		}
+		if command.Usage == "/jobs recent" {
+			recentIndex = index
+		}
 		foundInfo = foundInfo || command.Usage == "/job info <number>"
 		foundKill = foundKill || command.Usage == "/job kill <number>"
 		foundMessage = foundMessage || command.Usage == "/job message <number> <text>"
 		foundPing = foundPing || command.Usage == "/job ping <number>"
+		foundOutput = foundOutput || command.Usage == "/job output <number> [tail <bytes>]"
+		foundRecent = foundRecent || command.Usage == "/jobs recent"
 	}
-	if !foundInfo || !foundKill || !foundMessage || !foundPing {
-		t.Fatalf("job commands in catalog: info=%t message=%t ping=%t kill=%t", foundInfo, foundMessage, foundPing, foundKill)
+	if !foundInfo || !foundKill || !foundMessage || !foundPing || !foundOutput || !foundRecent {
+		t.Fatalf("job commands in catalog: recent=%t info=%t output=%t message=%t ping=%t kill=%t", foundRecent, foundInfo, foundOutput, foundMessage, foundPing, foundKill)
+	}
+	if jobsIndex < 0 || recentIndex != jobsIndex+1 {
+		t.Fatalf("job command ordering: /jobs=%d /jobs recent=%d", jobsIndex, recentIndex)
 	}
 }
 
@@ -423,7 +559,7 @@ func TestJobPingAndGuardedContinuationPersistProviderIterations(t *testing.T) {
 	}
 }
 
-func TestJobControlAuthorizationAndTerminalRacesFailClosed(t *testing.T) {
+func TestAuthenticatedWorkspaceInterfacesControlDurableJobAcrossNotificationOrigin(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
@@ -443,9 +579,9 @@ func TestJobControlAuthorizationAndTerminalRacesFailClosed(t *testing.T) {
 	lease := orchestrator.Lease{ID: "lease-remote", OwnerID: "owner", SessionKey: "orchestrator:remote", File: path, Route: "tasks", State: "processing", Phase: "task_implementation", StartedAt: time.Now().UTC()}
 	writeJobLease(t, service, lease)
 	id := service.Runtime.BeginJobWithDetails(lease.SessionKey, "orchestrator", "markdown", "remote.md", JobDetails{Kind: "task", Route: "tasks", DurableFile: path})
-	run := func(conversation, command string) string {
+	run := func(channel, conversation, command string) string {
 		var response core.Event
-		if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: conversation, Text: command}, func(event core.Event) {
+		if err := service.Handle(context.Background(), core.Message{Channel: channel, Conversation: conversation, Text: command}, func(event core.Event) {
 			if event.Kind == core.EventFinal {
 				response = event
 			}
@@ -454,14 +590,25 @@ func TestJobControlAuthorizationAndTerminalRacesFailClosed(t *testing.T) {
 		}
 		return response.Text
 	}
-	if output := run("TG-8", "/job ping 1"); !strings.Contains(output, "not available") || len(target.requests) != 0 {
-		t.Fatalf("cross-origin output=%q requests=%d", output, len(target.requests))
+	if output := run("whatsapp", "WA-other", "/job info 1"); !strings.Contains(output, "# Job 1") || strings.Contains(output, "TG-7") {
+		t.Fatalf("cross-origin info output=%q", output)
 	}
-	if output := run("TG-7", "/job ping 1"); !strings.Contains(output, "Delivered") || len(target.requests) != 1 {
-		t.Fatalf("authorized output=%q requests=%d", output, len(target.requests))
+	if output := run("telegram", "TG-8", "/job ping 1"); !strings.Contains(output, "Delivered") || len(target.requests) != 1 {
+		t.Fatalf("cross-origin ping output=%q requests=%d", output, len(target.requests))
+	}
+	if output := run("tui", "local", "/job message 1 keep going"); !strings.Contains(output, "Delivered") || len(target.requests) != 2 {
+		t.Fatalf("cross-origin message output=%q requests=%d", output, len(target.requests))
+	}
+	unchanged, err := orchestrator.ReadDocument(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := orchestrator.NotificationFromDocument(unchanged)
+	if err != nil || policy.Origin.Channel != "telegram" || policy.Origin.Conversation != "TG-7" {
+		t.Fatalf("job controls changed notification routing: policy=%#v err=%v", policy, err)
 	}
 	service.Runtime.UpdateJob(id, core.ExecutionStatus{State: string(JobAwaitingTransition)})
-	if output := run("TG-7", "/job ping 1"); !strings.Contains(output, "no longer steerable") || len(target.requests) != 1 {
+	if output := run("cli", "automation", "/job ping 1"); !strings.Contains(output, "no longer steerable") || len(target.requests) != 2 {
 		t.Fatalf("terminal output=%q requests=%d", output, len(target.requests))
 	}
 }

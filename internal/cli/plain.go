@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -85,29 +86,45 @@ func runSendCommand(name string, args []string, version string, followupOnly boo
 func runNotifyCommand(args []string, version string) error {
 	flags := flag.NewFlagSet("notify", flag.ContinueOnError)
 	configPath := flags.String("config", "", "path to .spynel/config.yaml")
+	workdir := flags.String("workdir", "", "absolute Spynel workspace path")
 	origin := flags.String("origin", "", "stable channel/conversation origin")
+	message := flags.String("message", "", "notification message")
 	stdin := flags.Bool("stdin", false, "read the notification from standard input")
-	eventKey := flags.String("event-key", "", "stable internal notification identity")
-	outcome := flags.String("outcome", "", "task transition outcome for the stable identity")
-	journal := flags.String("journal", "", "record an authorized skipped or failed notification action")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	text := ""
-	var err error
-	text, err = cliMessageText(flags.Args(), *stdin, os.Stdin)
+	messageSet := false
+	flags.Visit(func(current *flag.Flag) {
+		if current.Name == "message" {
+			messageSet = true
+		}
+	})
+	text, err := notificationMessageText(flags.Args(), *stdin, messageSet, *message, os.Stdin)
 	if err != nil {
-		return fmt.Errorf("usage: spynel notify [--config PATH] --origin CHANNEL/CONVERSATION [--stdin] <message>: %w", err)
-	}
-	if *journal != "" && *journal != "skipped" && *journal != "failed" {
-		return errors.New("--journal must be skipped or failed")
+		return fmt.Errorf("usage: spynel notify [--workdir PATH|--config PATH] --origin CHANNEL/CONVERSATION --message MESSAGE: %w", err)
 	}
 	if strings.TrimSpace(*origin) == "" {
 		return errors.New("--origin is required")
 	}
+	if *workdir != "" && *configPath != "" {
+		return errors.New("--workdir and --config are mutually exclusive")
+	}
+	if *workdir != "" {
+		absolute, absErr := filepath.Abs(*workdir)
+		if absErr != nil {
+			return absErr
+		}
+		*configPath = config.PathForRoot(absolute)
+	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
+	}
+	if *workdir != "" {
+		absolute, _ := filepath.Abs(*workdir)
+		if filepath.Clean(cfg.Root) != filepath.Clean(absolute) {
+			return errors.New("--workdir must identify the loaded Spynel workspace root")
+		}
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -115,32 +132,34 @@ func runNotifyCommand(args []string, version string) error {
 	if client, active, clientErr := activeWorkspaceClient(ctx, cfg); clientErr != nil {
 		return clientErr
 	} else if active {
-		if *journal != "" {
-			err = client.JournalNotificationAction(ctx, *origin, *eventKey, *outcome, *journal, text)
-		} else {
-			id, err = client.NotifyWithIdentity(ctx, *origin, text, *eventKey, *outcome)
-		}
+		id, err = client.Notify(ctx, *origin, text)
 	} else {
 		service, buildErr := buildService(cfg, version)
 		if buildErr != nil {
 			return buildErr
 		}
 		defer service.Close()
-		if *journal != "" {
-			err = service.JournalNotificationAction(*origin, *eventKey, *outcome, *journal, text)
-		} else {
-			id, err = service.NotifyWithIdentity(ctx, *origin, text, *eventKey, *outcome)
-		}
+		id, err = service.Notify(ctx, *origin, text)
 	}
 	if err != nil {
 		return err
 	}
-	if *journal != "" {
-		fmt.Println("notification action journaled")
-	} else {
-		fmt.Println("queued notification " + id)
-	}
+	fmt.Println("queued notification " + id)
 	return nil
+}
+
+func notificationMessageText(arguments []string, stdin, messageSet bool, message string, input io.Reader) (string, error) {
+	if messageSet {
+		if stdin || len(arguments) > 0 {
+			return "", errors.New("--message cannot be combined with positional text or --stdin")
+		}
+		text := strings.TrimSpace(message)
+		if text == "" {
+			return "", errors.New("--message cannot be empty")
+		}
+		return text, nil
+	}
+	return cliMessageText(arguments, stdin, input)
 }
 
 func cliMessageText(arguments []string, stdin bool, input io.Reader) (string, error) {

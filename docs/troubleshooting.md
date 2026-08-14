@@ -8,6 +8,12 @@ spynel doctor
 
 Use `/status` in any interface for the current owner, harness, channel, workflow, and job summary. Use `/log` for bounded runtime diagnostics and `spynel instructions` to validate persistent instruction files without printing their contents.
 
+If the semantic heartbeat appears stuck, inspect its ordinary live job with `/jobs` or `/job info`, confirm the configured harness is available, and use `/trigger heartbeat` only when it is idle. The framework ignores all heartbeat provider output and creates no result, health, incident, escalation, fallback, or retry state. Inspect the durable task/goal progress logs for actions the heartbeat worker actually performed. Ordinary actionable task transitions invoke the notification agent directly; that agent calls the ordinary notification CLI when useful and edits the task log itself.
+
+For heartbeat or notification jobs, an initial `Codex turn started` event proves admission only. The job should remain live and retain later output until a terminal final/error event, cancellation, or timeout; a completed archive containing only that admission status indicates a lifecycle defect.
+
+After a job finishes or the primary restarts, use `/jobs recent`, then `/job info <number>` and `/job output <number>`. A record without an end timestamp is shown as interrupted or running; recovery of the same durable work keeps its number and continues the last atomic snapshot. Numbers wrap after 9999, so an intentionally reused number selects its newest generation. Output is capped, terminal controls and common credential forms are removed, and truncation markers identify omitted data. Archived output is debugging material only and never controls task, goal, heartbeat, or notification state.
+
 ## Installation or startup
 
 - The public `npm install -g spynel` path is not available until the first public npm and GitHub release. For an authorized checkout, use the development steps in [getting started](getting-started.md).

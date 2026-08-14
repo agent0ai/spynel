@@ -51,11 +51,8 @@ type settingsRequest struct {
 	Values map[string]string `json:"values"`
 }
 type notifyRequest struct {
-	Origin   string `json:"origin"`
-	Message  string `json:"message"`
-	EventKey string `json:"event_key,omitempty"`
-	Outcome  string `json:"outcome,omitempty"`
-	Journal  string `json:"journal,omitempty"`
+	Origin  string `json:"origin"`
+	Message string `json:"message"`
 }
 type notifyResponse struct {
 	ID string `json:"id"`
@@ -184,15 +181,7 @@ func (s *Server) notify(response http.ResponseWriter, request *http.Request) {
 		http.Error(response, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if input.Journal != "" {
-		if err := s.Service.JournalNotificationAction(input.Origin, input.EventKey, input.Outcome, input.Journal, input.Message); err != nil {
-			writeError(response, err)
-			return
-		}
-		writeJSON(response, http.StatusAccepted, notifyResponse{ID: "journaled"})
-		return
-	}
-	id, err := s.Service.NotifyWithIdentity(request.Context(), input.Origin, input.Message, input.EventKey, input.Outcome)
+	id, err := s.Service.Notify(request.Context(), input.Origin, input.Message)
 	if err != nil {
 		writeError(response, err)
 		return

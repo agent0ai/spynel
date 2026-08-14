@@ -94,19 +94,8 @@ func TestOrphanedNotifiedTaskKeepsTransitionIdentityThroughReconciliation(t *tes
 		t.Fatal(err)
 	}
 	manager.Wait()
-	entries, err := os.ReadDir(manager.notificationAgentDirectory())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("notification events = %d, want 1", len(entries))
-	}
-	event, err := readNotificationAgentEvent(filepath.Join(manager.notificationAgentDirectory(), entries[0].Name()), strings.TrimSuffix(entries[0].Name(), ".json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if event.Transition != phaseTaskImplementation+":1" || event.TaskFile != failed {
-		t.Fatalf("recovered notification event = %#v", event)
+	if fake.calls != 2 || len(fake.prompts) != 2 || !strings.Contains(fake.prompts[1], failed) {
+		t.Fatalf("recovered notification dispatch lost terminal task identity: calls=%d prompts=%d", fake.calls, len(fake.prompts))
 	}
 }
 

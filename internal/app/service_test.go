@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -53,6 +54,25 @@ type heldServiceHarness struct {
 	emits map[string]core.Emit
 }
 
+type failingServiceHarness struct {
+	*serviceHarness
+	err error
+}
+
+type synchronousInterruptHarness struct {
+	*heldServiceHarness
+	err    error
+	reject bool
+}
+
+type concurrentInterruptHarness struct {
+	*heldServiceHarness
+	mu           sync.Mutex
+	calls        int
+	firstEntered chan struct{}
+	releaseFirst chan struct{}
+}
+
 type notificationRouter struct{ calls []string }
 
 func (r *notificationRouter) Deliver(_ context.Context, channelName, conversation, eventID, text string) error {
@@ -96,110 +116,6 @@ func TestNotifyDeliversAllOriginsWithStableEventIdentity(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(router.calls, "\n"), "rgb:0000") {
 		t.Fatalf("terminal replies reached remote delivery: %#v", router.calls)
-	}
-}
-
-func TestAutomaticNotifyCommandUsesAuthoritativeTransitionActionAndDeduplicates(t *testing.T) {
-	root := t.TempDir()
-	if err := workspace.Init(root, false); err != nil {
-		t.Fatal(err)
-	}
-	cfg, _ := config.Load(config.PathForRoot(root))
-	cfg.Orchestrator.TaskNotifications = config.TaskNotificationsAlways
-	service := New(cfg, newServiceHarness())
-	if _, err := service.History.Append("cli", "local", history.Entry{Role: "user", Content: "known"}); err != nil {
-		t.Fatal(err)
-	}
-	taskFile := filepath.Join(cfg.StatePath("tasks", "done"), "task.md")
-	document := orchestrator.Document{FrontMatter: map[string]any{
-		"id": "task-1", "title": "Report", "status": "done", "attempt": 1,
-		"notify": map[string]any{"enabled": true, "origin": "cli/local", "on": []any{"done"}},
-	}, Body: "# Report\n\n## Progress\n\n- Complete.\n"}
-	if err := orchestrator.WriteDocument(taskFile, document); err != nil {
-		t.Fatal(err)
-	}
-	eventDirectory := cfg.StatePath("runtime", "notification-agents")
-	if err := os.MkdirAll(eventDirectory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	event := map[string]any{
-		"id": "event-1", "task_id": "task-1", "outcome": "done", "task_file": taskFile,
-		"transition": "task_implementation:1", "origin": "cli/local", "mode": "always", "state": "invoked", "attempts": 1,
-	}
-	data, _ := json.Marshal(event)
-	if err := os.WriteFile(filepath.Join(eventDirectory, "event-1.json"), data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, err := service.NotifyWithIdentity(context.Background(), "cli/local", "\x1b]11;rgb:0000/0000/0000\x07\x1b[1;1RThe report is ready.", "task-notification:event-1", "done")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if again, err := service.NotifyWithIdentity(context.Background(), "cli/local", "Changed retry wording.", "task-notification:event-1", "done"); err == nil || again != "" {
-		t.Fatalf("incompatible retry identity = %q, %v; want rejection", again, err)
-	}
-	if _, err := service.NotifyWithIdentity(context.Background(), "cli/other", "redirect", "task-notification:event-1", "done"); err == nil {
-		t.Fatal("automatic command redirected its authorized origin")
-	}
-	journaled, err := orchestrator.ReadDocument(taskFile)
-	if err != nil || strings.Count(journaled.Body, "Sent the user a notification: The report is ready.") != 1 {
-		t.Fatalf("transition journal = %#v, %v", journaled.Body, err)
-	}
-	eventData, err := os.ReadFile(filepath.Join(eventDirectory, "event-1.json"))
-	if err != nil || !strings.Contains(string(eventData), `"journaled": true`) {
-		t.Fatalf("transition receipt = %s, %v", eventData, err)
-	}
-	entries, _, err := service.History.RecentEntries("cli", "local", 10, 10000)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 2 || entries[1].Content != "The report is ready." {
-		t.Fatalf("deduplicated history = %#v", entries)
-	}
-}
-
-func TestNotificationActionJournalRequiresAuthorizedInvokedEvent(t *testing.T) {
-	root := t.TempDir()
-	if err := workspace.Init(root, false); err != nil {
-		t.Fatal(err)
-	}
-	cfg, _ := config.Load(config.PathForRoot(root))
-	service := New(cfg, newServiceHarness())
-	if _, err := service.History.Append("cli", "local", history.Entry{Role: "user", Content: "known"}); err != nil {
-		t.Fatal(err)
-	}
-	taskFile := filepath.Join(cfg.StatePath("tasks", "done"), "task.md")
-	document := orchestrator.Document{FrontMatter: map[string]any{
-		"id": "task-1", "title": "Report", "status": "done", "attempt": 1,
-		"notify": map[string]any{"enabled": true, "origin": "cli/local", "on": []any{"done"}},
-	}, Body: "# Report\n\n## Progress\n\n- Complete.\n"}
-	if err := orchestrator.WriteDocument(taskFile, document); err != nil {
-		t.Fatal(err)
-	}
-	eventDirectory := cfg.StatePath("runtime", "notification-agents")
-	if err := os.MkdirAll(eventDirectory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	event := map[string]any{
-		"id": "event-1", "task_id": "task-1", "outcome": "done", "task_file": taskFile,
-		"transition": "task_implementation:1", "origin": "cli/local", "mode": "decide", "state": "invoked", "attempts": 1,
-	}
-	data, _ := json.Marshal(event)
-	if err := os.WriteFile(filepath.Join(eventDirectory, "event-1.json"), data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := service.JournalNotificationAction("cli/other", "task-notification:event-1", "done", "skipped", "already known"); err == nil {
-		t.Fatal("audit action redirected its authorized origin")
-	}
-	if err := service.JournalNotificationAction("cli/local", "task-notification:event-1", "done", "skipped", "already known"); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(filepath.Join(eventDirectory, "event-1.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var saved map[string]any
-	if json.Unmarshal(data, &saved) != nil || saved["journal_kind"] != "skipped" || saved["journaled"] != true {
-		t.Fatalf("journaled event = %#v", saved)
 	}
 }
 
@@ -421,6 +337,13 @@ func (r *heldServiceHarness) Send(_ context.Context, key, prompt string, emit co
 	return thread, steered, nil
 }
 
+func (r *failingServiceHarness) Send(_ context.Context, key, prompt string, _ core.Emit) (string, bool, error) {
+	r.mu.Lock()
+	r.prompts[key] = append(r.prompts[key], prompt)
+	r.mu.Unlock()
+	return "", false, r.err
+}
+
 func (r *heldServiceHarness) finish(key string) {
 	r.mu.Lock()
 	emit := r.emits[key]
@@ -430,6 +353,46 @@ func (r *heldServiceHarness) finish(key string) {
 	if emit != nil {
 		emit(core.Event{Kind: core.EventFinal, Text: "finished", Done: true})
 	}
+}
+
+func (r *synchronousInterruptHarness) Interrupt(_ context.Context, key string) (bool, error) {
+	r.mu.Lock()
+	if r.err != nil {
+		err := r.err
+		r.mu.Unlock()
+		return false, err
+	}
+	if r.reject {
+		r.mu.Unlock()
+		return false, nil
+	}
+	if !r.active[key] {
+		r.mu.Unlock()
+		return false, nil
+	}
+	emit := r.emits[key]
+	delete(r.emits, key)
+	r.active[key] = false
+	r.mu.Unlock()
+	if emit != nil {
+		emit(core.Event{Kind: core.EventFinal, Text: "synchronously cancelled", Done: true})
+	}
+	return true, nil
+}
+
+func (r *concurrentInterruptHarness) Interrupt(_ context.Context, _ string) (bool, error) {
+	r.mu.Lock()
+	r.calls++
+	call := r.calls
+	if call == 1 {
+		close(r.firstEntered)
+	}
+	r.mu.Unlock()
+	if call == 1 {
+		<-r.releaseFirst
+		return true, nil
+	}
+	return false, nil
 }
 
 func newServiceHarness() *serviceHarness {
@@ -481,6 +444,36 @@ func (r *serviceHarness) Send(_ context.Context, key, prompt string, emit core.E
 	r.mu.Unlock()
 	emit(core.Event{Kind: core.EventFinal, Text: "reply for " + key, ThreadID: thread, Done: true})
 	return thread, false, nil
+}
+
+func TestHarnessDispatchFailsClosedWhenDurableJobNumberCannotBeAllocated(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newServiceHarness()
+	service := New(cfg, target)
+	outside := t.TempDir()
+	blocked := filepath.Join(t.TempDir(), "jobs")
+	if err := os.Symlink(outside, blocked); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	service.Runtime.ConfigureJobArchive(blocked)
+
+	err = service.dispatchHarnessPrompt(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "hello"}, "hello", nil)
+	if err == nil || !strings.Contains(err.Error(), "allocate durable job number") {
+		t.Fatalf("dispatch error = %v", err)
+	}
+	target.mu.Lock()
+	promptCount := len(target.prompts)
+	target.mu.Unlock()
+	if promptCount != 0 || service.Runtime.Status().Jobs != 0 {
+		t.Fatalf("failed admission reached harness or runtime: prompts=%d status=%#v", promptCount, service.Runtime.Status())
+	}
 }
 
 func TestServiceKeepsChannelContextsSeparateAndLinksFullHistory(t *testing.T) {
@@ -837,7 +830,7 @@ func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
 	statusFound := false
 	tasksFound := false
 	goalsFound := false
-	jobsIndex, firstJobIndex, lastJobIndex, tasksIndex := -1, -1, -1, -1
+	jobsIndex, recentJobsIndex, firstJobIndex, lastJobIndex, tasksIndex := -1, -1, -1, -1, -1
 	for index, command := range commands {
 		if !strings.Contains(commandHelp, command.Usage) || !strings.Contains(commandHelp, command.Description) {
 			t.Fatalf("command help does not contain %#v", command)
@@ -854,6 +847,9 @@ func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
 		}
 		if command.Value == "/jobs" {
 			jobsIndex = index
+		}
+		if command.Value == "/jobs recent" {
+			recentJobsIndex = index
 		}
 		if strings.HasPrefix(command.Value, "/job ") {
 			if firstJobIndex < 0 {
@@ -877,8 +873,8 @@ func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
 	if !tasksFound || !goalsFound {
 		t.Fatalf("slash command catalog is missing base durable-work commands: tasks=%v goals=%v", tasksFound, goalsFound)
 	}
-	if firstJobIndex != jobsIndex+1 || tasksIndex != lastJobIndex+1 {
-		t.Fatalf("job command block is not directly after /jobs: jobs=%d first=%d last=%d tasks=%d", jobsIndex, firstJobIndex, lastJobIndex, tasksIndex)
+	if recentJobsIndex != jobsIndex+1 || firstJobIndex != recentJobsIndex+1 || tasksIndex != lastJobIndex+1 {
+		t.Fatalf("job command block is not directly after /jobs and /jobs recent: jobs=%d recent=%d first=%d last=%d tasks=%d", jobsIndex, recentJobsIndex, firstJobIndex, lastJobIndex, tasksIndex)
 	}
 
 	original := commands[0].Value
@@ -1446,10 +1442,16 @@ func TestStopCommandInterruptsOnlyAnActiveConversation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	target := newServiceHarness()
+	target := newHeldServiceHarness()
 	service := New(cfg, target)
 	key := "chat:tui:local"
-	target.active[key] = true
+	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "active request"}, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	job, ok := service.Runtime.JobForSession(key)
+	if !ok {
+		t.Fatal("active job was not registered")
+	}
 
 	var response core.Event
 	err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "/stop"}, func(event core.Event) { response = event })
@@ -1459,11 +1461,139 @@ func TestStopCommandInterruptsOnlyAnActiveConversation(t *testing.T) {
 	if target.IsActive(key) || response.Kind != core.EventFinal || !strings.Contains(response.Text, "Stop requested") {
 		t.Fatalf("active=%t response=%#v", target.IsActive(key), response)
 	}
+	if current, live := service.Runtime.Job(job.ID); !live || current.Execution != JobCancelling {
+		t.Fatalf("cancelled job was not retained for provider termination: %#v, live=%t", current, live)
+	}
+	target.finish(key)
+	archived, _, archiveErr := service.Runtime.ArchivedJob(job.StableID)
+	if archiveErr != nil || archived.State != string(JobCancelling) {
+		t.Fatalf("stopped archive = %#v, %v; want cancelling", archived, archiveErr)
+	}
+	_, output, archiveErr := service.Runtime.ArchivedJob(job.StableID)
+	if archiveErr != nil || !strings.Contains(output, "finished") || !strings.Contains(output, string(core.EventFinal)) {
+		t.Fatalf("stopped archive output = %q, %v; want delayed terminal event", output, archiveErr)
+	}
 
 	response = core.Event{}
 	err = service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "/stop"}, func(event core.Event) { response = event })
 	if err != nil || !strings.Contains(response.Text, "no active execution") {
 		t.Fatalf("inactive stop response=%#v err=%v", response, err)
+	}
+}
+
+func TestStopCommandPreservesCancellingWhenInterruptTerminatesSynchronously(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	target := &synchronousInterruptHarness{heldServiceHarness: newHeldServiceHarness()}
+	service := New(cfg, target)
+	message := core.Message{Channel: "tui", Conversation: "synchronous-stop", Text: "active request"}
+	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	job, ok := service.Runtime.JobForSession("chat:tui:synchronous-stop")
+	if !ok {
+		t.Fatal("active job was not registered")
+	}
+
+	message.Text = "/stop"
+	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	archived, output, err := service.Runtime.ArchivedJob(job.StableID)
+	if err != nil || archived.State != string(JobCancelling) {
+		t.Fatalf("synchronous stop archive = %#v, %v; want cancelling", archived, err)
+	}
+	if !strings.Contains(output, "synchronously cancelled") || !strings.Contains(output, string(core.EventFinal)) {
+		t.Fatalf("synchronous stop output = %q; want terminal event", output)
+	}
+}
+
+func TestStopCommandRestoresLiveStateWhenInterruptFails(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	target := &synchronousInterruptHarness{heldServiceHarness: newHeldServiceHarness(), err: errors.New("interrupt unavailable")}
+	service := New(cfg, target)
+	message := core.Message{Channel: "tui", Conversation: "failed-stop", Text: "active request"}
+	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	job, ok := service.Runtime.JobForSession("chat:tui:failed-stop")
+	if !ok {
+		t.Fatal("active job was not registered")
+	}
+
+	message.Text = "/stop"
+	var response core.Event
+	if err := service.Handle(context.Background(), message, func(event core.Event) { response = event }); err != nil {
+		t.Fatal(err)
+	}
+	current, live := service.Runtime.Job(job.ID)
+	if !live || current.Execution != job.Execution || !strings.Contains(response.Text, "interrupt unavailable") {
+		t.Fatalf("failed stop state = %#v, live=%t response=%#v", current, live, response)
+	}
+}
+
+func TestStopCommandEventuallyFinalizesWhenProviderDoesNotTerminate(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	target := newHeldServiceHarness()
+	service := New(cfg, target)
+	service.jobCancellationGrace = 10 * time.Millisecond
+	message := core.Message{Channel: "tui", Conversation: "stuck", Text: "active request"}
+	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	job, ok := service.Runtime.JobForSession("chat:tui:stuck")
+	if !ok {
+		t.Fatal("active job was not registered")
+	}
+	message.Text = "/stop"
+	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, live := service.Runtime.Job(job.ID)
+		archived, _, archiveErr := service.Runtime.ArchivedJob(job.StableID)
+		if archiveErr == nil && archived.State == string(JobCancelling) && !live {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cancelled job did not reach bounded fallback: archive=%#v err=%v", archived, archiveErr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestSynchronousChatHarnessFailureIsCapturedInArchivedOutput(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	target := &failingServiceHarness{serviceHarness: newServiceHarness(), err: errors.New("provider terminated abruptly")}
+	service := New(cfg, target)
+
+	err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "failure", Text: "inspect failure"}, func(core.Event) {})
+	if err == nil || !strings.Contains(err.Error(), "provider terminated abruptly") {
+		t.Fatalf("chat failure = %v", err)
+	}
+	jobs, archiveErr := service.Runtime.RecentArchivedJobs(1)
+	if archiveErr != nil || len(jobs) != 1 || jobs[0].State != string(JobError) {
+		t.Fatalf("failed archive metadata = %#v, %v", jobs, archiveErr)
+	}
+	_, output, archiveErr := service.Runtime.ArchivedJob(jobs[0].ID)
+	if archiveErr != nil || !strings.Contains(output, "provider terminated abruptly") || !strings.Contains(output, string(core.EventError)) {
+		t.Fatalf("failed archive output = %q, %v", output, archiveErr)
 	}
 }
 
@@ -1630,30 +1760,189 @@ func TestJobsListAndKillActiveExecutionsByNumericID(t *testing.T) {
 		t.Fatalf("runtime status = %#v, want 2 jobs", status)
 	}
 
-	var response core.Event
-	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "/jobs"}, func(event core.Event) { response = event }); err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"Job 1", "telegram/42", "Job 2", "whatsapp/1555", "/job kill <number>"} {
-		if !strings.Contains(response.Text, want) {
-			t.Fatalf("jobs response does not contain %q: %s", want, response.Text)
+	var listing string
+	for _, caller := range []core.Message{
+		{Channel: "tui", Conversation: "local", Text: "/jobs"},
+		{Channel: "telegram", Conversation: "unrelated", Text: "/jobs"},
+		{Channel: "whatsapp", Conversation: "unrelated", Text: "/jobs"},
+		{Channel: "cli", Conversation: "automation", Text: "/jobs"},
+	} {
+		var response core.Event
+		if err := service.Handle(context.Background(), caller, func(event core.Event) { response = event }); err != nil {
+			t.Fatal(err)
+		}
+		if listing == "" {
+			listing = response.Text
+		} else if response.Text != listing {
+			t.Fatalf("%s job listing differs from the shared workspace listing:\n%s\n--- want ---\n%s", caller.Channel, response.Text, listing)
 		}
 	}
+	for _, want := range []string{"Job 1", "telegram", "Job 2", "whatsapp", "/job kill <number>"} {
+		if !strings.Contains(listing, want) {
+			t.Fatalf("jobs response does not contain %q: %s", want, listing)
+		}
+	}
+	for _, private := range []string{"investigate production", "review the release", "telegram/42", "whatsapp/1555"} {
+		if strings.Contains(listing, private) {
+			t.Fatalf("global jobs response exposed private value %q: %s", private, listing)
+		}
+	}
+	killedJob, ok := service.Runtime.JobForSession("chat:telegram:42")
+	if !ok {
+		t.Fatal("job selected for cancellation was not registered")
+	}
 
-	response = core.Event{}
-	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "42", Text: "/job kill 1"}, func(event core.Event) { response = event }); err != nil {
+	var response core.Event
+	if err := service.Handle(context.Background(), core.Message{Channel: "whatsapp", Conversation: "1555", Text: "/job kill 1"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(response.Text, "Kill requested for job 1") || service.Runtime.Status().Jobs != 1 {
+	if !strings.Contains(response.Text, "Kill requested for job 1") || service.Runtime.Status().Jobs != 2 {
 		t.Fatalf("kill response=%#v status=%#v", response, service.Runtime.Status())
 	}
 	if target.IsActive("chat:telegram:42") {
 		t.Fatal("killed harness session is still active")
 	}
+	target.finish("chat:telegram:42")
+	if service.Runtime.Status().Jobs != 1 {
+		t.Fatalf("provider-released cancelled job remains registered: %#v", service.Runtime.Jobs())
+	}
+	archived, output, archiveErr := service.Runtime.ArchivedJob(killedJob.StableID)
+	if archiveErr != nil || archived.State != string(JobCancelling) || !strings.Contains(output, "finished") {
+		t.Fatalf("cancelled job archive = %#v output=%q err=%v", archived, output, archiveErr)
+	}
 
 	target.finish("chat:whatsapp:1555")
 	if service.Runtime.Status().Jobs != 0 {
 		t.Fatalf("completed job remains registered: %#v", service.Runtime.Jobs())
+	}
+}
+
+func TestJobKillRestoresConversationStateWhenInterruptFails(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	target := &synchronousInterruptHarness{heldServiceHarness: newHeldServiceHarness(), err: errors.New("interrupt unavailable")}
+	service := New(cfg, target)
+	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "failed-kill", Text: "active request"}, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	job, ok := service.Runtime.JobForSession("chat:tui:failed-kill")
+	if !ok {
+		t.Fatal("active conversation job was not registered")
+	}
+
+	var response core.Event
+	if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "operator", Text: "/job kill 1"}, func(event core.Event) { response = event }); err != nil {
+		t.Fatal(err)
+	}
+	current, live := service.Runtime.Job(job.ID)
+	archived, _, archiveErr := service.Runtime.ArchivedJob(job.StableID)
+	if !live || current.Execution != job.Execution || archiveErr != nil || archived.State != string(job.Execution) || !target.IsActive(job.SessionKey) || !strings.Contains(response.Text, "interrupt unavailable") {
+		t.Fatalf("failed conversation kill: current=%#v live=%t archive=%#v archiveErr=%v active=%t response=%#v", current, live, archived, archiveErr, target.IsActive(job.SessionKey), response)
+	}
+}
+
+func TestJobKillRestoresDurableControlFenceWhenInterruptFails(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	target := &synchronousInterruptHarness{heldServiceHarness: newHeldServiceHarness(), reject: true}
+	service := New(cfg, target)
+	task, err := orchestrator.Create(cfg, "tasks", "retain durable control after rejected kill", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Orchestrator.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	service.Orchestrator.Wait()
+	jobs := service.Runtime.Jobs()
+	if len(jobs) != 1 || jobs[0].Kind != "task" {
+		t.Fatalf("durable job registration = %#v", jobs)
+	}
+	job := jobs[0]
+	lease, ok := service.Orchestrator.LeaseForSession(job.SessionKey)
+	if !ok {
+		t.Fatal("durable job lease was not registered")
+	}
+	document, err := orchestrator.ReadDocument(lease.File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	documentID, _ := document.FrontMatter["id"].(string)
+	if documentID == "" || !service.Orchestrator.ControlStillValid(lease, documentID) {
+		t.Fatalf("durable control was not valid before kill: task=%s lease=%#v", task, lease)
+	}
+
+	var response core.Event
+	if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "operator", Text: "/job kill 1"}, func(event core.Event) { response = event }); err != nil {
+		t.Fatal(err)
+	}
+	current, live := service.Runtime.Job(job.ID)
+	archived, _, archiveErr := service.Runtime.ArchivedJob(job.StableID)
+	if !live || current.Execution != job.Execution || archiveErr != nil || archived.State != string(job.Execution) || !target.IsActive(job.SessionKey) || !service.Orchestrator.ControlStillValid(lease, documentID) || !strings.Contains(response.Text, "did not accept") {
+		t.Fatalf("failed durable kill: current=%#v live=%t archive=%#v archiveErr=%v active=%t controlValid=%t response=%#v", current, live, archived, archiveErr, target.IsActive(job.SessionKey), service.Orchestrator.ControlStillValid(lease, documentID), response)
+	}
+}
+
+func TestConcurrentJobKillFailureDoesNotRollbackAcceptedCancellation(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	target := &concurrentInterruptHarness{
+		heldServiceHarness: newHeldServiceHarness(),
+		firstEntered:       make(chan struct{}),
+		releaseFirst:       make(chan struct{}),
+	}
+	service := New(cfg, target)
+	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "concurrent-kill", Text: "active request"}, func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+	job, ok := service.Runtime.JobForSession("chat:tui:concurrent-kill")
+	if !ok {
+		t.Fatal("active conversation job was not registered")
+	}
+
+	responses := make(chan core.Event, 2)
+	errors := make(chan error, 2)
+	kill := func(conversation string) {
+		var response core.Event
+		errors <- service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: conversation, Text: "/job kill 1"}, func(event core.Event) { response = event })
+		responses <- response
+	}
+	go kill("operator-accepted")
+	<-target.firstEntered
+	go kill("operator-rejected")
+	if err := <-errors; err != nil {
+		t.Fatal(err)
+	}
+	rejected := <-responses
+	if !strings.Contains(rejected.Text, "did not accept") {
+		t.Fatalf("concurrent rejected kill response = %#v", rejected)
+	}
+	current, live := service.Runtime.Job(job.ID)
+	archived, _, archiveErr := service.Runtime.ArchivedJob(job.StableID)
+	if !live || current.Execution != JobCancelling || archiveErr != nil || archived.State != string(JobCancelling) {
+		t.Fatalf("failed concurrent rollback: current=%#v live=%t archive=%#v err=%v", current, live, archived, archiveErr)
+	}
+	close(target.releaseFirst)
+	if err := <-errors; err != nil {
+		t.Fatal(err)
+	}
+	accepted := <-responses
+	if !strings.Contains(accepted.Text, "Kill requested") {
+		t.Fatalf("concurrent accepted kill response = %#v", accepted)
+	}
+	target.finish(job.SessionKey)
+	archived, output, archiveErr := service.Runtime.ArchivedJob(job.StableID)
+	if _, live := service.Runtime.Job(job.ID); live || archiveErr != nil || archived.State != string(JobCancelling) || !strings.Contains(output, "finished") {
+		t.Fatalf("concurrent cancellation terminal result: live=%t archive=%#v output=%q err=%v", live, archived, output, archiveErr)
 	}
 }
 
@@ -1689,6 +1978,63 @@ func TestJobKillKeepsHeartbeatInspectableUntilProviderRelease(t *testing.T) {
 	service.Runtime.EndJob(jobID)
 	if _, ok := service.Runtime.Job(jobID); ok {
 		t.Fatal("released heartbeat remains registered")
+	}
+}
+
+func TestOrchestratorJobAdmissionKeepsRecoveryDispatchIdentityPhaseScoped(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	path := cfg.StatePath("tasks", "working", "release.md")
+	if err := os.WriteFile(path, []byte("---\nid: release\nstatus: working\n---\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	implementationLease := orchestrator.Lease{DocumentType: "task", Route: "tasks", File: path, SessionKey: "implementation", Phase: "task_implementation", ClaimAttempt: 1}
+	implementationID, err := service.Orchestrator.JobStarted(implementationLease, "release.md", time.Time{}, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	implementation, _ := service.Runtime.Job(implementationID)
+	service.Runtime.EndJob(implementationID)
+
+	reviewLease := implementationLease
+	reviewLease.SessionKey = "review"
+	reviewLease.Phase = "task_review"
+	reviewID, err := service.Orchestrator.JobStarted(reviewLease, "release.md", time.Time{}, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	review, _ := service.Runtime.Job(reviewID)
+	service.Runtime.EndJob(reviewID)
+	if review.Number == implementation.Number || review.StableID == implementation.StableID {
+		t.Fatalf("review reused implementation archive: implementation=%#v review=%#v", implementation, review)
+	}
+
+	restarted := New(cfg, newServiceHarness())
+	reworkLease := implementationLease
+	reworkLease.SessionKey = "rework"
+	reworkLease.ClaimAttempt = 2
+	reworkID, err := restarted.Orchestrator.JobStarted(reworkLease, "release.md", time.Time{}, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rework, _ := restarted.Runtime.Job(reworkID)
+	if rework.Number == implementation.Number || rework.StableID == implementation.StableID {
+		t.Fatalf("later implementation attempt reused prior archive: implementation=%#v rework=%#v", implementation, rework)
+	}
+	restarted.Runtime.EndJob(reworkID)
+
+	recovery := New(cfg, newServiceHarness())
+	recoveredID, err := recovery.Orchestrator.JobStarted(reworkLease, "release.md", time.Time{}, 2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, _ := recovery.Runtime.Job(recoveredID)
+	if recovered.Number != rework.Number || recovered.Generation != rework.Generation || recovered.StableID != rework.StableID {
+		t.Fatalf("same-dispatch recovery identity = %#v, want %#v", recovered, rework)
 	}
 }
 

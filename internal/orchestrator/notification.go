@@ -125,8 +125,8 @@ func (o *Outbox) now() time.Time {
 }
 func (o *Outbox) path(id string) string { return filepath.Join(o.Directory, id+".json") }
 
-func NotificationOutboxID(eventKey, outcome string) string {
-	hash := sha256.Sum256([]byte(eventKey + "\x00" + outcome))
+func notificationOutboxID(deliveryKey, class string) string {
+	hash := sha256.Sum256([]byte(deliveryKey + "\x00" + class))
 	return hex.EncodeToString(hash[:16])
 }
 
@@ -268,7 +268,7 @@ func skipStringNotificationControl(value string, index int, bellTerminates bool)
 	return len(value)
 }
 
-func (o *Outbox) Enqueue(eventKey, outcome, origin, message string) (OutboxEntry, error) {
+func (o *Outbox) Enqueue(deliveryKey, class, origin, message string) (OutboxEntry, error) {
 	if _, err := ParseOrigin(origin); err != nil {
 		return OutboxEntry{}, err
 	}
@@ -276,7 +276,7 @@ func (o *Outbox) Enqueue(eventKey, outcome, origin, message string) (OutboxEntry
 	if err != nil {
 		return OutboxEntry{}, err
 	}
-	id := NotificationOutboxID(eventKey, outcome)
+	id := notificationOutboxID(deliveryKey, class)
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if data, err := os.ReadFile(o.path(id)); err == nil {

@@ -472,6 +472,14 @@ func (p *runtimeLogPersistence) run() {
 }
 
 func boundAndRedactLogText(message string) string {
+	message = redactLogText(message)
+	if runes := []rune(message); len(runes) > maxLogEntryRunes {
+		message = string(runes[:maxLogEntryRunes-1]) + "…"
+	}
+	return message
+}
+
+func redactLogText(message string) string {
 	message = strings.TrimSpace(sanitizeLogText(message))
 	message = urlUserinfoPattern.ReplaceAllString(message, "${1}[REDACTED]@${2}")
 	message = redactNestedPrivateFields(message)
@@ -485,9 +493,6 @@ func boundAndRedactLogText(message string) string {
 	}
 	for _, pattern := range unquotedSecretPatterns {
 		message = redactUnquotedSecrets(message, pattern)
-	}
-	if runes := []rune(message); len(runes) > maxLogEntryRunes {
-		message = string(runes[:maxLogEntryRunes-1]) + "…"
 	}
 	return message
 }

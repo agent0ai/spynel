@@ -46,43 +46,47 @@ type Service struct {
 	Startup         interface {
 		Sync(config.Config, bool) error
 	}
-	Updates             *updater.Manager
-	configurationMu     sync.Mutex
-	instanceMu          sync.RWMutex
-	primaryInstance     string
-	cleanupNotBefore    time.Time
-	titleMu             sync.Mutex
-	titleChanges        chan string
-	themeChanges        chan theme.Theme
-	connectionMu        sync.RWMutex
-	connections         map[string]channel.ConnectionStatus
-	pairingMu           sync.RWMutex
-	pairing             map[string]channel.PairingEvent
-	pairingEvents       chan channel.PairingEvent
-	noticeMu            sync.RWMutex
-	noticeSequence      uint64
-	lastNotice          channel.Notice
-	noticeEvents        chan channel.Notice
-	restartRequests     chan struct{}
-	updateRequests      chan struct{}
-	primaryRequests     chan string
-	primaryRequestMu    sync.Mutex
-	primaryRequested    bool
-	streamMu            sync.Mutex
-	liveTUIMu           sync.Mutex
-	liveTUI             map[string]map[string]time.Time
-	cleanupHistoryStep  func(string)
-	resumeAdmissionStep func(string)
-	readJobDocument     func(string) (orchestrator.Document, error)
-	streamText          map[string]string
-	telegramIdentity    *telegram.IdentityStore
+	Updates              *updater.Manager
+	configurationMu      sync.Mutex
+	instanceMu           sync.RWMutex
+	primaryInstance      string
+	cleanupNotBefore     time.Time
+	titleMu              sync.Mutex
+	titleChanges         chan string
+	themeChanges         chan theme.Theme
+	connectionMu         sync.RWMutex
+	connections          map[string]channel.ConnectionStatus
+	pairingMu            sync.RWMutex
+	pairing              map[string]channel.PairingEvent
+	pairingEvents        chan channel.PairingEvent
+	noticeMu             sync.RWMutex
+	noticeSequence       uint64
+	lastNotice           channel.Notice
+	noticeEvents         chan channel.Notice
+	restartRequests      chan struct{}
+	updateRequests       chan struct{}
+	primaryRequests      chan string
+	primaryRequestMu     sync.Mutex
+	primaryRequested     bool
+	streamMu             sync.Mutex
+	liveTUIMu            sync.Mutex
+	liveTUI              map[string]map[string]time.Time
+	cleanupHistoryStep   func(string)
+	resumeAdmissionStep  func(string)
+	readJobDocument      func(string) (orchestrator.Document, error)
+	streamText           map[string]string
+	telegramIdentity     *telegram.IdentityStore
+	jobCancellationGrace time.Duration
 }
+
+const jobCancellationGrace = 30 * time.Second
 
 func New(cfg config.Config, target harness.Harness) *Service {
 	return NewWithRuntime(cfg, target, NewRuntime())
 }
 
 func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime) *Service {
+	runtime.ConfigureJobArchive(cfg.StatePath("jobs"))
 	hooks := extensions.Runner{Directory: cfg.Resolve(cfg.Extensions.Directory), Timeout: cfg.Extensions.Timeout()}
 	hooks.Log = runtime.Writer("extensions")
 	store := history.New(cfg.StatePath("history"))
@@ -98,40 +102,56 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 		connections["whatsapp"] = channel.ConnectionStatus{Name: "whatsapp", State: channel.ConnectionConnecting}
 	}
 	service := &Service{
-		Config:           cfg,
-		Harness:          target,
-		History:          store,
-		Hooks:            hooks,
-		Orchestrator:     manager,
-		Runtime:          runtime,
-		Settings:         config.NewStore(cfg),
-		titleChanges:     make(chan string, 1),
-		themeChanges:     make(chan theme.Theme, 1),
-		connections:      connections,
-		pairing:          map[string]channel.PairingEvent{},
-		pairingEvents:    make(chan channel.PairingEvent, 1),
-		noticeEvents:     make(chan channel.Notice, 8),
-		restartRequests:  make(chan struct{}, 1),
-		updateRequests:   make(chan struct{}, 1),
-		primaryRequests:  make(chan string, 1),
-		streamText:       map[string]string{},
-		liveTUI:          map[string]map[string]time.Time{},
-		telegramIdentity: telegram.NewIdentityStore(cfg.StatePath("runtime", "telegram-identities.json")),
-		readJobDocument:  readBoundedJobDocument,
+		Config:               cfg,
+		Harness:              target,
+		History:              store,
+		Hooks:                hooks,
+		Orchestrator:         manager,
+		Runtime:              runtime,
+		Settings:             config.NewStore(cfg),
+		titleChanges:         make(chan string, 1),
+		themeChanges:         make(chan theme.Theme, 1),
+		connections:          connections,
+		pairing:              map[string]channel.PairingEvent{},
+		pairingEvents:        make(chan channel.PairingEvent, 1),
+		noticeEvents:         make(chan channel.Notice, 8),
+		restartRequests:      make(chan struct{}, 1),
+		updateRequests:       make(chan struct{}, 1),
+		primaryRequests:      make(chan string, 1),
+		streamText:           map[string]string{},
+		liveTUI:              map[string]map[string]time.Time{},
+		telegramIdentity:     telegram.NewIdentityStore(cfg.StatePath("runtime", "telegram-identities.json")),
+		readJobDocument:      readBoundedJobDocument,
+		jobCancellationGrace: jobCancellationGrace,
 	}
 	manager.Cleanup = service.runAutomaticCleanup
 	manager.Log = func(message string) { runtime.LogEvent("info", "orchestrator", "lifecycle", message) }
-	manager.JobStarted = func(lease orchestrator.Lease, description string, firstAssignedAt time.Time, providerIterations, implementationAttempts int) int {
+	manager.JobStarted = func(lease orchestrator.Lease, description string, firstAssignedAt time.Time, providerIterations, implementationAttempts int) (int, error) {
 		kind := lease.DocumentType
 		if kind == "" {
 			kind = "markdown"
 		}
-		id := runtime.BeginJobWithDetails(lease.SessionKey, "orchestrator", "markdown", description, JobDetails{
+		workID, parentID := "", ""
+		if lease.File != "" {
+			if document, err := orchestrator.ReadDocument(lease.File); err == nil {
+				if value, ok := document.FrontMatter["id"].(string); ok {
+					workID = value
+				}
+				if value, ok := document.FrontMatter["goal_id"].(string); ok {
+					parentID = value
+				}
+			}
+		}
+		id, err := runtime.TryBeginJobWithDetails(lease.SessionKey, "orchestrator", "markdown", description, JobDetails{
 			Kind: kind, Route: lease.Route, DurableFile: lease.File,
 			FirstAssignedAt: firstAssignedAt, ProviderIterations: providerIterations, ImplementationAttempts: implementationAttempts,
+			Provider: service.Settings.Snapshot().Harness.Name, WorkID: workID, ParentID: parentID, Phase: lease.Phase, PhaseAttempt: lease.ClaimAttempt,
 		})
+		if err != nil {
+			return 0, err
+		}
 		runtime.UpdateJobFromLease(id, lease.State, lease.Phase, lease.LastError, lease.HeartbeatAt, lease.RecoveryCount)
-		return id
+		return id, nil
 	}
 	manager.JobUpdated = func(id int, lease orchestrator.Lease) {
 		runtime.UpdateJobFromLease(id, lease.State, lease.Phase, lease.LastError, lease.HeartbeatAt, lease.RecoveryCount)
@@ -140,9 +160,9 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 		runtime.UpdateJobDurableTiming(id, firstAssignedAt, providerIterations)
 	}
 	manager.JobExecutionUpdated = func(id int, status core.ExecutionStatus) { runtime.UpdateJob(id, status) }
+	manager.JobEvent = runtime.RecordJobEvent
 	manager.JobFinished = runtime.EndJob
 	manager.SetNotificationDelivery(service.deliverNotification)
-	manager.AuthorizeNotificationOrigin = service.validateOrigin
 	return service
 }
 
@@ -249,10 +269,6 @@ func (s *Service) AckNotification(originText, eventID string, afterChars int) er
 }
 
 func (s *Service) Notify(ctx context.Context, originText, text string) (string, error) {
-	return s.NotifyWithIdentity(ctx, originText, text, "", "")
-}
-
-func (s *Service) NotifyWithIdentity(ctx context.Context, originText, text, eventKey, outcome string) (string, error) {
 	origin, err := orchestrator.ParseOrigin(originText)
 	if err != nil {
 		return "", err
@@ -263,42 +279,15 @@ func (s *Service) NotifyWithIdentity(ctx context.Context, originText, text, even
 	if err := s.validateOrigin(origin); err != nil {
 		return "", err
 	}
-	if eventKey == "" {
-		eventKey = fmt.Sprintf("manual-%d", time.Now().UTC().UnixNano())
-		outcome = "manual"
-	} else if outcome == "" {
-		return "", errors.New("notification outcome is required with event identity")
-	}
-	var entry orchestrator.OutboxEntry
-	if strings.HasPrefix(eventKey, "task-notification:") {
-		entry, err = s.Orchestrator.EnqueueNotificationAgentCommand(eventKey, outcome, originText, text)
-		if err != nil {
-			return "", err
-		}
-	} else {
-		entry, err = s.Orchestrator.Outbox.Enqueue(eventKey, outcome, originText, text)
-		if err != nil {
-			return "", err
-		}
+	deliveryKey := fmt.Sprintf("manual-%d", time.Now().UTC().UnixNano())
+	entry, err := s.Orchestrator.Outbox.Enqueue(deliveryKey, "manual", originText, text)
+	if err != nil {
+		return "", err
 	}
 	if processErr := s.Orchestrator.Outbox.Process(ctx); processErr != nil {
 		s.Runtime.LogEvent("error", "orchestrator", "notification_retry", "Notification retained for retry: "+processErr.Error())
 	}
 	return entry.ID, nil
-}
-
-func (s *Service) JournalNotificationAction(originText, eventKey, outcome, kind, detail string) error {
-	origin, err := orchestrator.ParseOrigin(originText)
-	if err != nil {
-		return err
-	}
-	if err := s.validateOrigin(origin); err != nil {
-		return err
-	}
-	if eventKey == "" || outcome == "" {
-		return errors.New("notification event identity and outcome are required to journal an action")
-	}
-	return s.Orchestrator.JournalNotificationAgentAction(eventKey, outcome, originText, kind, detail)
 }
 
 func (s *Service) Start(ctx context.Context) error {
@@ -412,7 +401,10 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	}
 	prompt = preparedPrompt
 	key := sessionKey(message)
-	jobID := s.Runtime.BeginJob(key, message.Channel, message.Conversation, message.Text)
+	jobID, err := s.Runtime.TryBeginJobWithDetails(key, message.Channel, message.Conversation, message.Text, JobDetails{Kind: "conversation", Provider: s.Settings.Snapshot().Harness.Name})
+	if err != nil {
+		return fmt.Errorf("start job: %w", err)
+	}
 	s.Runtime.LogEvent("info", "harness", "turn_started", "Harness turn started")
 	activity := newChatActivityEmitter(emit)
 	activity.start()
@@ -426,6 +418,7 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	}
 	if err != nil {
 		activity.stop()
+		s.Runtime.RecordJobEvent(jobID, core.Event{Kind: core.EventError, Text: err.Error(), Done: true})
 		s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobError), Detail: err.Error()})
 		s.Runtime.LogEvent("error", "harness", "start_failed", "Harness turn failed to start ("+harnessFailureEvidence(err)+")")
 		if !s.Harness.IsActive(key) {
@@ -615,6 +608,9 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 				s.Runtime.LogEvent("error", "history", "terminal_append_failed", fmt.Sprintf("Persist terminal history failed (%T)", err))
 			}
 		}
+		// Capture after extension and outbound-media processing so validated
+		// attachment paths and objects never enter the archive.
+		s.Runtime.RecordJobEvent(jobID, event)
 		if downstream != nil {
 			downstream(event)
 		}
@@ -724,7 +720,13 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 	case "log", "logs":
 		return s.logCommand(message, remainder, emit)
 	case "jobs":
-		return s.localReply(message, formatJobs(s.accessibleJobs(message)), emit)
+		if strings.EqualFold(strings.TrimSpace(remainder), "recent") {
+			return s.jobsRecentCommand(message, emit)
+		}
+		if strings.TrimSpace(remainder) != "" {
+			return s.localReply(message, "Usage: /jobs [recent]", emit)
+		}
+		return s.localReply(message, formatJobs(s.Runtime.NumericJobs()), emit)
 	case "tasks", "goals":
 		return s.workflowListCommand(message, command, remainder, emit)
 	case "job":
@@ -741,15 +743,26 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		}
 		return nil
 	case "stop":
-		stopped, err := s.Harness.Interrupt(ctx, sessionKey(message))
+		key := sessionKey(message)
+		job, hasJob := s.Runtime.JobForSession(key)
+		if hasJob {
+			job, hasJob = s.Runtime.ReserveJobCancellation(job.ID)
+		}
+		stopped, err := s.Harness.Interrupt(ctx, key)
 		if err != nil {
+			if hasJob {
+				s.Runtime.RestoreJobAfterFailedCancellation(job)
+			}
 			return s.localReply(message, "Cannot stop the active execution: "+err.Error(), emit)
 		}
 		if !stopped {
+			if hasJob {
+				s.Runtime.RestoreJobAfterFailedCancellation(job)
+			}
 			return s.localReply(message, "There is no active execution to stop.", emit)
 		}
-		if job, ok := s.Runtime.JobForSession(sessionKey(message)); ok {
-			s.Runtime.EndJob(job.ID)
+		if hasJob {
+			s.finishCancelledJobAfterGrace(job)
 		}
 		return s.localReply(message, "Stop requested for the active execution.", emit)
 	case "restart":
@@ -789,6 +802,19 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 	default:
 		return s.localReply(message, "Unknown command /"+command+". Use /help.", emit)
 	}
+}
+
+func (s *Service) finishCancelledJobAfterGrace(job Job) {
+	grace := s.jobCancellationGrace
+	if grace <= 0 {
+		grace = jobCancellationGrace
+	}
+	time.AfterFunc(grace, func() {
+		current, ok := s.Runtime.Job(job.ID)
+		if ok && current.StableID == job.StableID && current.Execution == JobCancelling {
+			s.Runtime.EndJob(job.ID)
+		}
+	})
 }
 
 func (s *Service) triggerCommand(ctx context.Context, message core.Message, remainder string, emit core.Emit) error {
@@ -924,75 +950,102 @@ func parseLogPageSpec(spec string) (int, int, error) {
 
 func (s *Service) jobCommand(ctx context.Context, message core.Message, remainder string, emit core.Emit) error {
 	parts := strings.Fields(remainder)
-	usage := "Usage: /job info <number> | /job message <number> <text> | /job ping <number> | /job kill <number>\n\nUse /jobs to list running jobs."
+	usage := "Usage: /job info <number> | /job output <number> [tail <bytes>] | /job message <number> <text> | /job ping <number> | /job kill <number>\n\nUse /jobs for live jobs or /jobs recent for archived jobs."
 	if len(parts) < 2 {
 		return s.localReply(message, usage, emit)
 	}
-	id, err := strconv.Atoi(parts[1])
-	if err != nil || id <= 0 {
-		return s.localReply(message, "Job number must be positive. Use /jobs to list running jobs.", emit)
-	}
+	id, numericErr := strconv.Atoi(parts[1])
 	switch strings.ToLower(parts[0]) {
 	case "info":
 		if len(parts) != 2 {
 			return s.localReply(message, usage, emit)
 		}
+		if numericErr != nil || id < 1 || id > maxJobNumber {
+			return s.localReply(message, fmt.Sprintf("Job number must be from 1 to %d. Use /jobs or /jobs recent to list jobs.", maxJobNumber), emit)
+		}
 		return s.jobInfoCommand(message, id, emit)
+	case "output":
+		if len(parts) != 2 && len(parts) != 4 || len(parts) == 4 && !strings.EqualFold(parts[2], "tail") {
+			return s.localReply(message, usage, emit)
+		}
+		tailBytes := 16 << 10
+		if len(parts) == 4 {
+			value, err := strconv.Atoi(parts[3])
+			if err != nil || value < 1 || value > 64<<10 {
+				return s.localReply(message, "Job output tail must be from 1 to 65536 bytes.", emit)
+			}
+			tailBytes = value
+		}
+		if numericErr != nil || id < 1 || id > maxJobNumber {
+			return s.localReply(message, fmt.Sprintf("Job number must be from 1 to %d. Use /jobs or /jobs recent to list jobs.", maxJobNumber), emit)
+		}
+		return s.jobOutputCommand(message, id, tailBytes, emit)
 	case "message":
+		if numericErr != nil || id < 1 || id > maxJobNumber {
+			return s.localReply(message, fmt.Sprintf("Job control requires a live job number from 1 to %d.", maxJobNumber), emit)
+		}
 		if len(parts) < 3 {
 			return s.localReply(message, "Usage: /job message <number> <text>", emit)
 		}
 		text := strings.TrimSpace(strings.Join(parts[2:], " "))
 		return s.jobControlCommand(ctx, message, id, text, false, emit)
 	case "ping":
+		if numericErr != nil || id < 1 || id > maxJobNumber {
+			return s.localReply(message, fmt.Sprintf("Job control requires a live job number from 1 to %d.", maxJobNumber), emit)
+		}
 		if len(parts) != 2 {
 			return s.localReply(message, "Usage: /job ping <number>", emit)
 		}
 		return s.jobControlCommand(ctx, message, id, "", true, emit)
 	case "kill":
+		if numericErr != nil || id < 1 || id > maxJobNumber {
+			return s.localReply(message, fmt.Sprintf("Job control requires a live job number from 1 to %d.", maxJobNumber), emit)
+		}
 		if len(parts) != 2 {
 			return s.localReply(message, usage, emit)
 		}
 	default:
 		return s.localReply(message, usage, emit)
 	}
-	job, ok := s.Runtime.Job(id)
+	liveJob, live := s.Runtime.JobByNumber(id)
+	var job Job
+	ok := false
+	if live {
+		job, ok = s.Runtime.ReserveJobCancellation(liveJob.ID)
+	}
 	if !ok {
+		if _, _, err := s.Runtime.ArchivedJob(id); err == nil {
+			return s.localReply(message, fmt.Sprintf("Job %d is completed and cannot be killed; killing is available only for live jobs.", id), emit)
+		}
 		return s.localReply(message, fmt.Sprintf("Job %d is not running. Use /jobs to list running jobs.", id), emit)
 	}
-	if err := s.authorizeJobAccess(message, job); err != nil {
-		return s.localReply(message, fmt.Sprintf("Job %d is not available to this conversation.", id), emit)
-	}
-	s.Orchestrator.MarkControlCancellation(job.SessionKey)
-	s.Runtime.UpdateJob(id, core.ExecutionStatus{State: string(JobCancelling)})
+	cancellationLeaseID := s.Orchestrator.MarkControlCancellation(job.SessionKey)
 	stopped, err := s.Harness.Interrupt(ctx, job.SessionKey)
 	if err != nil {
-		s.Runtime.UpdateJob(id, core.ExecutionStatus{State: string(JobError), Detail: err.Error()})
+		s.Runtime.RestoreJobAfterFailedCancellation(job)
+		s.Orchestrator.RestoreControlCancellation(cancellationLeaseID)
 		return s.localReply(message, fmt.Sprintf("Cannot kill job %d: %v", id, err), emit)
 	}
 	if !stopped {
-		s.Runtime.EndJob(id)
+		s.Runtime.RestoreJobAfterFailedCancellation(job)
+		s.Orchestrator.RestoreControlCancellation(cancellationLeaseID)
+		if s.Harness.IsActive(job.SessionKey) {
+			return s.localReply(message, fmt.Sprintf("Cannot kill job %d: the provider did not accept the interrupt request.", id), emit)
+		}
+		s.Runtime.EndJob(job.ID)
 		return s.localReply(message, fmt.Sprintf("Job %d was already finished.", id), emit)
 	}
-	s.Runtime.LogEvent("info", "jobs", "job_stop_requested", fmt.Sprintf("job_id=%d channel=%s kind=%s", job.ID, logField(job.Channel, "unknown"), logField(job.Kind, "chat")))
-	// A semantic heartbeat owns its job lifetime from provider entry through
-	// provider release. Keep a cancellation-ignoring audit visible until its
-	// completion callback can prove that the provider has actually returned.
-	if job.Kind != "heartbeat" {
-		s.Runtime.EndJob(id)
-	}
+	s.Runtime.LogEvent("info", "jobs", "job_stop_requested", fmt.Sprintf("job_id=%d channel=%s kind=%s", job.Number, logField(job.Channel, "unknown"), logField(job.Kind, "chat")))
+	s.finishCancelledJobAfterGrace(job)
 	return s.localReply(message, fmt.Sprintf("Kill requested for job %d.", id), emit)
 }
 
 const maxJobControlRunes = 8000
 
 func (s *Service) jobControlCommand(ctx context.Context, message core.Message, id int, text string, ping bool, emit core.Emit) error {
-	job, ok := s.Runtime.Job(id)
+	job, ok := s.Runtime.JobByNumber(id)
 	if !ok {
 		return s.localReply(message, fmt.Sprintf("Job %d is not running; it may be missing, stale, or already terminal. Use /jobs to list running jobs.", id), emit)
-	}
-	if err := s.authorizeJobAccess(message, job); err != nil {
-		return s.localReply(message, fmt.Sprintf("Job %d is not available to this conversation.", id), emit)
 	}
 	if executionStateIsTerminal(job.Execution) {
 		return s.localReply(message, fmt.Sprintf("Job %d is no longer steerable (status: %s).", id, job.Execution), emit)
@@ -1043,30 +1096,6 @@ func (s *Service) jobControlCommand(ctx context.Context, message core.Message, i
 		return s.localReply(message, fmt.Sprintf("Queued %s for job %d in its existing session.", map[bool]string{true: "a progress ping", false: "the operator message"}[ping], id), emit)
 	}
 	return s.localReply(message, fmt.Sprintf("Delivered %s to job %d in its existing session.", map[bool]string{true: "a progress ping", false: "the operator message"}[ping], id), emit)
-}
-
-func (s *Service) authorizeJobAccess(message core.Message, job Job) error {
-	if message.Channel == "tui" || message.Channel == "cli" {
-		return nil
-	}
-	if job.Channel != "orchestrator" {
-		if job.Channel == message.Channel && job.Conversation == message.Conversation {
-			return nil
-		}
-		return errors.New("job belongs to another conversation")
-	}
-	if job.DurableFile == "" {
-		return errors.New("orchestrator job has no durable origin")
-	}
-	document, err := s.readJobDocument(job.DurableFile)
-	if err != nil {
-		return err
-	}
-	policy, err := orchestrator.NotificationFromDocument(document)
-	if err != nil || !policy.Enabled || policy.Origin.Channel != message.Channel || policy.Origin.Conversation != message.Conversation {
-		return errors.New("job origin does not match caller")
-	}
-	return s.validateOrigin(policy.Origin)
 }
 
 // TitleChanges publishes persisted title updates so a running TUI can reflect
@@ -1516,7 +1545,9 @@ var slashCommands = []core.SlashCommand{
 	{Value: "/log search ", Usage: "/log search <text>", Description: "Search captured runtime logs"},
 	{Value: "/log clear", Usage: "/log clear", Description: "Clear captured runtime logs"},
 	{Value: "/jobs", Usage: "/jobs", Description: "List running agent jobs"},
-	{Value: "/job info ", Usage: "/job info <number>", Description: "Show safe details and durable progress for a running job"},
+	{Value: "/jobs recent", Usage: "/jobs recent", Description: "List recent job archives by number"},
+	{Value: "/job info ", Usage: "/job info <number>", Description: "Show bounded live or archived job metadata"},
+	{Value: "/job output ", Usage: "/job output <number> [tail <bytes>]", Description: "Show bounded captured job output"},
 	{Value: "/job message ", Usage: "/job message <number> <text>", Description: "Guide a running orchestrator job without replacing it"},
 	{Value: "/job ping ", Usage: "/job ping <number>", Description: "Request a durable progress update from a running job"},
 	{Value: "/job kill ", Usage: "/job kill <number>", Description: "Stop a running agent job by number"},
@@ -1528,7 +1559,7 @@ var slashCommands = []core.SlashCommand{
 	{Value: "/trigger", Usage: "/trigger [process]", Description: "List or start a triggerable background process"},
 	{Value: "/trigger orchestrator", Usage: "/trigger orchestrator", Description: "Request an immediate safe orchestrator pass"},
 	{Value: "/trigger heartbeat", Usage: "/trigger heartbeat", Description: "Start the semantic heartbeat when idle"},
-	{Value: "/cleanup ", Usage: "/cleanup [days]", Description: "Remove old conversations and archive old terminal tasks"},
+	{Value: "/cleanup ", Usage: "/cleanup [days]", Description: "Remove old conversations and job archives; archive old terminal tasks"},
 	{Value: "/extension list", Usage: "/extension list", Description: "List installed project extensions"},
 	{Value: "/extension install ", Usage: "/extension install URL", Description: "Install a trusted Git extension"},
 	{Value: "/extension remove ", Usage: "/extension remove NAME", Description: "Remove an installed extension"},
@@ -1567,7 +1598,7 @@ var helpTopics = []struct {
 	{
 		name:        "channels",
 		description: "The TUI, Telegram, and WhatsApp",
-		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, instance, and orchestrator indicators. From an idle local TUI, `/primary` safely hands workspace ownership to that TUI instance. Use `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to switch the TUI to a distinct conversation while preserving the prior one for `/resume`. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/update` checks npm with a ten-second deadline, and `/update install` lets a supervising npm launcher update after shutdown and then restart. `/log` shows bounded runtime output. `/jobs` lists accessible active executions; `/tasks` and `/goals` list open durable work by default with bounded semantic views. `/job info <number>` shows safe bounded details and durable progress, `/job message <number> <text>` sends nonterminal guidance through the existing job session, `/job ping <number>` requests a durable progress update, and `/job kill <number>` stops one.",
+		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, instance, and orchestrator indicators. From an idle local TUI, `/primary` safely hands workspace ownership to that TUI instance. Use `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to switch the TUI to a distinct conversation while preserving the prior one for `/resume`. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/update` checks npm with a ten-second deadline, and `/update install` lets a supervising npm launcher update after shutdown and then restart. `/log` shows bounded runtime diagnostics. `/jobs` lists active executions and `/jobs recent` lists archived executions by the same numeric reference; `/job info <number>` and `/job output <number>` inspect bounded metadata or captured output. `/tasks` and `/goals` list open durable work by default. `/job message <number> <text>` sends nonterminal guidance through the existing job session, `/job ping <number>` requests a durable progress update, and `/job kill <number>` stops one live job.",
 	},
 	{
 		name:        "workflows",

@@ -26,12 +26,14 @@ Waiting is reserved for a precise external condition. An optional RFC 3339 `wake
 
 Every implementation, planning, and review claim is journaled before its queue file moves. Persisted leases, owner fencing, bounded recovery, and status-folder checks prevent duplicate ownership across restarts. Independent reviewers start from the durable artifact rather than the implementation session. Reviewers may repair only trivial localized findings themselves; broader findings return to implementation.
 
-The elected primary also runs a bounded semantic heartbeat. It audits workflow evidence and may request existing recovery or notify the authorized originating conversation, but it does not invent lifecycle transitions or replace deterministic lease recovery.
+The elected primary also runs a bounded semantic heartbeat worker. The framework only starts one non-overlapping stable-session turn and ignores its provider output. The agent uses ordinary Spynel CLI inspection plus the task/goal Markdown contracts to make and journal evidence-backed safe repairs; no heartbeat result, finding, incident, health, escalation, fallback, or retry state exists. Ordinary terminal and actionable unscheduled waiting task transitions invoke the dedicated notification agent directly.
+
+Heartbeat and notification workers are ordinary asynchronous jobs. Provider admission is not completion: their job histories remain live through delayed output until a real terminal final/error event, cancellation, or bounded timeout. The first terminal boundary settles the job once; late duplicates are ignored, and heartbeat scheduling remains non-overlapping until provider release.
 
 ## Creating and inspecting work
 
 In a conversation, `/task` and `/goal` ask the communication assistant to create or refine framework-compliant work. Dedicated `/tasks`, `/goals`, `/status`, and `/jobs` commands inspect bounded durable state without invoking a harness. Scripts can use the matching `spynel task`, `spynel goal`, `spynel tasks`, and `spynel goals` commands.
 
-Selected task outcomes may carry an authorized notification origin. Notification delivery is restart-safe and revalidates channel authorization; a user reply remains ordinary conversation context rather than a hidden workflow acknowledgement.
+Selected task outcomes may carry an authorized notification origin. Every terminal or actionable unscheduled waiting transition directly starts one ordinary notification-agent job with the task and `spynel notify` guidance. The agent decides, calls the ordinary CLI when useful, and edits task progress with its send, skip, or CLI-failure result. Spynel does not manage or interpret that decision. Ordinary delivery revalidates channel authorization; a user reply remains ordinary conversation context rather than a hidden workflow acknowledgement.
 
 For the state machine, lease, recovery, notification, and primary-owner invariants, see [architecture](architecture.md). For command syntax and output contracts, see [plain CLI and automation](cli.md). For route and review settings, see [configuration](configuration.md).
