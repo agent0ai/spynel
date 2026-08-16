@@ -88,6 +88,7 @@ func runNotifyCommand(args []string, version string) error {
 	configPath := flags.String("config", "", "path to .spynel/config.yaml")
 	workdir := flags.String("workdir", "", "absolute Spynel workspace path")
 	origin := flags.String("origin", "", "stable channel/conversation origin")
+	recentAuthorized := flags.Bool("recent-authorized", false, "route to the most recently active unambiguous authorized conversation")
 	message := flags.String("message", "", "notification message")
 	stdin := flags.Bool("stdin", false, "read the notification from standard input")
 	if err := flags.Parse(args); err != nil {
@@ -101,10 +102,10 @@ func runNotifyCommand(args []string, version string) error {
 	})
 	text, err := notificationMessageText(flags.Args(), *stdin, messageSet, *message, os.Stdin)
 	if err != nil {
-		return fmt.Errorf("usage: spynel notify [--workdir PATH|--config PATH] --origin CHANNEL/CONVERSATION --message MESSAGE: %w", err)
+		return fmt.Errorf("usage: spynel notify [--workdir PATH|--config PATH] (--origin CHANNEL/CONVERSATION|--recent-authorized) --message MESSAGE: %w", err)
 	}
-	if strings.TrimSpace(*origin) == "" {
-		return errors.New("--origin is required")
+	if (strings.TrimSpace(*origin) == "") == !*recentAuthorized {
+		return errors.New("exactly one of --origin or --recent-authorized is required")
 	}
 	if *workdir != "" && *configPath != "" {
 		return errors.New("--workdir and --config are mutually exclusive")
@@ -132,14 +133,22 @@ func runNotifyCommand(args []string, version string) error {
 	if client, active, clientErr := activeWorkspaceClient(ctx, cfg); clientErr != nil {
 		return clientErr
 	} else if active {
-		id, err = client.Notify(ctx, *origin, text)
+		if *recentAuthorized {
+			id, err = client.NotifyRecentAuthorized(ctx, text)
+		} else {
+			id, err = client.Notify(ctx, *origin, text)
+		}
 	} else {
 		service, buildErr := buildService(cfg, version)
 		if buildErr != nil {
 			return buildErr
 		}
 		defer service.Close()
-		id, err = service.Notify(ctx, *origin, text)
+		if *recentAuthorized {
+			id, err = service.NotifyRecentAuthorized(ctx, text)
+		} else {
+			id, err = service.Notify(ctx, *origin, text)
+		}
 	}
 	if err != nil {
 		return err

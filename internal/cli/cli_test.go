@@ -548,6 +548,33 @@ func TestNotifyCommandSupportsConcreteAgentArguments(t *testing.T) {
 	}
 }
 
+func TestNotifyCommandRecentAuthorizedIsExplicitAndMutuallyExclusive(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	store := history.New(cfg.StatePath("history"))
+	if _, err := store.Append("cli", "recent", history.Entry{At: time.Now().UTC(), Role: "user", Content: "known"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runNotifyCommand([]string{"--config", cfg.Path, "--recent-authorized", "--message", "recent delivery"}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := store.RecentEntries("cli", "recent", 10, 1000)
+	if err != nil || len(entries) != 2 || entries[1].Content != "recent delivery" {
+		t.Fatalf("recent notification history = %#v, %v", entries, err)
+	}
+	for _, args := range [][]string{
+		{"--config", cfg.Path, "--message", "missing mode"},
+		{"--config", cfg.Path, "--origin", "cli/recent", "--recent-authorized", "--message", "conflict"},
+	} {
+		if err := runNotifyCommand(args, "test"); err == nil || !strings.Contains(err.Error(), "exactly one") {
+			t.Fatalf("routing mode conflict %v = %v", args, err)
+		}
+	}
+}
+
 func TestNotifyMessageRejectsEmptyStdinAndAmbiguousInputs(t *testing.T) {
 	if _, err := notificationMessageText(nil, true, false, "", strings.NewReader("")); err == nil || !strings.Contains(err.Error(), "standard input is empty") {
 		t.Fatalf("historical empty-stdin failure = %v", err)

@@ -30,6 +30,26 @@ func TestHistoriesAreIndependentAndBounded(t *testing.T) {
 	}
 }
 
+func TestListUserActivitySurvivesManyNotificationEntries(t *testing.T) {
+	store := New(t.TempDir())
+	userAt := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	if _, err := store.Append("telegram", "TG-7", Entry{At: userAt, Role: "user", Content: "private input"}); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 300; index++ {
+		if _, err := store.Append("telegram", "TG-7", Entry{At: userAt.Add(time.Duration(index+1) * time.Second), Role: "assistant", Sender: "Spy", Content: "notification"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	activity, err := store.ListUserActivity(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(activity) != 1 || !activity[0].UpdatedAt.Equal(userAt) {
+		t.Fatalf("durable user activity = %#v", activity)
+	}
+}
+
 func TestRecentBoundedUsesNewestMessageAndCharacterWindow(t *testing.T) {
 	store := New(t.TempDir())
 	for index := 1; index <= 100; index++ {

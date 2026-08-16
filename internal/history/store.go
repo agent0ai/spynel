@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/shortid"
 )
 
@@ -65,6 +66,10 @@ func (s *Store) Path(channel, conversation string) string {
 	return filepath.Join(s.root, clean(channel), clean(conversation)+".jsonl")
 }
 
+func (s *Store) userActivityPath(channel, conversation string) string {
+	return filepath.Join(s.root, ".user-activity", clean(channel), clean(conversation)+".json")
+}
+
 func clean(value string) string {
 	value = strings.Trim(unsafePath.ReplaceAllString(value, "_"), "._")
 	if value == "" {
@@ -98,7 +103,25 @@ func (s *Store) Append(channel, conversation string, entry Entry) (string, error
 	if _, err := file.Write(append(data, '\n')); err != nil {
 		return "", err
 	}
-	return path, file.Sync()
+	if err := file.Sync(); err != nil {
+		return "", err
+	}
+	if entry.Role == "user" {
+		activity, err := json.Marshal(struct {
+			At time.Time `json:"at"`
+		}{At: entry.At.UTC()})
+		if err != nil {
+			return "", err
+		}
+		activityPath := s.userActivityPath(channel, conversation)
+		if err := os.MkdirAll(filepath.Dir(activityPath), 0o700); err != nil {
+			return "", err
+		}
+		if err := fsx.AtomicWriteFile(activityPath, append(activity, '\n'), 0o600); err != nil {
+			return "", err
+		}
+	}
+	return path, nil
 }
 
 // Ensure creates an empty durable conversation without adding a synthetic
@@ -477,6 +500,66 @@ func (s *Store) List(limit int) ([]Conversation, error) {
 	return newestConversations(conversations, limit), nil
 }
 
+// ListUserActivity returns the newest accepted user activity per conversation.
+// It deliberately ignores assistant and notification entries so proactive
+// delivery cannot make its own destination appear recently user-active. The
+// bounded tail keeps recipient resolution independent of unbounded transcripts.
+func (s *Store) ListUserActivity(limit int) ([]Conversation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	channels, err := os.ReadDir(s.root)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var conversations []Conversation
+	for _, channelEntry := range channels {
+		if !channelEntry.IsDir() {
+			continue
+		}
+		channelName := channelEntry.Name()
+		files, err := os.ReadDir(filepath.Join(s.root, channelName))
+		if err != nil {
+			return nil, err
+		}
+		for _, file := range files {
+			if file.IsDir() || filepath.Ext(file.Name()) != ".jsonl" {
+				continue
+			}
+			path := filepath.Join(s.root, channelName, file.Name())
+			conversationName := strings.TrimSuffix(file.Name(), ".jsonl")
+			var activity struct {
+				At time.Time `json:"at"`
+			}
+			if data, readErr := os.ReadFile(s.userActivityPath(channelName, conversationName)); readErr == nil && json.Unmarshal(data, &activity) == nil && !activity.At.IsZero() {
+				conversations = append(conversations, Conversation{
+					Channel: channelName, Conversation: conversationName, Path: path,
+					UpdatedAt: activity.At.UTC(), LastRole: "user",
+				})
+				continue
+			}
+			entries, err := readRecentEntries(path, 256, 512*1024)
+			if err != nil {
+				return nil, err
+			}
+			for index := len(entries) - 1; index >= 0; index-- {
+				entry := entries[index]
+				if entry.Role != "user" || entry.At.IsZero() {
+					continue
+				}
+				conversations = append(conversations, Conversation{
+					Channel: channelName, Conversation: conversationName,
+					Path: path, UpdatedAt: entry.At, LastRole: "user",
+				})
+				break
+			}
+		}
+	}
+	return newestConversations(conversations, limit), nil
+}
+
 // Latest returns the most recently updated conversation for one channel
 // without retaining transcript bodies. Startup uses it to resume the last TUI
 // conversation only when this process becomes the first workspace owner.
@@ -599,7 +682,11 @@ func (s *Store) Clear(channel, conversation string) error {
 	defer s.mu.Unlock()
 	err := os.Remove(s.Path(channel, conversation))
 	if os.IsNotExist(err) {
+		_ = os.Remove(s.userActivityPath(channel, conversation))
 		return nil
+	}
+	if err == nil {
+		_ = os.Remove(s.userActivityPath(channel, conversation))
 	}
 	return err
 }
@@ -669,6 +756,7 @@ func (s *Store) RemoveOlderThan(cutoff time.Time, protected map[string]bool) Cle
 				result.Failed++
 				continue
 			}
+			_ = os.Remove(s.userActivityPath(channelName, conversation))
 			result.Removed++
 		}
 	}

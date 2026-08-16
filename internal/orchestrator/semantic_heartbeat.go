@@ -385,7 +385,7 @@ func (m *Manager) semanticHeartbeatPrompt(executionID string, now time.Time) (st
 		routeBytes += len(line) + 1
 		routes = append(routes, line)
 	}
-	prompt := string(data)
+	prompt := sanitizeHeartbeatTemplate(string(data))
 	prompt = strings.ReplaceAll(prompt, "{{EXECUTION_ID}}", executionID)
 	prompt = strings.ReplaceAll(prompt, "{{NOW_UTC}}", now.Format(time.RFC3339))
 	prompt = strings.ReplaceAll(prompt, "{{ROUTES}}", strings.Join(routes, "\n"))
@@ -395,6 +395,7 @@ func (m *Manager) semanticHeartbeatPrompt(executionID string, now time.Time) (st
 	}
 	prompt = strings.ReplaceAll(prompt, "{{SPYNEL_EXECUTABLE}}", filepath.ToSlash(executable))
 	prompt = appendTaskReviewModeInstruction(prompt, m.harnessSettings().Reviews)
+	prompt = strings.TrimRight(prompt, "\r\n") + "\n\n" + waitingReminderHeartbeatInstruction
 	prompt = instructions.InjectScopeDiscipline(prompt)
 	prompt, err = instructions.Append(prompt, m.Config.StatePath(), instructions.Heartbeat)
 	if err != nil {
@@ -404,6 +405,39 @@ func (m *Manager) semanticHeartbeatPrompt(executionID string, now time.Time) (st
 		return "", errors.New("rendered heartbeat prompt exceeds 128 KiB")
 	}
 	return prompt, nil
+}
+
+// sanitizeHeartbeatTemplate preserves workspace-owned inspection and repair
+// guidance while removing retired read-only/action-protocol paragraphs that
+// conflict with the framework-owned worker boundary. Older customized prompts
+// remain on disk during upgrades, so compatibility belongs at render time and
+// must not replace unrelated workspace content.
+func sanitizeHeartbeatTemplate(template string) string {
+	forbidden := []string{
+		"This audit is read-only",
+		"primary runtime\u2014not this agent\u2014owns due reminder selection",
+		"only to the affected workflow's authorized `notify.origin`",
+		"HEARTBEAT_ACTION_COMMAND",
+		"spynel.semantic-heartbeat/v1",
+		"Finish with only one JSON",
+		"exactly one audit outcome",
+		"Absence of an audit action",
+	}
+	paragraphs := strings.Split(template, "\n\n")
+	safe := paragraphs[:0]
+	for _, paragraph := range paragraphs {
+		obsolete := false
+		for _, marker := range forbidden {
+			if strings.Contains(paragraph, marker) {
+				obsolete = true
+				break
+			}
+		}
+		if !obsolete {
+			safe = append(safe, paragraph)
+		}
+	}
+	return strings.Join(safe, "\n\n")
 }
 
 func (m *Manager) beginSemanticHeartbeatTerm() uint64 {

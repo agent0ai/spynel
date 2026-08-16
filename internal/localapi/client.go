@@ -176,6 +176,26 @@ func (c *Client) Notify(ctx context.Context, origin, message string) (string, er
 	return result.ID, nil
 }
 
+func (c *Client) NotifyRecentAuthorized(ctx context.Context, message string) (string, error) {
+	body, err := json.Marshal(notifyRequest{RecentAuthorized: true, Message: message})
+	if err != nil {
+		return "", err
+	}
+	response, err := c.request(ctx, http.MethodPost, "/v1/notify", body)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if err := responseError(response); err != nil {
+		return "", err
+	}
+	var result notifyResponse
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	return result.ID, nil
+}
+
 func (c *Client) AckNotification(ctx context.Context, origin, id string, afterChars int) error {
 	body, err := json.Marshal(notificationAckRequest{Origin: origin, ID: id, AfterChars: afterChars})
 	if err != nil {

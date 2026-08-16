@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
@@ -320,6 +321,47 @@ func TestDecodeJSONRejectsOversizedAndTrailingRequests(t *testing.T) {
 	}
 	if err := decodeJSON(strings.NewReader(`{"origin":"tui/local","message":"first"} {"origin":"tui/local","message":"second"}`), &request); err == nil || !strings.Contains(err.Error(), "multiple JSON values") {
 		t.Fatalf("trailing request error = %v", err)
+	}
+}
+
+func TestNotifyRecentAuthorizedClientUsesExplicitRecipientFreeMode(t *testing.T) {
+	state := t.TempDir()
+	election, err := instance.NewWithEnvironmentID(state, environmentID("a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, _ := election.NewToken()
+	if _, acquired, err := election.TryAcquire("127.0.0.1:12345", token); err != nil || !acquired {
+		t.Fatalf("acquire = %t, %v", acquired, err)
+	}
+	client := NewClient(election)
+	client.HTTP.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var input notifyRequest
+		if err := json.NewDecoder(request.Body).Decode(&input); err != nil {
+			t.Fatal(err)
+		}
+		if !input.RecentAuthorized || input.Origin != "" || input.Message != "hello" {
+			t.Fatalf("recent notify request = %#v", input)
+		}
+		return &http.Response{StatusCode: http.StatusAccepted, Body: io.NopCloser(strings.NewReader(`{"id":"event"}`)), Header: make(http.Header)}, nil
+	})
+	if id, err := client.NotifyRecentAuthorized(context.Background(), "hello"); err != nil || id != "event" {
+		t.Fatalf("recent notify result = %q, %v", id, err)
+	}
+}
+
+func TestNotifyRequestRequiresExactlyOneRoutingMode(t *testing.T) {
+	server := &Server{}
+	for _, body := range []string{
+		`{"message":"missing"}`,
+		`{"origin":"cli/recent","recent_authorized":true,"message":"conflict"}`,
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/notify", strings.NewReader(body))
+		response := httptest.NewRecorder()
+		server.notify(response, request)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "exactly one") {
+			t.Fatalf("notify routing response = %d %q", response.Code, response.Body.String())
+		}
 	}
 }
 

@@ -24,3 +24,5 @@ func TaskReviewModeInstruction(mode string) string {
 func appendTaskReviewModeInstruction(prompt, mode string) string {
 	return strings.TrimRight(prompt, "\r\n") + "\n\n" + TaskReviewModeInstruction(mode)
 }
+
+const waitingReminderHeartbeatInstruction = "Framework-owned stale-wait rule: agents do the work; the framework only triggers this audit and provides the ordinary recent-authorized notification primitive. Inspect bounded waiting-task progress, judge whether inactivity is considerable and a reminder is useful, avoid unnecessary repetition by reading prior progress, then either call `spynel notify --recent-authorized --message TEXT` and append the successful send to that task's Progress log, or append a concise skip/CLI-failure result when a durable record is useful. Never create reminder queues, timers, thresholds, eligibility rules, identity links, correlation tokens, acknowledgement state, deduplication state, restart contingencies, or other reminder orchestration."

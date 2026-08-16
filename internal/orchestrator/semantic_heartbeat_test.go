@@ -94,7 +94,7 @@ func TestSemanticHeartbeatIgnoresProviderProseWithoutFrameworkState(t *testing.T
 	target.mu.Lock()
 	prompt := target.prompt
 	target.mu.Unlock()
-	if !strings.Contains(prompt, "final-response payload") || !strings.Contains(prompt, "tasks") || !strings.Contains(prompt, "command /trigger orchestrator") {
+	if !strings.Contains(prompt, "final-response payload") || !strings.Contains(prompt, "tasks") || !strings.Contains(prompt, "command /trigger orchestrator") || !strings.Contains(prompt, "agents do the work") || !strings.Contains(prompt, "spynel notify --recent-authorized") {
 		t.Fatalf("heartbeat prompt omitted worker/CLI guidance: %q", prompt)
 	}
 	if strings.Contains(prompt, "HEARTBEAT_ACTION_COMMAND") || strings.Contains(prompt, "spynel.semantic-heartbeat/v1") || strings.Contains(prompt, "Finish with only one JSON") {
@@ -107,6 +107,40 @@ func TestSemanticHeartbeatIgnoresProviderProseWithoutFrameworkState(t *testing.T
 		if _, err := os.Stat(manager.Config.StatePath("runtime", name)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("framework created retired heartbeat state %q: %v", name, err)
 		}
+	}
+}
+
+func TestSemanticHeartbeatSanitizesRetiredWorkspaceOverride(t *testing.T) {
+	target := &heartbeatHarness{}
+	manager := newHeartbeatManager(t, target)
+	legacy := `# Custom heartbeat
+
+Keep this workspace-specific inspection rule.
+
+This audit is read-only: do not edit or move workflow documents and do not start jobs. The primary runtime\u2014not this agent\u2014owns due reminder selection and progress journaling.
+
+Propose notifications only to the affected workflow's authorized ` + "`notify.origin`" + `; never switch channels.
+
+Record findings with {{HEARTBEAT_ACTION_COMMAND}} and finish with exactly one audit outcome. Absence of an audit action is failure.
+`
+	path := manager.Config.StatePath("prompts", "heartbeat.md")
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := manager.semanticHeartbeatPrompt("heartbeat-test", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, "Keep this workspace-specific inspection rule.") {
+		t.Fatalf("heartbeat sanitizer removed unrelated customization: %q", prompt)
+	}
+	for _, obsolete := range []string{"This audit is read-only", "primary runtime\u2014not this agent", "notify.origin", "HEARTBEAT_ACTION_COMMAND", "exactly one audit outcome", "Absence of an audit action"} {
+		if strings.Contains(prompt, obsolete) {
+			t.Fatalf("heartbeat prompt retained obsolete rule %q: %q", obsolete, prompt)
+		}
+	}
+	if !strings.Contains(prompt, "agents do the work") || !strings.Contains(prompt, "spynel notify --recent-authorized") || !strings.Contains(prompt, "append the successful send") {
+		t.Fatalf("heartbeat prompt omitted current worker boundary: %q", prompt)
 	}
 }
 

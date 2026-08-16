@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/app"
@@ -51,8 +52,9 @@ type settingsRequest struct {
 	Values map[string]string `json:"values"`
 }
 type notifyRequest struct {
-	Origin  string `json:"origin"`
-	Message string `json:"message"`
+	Origin           string `json:"origin,omitempty"`
+	RecentAuthorized bool   `json:"recent_authorized,omitempty"`
+	Message          string `json:"message"`
 }
 type notifyResponse struct {
 	ID string `json:"id"`
@@ -181,7 +183,17 @@ func (s *Server) notify(response http.ResponseWriter, request *http.Request) {
 		http.Error(response, err.Error(), http.StatusBadRequest)
 		return
 	}
-	id, err := s.Service.Notify(request.Context(), input.Origin, input.Message)
+	if (strings.TrimSpace(input.Origin) == "") == !input.RecentAuthorized {
+		http.Error(response, "exactly one of origin or recent_authorized is required", http.StatusBadRequest)
+		return
+	}
+	var id string
+	var err error
+	if input.RecentAuthorized {
+		id, err = s.Service.NotifyRecentAuthorized(request.Context(), input.Message)
+	} else {
+		id, err = s.Service.Notify(request.Context(), input.Origin, input.Message)
+	}
 	if err != nil {
 		writeError(response, err)
 		return

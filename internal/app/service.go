@@ -290,6 +290,79 @@ func (s *Service) Notify(ctx context.Context, originText, text string) (string, 
 	return entry.ID, nil
 }
 
+// NotifyRecentAuthorized resolves a destination inside the application-owned
+// authorization boundary. Callers receive only the queued ID, never recipient
+// or history data.
+func (s *Service) NotifyRecentAuthorized(ctx context.Context, text string) (string, error) {
+	if strings.TrimSpace(text) == "" {
+		return "", errors.New("notification message is required")
+	}
+	origin, err := s.mostRecentAuthorizedOrigin()
+	if err != nil {
+		return "", err
+	}
+	deliveryKey := fmt.Sprintf("recent-%d", time.Now().UTC().UnixNano())
+	entry, err := s.Orchestrator.Outbox.Enqueue(deliveryKey, "manual", origin.Channel+"/"+origin.Conversation, text)
+	if err != nil {
+		return "", err
+	}
+	if processErr := s.Orchestrator.Outbox.Process(ctx); processErr != nil {
+		s.Runtime.LogEvent("error", "orchestrator", "notification_retry", "Notification retained for retry: "+processErr.Error())
+	}
+	return entry.ID, nil
+}
+
+func (s *Service) mostRecentAuthorizedOrigin() (orchestrator.Origin, error) {
+	cfg := s.Settings.Snapshot()
+	if remoteAuthorizedPrincipalCount(cfg) > 1 {
+		return orchestrator.Origin{}, errors.New("most-recent-authorized routing is ambiguous: multiple remote users are authorized")
+	}
+	activity, err := s.History.ListUserActivity(256)
+	if err != nil {
+		return orchestrator.Origin{}, err
+	}
+	var selected orchestrator.Origin
+	var selectedAt time.Time
+	for _, candidate := range activity {
+		origin := orchestrator.Origin{Channel: candidate.Channel, Conversation: candidate.Conversation}
+		if (origin.Channel == "telegram" && !cfg.Channels.Telegram.Enabled) || (origin.Channel == "whatsapp" && !cfg.Channels.WhatsApp.Enabled) {
+			continue
+		}
+		if strings.Contains(origin.Conversation, "-group-") || s.validateOrigin(origin) != nil {
+			continue
+		}
+		if candidate.UpdatedAt.Equal(selectedAt) && selected.Channel != "" && (selected.Channel != origin.Channel || selected.Conversation != origin.Conversation) {
+			return orchestrator.Origin{}, errors.New("most-recent-authorized routing is ambiguous: recent activity timestamps are tied")
+		}
+		if selected.Channel == "" || candidate.UpdatedAt.After(selectedAt) {
+			selected, selectedAt = origin, candidate.UpdatedAt
+		}
+	}
+	if selected.Channel == "" {
+		return orchestrator.Origin{}, errors.New("no unambiguous recently active authorized conversation is available")
+	}
+	return selected, nil
+}
+
+func remoteAuthorizedPrincipalCount(cfg config.Config) int {
+	principals := map[string]struct{}{}
+	if cfg.Channels.Telegram.Enabled {
+		for _, value := range cfg.Channels.Telegram.AllowedUsers {
+			if principal := config.NormalizeTelegramUser(value); principal != "" {
+				principals["telegram:"+principal] = struct{}{}
+			}
+		}
+	}
+	if cfg.Channels.WhatsApp.Enabled {
+		for _, value := range cfg.Channels.WhatsApp.AllowedNumbers {
+			if principal := config.NormalizeAllowedWhatsAppNumber(value); principal != "" {
+				principals["whatsapp:"+principal] = struct{}{}
+			}
+		}
+	}
+	return len(principals)
+}
+
 func (s *Service) Start(ctx context.Context) error {
 	return s.Harness.Start(ctx)
 }

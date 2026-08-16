@@ -10,6 +10,7 @@
 - Build prompts backward from disk under both message and character limits; never load an unbounded history to compute bounded context.
 - Branch into a new conversation without mutating its source, retain bounded reply references, and exclude private attachment contents from records.
 - Retention uses the last durable entry timestamp, falling back to file modification time only for empty histories; delete only strict pre-cutoff regular files and preserve explicitly protected live conversations while reporting per-item failures.
+- Recent-authorized proactive routing reads a content-free durable latest-`user` activity sidecar per conversation, ignores assistant, notification, and delivery-ledger entries so delivery cannot select itself, and ignores sidecars without a corresponding history. This sidecar is only the minimal channel-resolution primitive; it carries no reminder policy or state.
 
 ## Child DOX Index
 
