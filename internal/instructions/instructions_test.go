@@ -230,3 +230,38 @@ func TestInjectScopeDisciplineIsExactOnceAndPreservesPrecedence(t *testing.T) {
 		}
 	}
 }
+
+func TestInjectRoleScopeDisciplineIsExactOnceAndPractical(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		role     Role
+		guidance string
+		required []string
+	}{
+		{
+			name: "developer", role: Developer, guidance: DeveloperScopeDisciplineGuidance,
+			required: []string{"80/20", "observed problem", "common realistic paths", "reuse existing mechanisms", "stop when", "state machines", "synchronization machinery", "improbable hypothetical cases", "credible evidence", "data integrity"},
+		},
+		{
+			name: "reviewer", role: Reviewer, guidance: ReviewerScopeDisciplineGuidance,
+			required: []string{"practical correctness", "realistic supported use", "contrived interleavings", "unrelated flaky checks", "theoretical perfection", "invented beyond the task", "overengineering", "removal or simplification", "evidence-backed", "data-integrity"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const custom = "custom prompt with explicit requirements and safety rules"
+			prompt := InjectRoleScopeDiscipline(custom, test.role)
+			prompt = InjectRoleScopeDiscipline(prompt, test.role)
+			if strings.Count(prompt, ScopeDisciplineGuidance) != 1 || strings.Count(prompt, test.guidance) != 1 {
+				t.Fatalf("role scope discipline was missing or duplicated: %q", prompt)
+			}
+			if !strings.Contains(prompt, custom) {
+				t.Fatalf("role scope discipline replaced the custom prompt: %q", prompt)
+			}
+			for _, required := range test.required {
+				if !strings.Contains(test.guidance, required) {
+					t.Errorf("role guidance omitted %q: %q", required, test.guidance)
+				}
+			}
+		})
+	}
+}

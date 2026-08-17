@@ -34,28 +34,30 @@ import (
 )
 
 type Client struct {
-	config         config.WhatsApp
-	dbPath         string
-	handler        channel.Handler
-	client         *whatsmeow.Client
-	ctx            context.Context
-	report         channel.StatusReporter
-	pairing        channel.PairingReporter
-	log            io.Writer
-	store          *media.Store
-	speech         media.Transcriber
-	incoming       chan incomingMessage
-	download       func(context.Context, whatsmeow.DownloadableMessage, *os.File) error
-	upload         func(context.Context, io.Reader, io.ReadWriteSeeker, whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
-	deliver        func(context.Context, types.JID, *waE2E.Message) (whatsmeow.SendResponse, error)
-	deliverID      func(context.Context, types.JID, *waE2E.Message, types.MessageID) (whatsmeow.SendResponse, error)
-	presence       func(context.Context, types.JID, types.ChatPresence, types.ChatPresenceMedia) error
-	disconnect     func()
-	activity       *channel.ActivityIndicator[types.JID]
-	allowedNumbers func() []string
-	revoked        atomic.Bool
-	authLost       chan struct{}
-	authLostOnce   sync.Once
+	config                 config.WhatsApp
+	dbPath                 string
+	handler                channel.Handler
+	client                 *whatsmeow.Client
+	ctx                    context.Context
+	report                 channel.StatusReporter
+	pairing                channel.PairingReporter
+	log                    io.Writer
+	store                  *media.Store
+	speech                 media.Transcriber
+	incoming               chan incomingMessage
+	download               func(context.Context, whatsmeow.DownloadableMessage, *os.File) error
+	upload                 func(context.Context, io.Reader, io.ReadWriteSeeker, whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
+	deliver                func(context.Context, types.JID, *waE2E.Message) (whatsmeow.SendResponse, error)
+	deliverID              func(context.Context, types.JID, *waE2E.Message, types.MessageID) (whatsmeow.SendResponse, error)
+	presence               func(context.Context, types.JID, types.ChatPresence, types.ChatPresenceMedia) error
+	disconnect             func()
+	activity               *channel.ActivityIndicator[types.JID]
+	conversationActivityMu sync.Mutex
+	conversationActivity   map[string][]func()
+	allowedNumbers         func() []string
+	revoked                atomic.Bool
+	authLost               chan struct{}
+	authLostOnce           sync.Once
 
 	mu      sync.Mutex
 	sentIDs map[types.MessageID]time.Time
@@ -85,7 +87,7 @@ func New(cfg config.WhatsApp, database string) *Client {
 	client := &Client{
 		config: cfg, dbPath: database, sentIDs: map[types.MessageID]time.Time{}, log: os.Stderr,
 		incoming: make(chan incomingMessage, 64), pairingRetry: make(chan struct{}, 1), pairingDelay: 2 * time.Second,
-		authLost: make(chan struct{}),
+		authLost: make(chan struct{}), conversationActivity: map[string][]func(){},
 	}
 	client.allowedNumbers = func() []string { return cfg.AllowedNumbers }
 	client.activity = newWhatsAppActivity(client, 4*time.Second)
@@ -180,6 +182,92 @@ func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string
 	}
 	_, err := c.sendEvent(ctx, chat, eventID, text)
 	return err
+}
+
+func (c *Client) DeliverEvent(ctx context.Context, conversation, eventID string, event core.Event) error {
+	if err := c.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
+	chat, err := c.deliveryChat(conversation)
+	if err != nil {
+		return err
+	}
+	if event.Kind == core.EventActivity {
+		if event.Active {
+			c.startConversationActivity(ctx, conversation, chat)
+			return nil
+		}
+		c.stopConversationActivity(conversation)
+		return nil
+	}
+	if event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+		if !c.conversationIsActive(conversation) {
+			// ActivityIndicator cleanup is deliberately asynchronous. Reassert the
+			// terminal ordering synchronously before recovered response delivery.
+			_ = c.sendChatPresence(ctx, chat, types.ChatPresencePaused)
+		}
+		text := event.Text
+		if event.Kind == core.EventFinal && event.FinalText != nil {
+			text = *event.FinalText
+		}
+		if event.Kind == core.EventError {
+			text = channel.ErrorResponse(text)
+		}
+		return c.Deliver(ctx, conversation, eventID, text)
+	}
+	return nil
+}
+
+func (c *Client) startConversationActivity(ctx context.Context, conversation string, chat types.JID) {
+	stop := c.activity.Start(ctx, chat)
+	c.conversationActivityMu.Lock()
+	c.conversationActivity[conversation] = append(c.conversationActivity[conversation], stop)
+	c.conversationActivityMu.Unlock()
+}
+
+func (c *Client) stopConversationActivity(conversation string) {
+	c.conversationActivityMu.Lock()
+	stops := c.conversationActivity[conversation]
+	if len(stops) == 0 {
+		c.conversationActivityMu.Unlock()
+		return
+	}
+	stop := stops[len(stops)-1]
+	stops = stops[:len(stops)-1]
+	if len(stops) == 0 {
+		delete(c.conversationActivity, conversation)
+	} else {
+		c.conversationActivity[conversation] = stops
+	}
+	c.conversationActivityMu.Unlock()
+	stop()
+}
+
+func (c *Client) conversationIsActive(conversation string) bool {
+	c.conversationActivityMu.Lock()
+	defer c.conversationActivityMu.Unlock()
+	return len(c.conversationActivity[conversation]) > 0
+}
+
+func (c *Client) deliveryChat(conversation string) (types.JID, error) {
+	if strings.HasPrefix(conversation, "WA-group-") {
+		if !c.config.AllowGroups {
+			return types.JID{}, errors.New("WhatsApp group delivery is disabled")
+		}
+		return types.NewJID(strings.TrimPrefix(conversation, "WA-group-"), types.GroupServer), nil
+	}
+	if strings.HasPrefix(conversation, "WA-") {
+		number := config.NormalizeWhatsAppNumber(strings.TrimPrefix(conversation, "WA-"))
+		authorized := false
+		for _, allowed := range c.liveAllowedNumbers() {
+			authorized = authorized || config.NormalizeAllowedWhatsAppNumber(allowed) == number
+		}
+		if number == "" || !authorized {
+			return types.JID{}, errors.New("WhatsApp origin is not in allowed_numbers")
+		}
+		return types.NewJID(number, types.DefaultUserServer), nil
+	}
+	return types.JID{}, errors.New("invalid WhatsApp conversation origin")
 }
 
 func stableWhatsAppMessageID(eventID string, index int) types.MessageID {
@@ -732,18 +820,15 @@ func (c *Client) messageWorker(ctx context.Context) {
 			if err := c.requireRuntimeAuthorization(); err != nil {
 				continue
 			}
-			finishActivity := c.activity.Start(ctx, incoming.chat)
 			text, err := c.prepareMessage(ctx, incoming)
 			if err != nil {
 				_ = c.send(ctx, incoming.chat, channel.ErrorResponse("Spynel attachment error: "+err.Error()))
-				finishActivity()
 				continue
 			}
 			if err := c.requireRuntimeAuthorization(); err != nil {
-				finishActivity()
 				continue
 			}
-			c.handleWithReply(incoming.received, incoming.chat, incoming.sender, text, whatsappReplyTo(incoming.message), finishActivity)
+			c.handleWithReplyID(incoming.received, incoming.chat, incoming.sender, text, whatsappReplyTo(incoming.message), "whatsapp:"+incoming.chat.String()+":"+string(incoming.id), nil)
 		}
 	}
 }
@@ -828,7 +913,7 @@ func (c *Client) handle(received time.Time, chat types.JID, sender, text string)
 	if err := c.requireRuntimeAuthorization(); err != nil {
 		return
 	}
-	c.handleWithActivity(received, chat, sender, text, c.activity.Start(ctx, chat))
+	c.handleWithActivity(received, chat, sender, text, nil)
 }
 
 func (c *Client) handleWithActivity(received time.Time, chat types.JID, sender, text string, finishActivity func()) {
@@ -836,19 +921,68 @@ func (c *Client) handleWithActivity(received time.Time, chat types.JID, sender, 
 }
 
 func (c *Client) handleWithReply(received time.Time, chat types.JID, sender, text, replyTo string, finishActivity func()) {
+	c.handleWithReplyID(received, chat, sender, text, replyTo, "", finishActivity)
+}
+
+func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, text, replyTo, sourceMessageID string, finishActivity func()) {
 	ctx := c.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := c.requireRuntimeAuthorization(); err != nil {
-		finishActivity()
+		if finishActivity != nil {
+			finishActivity()
+		}
 		return
 	}
+	conversation := whatsappConversation(chat, sender)
+	var activityMu sync.Mutex
+	agentOwnedActivity := false
+	hadAgentActivity := false
+	setActivity := func(active bool) {
+		activityMu.Lock()
+		if active && !agentOwnedActivity {
+			agentOwnedActivity = true
+			hadAgentActivity = true
+			c.startConversationActivity(ctx, conversation, chat)
+			activityMu.Unlock()
+			return
+		}
+		if !active && agentOwnedActivity {
+			agentOwnedActivity = false
+			c.stopConversationActivity(conversation)
+			activityMu.Unlock()
+			return
+		}
+		activityMu.Unlock()
+	}
+	pauseReleasedActivity := func() {
+		activityMu.Lock()
+		hadActivity := hadAgentActivity
+		activityMu.Unlock()
+		if hadActivity && !c.conversationIsActive(conversation) {
+			_ = c.sendChatPresence(ctx, chat, types.ChatPresencePaused)
+		}
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			setActivity(false)
+			panic(recovered)
+		}
+	}()
 	emit := func(event core.Event) {
+		if event.Kind == core.EventActivity {
+			setActivity(event.Active)
+			return
+		}
 		if !event.Done || event.Continues || (event.Kind != core.EventFinal && event.Kind != core.EventError) {
 			return
 		}
-		defer finishActivity()
+		// Activity-off normally arrives immediately before the terminal event.
+		// This fallback also covers incomplete handlers and synchronously pauses
+		// before delivery when no overlapping turn remains in the conversation.
+		setActivity(false)
+		pauseReleasedActivity()
 		text := event.Text
 		if event.Kind == core.EventFinal && event.FinalText != nil {
 			text = *event.FinalText
@@ -866,11 +1000,18 @@ func (c *Client) handleWithReply(received time.Time, chat types.JID, sender, tex
 		}
 	}
 	err := c.handler(ctx, core.Message{
-		Channel: c.Name(), Conversation: whatsappConversation(chat, sender), Sender: sender,
-		ReplyTo: replyTo, Text: text, ReceivedAt: received.UTC(),
+		Channel: c.Name(), Conversation: conversation, Sender: sender,
+		SourceMessageID: sourceMessageID, ReplyTo: replyTo, Text: text, ReceivedAt: received.UTC(),
 	}, emit)
 	if err != nil {
+		setActivity(false)
+		pauseReleasedActivity()
 		_ = c.send(ctx, chat, channel.ErrorResponse(err.Error()))
+	}
+	activityMu.Lock()
+	owned := agentOwnedActivity
+	activityMu.Unlock()
+	if !owned && finishActivity != nil {
 		finishActivity()
 	}
 }

@@ -277,6 +277,22 @@ func (s *Supervisor) SendConversation(ctx context.Context, key, prompt, message 
 	return s.send(ctx, key, prompt, message, emit)
 }
 
+// ConversationAdmission reports the provider-neutral follow-up mode visible
+// at the admission fence. The send path still rechecks under the same session
+// operation lock before delivery.
+func (s *Supervisor) ConversationAdmission(key string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	target, err := s.targetLocked()
+	if err != nil || s.active[key] == 0 && !target.IsActive(key) {
+		return "new"
+	}
+	if followUpMode(target) == FollowUpQueue {
+		return "queued"
+	}
+	return "steered"
+}
+
 func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit core.Emit) (string, bool, error) {
 	operation := s.controlOperation(key)
 	operation.Lock()

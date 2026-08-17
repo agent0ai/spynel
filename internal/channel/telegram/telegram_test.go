@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -71,6 +72,9 @@ func TestTelegramRealShapeReplyCarriesIDAndCaption(t *testing.T) {
 	}, update.Message)
 	if got.ReplyTo != "91 caption with space" {
 		t.Fatalf("Telegram reply_to = %q", got.ReplyTo)
+	}
+	if got.SourceMessageID != "telegram:7:303" {
+		t.Fatalf("Telegram source_message_id = %q", got.SourceMessageID)
 	}
 	update.Message.ReplyToMessage.Text = ""
 	update.Message.ReplyToMessage.Caption = ""
@@ -565,6 +569,36 @@ func TestTelegramTypingRefreshesFromArrivalThroughVoiceTranscriptionAndAgentTurn
 	}
 }
 
+func TestTelegramProactiveConversationEventUsesTypingLifecycle(t *testing.T) {
+	var actions atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Path == "/bottest/sendChatAction" {
+			actions.Add(1)
+		}
+		_, _ = writer.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+	bot := New(config.Telegram{AllowedUsers: []string{"7"}}, "test")
+	bot.baseURL = server.URL
+	bot.activity = newTelegramActivity(bot, 10*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := bot.DeliverEvent(ctx, "TG-7", "activity", core.Event{Kind: core.EventActivity, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitAtomicCount(t, &actions, 2, "proactive Telegram typing refresh")
+	if err := bot.DeliverEvent(ctx, "TG-7", "activity", core.Event{Kind: core.EventActivity}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	stoppedAt := actions.Load()
+	time.Sleep(30 * time.Millisecond)
+	if got := actions.Load(); got != stoppedAt {
+		t.Fatalf("proactive Telegram typing continued after stop: %d -> %d", stoppedAt, got)
+	}
+}
+
 func TestTelegramFrameworkOnlyResponseDoesNotStartTyping(t *testing.T) {
 	var actions atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -613,6 +647,41 @@ func TestTelegramHandlerReturnWithoutTerminalStopsArrivalActivity(t *testing.T) 
 	time.Sleep(30 * time.Millisecond)
 	if got := actions.Load(); got != stoppedAt {
 		t.Fatalf("Telegram typing continued after handler return: %d -> %d", stoppedAt, got)
+	}
+}
+
+func TestTelegramHandlerFailureStopsActivityBeforeErrorDelivery(t *testing.T) {
+	activityEntered := make(chan struct{})
+	var activityContext context.Context
+	stoppedBeforeDelivery := false
+	bot := New(config.Telegram{AllowedUsers: []string{"7"}}, "test")
+	bot.client = &http.Client{Transport: telegramRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/bottest/sendChatAction":
+			activityContext = request.Context()
+			close(activityEntered)
+			<-request.Context().Done()
+			return nil, request.Context().Err()
+		case "/bottest/sendMessage":
+			stoppedBeforeDelivery = activityContext != nil && activityContext.Err() != nil
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true,"result":{}}`)),
+				Request:    request,
+			}, nil
+		default:
+			return nil, fmt.Errorf("unexpected Telegram API path %q", request.URL.Path)
+		}
+	})}
+
+	bot.handle(context.Background(), func(context.Context, core.Message, core.Emit) error {
+		<-activityEntered
+		return errors.New("provider admission failed")
+	}, &telegramMessage{MessageID: 8, From: telegramUser{ID: 7}, Chat: telegramChat{ID: 42, Type: "private"}, Date: 1, Text: "hello"})
+
+	if !stoppedBeforeDelivery {
+		t.Fatal("Telegram handler failure was delivered before its activity context stopped")
 	}
 }
 

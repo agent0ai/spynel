@@ -144,6 +144,9 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 		return nil, err
 	}
 	service.Runtime.LogEvent("info", "config", "reloaded", "Configuration loaded for primary startup")
+	service.SetRecoveryOwnershipFence(func(action func() error) (bool, error) {
+		return election.RunWhileOwner(token, action)
+	})
 	service.SetPrimaryInstanceID(election.ID())
 	if err := service.Start(ctx); err != nil {
 		service.Runtime.LogEvent("error", "harness", "unavailable", "Harness unavailable: "+err.Error())
@@ -267,16 +270,29 @@ type tuiStateEvents struct {
 	themes      chan theme.Theme
 	runtime     chan core.RuntimeStatus
 	durableWork chan core.DurableWorkCounts
+	activity    chan core.Event
+	activitySet chan int
 }
 
-func startTUIStatePolling(ctx context.Context, client *localapi.Client, initial app.SharedState, themeDirectory string) tuiStateEvents {
+func startTUIStatePolling(ctx context.Context, client *localapi.Client, initial app.SharedState, themeDirectory string, conversations ...string) tuiStateEvents {
 	events := tuiStateEvents{
 		connections: make(chan channel.ConnectionStatus, 4),
 		pairings:    make(chan channel.PairingEvent, 4),
 		notices:     make(chan channel.Notice, 4), titles: make(chan string, 1),
 		themes: make(chan theme.Theme, 1), runtime: make(chan core.RuntimeStatus, 1),
 		durableWork: make(chan core.DurableWorkCounts, 1),
+		activity:    make(chan core.Event, 16),
+		activitySet: make(chan int, 1),
 	}
+	conversation := ""
+	if len(conversations) > 0 {
+		conversation = conversations[0]
+	}
+	initialActivity := 0
+	if conversation != "" {
+		initialActivity = initial.ConversationActivity
+	}
+	go bridgeTUIActivity(ctx, events.activity, events.activitySet, initialActivity)
 	go func() {
 		previous := initial
 		ticker := time.NewTicker(time.Second)
@@ -291,14 +307,14 @@ func startTUIStatePolling(ctx context.Context, client *localapi.Client, initial 
 			if err != nil {
 				continue
 			}
-			publishTUIStateChanges(events, previous, state, themeDirectory)
+			publishTUIStateChanges(events, previous, state, themeDirectory, conversation)
 			previous = state
 		}
 	}()
 	return events
 }
 
-func publishTUIStateChanges(events tuiStateEvents, previous, state app.SharedState, themeDirectory string) {
+func publishTUIStateChanges(events tuiStateEvents, previous, state app.SharedState, themeDirectory string, conversation ...string) {
 	if state.Title != previous.Title {
 		publishLatest(events.titles, state.Title)
 	}
@@ -329,6 +345,39 @@ func publishTUIStateChanges(events tuiStateEvents, previous, state app.SharedSta
 	}
 	if state.NoticeSequence != previous.NoticeSequence && state.Notice.Channel != "" {
 		publishLatest(events.notices, state.Notice)
+	}
+	if len(conversation) > 0 {
+		publishLatest(events.activitySet, state.ConversationActivity)
+	}
+}
+
+// bridgeTUIActivity converts latest-value shared-state counts into the balanced
+// event stream consumed by the TUI. Keeping the desired count separate from the
+// output means neither startup nor polling can block behind an unstarted or slow
+// TUI consumer, even when the overlap count exceeds the event buffer.
+func bridgeTUIActivity(ctx context.Context, output chan<- core.Event, desired <-chan int, initial int) {
+	current, target := 0, initial
+	for {
+		if current == target {
+			select {
+			case <-ctx.Done():
+				return
+			case target = <-desired:
+			}
+			continue
+		}
+		event := core.Event{Kind: core.EventActivity, Active: current < target}
+		select {
+		case <-ctx.Done():
+			return
+		case target = <-desired:
+		case output <- event:
+			if event.Active {
+				current++
+			} else {
+				current--
+			}
+		}
 	}
 }
 

@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // Definition is one built-in coding harness that Spynel can discover and
@@ -20,6 +22,8 @@ type Definition struct {
 	Env         []string
 	Description string
 	InstallURL  string
+	CheckArgs   []string
+	CheckOutput string
 	Custom      bool
 	factory     Factory
 }
@@ -35,6 +39,10 @@ var catalog = []Definition{
 		Description: "Anthropic Claude Code CLI", InstallURL: "https://docs.anthropic.com/en/docs/claude-code/overview",
 		factory: func(cfg HarnessConfig) (Harness, error) { return NewClaude(cfg) },
 	},
+	acpDefinitionWithCheck(
+		"agent-zero", "Agent Zero CLI", "a0", []string{"acp"}, []string{"acp", "--check"}, "A0 ACP check OK",
+		"Agent Zero CLI via ACP", "https://github.com/agent0ai/a0-connector",
+	),
 	{
 		Name: "pi", DisplayName: "Pi", Command: "pi",
 		Description: "Pi coding agent via native RPC", InstallURL: "https://github.com/earendil-works/pi",
@@ -73,6 +81,13 @@ func acpDefinition(name, displayName, command string, args []string, description
 	}
 }
 
+func acpDefinitionWithCheck(name, displayName, command string, args, checkArgs []string, checkOutput, description, installURL string) Definition {
+	definition := acpDefinition(name, displayName, command, args, description, installURL)
+	definition.CheckArgs = append([]string(nil), checkArgs...)
+	definition.CheckOutput = checkOutput
+	return definition
+}
+
 func newCodexFromHarnessConfig(cfg HarnessConfig) (Harness, error) {
 	return NewCodex(CodexConfig{
 		Command: cfg.Command, Cwd: cfg.Cwd, Model: cfg.Model, Effort: cfg.Effort,
@@ -105,8 +120,22 @@ func Catalog() []Definition {
 func cloneDefinition(definition Definition) Definition {
 	definition.Args = append([]string(nil), definition.Args...)
 	definition.Env = append([]string(nil), definition.Env...)
+	definition.CheckArgs = append([]string(nil), definition.CheckArgs...)
 	return definition
 }
+
+// CapabilityError means an executable was found but failed its profile's
+// bounded capability check. It is distinct from an absent executable so user
+// interfaces can recommend an update instead of reporting a false absence.
+type CapabilityError struct {
+	DisplayName string
+}
+
+func (e *CapabilityError) Error() string {
+	return e.DisplayName + " is installed but does not support ACP; install or update to an ACP-capable release"
+}
+
+type capabilityProbe func(command string, args []string) (string, error)
 
 func Names() []string {
 	result := make([]string, 0, len(catalog))
@@ -132,6 +161,10 @@ func NormalizeName(value string) string {
 
 // Detect returns the first installed harness in catalog priority order.
 func Detect(lookPath func(string) (string, error)) (Definition, string, bool) {
+	return detectWithProbe(lookPath, runCapabilityProbe)
+}
+
+func detectWithProbe(lookPath func(string) (string, error), probe capabilityProbe) (Definition, string, bool) {
 	homeDir := (func() (string, error))(nil)
 	if lookPath == nil {
 		lookPath = exec.LookPath
@@ -141,7 +174,7 @@ func Detect(lookPath func(string) (string, error)) (Definition, string, bool) {
 		if definition.Custom || definition.Command == "" {
 			continue
 		}
-		if command, err := resolveDefinitionCommand(definition, lookPath, homeDir); err == nil {
+		if command, err := resolveDefinitionCommand(definition, lookPath, homeDir); err == nil && checkDefinitionCapability(definition, command, probe) == nil {
 			return cloneDefinition(definition), command, true
 		}
 	}
@@ -196,6 +229,10 @@ func CommandArgs(name string, custom []string) []string {
 // conventional per-user .local/bin directory each time a runtime is
 // constructed or reconfigured.
 func ResolveCommand(name string, lookPath func(string) (string, error)) (string, error) {
+	return resolveCommandWithProbe(name, lookPath, runCapabilityProbe)
+}
+
+func resolveCommandWithProbe(name string, lookPath func(string) (string, error), probe capabilityProbe) (string, error) {
 	definition, ok := Lookup(name)
 	if !ok {
 		if strings.TrimSpace(name) == "" {
@@ -212,7 +249,35 @@ func ResolveCommand(name string, lookPath func(string) (string, error)) (string,
 	if err != nil {
 		return "", fmt.Errorf("%s is not installed on PATH or in the standard user-local bin directory", definition.DisplayName)
 	}
+	if err := checkDefinitionCapability(definition, command, probe); err != nil {
+		return "", err
+	}
 	return command, nil
+}
+
+func checkDefinitionCapability(definition Definition, command string, probe capabilityProbe) error {
+	if len(definition.CheckArgs) == 0 {
+		return nil
+	}
+	output, err := probe(command, append([]string(nil), definition.CheckArgs...))
+	if err != nil || !strings.Contains(output, definition.CheckOutput) {
+		return &CapabilityError{DisplayName: definition.DisplayName}
+	}
+	return nil
+}
+
+func runCapabilityProbe(command string, args []string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, command, args...)
+	output := newTailBuffer(64 * 1024)
+	cmd.Stdout = output
+	cmd.Stderr = output
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return output.String(), ctx.Err()
+	}
+	return output.String(), err
 }
 
 func resolveDefinitionCommand(definition Definition, lookPath func(string) (string, error), homeDir func() (string, error)) (string, error) {

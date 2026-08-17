@@ -169,12 +169,13 @@ type Startup struct {
 }
 
 type Orchestrator struct {
-	Enabled                  bool    `yaml:"enabled"`
-	IntervalSec              int     `yaml:"interval_seconds"`
-	SemanticHeartbeatMinutes int     `yaml:"semantic_heartbeat_minutes"`
-	TaskNotifications        string  `yaml:"task_notifications"`
-	MaxParallel              int     `yaml:"max_parallel"`
-	Routes                   []Route `yaml:"routes"`
+	Enabled                      bool    `yaml:"enabled"`
+	IntervalSec                  int     `yaml:"interval_seconds"`
+	RetriggerUnrespondedMessages bool    `yaml:"retrigger_unresponded_messages"`
+	SemanticHeartbeatMinutes     int     `yaml:"semantic_heartbeat_minutes"`
+	TaskNotifications            string  `yaml:"task_notifications"`
+	MaxParallel                  int     `yaml:"max_parallel"`
+	Routes                       []Route `yaml:"routes"`
 }
 
 type Route struct {
@@ -226,7 +227,7 @@ func Default() Config {
 		Speech:  Speech{Enabled: true, Language: "en", NumThreads: 2, MaxFileMB: 100, MaxDurationSec: 1800, ChunkSeconds: 600},
 		Startup: Startup{},
 		Orchestrator: Orchestrator{
-			Enabled: true, IntervalSec: 10, SemanticHeartbeatMinutes: 15, TaskNotifications: TaskNotificationsDecide, MaxParallel: 4,
+			Enabled: true, IntervalSec: 10, RetriggerUnrespondedMessages: true, SemanticHeartbeatMinutes: 15, TaskNotifications: TaskNotificationsDecide, MaxParallel: 4,
 			Routes: []Route{
 				{Name: "tasks", Source: ".spynel/tasks/todo", Working: ".spynel/tasks/working", Prompt: ".spynel/prompts/task.md", RecoveryPrompt: ".spynel/prompts/recovery.md", ReviewPrompt: ".spynel/prompts/review.md", StaleAfter: "30m", AllowedNext: []string{"todo", "working", "review", "reviewing", "waiting", "done", "failed", "cancelled"}},
 				{Name: "goals", Source: ".spynel/goals/proposed", Working: ".spynel/goals/planning", Prompt: ".spynel/prompts/goal.md", RecoveryPrompt: ".spynel/prompts/recovery.md", ReviewPrompt: ".spynel/prompts/goal-review.md", StaleAfter: "2h", AllowedNext: []string{"proposed", "planning", "active", "review", "reviewing", "waiting", "done", "abandoned"}},

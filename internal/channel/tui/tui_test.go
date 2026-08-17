@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1006,36 +1007,242 @@ func TestSameSizeRedrawPreservesChatHistoryOffset(t *testing.T) {
 	}
 }
 
-func TestRedrawTickRequestsSameSizeRendererRepaint(t *testing.T) {
+func TestTerminalEventFilterRejectsInvalidAndDuplicateResizeBeforeRenderer(t *testing.T) {
 	m := testModel()
-	_, cmd := m.Update(redrawTickMsg{})
-	if cmd == nil {
-		t.Fatal("redraw tick returned no commands")
+	for _, size := range []tea.WindowSizeMsg{
+		{Width: 0, Height: m.height},
+		{Width: m.width, Height: 0},
+		{Width: -1, Height: -1},
+		{Width: m.width, Height: m.height},
+	} {
+		if got := filterTerminalEvents(m, size); got != nil {
+			t.Fatalf("filterTerminalEvents(%+v) = %#v, want nil", size, got)
+		}
 	}
-	batch, ok := cmd().(tea.BatchMsg)
-	if !ok || len(batch) != 2 {
-		t.Fatalf("redraw tick command = %#v, want repaint and next tick", batch)
+	changed := tea.WindowSizeMsg{Width: m.width + 1, Height: m.height + 1}
+	got, ok := filterTerminalEvents(m, changed).(tea.WindowSizeMsg)
+	if !ok || got != changed {
+		t.Fatalf("changed resize = %#v, want %#v", got, changed)
 	}
-	message, ok := batch[0]().(tea.WindowSizeMsg)
-	if !ok || message.Width != m.width || message.Height != m.height {
-		t.Fatalf("redraw message = %#v, want current size %dx%d", message, m.width, m.height)
+	key := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")}
+	if got := filterTerminalEvents(m, key); !reflect.DeepEqual(got, key) {
+		t.Fatalf("non-resize event = %#v, want %#v", got, key)
 	}
 }
 
-func TestCtrlLRequestsImmediateRendererRepaint(t *testing.T) {
+func TestResizeStormAndResumeRepaintPreserveInteractiveState(t *testing.T) {
 	m := testModel()
 	m.input.SetValue("keep this draft")
-	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlL})
+	m.transcript = []transcriptEntry{{role: "assistant", text: strings.Repeat("history\n", 80)}}
+	m.renderHistory()
+	m.viewport.SetYOffset(9)
+	wantOffset := m.viewport.YOffset
+	wantTranscript := append([]transcriptEntry(nil), m.transcript...)
+
+	storm := []tea.WindowSizeMsg{
+		{Width: 0, Height: 0},
+		{Width: 120, Height: 40},
+		{Width: 120, Height: 40},
+		{Width: 74, Height: 24},
+		{Width: 1, Height: 1},
+		{Width: -1, Height: 0},
+		{Width: 96, Height: 30},
+	}
+	for _, size := range storm {
+		filtered := filterTerminalEvents(m, size)
+		if filtered == nil {
+			continue
+		}
+		next, _ := m.Update(filtered)
+		m = next.(model)
+	}
+	if m.input.Value() != "keep this draft" || !reflect.DeepEqual(m.transcript, wantTranscript) {
+		t.Fatalf("resize storm changed draft or transcript: draft=%q transcript=%#v", m.input.Value(), m.transcript)
+	}
+	if m.width != 96 || m.height != 30 || m.viewport.YOffset != wantOffset {
+		t.Fatalf("resize storm state = %dx%d offset %d, want 96x30 offset %d", m.width, m.height, m.viewport.YOffset, wantOffset)
+	}
+
+	next, cmd := m.Update(tea.FocusMsg{})
 	got := next.(model)
-	if got.input.Value() != "keep this draft" {
-		t.Fatalf("Ctrl+L changed draft to %q", got.input.Value())
+	if got.input.Value() != "keep this draft" || !reflect.DeepEqual(got.transcript, wantTranscript) || got.viewport.YOffset != wantOffset {
+		t.Fatalf("focus repaint changed interactive state: draft=%q offset=%d transcript=%#v", got.input.Value(), got.viewport.YOffset, got.transcript)
 	}
 	if cmd == nil {
-		t.Fatal("Ctrl+L returned no repaint command")
+		t.Fatal("focus restoration returned no repaint command")
 	}
-	message, ok := cmd().(tea.WindowSizeMsg)
-	if !ok || message.Width != m.width || message.Height != m.height {
-		t.Fatalf("Ctrl+L message = %#v, want current size %dx%d", message, m.width, m.height)
+
+	next, cmd = got.Update(tea.KeyMsg{Type: tea.KeyCtrlL})
+	got = next.(model)
+	if got.input.Value() != "keep this draft" || cmd == nil {
+		t.Fatalf("Ctrl+L changed draft or omitted repaint: draft=%q command=%v", got.input.Value(), cmd)
+	}
+}
+
+type terminalCapture struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (c *terminalCapture) Write(value []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buffer.Write(value)
+}
+
+func (c *terminalCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buffer.String()
+}
+
+func waitForTerminalOutput(t *testing.T, capture *terminalCapture, condition func(string) bool) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		output := capture.String()
+		if condition(output) {
+			return output
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	output := capture.String()
+	t.Fatalf("terminal output did not reach expected state; bytes=%d", len(output))
+	return ""
+}
+
+func waitForTerminalQuiescence(t *testing.T, capture *terminalCapture, quiet time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	last := capture.String()
+	unchangedSince := time.Now()
+	for time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		current := capture.String()
+		if current != last {
+			last = current
+			unchangedSince = time.Now()
+			continue
+		}
+		if time.Since(unchangedSince) >= quiet {
+			return current
+		}
+	}
+	t.Fatalf("terminal output did not quiesce; bytes=%d", len(last))
+	return ""
+}
+
+func TestBubbleTeaRendererKeepsOneComposerAcrossResizeStormAndResume(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const draft = "resume-draft-marker"
+	m := testModel()
+	m.ctx = ctx
+	m.input.SetValue(draft)
+	// Keep the real focused cursor visible while separating ordinary blink
+	// publication from the resize/output boundary under test.
+	m.input.Cursor.BlinkSpeed = 10 * time.Second
+	m.transcript = []transcriptEntry{{role: "assistant", text: strings.Repeat("renderer history\n", 80)}}
+	m.renderHistory()
+	m.viewport.SetYOffset(7)
+	m.mainAgentActivity = 1
+	m.working = true
+	m.status = "Harness working"
+	wantOffset := m.viewport.YOffset
+	wantTranscript := append([]transcriptEntry(nil), m.transcript...)
+
+	capture := &terminalCapture{}
+	program := tea.NewProgram(
+		m,
+		tea.WithInput(nil),
+		tea.WithOutput(capture),
+		tea.WithAltScreen(),
+		tea.WithContext(ctx),
+		tea.WithFilter(filterTerminalEvents),
+		tea.WithFPS(120),
+		tea.WithoutSignals(),
+	)
+	result := make(chan tea.Model, 1)
+	errors := make(chan error, 1)
+	go func() {
+		final, err := program.Run()
+		result <- final
+		errors <- err
+	}()
+
+	waitForTerminalOutput(t, capture, func(output string) bool {
+		return strings.Contains(output, draft)
+	})
+	for _, size := range []tea.WindowSizeMsg{
+		{Width: 0, Height: 0},
+		{Width: 120, Height: 40},
+		{Width: 120, Height: 40},
+		{Width: 74, Height: 24},
+		{Width: 1, Height: 1},
+		{Width: -1, Height: 0},
+		{Width: 96, Height: 30},
+	} {
+		program.Send(size)
+	}
+	finalComposerBorder := "╭" + strings.Repeat("─", 94) + "╮"
+	waitForTerminalOutput(t, capture, func(output string) bool {
+		return strings.Contains(output, finalComposerBorder) && strings.Contains(output, draft)
+	})
+	stable := waitForTerminalQuiescence(t, capture, 75*time.Millisecond)
+
+	for _, size := range []tea.WindowSizeMsg{
+		{Width: 96, Height: 30},
+		{Width: 0, Height: 30},
+		{Width: 96, Height: 0},
+		{Width: -1, Height: -1},
+		{Width: 96, Height: 30},
+	} {
+		program.Send(size)
+	}
+	if got := waitForTerminalQuiescence(t, capture, 75*time.Millisecond); got != stable {
+		t.Fatalf("invalid/duplicate resize storm emitted %d extra terminal bytes", len(got)-len(stable))
+	}
+
+	program.Send(tea.FocusMsg{})
+	resumed := waitForTerminalOutput(t, capture, func(output string) bool {
+		segment := output[len(stable):]
+		return strings.Contains(segment, ansi.ResetAltScreenSaveCursorMode) &&
+			strings.Contains(segment, ansi.SetAltScreenSaveCursorMode) &&
+			strings.Contains(segment, draft)
+	})
+	segment := resumed[len(stable):]
+	exitIndex := strings.Index(segment, ansi.ResetAltScreenSaveCursorMode)
+	enterIndex := strings.Index(segment, ansi.SetAltScreenSaveCursorMode)
+	if exitIndex < 0 || enterIndex <= exitIndex {
+		t.Fatalf("resume restoration order = exit %d enter %d", exitIndex, enterIndex)
+	}
+	if count := strings.Count(stable, ansi.SetAltScreenSaveCursorMode); count != 1 {
+		t.Fatalf("renderer started %d alternate-screen owners, want one", count)
+	}
+	settled := waitForTerminalQuiescence(t, capture, 75*time.Millisecond)
+	settledSegment := settled[len(stable):]
+	lastClear := strings.LastIndex(settledSegment, ansi.EraseEntireScreen)
+	if lastClear < 0 || strings.Count(settledSegment[lastClear:], draft) != 1 {
+		t.Fatalf("final restored terminal frame does not contain exactly one composer; clear=%d composers=%d", lastClear, strings.Count(settledSegment[lastClear:], draft))
+	}
+
+	program.Quit()
+	select {
+	case final := <-result:
+		got := final.(model)
+		lineInfo := got.input.LineInfo()
+		cursor := lineInfo.StartColumn + lineInfo.ColumnOffset
+		if got.width != 96 || got.height != 30 || got.input.Value() != draft || cursor != len([]rune(draft)) ||
+			!reflect.DeepEqual(got.transcript, wantTranscript) || got.viewport.YOffset != wantOffset ||
+			!got.working || got.mainAgentActivity != 1 || got.workingSpinner.View() == "" {
+			t.Fatalf("renderer sequence changed interactive state: size=%dx%d draft=%q cursor=%d transcript=%d offset=%d working=%t activity=%d spinner=%q", got.width, got.height, got.input.Value(), cursor, len(got.transcript), got.viewport.YOffset, got.working, got.mainAgentActivity, got.workingSpinner.View())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Bubble Tea renderer did not stop")
+	}
+	if err := <-errors; err != nil {
+		t.Fatalf("Bubble Tea renderer failed: %v", err)
 	}
 }
 
@@ -1774,6 +1981,87 @@ func TestHeaderShowsMeaningfulBuildVersionAsFinalOptionalItem(t *testing.T) {
 	}
 	if got := headerVersion("v2.3.4"); got != "v2.3.4" {
 		t.Fatalf("prefixed build version = %q, want v2.3.4", got)
+	}
+}
+
+func TestHeaderShowsSemanticWarningOnlyBesideVisibleVersion(t *testing.T) {
+	profile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(profile) })
+	m := testModel()
+	m.width = 120
+	m.version = headerVersion("1.2.3")
+	m.updateAvailable = true
+	header := strings.Split(m.View(), "\n")[0]
+	plain := ansi.Strip(header)
+	if !strings.HasSuffix(plain, "⚠ v1.2.3▀▀") || strings.Count(plain, "⚠") != 1 {
+		t.Fatalf("update warning is not beside the final version: %q", plain)
+	}
+	warning := m.styles.warning.Background(m.styles.header.GetBackground()).Render("⚠")
+	if !strings.Contains(header, warning) {
+		t.Fatalf("update warning does not use semantic warning color: %q", header)
+	}
+
+	m.version = ""
+	if header := ansi.Strip(strings.Split(m.View(), "\n")[0]); strings.Contains(header, "⚠") {
+		t.Fatalf("update warning leaked without a meaningful version: %q", header)
+	}
+}
+
+func TestPeriodicUpdateCheckIsAsyncHourlyAndFailureClearsState(t *testing.T) {
+	m := testModel()
+	checkedAt := time.Date(2026, 8, 16, 7, 0, 0, 0, time.UTC)
+	now := checkedAt.Add(30 * time.Minute)
+	m.now = func() time.Time { return now }
+	m.updateInterval = time.Hour
+	m.updateCheckedAt = checkedAt
+	calls := 0
+	m.updateCheck = func(context.Context) (bool, error) {
+		calls++
+		return true, nil
+	}
+
+	command := m.scheduleInitialUpdateCheck()
+	if command == nil || calls != 0 {
+		t.Fatalf("scheduled check = %v, synchronous calls = %d", command != nil, calls)
+	}
+	if delay, wait := m.nextUpdateCheckDelay(now); !wait || delay != 30*time.Minute {
+		t.Fatalf("next check delay = %s, wait %t", delay, wait)
+	}
+	// Drive the timer deterministically without waiting on tea.Tick.
+	next, checkCommand := m.Update(updateCheckTickMsg{})
+	m = next.(model)
+	if checkCommand == nil || calls != 0 {
+		t.Fatalf("tick command = %v, calls before command = %d", checkCommand != nil, calls)
+	}
+	next, _ = m.Update(runCommandAt(checkCommand, 0))
+	m = next.(model)
+	if calls != 1 || !m.updateAvailable || !m.updateCheckedAt.Equal(now) {
+		t.Fatalf("successful refresh = calls %d, available %t, checked %v", calls, m.updateAvailable, m.updateCheckedAt)
+	}
+
+	m.updateCheck = func(context.Context) (bool, error) {
+		calls++
+		return true, errors.New("registry unavailable")
+	}
+	next, checkCommand = m.Update(updateCheckTickMsg{})
+	m = next.(model)
+	next, _ = m.Update(runCommandAt(checkCommand, 0))
+	m = next.(model)
+	if calls != 2 || m.updateAvailable {
+		t.Fatalf("failed refresh = calls %d, available %t", calls, m.updateAvailable)
+	}
+}
+
+func TestUpdateAvailabilityComposesWithConcurrentRuntimeState(t *testing.T) {
+	m := testModel()
+	m.updateCheck = func(context.Context) (bool, error) { return true, nil }
+	next, _ := m.Update(runtimeEvent{status: core.RuntimeStatus{Jobs: 4}})
+	m = next.(model)
+	next, _ = m.Update(updateCheckResultMsg{available: true})
+	m = next.(model)
+	if m.runtimeStatus.Jobs != 4 || !m.updateAvailable {
+		t.Fatalf("composed state = jobs %d, update %t", m.runtimeStatus.Jobs, m.updateAvailable)
 	}
 }
 
@@ -4186,6 +4474,89 @@ func TestMainAgentActivityReplacementDoesNotClearNewerTurn(t *testing.T) {
 	m = next.(model)
 	if m.working || m.mainAgentActivity != 0 {
 		t.Fatalf("replacement completion state = working %t, activity %d", m.working, m.mainAgentActivity)
+	}
+}
+
+func TestRecoveredTerminalReplacesActivityVisiblyWithoutTouchingNewerStream(t *testing.T) {
+	m := testModel()
+	m.transcript = []transcriptEntry{
+		{role: "user", text: "original question"},
+		{role: "user", text: "/restart"},
+		{role: "assistant", text: "Restarting Spynel..."},
+	}
+	next, _ := m.Update(uiEvent{event: core.Event{Kind: core.EventActivity, Active: true}, conversation: true})
+	m = next.(model)
+	next, _ = m.Update(uiEvent{event: core.Event{Kind: core.EventActivity, Active: true}})
+	m = next.(model)
+	m.streaming = "newer turn"
+	m.responseText = "newer turn"
+
+	next, _ = m.Update(taskNotificationEvent{notification: channel.Notification{Text: "recovered answer", Recovery: true}})
+	m = next.(model)
+	if len(m.transcript) != 4 || m.transcript[3].text != "recovered answer" {
+		t.Fatalf("recovered transcript ordering = %#v", m.transcript)
+	}
+	if m.streaming != "newer turn" || m.responseText != "newer turn" || !m.working {
+		t.Fatalf("recovery disturbed newer turn: streaming=%q response=%q working=%t", m.streaming, m.responseText, m.working)
+	}
+	if m.notificationAckBusy || len(m.pendingNotifications) != 0 {
+		t.Fatalf("recovery entered notification acknowledgement: busy=%t pending=%#v", m.notificationAckBusy, m.pendingNotifications)
+	}
+	if m.recoveryActivity != 1 || m.recoveryTerminalAhead != 1 || m.mainAgentActivity != 1 {
+		t.Fatalf("recovered placeholder was not settled independently: recovery=%d ahead=%d activity=%d", m.recoveryActivity, m.recoveryTerminalAhead, m.mainAgentActivity)
+	}
+
+	next, _ = m.Update(uiEvent{event: core.Event{Kind: core.EventActivity}, conversation: true})
+	m = next.(model)
+	if m.recoveryActivity != 0 || m.recoveryTerminalAhead != 0 || m.mainAgentActivity != 1 || m.transcript[3].text != "recovered answer" {
+		t.Fatalf("activity cleanup removed recovered answer: recovery=%d ahead=%d activity=%d transcript=%#v", m.recoveryActivity, m.recoveryTerminalAhead, m.mainAgentActivity, m.transcript)
+	}
+}
+
+func TestRecoveredTerminalAndDelayedInactivePreserveOverlappingRecovery(t *testing.T) {
+	m := testModel()
+	for range 2 {
+		next, _ := m.Update(uiEvent{event: core.Event{Kind: core.EventActivity, Active: true}, conversation: true})
+		m = next.(model)
+	}
+
+	next, _ := m.Update(taskNotificationEvent{notification: channel.Notification{Text: "first recovered answer", Recovery: true}})
+	m = next.(model)
+	if m.recoveryActivity != 2 || m.recoveryTerminalAhead != 1 || m.mainAgentActivity != 1 || !m.working {
+		t.Fatalf("first terminal state = recovery %d, ahead %d, activity %d, working %t", m.recoveryActivity, m.recoveryTerminalAhead, m.mainAgentActivity, m.working)
+	}
+
+	next, _ = m.Update(uiEvent{event: core.Event{Kind: core.EventActivity}, conversation: true})
+	m = next.(model)
+	if m.recoveryActivity != 1 || m.recoveryTerminalAhead != 0 || m.mainAgentActivity != 1 || !m.working {
+		t.Fatalf("delayed inactive consumed overlapping recovery = recovery %d, ahead %d, activity %d, working %t", m.recoveryActivity, m.recoveryTerminalAhead, m.mainAgentActivity, m.working)
+	}
+
+	next, _ = m.Update(taskNotificationEvent{notification: channel.Notification{Text: "second recovered answer", Recovery: true}})
+	m = next.(model)
+	next, _ = m.Update(uiEvent{event: core.Event{Kind: core.EventActivity}, conversation: true})
+	m = next.(model)
+	if m.recoveryActivity != 0 || m.recoveryTerminalAhead != 0 || m.mainAgentActivity != 0 || m.working {
+		t.Fatalf("final overlap settlement = recovery %d, ahead %d, activity %d, working %t", m.recoveryActivity, m.recoveryTerminalAhead, m.mainAgentActivity, m.working)
+	}
+}
+
+func TestRecoveredTerminalPreservesIntentionalScrollAndShowsNewMessageStatus(t *testing.T) {
+	m, _ := streamingScrollTestModel()
+	m.viewport.GotoBottom()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+	m = next.(model)
+	wantOffset := m.viewport.YOffset
+
+	next, _ = m.Update(taskNotificationEvent{notification: channel.Notification{Text: "recovered below", Recovery: true}})
+	m = next.(model)
+	if m.viewport.YOffset != wantOffset || m.status != "1 new message below" || m.newMessages != 1 {
+		t.Fatalf("recovered scroll state = offset %d want %d status %q new %d", m.viewport.YOffset, wantOffset, m.status, m.newMessages)
+	}
+	m.viewport.GotoBottom()
+	m.resumeTailFollowAtBottom()
+	if m.newMessages != 0 || m.status != "Harness working" {
+		t.Fatalf("tail return did not clear new-message status: status=%q new=%d", m.status, m.newMessages)
 	}
 }
 

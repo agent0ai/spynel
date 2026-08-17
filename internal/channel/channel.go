@@ -79,8 +79,10 @@ type Notice struct {
 type NoticeReporter func(Notice)
 
 type Notification struct {
-	ID   string `json:"id"`
-	Text string `json:"text"`
+	ID       string `json:"id"`
+	Text     string `json:"text"`
+	Recovery bool   `json:"recovery,omitempty"`
+	Error    bool   `json:"error,omitempty"`
 }
 
 type Channel interface {
@@ -106,6 +108,18 @@ type ProactiveDeliverer interface {
 
 type DeliveryRouter interface {
 	Deliver(context.Context, string, string, string, string) error
+}
+
+// ConversationEventRouter routes the canonical communication-agent lifecycle
+// to a connected conversation outside an inbound request callback.
+type ConversationEventRouter interface {
+	DeliverEvent(context.Context, string, string, string, core.Event) error
+}
+
+// ProactiveEventDeliverer translates canonical lifecycle events for one
+// transport conversation. Activity must stop before terminal delivery.
+type ProactiveEventDeliverer interface {
+	DeliverEvent(context.Context, string, string, core.Event) error
 }
 
 type ConnectionReporter interface {

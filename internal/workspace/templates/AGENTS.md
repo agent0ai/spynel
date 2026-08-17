@@ -12,6 +12,7 @@
 - Keep the stock chat prompt's evidence-grounded honesty wording synchronized with framework-owned runtime injection, including evidence provenance, proportionate authoritative checks, explicit unknowns, truthful external-action reporting, and evidence-based corrections without an impossible guarantee of flawless model behavior.
 - Keep the task-notification template explicit that Spynel has already validated and filled in the absolute workspace and exact authorized task origin, and that the agent changes only the example `--message` text; do not instruct task agents to use stdin, pipes, or destination placeholders.
 - Default configuration must validate without secrets and must not introduce a configurable state directory.
+- Default forward stalled-message recovery on with the canonical live setting name and user-facing description; upgrades preserve existing configuration text while decode defaults activate the current behavior.
 
 ## Child DOX Index
 

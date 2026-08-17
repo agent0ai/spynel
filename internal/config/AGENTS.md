@@ -11,6 +11,7 @@
 - Keep Telegram and WhatsApp enablement fail-closed on canonical allow-lists, validate harness/review/prefix choices, and keep extension enabled state, directory, and hook timeout as the sole restart-bound settings. Every other catalog setting applies live. Normalize the retired TUI launch key away on load and never emit it from canonical saves.
 - Keep custom ACP arguments as a canonical YAML and runtime string vector, but expose them through one shared deterministic one-line command-text parser and formatter. Support quotes, empty arguments, and narrowly escaped whitespace/quotes/backslashes while preserving ordinary Windows backslashes; reject malformed, multiline, NUL, or invalid-UTF-8 input transactionally and never perform shell expansion.
 - Default `workspace.cleanup_retention_days` to 30 for omitted and generated configurations, validate 1 through 36500 whole days, and apply it live to conversation cleanup, job-archive removal, and terminal-task archiving.
+- Default `orchestrator.retrigger_unresponded_messages` on for omitted and generated configurations, expose it with “Automatically processes stalled messages after restarts and disconnects.”, and apply it live so disabling prevents later scans without cancelling an admitted turn.
 
 ## Child DOX Index
 

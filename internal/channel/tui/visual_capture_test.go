@@ -307,6 +307,7 @@ func visualBaseModel() model {
 	value := testModel()
 	value.title = "API workspace"
 	value.version = headerVersion("1.2.3")
+	value.updateAvailable = true
 	value.connection = connectionMap([]channel.ConnectionStatus{
 		{Name: "telegram", State: channel.ConnectionConnected},
 		{Name: "whatsapp", State: channel.ConnectionConnecting},

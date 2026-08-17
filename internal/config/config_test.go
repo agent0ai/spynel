@@ -69,6 +69,9 @@ func TestDefaultIsValidAndRoutesAreExtensible(t *testing.T) {
 	if cfg.Orchestrator.SemanticHeartbeatMinutes != 15 {
 		t.Fatalf("semantic heartbeat default = %d, want 15", cfg.Orchestrator.SemanticHeartbeatMinutes)
 	}
+	if !cfg.Orchestrator.RetriggerUnrespondedMessages {
+		t.Fatal("conversation recovery should default on")
+	}
 	if cfg.Workspace.CleanupRetentionDays != 30 {
 		t.Fatalf("cleanup retention default = %d, want 30", cfg.Workspace.CleanupRetentionDays)
 	}

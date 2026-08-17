@@ -316,6 +316,13 @@ func (r *Runtime) BeginJobWithDetails(sessionKey, channel, conversation, descrip
 // number has been allocated. Callers that would start provider work must use
 // this error-returning boundary so an unavailable counter fails closed.
 func (r *Runtime) TryBeginJobWithDetails(sessionKey, channel, conversation, description string, details JobDetails) (int, error) {
+	id, _, err := r.tryBeginJobWithDetails(sessionKey, channel, conversation, description, details)
+	return id, err
+}
+
+// tryBeginJobWithDetails also reports whether this call created the runtime
+// job, allowing pre-provider callers to unwind only ownership they admitted.
+func (r *Runtime) tryBeginJobWithDetails(sessionKey, channel, conversation, description string, details JobDetails) (int, bool, error) {
 	r.mu.Lock()
 	if id, ok := r.bySession[sessionKey]; ok {
 		job := r.jobs[id]
@@ -333,7 +340,7 @@ func (r *Runtime) TryBeginJobWithDetails(sessionKey, channel, conversation, desc
 			r.publishLocked()
 		}
 		r.mu.Unlock()
-		return id, nil
+		return id, false, nil
 	}
 	now := r.Now().UTC()
 	archive := r.archive
@@ -345,7 +352,7 @@ func (r *Runtime) TryBeginJobWithDetails(sessionKey, channel, conversation, desc
 		number, generation, stableID, err = archive.allocate(now, details.WorkID, details.Kind, details.Phase, details.PhaseAttempt)
 		if err != nil {
 			r.mu.Unlock()
-			return 0, fmt.Errorf("allocate durable job number: %w", err)
+			return 0, false, fmt.Errorf("allocate durable job number: %w", err)
 		}
 	}
 	r.nextJobID++
@@ -374,7 +381,7 @@ func (r *Runtime) TryBeginJobWithDetails(sessionKey, channel, conversation, desc
 		persistedID, err := archive.begin(job)
 		if err != nil {
 			r.mu.Unlock()
-			return 0, fmt.Errorf("persist durable job archive: %w", err)
+			return 0, false, fmt.Errorf("persist durable job archive: %w", err)
 		}
 		job.StableID = persistedID
 	}
@@ -386,7 +393,7 @@ func (r *Runtime) TryBeginJobWithDetails(sessionKey, channel, conversation, desc
 	r.publishLocked()
 	r.mu.Unlock()
 	r.LogEvent("info", "jobs", "job_started", fmt.Sprintf("job_id=%d channel=%s kind=%s", job.Number, logField(job.Channel, "unknown"), logField(job.Kind, "chat")))
-	return job.ID, nil
+	return job.ID, true, nil
 }
 
 // UpdateJobDurableTiming applies only non-regressing durable observations to

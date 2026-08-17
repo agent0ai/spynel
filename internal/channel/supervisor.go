@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
 )
 
 // Managed describes one hot-reloadable transport without coupling the shared
@@ -22,6 +23,7 @@ type Managed struct {
 
 type runningChannel struct {
 	cancel      context.CancelFunc
+	ctx         context.Context
 	fingerprint string
 	generation  uint64
 	instance    Channel
@@ -165,6 +167,7 @@ func (s *Supervisor) reconcileConfig(ctx context.Context, cfg config.Config) err
 		channelContext, cancel := context.WithCancel(ctx)
 		running := &runningChannel{
 			cancel:      cancel,
+			ctx:         channelContext,
 			fingerprint: fingerprint,
 			generation:  generation,
 			lastStatus:  ConnectionStatus{Name: managed.Name, State: ConnectionConnecting},
@@ -257,6 +260,27 @@ func (s *Supervisor) Deliver(ctx context.Context, name, conversation, eventID, t
 		return fmt.Errorf("%s does not support proactive delivery", name)
 	}
 	return deliverer.Deliver(ctx, conversation, eventID, text)
+}
+
+func (s *Supervisor) DeliverEvent(ctx context.Context, name, conversation, eventID string, event core.Event) error {
+	s.mu.Lock()
+	running := s.running[name]
+	var instance Channel
+	if running != nil {
+		instance = running.instance
+		if running.ctx != nil {
+			ctx = running.ctx
+		}
+	}
+	s.mu.Unlock()
+	if instance == nil {
+		return fmt.Errorf("%s is disconnected", name)
+	}
+	deliverer, ok := instance.(ProactiveEventDeliverer)
+	if !ok {
+		return fmt.Errorf("%s does not support proactive conversation events", name)
+	}
+	return deliverer.DeliverEvent(ctx, conversation, eventID, event)
 }
 
 func (s *Supervisor) runOne(ctx context.Context, name string, running *runningChannel, instance Channel) {

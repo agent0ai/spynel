@@ -17,12 +17,35 @@ const { current } = require("../platform");
 const UPDATE_EXIT_CODE = 75;
 const packageRoot = path.resolve(__dirname, "..", "..");
 let args = process.argv.slice(2);
+let startupUpdate;
+let startupUpdateCheckedAt;
+
+function createLaunchEnvironment(parentEnvironment = process.env, periodicChecks, checkedAt, update) {
+  const environment = {
+    ...parentEnvironment,
+    SPYNEL_NPM_PACKAGE_ROOT: packageRoot,
+    SPYNEL_NPM_LAUNCHER_MANAGED: "1",
+    SPYNEL_NPM_LAUNCHER: __filename,
+    SPYNEL_NPM_NODE: process.execPath,
+    SPYNEL_NPM_UPDATE_STATE: path.join(os.tmpdir(), `spynel-update-${process.pid}-${crypto.randomBytes(8).toString("hex")}.json`)
+  };
+  delete environment.SPYNEL_NPM_PERIODIC_UPDATE_CHECKS;
+  delete environment.SPYNEL_NPM_UPDATE_CHECKED_AT;
+  delete environment.SPYNEL_NPM_UPDATE_LATEST;
+  if (periodicChecks) environment.SPYNEL_NPM_PERIODIC_UPDATE_CHECKS = "1";
+  if (checkedAt) environment.SPYNEL_NPM_UPDATE_CHECKED_AT = checkedAt;
+  if (update) environment.SPYNEL_NPM_UPDATE_LATEST = update.latest;
+  return environment;
+}
 
 async function main() {
   current();
-  if (shouldCheckAtStartup(args)) {
+  const periodicChecks = shouldCheckAtStartup(args);
+  if (periodicChecks) {
+    startupUpdateCheckedAt = new Date().toISOString();
     try {
       const update = await checkForUpdate();
+      startupUpdate = update;
       if (update.available && await promptForStartupUpdate(update, { packageRoot })) {
         try {
           runNPMUpdate({ packageRoot });
@@ -39,14 +62,7 @@ async function main() {
     }
   }
 
-  const environment = {
-    ...process.env,
-    SPYNEL_NPM_PACKAGE_ROOT: packageRoot,
-    SPYNEL_NPM_LAUNCHER_MANAGED: "1",
-    SPYNEL_NPM_LAUNCHER: __filename,
-    SPYNEL_NPM_NODE: process.execPath,
-    SPYNEL_NPM_UPDATE_STATE: path.join(os.tmpdir(), `spynel-update-${process.pid}-${crypto.randomBytes(8).toString("hex")}.json`)
-  };
+  const environment = createLaunchEnvironment(process.env, periodicChecks, startupUpdateCheckedAt, startupUpdate);
   for (;;) {
     const binary = path.join(__dirname, "..", "vendor", "spynel");
     const result = childProcess.spawnSync(binary, args, { stdio: "inherit", env: environment });
@@ -76,7 +92,11 @@ async function main() {
   }
 }
 
-main().then(code => process.exit(code), error => {
-  console.error(`Unable to run Spynel: ${error.message}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().then(code => process.exit(code), error => {
+    console.error(`Unable to run Spynel: ${error.message}`);
+    process.exit(1);
+  });
+}
+
+module.exports = { createLaunchEnvironment };

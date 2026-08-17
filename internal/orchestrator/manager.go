@@ -1638,12 +1638,12 @@ func (m *Manager) renderPrompt(route config.Route, lease Lease, promptPath strin
 		prompt = strings.ReplaceAll(prompt, from, to)
 	}
 	prompt = appendTaskReviewModeInstruction(prompt, m.harnessSettings().Reviews)
-	prompt = instructions.InjectScopeDiscipline(prompt)
 	role := instructions.Developer
 	phase := normalizeLeasePhase(route.Name, phaseForFile(route.Name, file))
 	if phase == phaseTaskReview || phase == phaseGoalReview {
 		role = instructions.Reviewer
 	}
+	prompt = instructions.InjectRoleScopeDiscipline(prompt, role)
 	return instructions.Append(prompt, m.Config.StatePath(), role)
 }
 

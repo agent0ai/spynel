@@ -32,8 +32,9 @@ import (
 )
 
 type uiEvent struct {
-	event  core.Event
-	replay bool
+	event        core.Event
+	replay       bool
+	conversation bool
 }
 type connectionEvent struct{ status channel.ConnectionStatus }
 type pairingEvent struct{ event channel.PairingEvent }
@@ -55,7 +56,10 @@ type notificationBoundaryMsg struct {
 	safe     bool
 	after    int
 }
-type redrawTickMsg struct{}
+type updateCheckTickMsg struct{}
+type updateCheckResultMsg struct {
+	available bool
+}
 type logoAnimationTickMsg struct{ generation uint64 }
 
 type logoAnimationMode uint8
@@ -125,6 +129,7 @@ type Options struct {
 	PairingEvents      <-chan channel.PairingEvent
 	NoticeEvents       <-chan channel.Notice
 	NotificationEvents <-chan channel.Notification
+	ConversationEvents <-chan core.Event
 	AckNotification    func(string, int) error
 	InitialConnections []channel.ConnectionStatus
 	TitleEvents        <-chan string
@@ -137,6 +142,9 @@ type Options struct {
 	InitialRuntime     core.RuntimeStatus
 	DurableWorkEvents  <-chan core.DurableWorkCounts
 	InitialDurableWork core.DurableWorkCounts
+	UpdateCheck        func(context.Context) (bool, error)
+	UpdateAvailable    bool
+	UpdateCheckedAt    time.Time
 	SaveSettings       func(map[string]string) error
 	InitialScreen      *core.Screen
 	ScreenAction       func(context.Context, string, string, map[string]string) (*core.Screen, error)
@@ -198,6 +206,8 @@ type model struct {
 	responseCommit           int
 	working                  bool
 	mainAgentActivity        int
+	recoveryActivity         int
+	recoveryTerminalAhead    int
 	logoSpinner              bubblespinner.Model
 	logoAnimation            logoAnimationMode
 	logoGeneration           uint64
@@ -222,12 +232,17 @@ type model struct {
 	pairings                 <-chan channel.PairingEvent
 	notices                  <-chan channel.Notice
 	notifications            <-chan channel.Notification
+	conversationEvents       <-chan core.Event
 	ackNotification          func(string, int) error
 	titles                   <-chan string
 	runtimeEvents            <-chan core.RuntimeStatus
 	runtimeStatus            core.RuntimeStatus
 	durableWorkEvents        <-chan core.DurableWorkCounts
 	durableWork              core.DurableWorkCounts
+	updateCheck              func(context.Context) (bool, error)
+	updateAvailable          bool
+	updateCheckedAt          time.Time
+	updateInterval           time.Duration
 	connection               map[string]channel.ConnectionStatus
 	ignoreNextLF             bool
 	pendingMouse             string
@@ -284,6 +299,7 @@ type model struct {
 	initialHistoryScroll     bool
 	now                      func() time.Time
 	manualScrollUpUntil      time.Time
+	newMessages              int
 	diagnostic               func(context.Context, string, string) error
 	diagnosticBusy           bool
 	lastDiagnostic           time.Time
@@ -301,7 +317,6 @@ const (
 	maxTitleChars     = 80
 	// Header, footer, history top/bottom insets, and composer borders.
 	layoutOverhead         = 6
-	redrawInterval         = 10 * time.Second
 	maxTranscriptRows      = 500
 	maxTranscriptRunes     = 500000
 	maxPendingPastes       = 8
@@ -471,12 +486,17 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 		pairings:             options.PairingEvents,
 		notices:              options.NoticeEvents,
 		notifications:        options.NotificationEvents,
+		conversationEvents:   options.ConversationEvents,
 		ackNotification:      options.AckNotification,
 		titles:               options.TitleEvents,
 		runtimeEvents:        options.RuntimeEvents,
 		runtimeStatus:        options.InitialRuntime,
 		durableWorkEvents:    options.DurableWorkEvents,
 		durableWork:          options.InitialDurableWork,
+		updateCheck:          options.UpdateCheck,
+		updateAvailable:      options.UpdateAvailable,
+		updateCheckedAt:      options.UpdateCheckedAt,
+		updateInterval:       time.Hour,
 		saveSettings:         options.SaveSettings,
 		screenAction:         options.ScreenAction,
 		preparePaste:         preparePaste,
@@ -495,7 +515,7 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 	if m.logoAnimation != logoStopped {
 		m.logoGeneration = 1
 	}
-	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
+	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx), tea.WithFilter(filterTerminalEvents))
 	_, err = program.Run()
 	return err
 }
@@ -674,22 +694,79 @@ func (m model) Init() tea.Cmd {
 		}
 		logo = tick(0, m.logoGeneration)
 	}
-	return tea.Batch(textarea.Blink, m.waitEvent(), m.redrawTick(), tea.DisableMouse, logo)
+	return tea.Batch(textarea.Blink, m.waitEvent(), tea.DisableMouse, tea.EnableReportFocus, logo, m.scheduleInitialUpdateCheck())
 }
 
-func (m model) redrawTick() tea.Cmd {
-	return tea.Tick(redrawInterval, func(time.Time) tea.Msg { return redrawTickMsg{} })
+// filterTerminalEvents rejects resize reports that would make Bubble Tea's
+// renderer repaint with invalid geometry, and coalesces duplicate reports
+// before they invalidate its frame cache. Display changes can briefly publish
+// zero dimensions, especially while resuming from sleep or moving between
+// monitors. Bubble Tea handles WindowSizeMsg before Model.Update, so guarding
+// only in Update is too late to keep those values out of the renderer.
+func filterTerminalEvents(current tea.Model, message tea.Msg) tea.Msg {
+	size, ok := message.(tea.WindowSizeMsg)
+	if !ok {
+		return message
+	}
+	if size.Width <= 0 || size.Height <= 0 {
+		return nil
+	}
+	value, ok := current.(model)
+	if ok && value.width == size.Width && value.height == size.Height {
+		return nil
+	}
+	return message
+}
+
+func (m model) scheduleInitialUpdateCheck() tea.Cmd {
+	if m.updateCheck == nil {
+		return nil
+	}
+	now := time.Now()
+	if m.now != nil {
+		now = m.now()
+	}
+	delay, wait := m.nextUpdateCheckDelay(now)
+	if !wait {
+		return m.runUpdateCheck()
+	}
+	return tea.Tick(delay, func(time.Time) tea.Msg { return updateCheckTickMsg{} })
+}
+
+func (m model) nextUpdateCheckDelay(now time.Time) (time.Duration, bool) {
+	interval := m.updateInterval
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	if m.updateCheckedAt.IsZero() {
+		return 0, false
+	}
+	delay := interval - now.Sub(m.updateCheckedAt)
+	if m.updateCheckedAt.After(now) {
+		delay = interval
+	}
+	return delay, delay > 0
+}
+
+func (m model) runUpdateCheck() tea.Cmd {
+	if m.updateCheck == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		available, err := m.updateCheck(m.ctx)
+		return updateCheckResultMsg{available: err == nil && available}
+	}
 }
 
 func (m model) repaint() tea.Cmd {
 	if m.width <= 0 || m.height <= 0 {
 		return nil
 	}
-	// Bubble Tea invalidates its differential-render cache for every window
-	// size message. Sending the current size repaints the complete frame without
-	// clearing it first, which repairs terminal-owned screen clears without a
-	// visible erase/repaint flash.
-	return func() tea.Msg { return tea.WindowSizeMsg{Width: m.width, Height: m.height} }
+	// Bubble Tea's renderer can still believe it owns the alternate screen
+	// after a terminal process was suspended or a display server restored the
+	// main buffer. Leave and re-enter through that same renderer so its state
+	// and the terminal agree again, then force one complete frame repaint.
+	return tea.Sequence(tea.ExitAltScreen, tea.EnterAltScreen, tea.ClearScreen)
 }
 
 func (m model) waitEvent() tea.Cmd {
@@ -705,6 +782,8 @@ func (m model) waitEvent() tea.Cmd {
 			return noticeEvent{notice: notice}
 		case notification := <-m.notifications:
 			return taskNotificationEvent{notification: notification}
+		case event := <-m.conversationEvents:
+			return uiEvent{event: event, conversation: true}
 		case title := <-m.titles:
 			return titleEvent{title: title}
 		case value := <-m.themeEvents:
@@ -744,10 +823,33 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 	manualScrollDirection := 0
 	manualScrollOffset := m.viewport.YOffset
 	switch value := message.(type) {
+	case updateCheckTickMsg:
+		updateInput = false
+		updateViewport = false
+		commands = append(commands, m.runUpdateCheck())
+	case updateCheckResultMsg:
+		updateInput = false
+		updateViewport = false
+		m.updateAvailable = value.available
+		if m.now != nil {
+			m.updateCheckedAt = m.now()
+		} else {
+			m.updateCheckedAt = time.Now()
+		}
+		commands = append(commands, m.scheduleInitialUpdateCheck())
 	case tea.WindowSizeMsg:
+		// The program-level filter keeps invalid dimensions out of Bubble Tea's
+		// renderer. Retain this guard for direct model updates and tests.
+		if value.Width <= 0 || value.Height <= 0 {
+			updateInput = false
+			updateViewport = false
+			break
+		}
 		if m.width == value.Width && m.height == value.Height {
-			// A same-size message is an intentional renderer-cache invalidation.
-			// Leave the model, especially the user's history offset, untouched.
+			// Duplicate reports are normally coalesced by filterTerminalEvents.
+			// Leave direct model updates idempotent as a second line of defense.
+			updateInput = false
+			updateViewport = false
 			break
 		}
 		m.width, m.height = value.Width, value.Height
@@ -1014,17 +1116,31 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = event.Text
 		case core.EventActivity:
 			wasWorking := m.working
-			if event.Active {
+			if value.conversation && event.Active {
+				m.recoveryActivity++
 				m.mainAgentActivity++
-			} else if m.mainAgentActivity > 0 {
+			} else if value.conversation && m.recoveryActivity > 0 {
+				m.recoveryActivity--
+				if m.recoveryTerminalAhead > 0 {
+					m.recoveryTerminalAhead--
+				} else if m.mainAgentActivity > 0 {
+					m.mainAgentActivity--
+				}
+			} else if !value.conversation && event.Active {
+				m.mainAgentActivity++
+			} else if !value.conversation && m.mainAgentActivity > 0 {
 				m.mainAgentActivity--
 			}
 			m.working = m.mainAgentActivity > 0
-			if event.Active {
+			if m.newMessages > 0 {
+				m.status = newMessageStatus(m.newMessages)
+			} else if event.Active {
 				m.status = "Harness working"
 				if !wasWorking {
 					commands = append(commands, m.workingSpinner.Tick)
 				}
+			} else if !m.working {
+				m.status = "Ready"
 			}
 		case core.EventScreen:
 			if event.Screen != nil {
@@ -1051,6 +1167,12 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			commands = append(commands, func() tea.Msg { return uiEvent{event: event, replay: true} })
 		}
 	case taskNotificationEvent:
+		if value.notification.Recovery {
+			m.appendRecoveredResponse(value.notification)
+			m.refresh()
+			commands = append(commands, m.waitEvent())
+			break
+		}
 		m.pendingNotifications = append(m.pendingNotifications, value.notification)
 		if !m.working {
 			m.flushNotifications()
@@ -1325,10 +1447,10 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case diagnosticResultMsg:
 		m.diagnosticBusy = false
-	case redrawTickMsg:
+	case tea.FocusMsg:
 		updateInput = false
 		updateViewport = false
-		commands = append(commands, m.repaint(), m.redrawTick())
+		commands = append(commands, m.repaint())
 	case streamRefreshMsg:
 		m.streamRefreshPending = false
 		if m.streaming != "" {
@@ -1545,9 +1667,11 @@ func notificationPause(sequence uint64) tea.Cmd {
 }
 
 func notificationIDs(notifications []channel.Notification) []string {
-	ids := make([]string, len(notifications))
-	for index, notification := range notifications {
-		ids[index] = notification.ID
+	ids := make([]string, 0, len(notifications))
+	for _, notification := range notifications {
+		if notification.ID != "" {
+			ids = append(ids, notification.ID)
+		}
 	}
 	return ids
 }
@@ -1589,6 +1713,50 @@ func (m *model) flushNotificationPrefix(count int) {
 	m.pendingNotifications = m.pendingNotifications[count:]
 }
 
+// appendRecoveredResponse reconciles a durable recovery terminal without
+// touching the response buffer of a newer foreground turn. Recovery entries
+// are not task notifications and therefore never enter the acknowledgement
+// protocol.
+func (m *model) appendRecoveredResponse(notification channel.Notification) {
+	followingTail := m.shouldFollowTail()
+	// The durable terminal and polled activity count deliberately travel over
+	// separate reconnect-safe paths. Visibly settle one already-observed
+	// recovery reference now so its placeholder cannot outlive the answer, but
+	// retain the authoritative observed count and credit its later inactive
+	// edge. Otherwise overlapping recoveries would both be settled by one
+	// terminal followed by that terminal's delayed inactive edge.
+	if m.recoveryActivity > m.recoveryTerminalAhead {
+		m.recoveryTerminalAhead++
+		if m.mainAgentActivity > 0 {
+			m.mainAgentActivity--
+		}
+		m.working = m.mainAgentActivity > 0
+	}
+	role := "assistant"
+	if notification.Error {
+		role = "error"
+	}
+	m.appendTranscript(transcriptEntry{role: role, text: notification.Text})
+	if !followingTail {
+		m.newMessages++
+		m.status = newMessageStatus(m.newMessages)
+		return
+	}
+	m.newMessages = 0
+	if m.working {
+		m.status = "Harness working"
+	} else {
+		m.status = "Ready"
+	}
+}
+
+func newMessageStatus(count int) string {
+	if count == 1 {
+		return "1 new message below"
+	}
+	return fmt.Sprintf("%d new messages below", count)
+}
+
 func (m *model) dispatchMessage(displayText, messageText string) []tea.Cmd {
 	wasWorking := m.working
 	isCommand := strings.HasPrefix(displayText, "/")
@@ -1602,11 +1770,13 @@ func (m *model) dispatchMessage(displayText, messageText string) []tea.Cmd {
 	m.appendTranscript(transcriptEntry{role: "user", text: displayText})
 	// Sending is explicit navigation to the active conversation tail.
 	m.manualScrollUpUntil = time.Time{}
+	m.newMessages = 0
 	m.viewport.GotoBottom()
 	m.status = "Sending…"
 	m.resizeComposer()
 	m.refresh()
-	msg := core.Message{Channel: "tui", Conversation: m.conversation, Sender: "local", Text: messageText, ReceivedAt: time.Now().UTC()}
+	sourceMessageID, _ := core.NewSourceMessageID()
+	msg := core.Message{Channel: "tui", Conversation: m.conversation, Sender: "local", SourceMessageID: sourceMessageID, Text: messageText, ReceivedAt: time.Now().UTC()}
 	handler := m.handler
 	events := m.events
 	ctx := m.ctx
@@ -2648,6 +2818,14 @@ func (m *model) noteManualScrollUp() {
 func (m *model) resumeTailFollowAtBottom() {
 	if m.viewport.AtBottom() {
 		m.manualScrollUpUntil = time.Time{}
+		if m.newMessages > 0 {
+			m.newMessages = 0
+			if m.working {
+				m.status = "Harness working"
+			} else {
+				m.status = "Ready"
+			}
+		}
 	}
 }
 
@@ -3109,6 +3287,10 @@ func (m model) headerView(width int) string {
 	right := strings.Join(segments, ribbon) + ribbon
 	if m.version != "" {
 		version := m.styles.status.Background(m.styles.header.GetBackground()).Render(m.version)
+		if m.updateAvailable {
+			warning := m.styles.warning.Background(m.styles.header.GetBackground()).Render("⚠")
+			version = warning + " " + version
+		}
 		withVersion := strings.Join(append(append([]string(nil), segments...), version), ribbon) + ribbon
 		// The version is the lowest-priority status item. Omit it instead of
 		// displacing or rendering a misleading partial version on narrow rows.

@@ -115,7 +115,7 @@ func (c *Client) Handle(ctx context.Context, message core.Message, emit core.Emi
 }
 
 func (c *Client) State(ctx context.Context) (app.SharedState, error) {
-	response, err := c.request(ctx, http.MethodGet, "/v1/state", nil)
+	response, err := c.request(ctx, http.MethodGet, "/v1/state?instance_id="+url.QueryEscape(c.Election.ID()), nil)
 	if err != nil {
 		return app.SharedState{}, err
 	}
@@ -131,16 +131,31 @@ func (c *Client) State(ctx context.Context) (app.SharedState, error) {
 }
 
 func (c *Client) RegisterLiveTUI(ctx context.Context, conversation string) error {
+	_, err := c.RegisterLiveTUIState(ctx, conversation)
+	return err
+}
+
+// RegisterLiveTUIState registers the selected conversation and returns the
+// first caller-scoped state snapshot from that same request. Startup uses this
+// instead of seeding activity from the earlier unscoped readiness response.
+func (c *Client) RegisterLiveTUIState(ctx context.Context, conversation string) (app.SharedState, error) {
 	body, err := json.Marshal(liveTUIRequest{InstanceID: c.Election.ID(), Conversation: conversation})
 	if err != nil {
-		return err
+		return app.SharedState{}, err
 	}
 	response, err := c.request(ctx, http.MethodPost, "/v1/tui-live", body)
 	if err != nil {
-		return err
+		return app.SharedState{}, err
 	}
 	defer response.Body.Close()
-	return responseError(response)
+	if err := responseError(response); err != nil {
+		return app.SharedState{}, err
+	}
+	var state app.SharedState
+	if err := json.NewDecoder(response.Body).Decode(&state); err != nil {
+		return app.SharedState{}, err
+	}
+	return state, nil
 }
 
 func (c *Client) UnregisterLiveTUI(ctx context.Context) error {

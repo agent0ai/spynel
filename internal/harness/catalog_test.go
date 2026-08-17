@@ -4,8 +4,77 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
+
+func TestCatalogKeepsLeadingHarnessChoicesInProductOrder(t *testing.T) {
+	names := Names()
+	want := []string{"codex", "claude-code", "agent-zero"}
+	if len(names) < len(want) || !reflect.DeepEqual(names[:len(want)], want) {
+		t.Fatalf("leading harness choices = %#v, want %#v", names, want)
+	}
+	definition, ok := Lookup("agent-zero")
+	if !ok || definition.DisplayName != "Agent Zero CLI" || definition.Command != "a0" || !reflect.DeepEqual(definition.Args, []string{"acp"}) {
+		t.Fatalf("Agent Zero definition = %#v, %t", definition, ok)
+	}
+}
+
+func TestAgentZeroRequiresSuccessfulACPCapabilityCheck(t *testing.T) {
+	lookPath := func(name string) (string, error) {
+		if name == "a0" {
+			return "/tools/a0", nil
+		}
+		return "", errors.New("missing")
+	}
+	var checkedCommand string
+	var checkedArgs []string
+	command, err := resolveCommandWithProbe("agent-zero", lookPath, func(command string, args []string) (string, error) {
+		checkedCommand = command
+		checkedArgs = append([]string(nil), args...)
+		return "A0 ACP check OK\n", nil
+	})
+	if err != nil || command != "/tools/a0" || checkedCommand != command || !reflect.DeepEqual(checkedArgs, []string{"acp", "--check"}) {
+		t.Fatalf("Agent Zero capability resolution = %q, %v, probe %q %#v", command, err, checkedCommand, checkedArgs)
+	}
+	_, err = resolveCommandWithProbe("agent-zero", lookPath, func(string, []string) (string, error) {
+		return "usage: a0", errors.New("exit status 2")
+	})
+	var capabilityErr *CapabilityError
+	if !errors.As(err, &capabilityErr) {
+		t.Fatalf("pre-ACP Agent Zero error = %T %v", err, err)
+	}
+}
+
+func TestAgentZeroFactoryBuildsSharedACPCommandWithoutShell(t *testing.T) {
+	registry := NewBuiltinRegistry()
+	target, err := registry.Create(HarnessConfig{Name: "agent-zero", Command: "/tools/a0", Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, ok := target.(*ACP)
+	if !ok || adapter.config.Command != "/tools/a0" || !reflect.DeepEqual(adapter.config.Args, []string{"acp"}) {
+		t.Fatalf("Agent Zero adapter = %#v, %t", target, ok)
+	}
+}
+
+func TestDetectionSkipsPreACPAgentZero(t *testing.T) {
+	definition, command, ok := detectWithProbe(func(name string) (string, error) {
+		switch name {
+		case "a0":
+			return "/tools/a0", nil
+		case "pi":
+			return "/tools/pi", nil
+		default:
+			return "", errors.New("missing")
+		}
+	}, func(string, []string) (string, error) {
+		return "", errors.New("ACP unsupported")
+	})
+	if !ok || definition.Name != "pi" || command != "/tools/pi" {
+		t.Fatalf("detection after pre-ACP Agent Zero = %#v, %q, %t", definition, command, ok)
+	}
+}
 
 func TestDetectUsesCatalogPriorityAndAutomaticCommands(t *testing.T) {
 	seen := []string{}

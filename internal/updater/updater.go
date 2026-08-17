@@ -18,6 +18,9 @@ const (
 	DefaultCheckTimeout = 10 * time.Second
 	defaultRegistryURL  = "https://registry.npmjs.org/spynel/latest"
 	maxRegistryResponse = 64 * 1024
+	periodicChecksEnv   = "SPYNEL_NPM_PERIODIC_UPDATE_CHECKS"
+	checkedAtEnv        = "SPYNEL_NPM_UPDATE_CHECKED_AT"
+	latestVersionEnv    = "SPYNEL_NPM_UPDATE_LATEST"
 )
 
 // Result describes the installed and published npm versions. InstalledViaNPM
@@ -32,11 +35,38 @@ type Result struct {
 	Command         string
 }
 
+// PeriodicChecksEnabled reports whether the validated npm package is running
+// under an interactive launch that authorized proactive checks. Archive,
+// directly invoked, automatic-startup, and noninteractive processes must not
+// claim npm-owned periodic update state.
+func (m *Manager) PeriodicChecksEnabled() bool {
+	return m != nil && m.PackageRoot != "" && m.LauncherManaged && m.PeriodicChecks
+}
+
+// InitialAvailability reads the launcher's bounded startup-check snapshot.
+// A valid timestamp records an attempted check even when the registry failed;
+// in that case availability remains false until the next hourly refresh.
+func (m *Manager) InitialAvailability() (available bool, checkedAt time.Time, ok bool) {
+	if !m.PeriodicChecksEnabled() {
+		return false, time.Time{}, false
+	}
+	checkedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(os.Getenv(checkedAtEnv)))
+	if err != nil {
+		return false, time.Time{}, false
+	}
+	latest := strings.TrimSpace(os.Getenv(latestVersionEnv))
+	if _, valid := parseVersion(latest); valid {
+		available = compareVersions(latest, m.CurrentVersion) > 0
+	}
+	return available, checkedAt, true
+}
+
 // Manager owns npm release discovery and launcher-managed updates.
 type Manager struct {
 	CurrentVersion  string
 	PackageRoot     string
 	LauncherManaged bool
+	PeriodicChecks  bool
 	RegistryURL     string
 	CheckTimeout    time.Duration
 	Client          *http.Client
@@ -69,6 +99,7 @@ func Detect(currentVersion string) *Manager {
 	if validNPMRoot(root, currentVersion) {
 		manager.PackageRoot = root
 		manager.LauncherManaged = os.Getenv("SPYNEL_NPM_LAUNCHER_MANAGED") == "1"
+		manager.PeriodicChecks = os.Getenv(periodicChecksEnv) == "1"
 	}
 	return manager
 }
@@ -181,7 +212,11 @@ type parsedVersion struct {
 
 func parseVersion(value string) (parsedVersion, bool) {
 	raw := strings.TrimPrefix(strings.TrimSpace(value), "v")
-	withoutBuild := strings.SplitN(raw, "+", 2)[0]
+	buildParts := strings.Split(raw, "+")
+	if len(buildParts) > 2 || (len(buildParts) == 2 && !validIdentifiers(buildParts[1], false)) {
+		return parsedVersion{}, false
+	}
+	withoutBuild := buildParts[0]
 	parts := strings.SplitN(withoutBuild, "-", 2)
 	numbers := strings.Split(parts[0], ".")
 	if len(numbers) != 3 {
@@ -199,22 +234,33 @@ func parseVersion(value string) (parsedVersion, bool) {
 		parsed.numbers[index] = value
 	}
 	if len(parts) == 2 {
-		if parts[1] == "" {
+		if !validIdentifiers(parts[1], true) {
 			return parsedVersion{}, false
 		}
 		parsed.prerelease = strings.Split(parts[1], ".")
-		for _, identifier := range parsed.prerelease {
-			if identifier == "" {
-				return parsedVersion{}, false
-			}
-			for _, character := range identifier {
-				if (character < '0' || character > '9') && (character < 'A' || character > 'Z') && (character < 'a' || character > 'z') && character != '-' {
-					return parsedVersion{}, false
-				}
-			}
-		}
 	}
 	return parsed, true
+}
+
+func validIdentifiers(value string, rejectNumericLeadingZeros bool) bool {
+	for _, identifier := range strings.Split(value, ".") {
+		if identifier == "" {
+			return false
+		}
+		numeric := true
+		for _, character := range identifier {
+			if character < '0' || character > '9' {
+				numeric = false
+			}
+			if (character < '0' || character > '9') && (character < 'A' || character > 'Z') && (character < 'a' || character > 'z') && character != '-' {
+				return false
+			}
+		}
+		if rejectNumericLeadingZeros && numeric && len(identifier) > 1 && identifier[0] == '0' {
+			return false
+		}
+	}
+	return true
 }
 
 func compareVersions(left, right string) int {

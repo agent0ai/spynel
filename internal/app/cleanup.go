@@ -204,6 +204,19 @@ func (s *Service) UnregisterLiveTUI(instanceID string) {
 	s.liveTUIMu.Unlock()
 }
 
+func (s *Service) liveTUIConversation(instanceID string, now time.Time) string {
+	s.liveTUIMu.Lock()
+	defer s.liveTUIMu.Unlock()
+	var selected string
+	var selectedExpiry time.Time
+	for conversation, expires := range s.liveTUI[strings.TrimSpace(instanceID)] {
+		if expires.After(now) && (expires.After(selectedExpiry) || expires.Equal(selectedExpiry) && conversation < selected) {
+			selected, selectedExpiry = conversation, expires
+		}
+	}
+	return selected
+}
+
 func (s *Service) liveTUIConversations(now time.Time) map[string]bool {
 	s.liveTUIMu.Lock()
 	defer s.liveTUIMu.Unlock()

@@ -62,6 +62,11 @@ type failingServiceHarness struct {
 	err error
 }
 
+type observingServiceHarness struct {
+	*serviceHarness
+	beforeSend func()
+}
+
 type synchronousInterruptHarness struct {
 	*heldServiceHarness
 	err    error
@@ -81,6 +86,28 @@ type notificationRouter struct{ calls []string }
 func (r *notificationRouter) Deliver(_ context.Context, channelName, conversation, eventID, text string) error {
 	r.calls = append(r.calls, channelName+"/"+conversation+"/"+eventID+"/"+text)
 	return nil
+}
+
+type conversationEventRouter struct {
+	mu     sync.Mutex
+	events []core.Event
+}
+
+func (r *conversationEventRouter) Deliver(context.Context, string, string, string, string) error {
+	return nil
+}
+
+func (r *conversationEventRouter) DeliverEvent(_ context.Context, _, _, _ string, event core.Event) error {
+	r.mu.Lock()
+	r.events = append(r.events, event)
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *conversationEventRouter) snapshot() []core.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]core.Event(nil), r.events...)
 }
 
 func TestNotifyDeliversAllOriginsWithStableEventIdentity(t *testing.T) {
@@ -498,6 +525,13 @@ func (r *serviceHarness) Send(_ context.Context, key, prompt string, emit core.E
 	return thread, false, nil
 }
 
+func (r *observingServiceHarness) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	if r.beforeSend != nil {
+		r.beforeSend()
+	}
+	return r.serviceHarness.Send(ctx, key, prompt, emit)
+}
+
 func TestHarnessDispatchFailsClosedWhenDurableJobNumberCannotBeAllocated(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
@@ -516,7 +550,8 @@ func TestHarnessDispatchFailsClosedWhenDurableJobNumberCannotBeAllocated(t *test
 	}
 	service.Runtime.ConfigureJobArchive(blocked)
 
-	err = service.dispatchHarnessPrompt(context.Background(), core.Message{Channel: "tui", Conversation: "local", Text: "hello"}, "hello", nil)
+	message := core.Message{Channel: "tui", Conversation: "local", SourceMessageID: "local:admission-failure", Text: "hello"}
+	err = service.dispatchHarnessPrompt(context.Background(), message, "hello", nil)
 	if err == nil || !strings.Contains(err.Error(), "allocate durable job number") {
 		t.Fatalf("dispatch error = %v", err)
 	}
@@ -525,6 +560,9 @@ func TestHarnessDispatchFailsClosedWhenDurableJobNumberCannotBeAllocated(t *test
 	target.mu.Unlock()
 	if promptCount != 0 || service.Runtime.Status().Jobs != 0 {
 		t.Fatalf("failed admission reached harness or runtime: prompts=%d status=%#v", promptCount, service.Runtime.Status())
+	}
+	if service.conversationInFlight(sessionKey(message)) {
+		t.Fatal("failed durable job admission left conversation correlation in flight")
 	}
 }
 
@@ -732,6 +770,49 @@ func TestChatActivityEmitterReplacementOrdersNewStartBeforeOldRelease(t *testing
 	}
 	if len(events) != 7 || events[2].Kind != core.EventActivity || events[3].Kind != core.EventStatus || events[5].Kind != core.EventActivity || events[6].Kind != core.EventFinal {
 		t.Fatalf("replacement handoff ordering = %#v", events)
+	}
+}
+
+func TestChatActivityEmitterStopBeforeStartSuppressesLateActivation(t *testing.T) {
+	var events []core.Event
+	activity := newChatActivityEmitter(func(event core.Event) { events = append(events, event) })
+
+	activity.stop()
+	activity.start()
+	activity.stop()
+
+	if len(events) != 0 {
+		t.Fatalf("stop-before-start activity sequence = %#v, want no activation", events)
+	}
+}
+
+func TestServiceCloseStopsActiveChatActivity(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newHeldServiceHarness())
+	var events []core.Event
+	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "shutdown", Text: "active request"}, func(event core.Event) {
+		events = append(events, event)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var activity []bool
+	for _, event := range events {
+		if event.Kind == core.EventActivity {
+			activity = append(activity, event.Active)
+		}
+	}
+	if !reflect.DeepEqual(activity, []bool{true, false}) {
+		t.Fatalf("shutdown activity sequence = %v; events = %#v", activity, events)
 	}
 }
 
@@ -1601,7 +1682,21 @@ func TestStopCommandEventuallyFinalizesWhenProviderDoesNotTerminate(t *testing.T
 	service := New(cfg, target)
 	service.jobCancellationGrace = 10 * time.Millisecond
 	message := core.Message{Channel: "tui", Conversation: "stuck", Text: "active request"}
-	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+	var mu sync.Mutex
+	activity := 0
+	emit := func(event core.Event) {
+		if event.Kind != core.EventActivity {
+			return
+		}
+		mu.Lock()
+		if event.Active {
+			activity++
+		} else {
+			activity--
+		}
+		mu.Unlock()
+	}
+	if err := service.Handle(context.Background(), message, emit); err != nil {
 		t.Fatal(err)
 	}
 	job, ok := service.Runtime.JobForSession("chat:tui:stuck")
@@ -1609,7 +1704,7 @@ func TestStopCommandEventuallyFinalizesWhenProviderDoesNotTerminate(t *testing.T
 		t.Fatal("active job was not registered")
 	}
 	message.Text = "/stop"
-	if err := service.Handle(context.Background(), message, func(core.Event) {}); err != nil {
+	if err := service.Handle(context.Background(), message, emit); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -1617,6 +1712,12 @@ func TestStopCommandEventuallyFinalizesWhenProviderDoesNotTerminate(t *testing.T
 		_, live := service.Runtime.Job(job.ID)
 		archived, _, archiveErr := service.Runtime.ArchivedJob(job.StableID)
 		if archiveErr == nil && archived.State == string(JobCancelling) && !live {
+			mu.Lock()
+			remainingActivity := activity
+			mu.Unlock()
+			if remainingActivity != 0 {
+				t.Fatalf("cancelled job retained chat activity: %d", remainingActivity)
+			}
 			break
 		}
 		if time.Now().After(deadline) {
@@ -2398,6 +2499,9 @@ func TestHarnessAndModelCommandsUseSharedSettings(t *testing.T) {
 	}
 	if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != "harness" || len(response.Screen.Controls) != len(harness.Catalog()) || !response.Screen.SaveDisabled || response.Screen.InitialControl != "select:claude-code" || response.Screen.Controls[0].Kind != "action" {
 		t.Fatalf("/harness response = %#v", response)
+	}
+	if len(response.Screen.Controls) < 3 || response.Screen.Controls[0].Key != "select:codex" || response.Screen.Controls[1].Key != "select:claude-code" || response.Screen.Controls[2].Key != "select:agent-zero" {
+		t.Fatalf("leading /harness controls = %#v", response.Screen.Controls)
 	}
 	if next, err := service.ScreenAction(context.Background(), "harness", "select:codex", nil); err != nil || next == nil || next.ID != "welcome" || next.ActionMessage != "Saved `harness.name` = `codex` and connected the coding harness." || service.Settings.Snapshot().Harness.Name != "codex" {
 		t.Fatalf("harness screen selection = %#v, %v, config %#v", next, err, service.Settings.Snapshot().Harness)

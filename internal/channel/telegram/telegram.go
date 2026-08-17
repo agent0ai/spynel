@@ -28,23 +28,25 @@ import (
 )
 
 type Bot struct {
-	config       config.Telegram
-	token        string
-	client       *http.Client
-	baseURL      string
-	report       channel.StatusReporter
-	notice       channel.NoticeReporter
-	store        *media.Store
-	speech       media.Transcriber
-	me           telegramUser
-	activity     *channel.ActivityIndicator[string]
-	identity     *IdentityStore
-	log          io.Writer
-	allowedUsers func() []string
-	revoked      atomic.Bool
-	authLost     chan struct{}
-	authLostOnce sync.Once
-	listen       func(string, string) (net.Listener, error)
+	config            config.Telegram
+	token             string
+	client            *http.Client
+	baseURL           string
+	report            channel.StatusReporter
+	notice            channel.NoticeReporter
+	store             *media.Store
+	speech            media.Transcriber
+	me                telegramUser
+	activity          *channel.ActivityIndicator[string]
+	activityMu        sync.Mutex
+	proactiveActivity map[string][]func()
+	identity          *IdentityStore
+	log               io.Writer
+	allowedUsers      func() []string
+	revoked           atomic.Bool
+	authLost          chan struct{}
+	authLostOnce      sync.Once
+	listen            func(string, string) (net.Listener, error)
 }
 
 var errTelegramRuntimeAuthorization = errors.New("Telegram runtime authorization is unavailable: allowed_users has no valid user")
@@ -58,7 +60,7 @@ func NewWithIdentityStore(cfg config.Telegram, token, identityPath string) *Bot 
 	if timeout < 20*time.Second {
 		timeout = 20 * time.Second
 	}
-	bot := &Bot{config: cfg, token: token, client: &http.Client{Timeout: timeout}, baseURL: "https://api.telegram.org", identity: NewIdentityStore(identityPath), authLost: make(chan struct{}), listen: net.Listen}
+	bot := &Bot{config: cfg, token: token, client: &http.Client{Timeout: timeout}, baseURL: "https://api.telegram.org", identity: NewIdentityStore(identityPath), authLost: make(chan struct{}), listen: net.Listen, proactiveActivity: map[string][]func(){}}
 	bot.allowedUsers = func() []string { return cfg.AllowedUsers }
 	bot.activity = newTelegramActivity(bot, 4*time.Second)
 	return bot
@@ -145,6 +147,67 @@ func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string) e
 	}
 	_, err := b.sendWithIDs(ctx, chatID, text, 0, false)
 	return err
+}
+
+func (b *Bot) DeliverEvent(ctx context.Context, conversation, eventID string, event core.Event) error {
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
+	chatID, err := b.deliveryChatID(conversation)
+	if err != nil {
+		return err
+	}
+	if event.Kind == core.EventActivity {
+		b.activityMu.Lock()
+		if event.Active {
+			b.proactiveActivity[conversation] = append(b.proactiveActivity[conversation], b.activity.Start(ctx, chatID))
+			b.activityMu.Unlock()
+			return nil
+		}
+		stops := b.proactiveActivity[conversation]
+		if len(stops) > 0 {
+			stop := stops[len(stops)-1]
+			stops = stops[:len(stops)-1]
+			if len(stops) == 0 {
+				delete(b.proactiveActivity, conversation)
+			} else {
+				b.proactiveActivity[conversation] = stops
+			}
+			b.activityMu.Unlock()
+			stop()
+			return nil
+		}
+		b.activityMu.Unlock()
+		return nil
+	}
+	if event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+		text := event.Text
+		if event.Kind == core.EventFinal && event.FinalText != nil {
+			text = *event.FinalText
+		}
+		if event.Kind == core.EventError {
+			text = channel.ErrorResponse(text)
+		}
+		return b.Deliver(ctx, conversation, eventID, text)
+	}
+	return nil
+}
+
+func (b *Bot) deliveryChatID(conversation string) (string, error) {
+	if strings.HasPrefix(conversation, "TG-group-") {
+		if b.config.GroupMode == "off" {
+			return "", errors.New("Telegram group delivery is disabled")
+		}
+		return strings.TrimPrefix(conversation, "TG-group-"), nil
+	}
+	if strings.HasPrefix(conversation, "TG-") {
+		chatID := strings.TrimPrefix(conversation, "TG-")
+		if !b.identity.AuthorizedPrivate(b.liveAllowedUsers(), chatID) {
+			return "", errors.New("Telegram origin is not in allowed_users")
+		}
+		return chatID, nil
+	}
+	return "", errors.New("invalid Telegram conversation origin")
 }
 
 func (b *Bot) Run(ctx context.Context, handler channel.Handler) error {
@@ -456,11 +519,11 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 	}
 	err = handler(ctx, core.Message{
 		Channel: b.Name(), Conversation: b.conversationID(message), Sender: b.sender(message.From),
-		ReplyTo: telegramReplyTo(message), Text: text, ReceivedAt: time.Unix(message.Date, 0).UTC(),
+		SourceMessageID: fmt.Sprintf("telegram:%s:%d", chatID, message.MessageID), ReplyTo: telegramReplyTo(message), Text: text, ReceivedAt: time.Unix(message.Date, 0).UTC(),
 	}, emit)
 	if err != nil {
-		_ = b.send(context.Background(), chatID, channel.ErrorResponse(err.Error()), message.MessageID)
 		setActivity(false)
+		_ = b.send(context.Background(), chatID, channel.ErrorResponse(err.Error()), message.MessageID)
 		return
 	}
 	activityMu.Lock()

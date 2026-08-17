@@ -62,6 +62,8 @@ startup:
 orchestrator:
   enabled: true
   interval_seconds: 10
+  # Automatically processes stalled messages after restarts and disconnects.
+  retrigger_unresponded_messages: true
   # Higher-level agent audit; 0 disables it. Changes take effect live.
   semantic_heartbeat_minutes: 15
   # off, decide (agent sends or records a skip once), or always (agent sends unless safely impossible).

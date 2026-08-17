@@ -25,15 +25,61 @@ const (
 )
 
 type Entry struct {
-	At         time.Time `json:"at"`
-	Role       string    `json:"role"`
-	Sender     string    `json:"sender,omitempty"`
-	ReplyTo    string    `json:"reply_to,omitempty"`
-	Content    string    `json:"content"`
-	EventID    string    `json:"event_id,omitempty"`
-	AfterChars int       `json:"after_chars,omitempty"`
-	Terminal   bool      `json:"terminal,omitempty"`
-	compact    bool
+	At               time.Time `json:"at"`
+	Role             string    `json:"role"`
+	Sender           string    `json:"sender,omitempty"`
+	ReplyTo          string    `json:"reply_to,omitempty"`
+	Content          string    `json:"content"`
+	EventID          string    `json:"event_id,omitempty"`
+	AfterChars       int       `json:"after_chars,omitempty"`
+	Terminal         bool      `json:"terminal,omitempty"`
+	SourceMessageID  string    `json:"source_message_id,omitempty"`
+	AcceptedAt       time.Time `json:"accepted_at,omitempty"`
+	ExecutionID      string    `json:"execution_id,omitempty"`
+	Admission        string    `json:"admission,omitempty"`
+	Covers           []string  `json:"covers,omitempty"`
+	Outcome          string    `json:"outcome,omitempty"`
+	RetriggerOf      []string  `json:"retrigger_of,omitempty"`
+	Recovery         bool      `json:"recovery,omitempty"`
+	RecoveryBaseline bool      `json:"recovery_baseline,omitempty"`
+	compact          bool
+}
+
+// ActivateRecovery establishes the forward-only correlation boundary. The
+// first upgraded startup creates it without inspecting or rewriting history;
+// entries before it remain categorically ineligible for recovery.
+func (s *Store) ActivateRecovery() (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := filepath.Join(s.root, ".retrigger-v1.json")
+	data, err := os.ReadFile(path)
+	if err == nil {
+		var value struct {
+			ActivatedAt time.Time `json:"activated_at"`
+		}
+		if json.Unmarshal(data, &value) != nil || value.ActivatedAt.IsZero() {
+			return time.Time{}, errors.New("invalid conversation recovery activation baseline")
+		}
+		return value.ActivatedAt.UTC(), nil
+	}
+	if !os.IsNotExist(err) {
+		return time.Time{}, err
+	}
+	activatedAt := time.Now().UTC()
+	value := struct {
+		ActivatedAt time.Time `json:"activated_at"`
+	}{ActivatedAt: activatedAt}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := os.MkdirAll(s.root, 0o700); err != nil {
+		return time.Time{}, err
+	}
+	if err := fsx.AtomicWriteFile(path, append(encoded, '\n'), 0o600); err != nil {
+		return time.Time{}, err
+	}
+	return activatedAt, nil
 }
 
 type Conversation struct {
@@ -84,6 +130,10 @@ func clean(value string) string {
 func (s *Store) Append(channel, conversation string, entry Entry) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.appendLocked(channel, conversation, entry)
+}
+
+func (s *Store) appendLocked(channel, conversation string, entry Entry) (string, error) {
 	path := s.Path(channel, conversation)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
@@ -122,6 +172,89 @@ func (s *Store) Append(channel, conversation string, entry Entry) (string, error
 		}
 	}
 	return path, nil
+}
+
+// ReserveRetrigger atomically rechecks exact source coverage and appends one
+// recovery reservation. A concurrent terminal/cancellation append therefore
+// wins either before this check or after the durable retrigger fact, never in
+// an uncovered gap.
+func (s *Store) ReserveRetrigger(channel, conversation string, requested []string, activation, cutoff time.Time, max int) ([]Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	wanted := map[string]bool{}
+	for _, id := range requested {
+		if id != "" {
+			wanted[id] = true
+		}
+	}
+	covered := map[string]bool{}
+	admitted := map[string]bool{}
+	users := map[string]Entry{}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
+	count := 0
+	for scanner.Scan() {
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
+			continue
+		}
+		count++
+		if max > 0 && count > max {
+			return nil, fmt.Errorf("conversation history exceeds recovery bound of %d entries", max)
+		}
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return nil, errors.New("conversation history contains corrupt correlation data")
+		}
+		if entry.RecoveryBaseline {
+			covered = map[string]bool{}
+			admitted = map[string]bool{}
+			users = map[string]Entry{}
+			continue
+		}
+		for _, id := range entry.Covers {
+			covered[id] = true
+		}
+		for _, id := range entry.RetriggerOf {
+			covered[id] = true
+		}
+		if wanted[entry.SourceMessageID] && entry.Admission != "" {
+			admitted[entry.SourceMessageID] = true
+		}
+		if entry.Role == "user" && wanted[entry.SourceMessageID] && !entry.AcceptedAt.IsZero() && !entry.AcceptedAt.Before(activation) && !entry.At.Before(cutoff) {
+			users[entry.SourceMessageID] = entry
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(users))
+	for id := range users {
+		if !covered[id] {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if _, err := s.appendLocked(channel, conversation, Entry{Role: "correlation", RetriggerOf: ids}); err != nil {
+		return nil, err
+	}
+	result := make([]Entry, 0, len(ids))
+	for _, id := range ids {
+		entry := users[id]
+		if admitted[id] {
+			entry.Admission = "admitted"
+		}
+		result = append(result, entry)
+	}
+	return result, nil
 }
 
 // Ensure creates an empty durable conversation without adding a synthetic
@@ -218,6 +351,33 @@ func (s *Store) RecentEntries(channel, conversation string, messageLimit, charac
 	return entries, path, err
 }
 
+// RecentEntriesSnapshot returns a bounded visible tail and the exact byte
+// boundary it represents. A file follower can begin at that boundary without
+// losing or duplicating an append that races TUI startup.
+func (s *Store) RecentEntriesSnapshot(channel, conversation string, messageLimit, characterLimit int) ([]Entry, string, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, path, 0, nil
+	}
+	if err != nil {
+		return nil, path, 0, err
+	}
+	info, err := file.Stat()
+	file.Close()
+	if err != nil {
+		return nil, path, 0, err
+	}
+	boundary := info.Size()
+	if messageLimit == 0 || characterLimit <= 0 {
+		return nil, path, boundary, nil
+	}
+	entries, err := readRecentEntriesThrough(path, messageLimit, characterLimit, boundary)
+	return entries, path, boundary, err
+}
+
 func readRecentEntries(path string, messageLimit, characterLimit int) ([]Entry, error) {
 	file, err := os.Open(path)
 	if os.IsNotExist(err) {
@@ -231,7 +391,20 @@ func readRecentEntries(path string, messageLimit, characterLimit int) ([]Entry, 
 	if err != nil {
 		return nil, err
 	}
-	position := info.Size()
+	return readRecentEntriesThroughFile(file, messageLimit, characterLimit, info.Size())
+}
+
+func readRecentEntriesThrough(path string, messageLimit, characterLimit int, boundary int64) ([]Entry, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return readRecentEntriesThroughFile(file, messageLimit, characterLimit, boundary)
+}
+
+func readRecentEntriesThroughFile(file *os.File, messageLimit, characterLimit int, boundary int64) ([]Entry, error) {
+	position := boundary
 	var carry []byte
 	var reversed []Entry
 	used := 0
@@ -242,6 +415,9 @@ func readRecentEntries(path string, messageLimit, characterLimit int) ([]Entry, 
 		}
 		var entry Entry
 		if json.Unmarshal(line, &entry) != nil {
+			return
+		}
+		if entry.Role == "correlation" {
 			return
 		}
 		formatted := formatEntry(entry)
@@ -423,14 +599,24 @@ func truncateTail(value []rune, budget int) string {
 	return "…" + string(value[len(value)-budget+1:])
 }
 
-// Entries returns the complete structured history for one channel
-// conversation, in append order.
+// Entries returns the complete user-visible structured transcript for one
+// channel conversation in append order; private correlation facts remain
+// available only through recovery-specific strict readers.
 func (s *Store) Entries(channel, conversation string) ([]Entry, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	path := s.Path(channel, conversation)
 	entries, err := readEntries(path)
-	return entries, path, err
+	if err != nil {
+		return nil, path, err
+	}
+	visible := entries[:0]
+	for _, entry := range entries {
+		if entry.Role != "correlation" {
+			visible = append(visible, entry)
+		}
+	}
+	return visible, path, nil
 }
 
 func (s *Store) HasEntries(channel, conversation string) (bool, error) {
@@ -444,6 +630,107 @@ func (s *Store) HasEntries(channel, conversation string) (bool, error) {
 		return false, err
 	}
 	return info.Size() > 0, nil
+}
+
+// HasUserSourceID performs a bounded strict duplicate-admission check. A
+// bound or corruption error fails closed instead of accepting the message a
+// second time.
+func (s *Store) HasUserSourceID(channel, conversation, sourceID string) (bool, error) {
+	if sourceID == "" {
+		return false, nil
+	}
+	entries, _, err := s.RecoveryEntries(channel, conversation, 2000)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.Role == "user" && entry.SourceMessageID == sourceID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// RecoveryEntries strictly reads at most max append-only entries. Recovery
+// never skips corrupt JSON or silently truncates an oversized conversation.
+func (s *Store) RecoveryEntries(channel, conversation string, max int) ([]Entry, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, path, nil
+	}
+	if err != nil {
+		return nil, path, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
+	entries := make([]Entry, 0, min(max, 128))
+	for scanner.Scan() {
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
+			continue
+		}
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return nil, path, errors.New("conversation history contains corrupt correlation data")
+		}
+		entries = append(entries, entry)
+		if max > 0 && len(entries) > max {
+			return nil, path, fmt.Errorf("conversation history exceeds recovery bound of %d entries", max)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, path, err
+	}
+	return entries, path, nil
+}
+
+// RecoveryTail strictly validates a bounded file prefix while retaining only
+// the newest tailMax entries. It never treats omitted overflow as handled.
+func (s *Store) RecoveryTail(channel, conversation string, tailMax, scanMax int) ([]Entry, bool, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.Path(channel, conversation)
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, false, path, nil
+	}
+	if err != nil {
+		return nil, false, path, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
+	entries := make([]Entry, 0, min(tailMax, 128))
+	count := 0
+	for scanner.Scan() {
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
+			continue
+		}
+		count++
+		if scanMax > 0 && count > scanMax {
+			return nil, true, path, fmt.Errorf("conversation history exceeds recovery scan bound of %d entries", scanMax)
+		}
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return nil, false, path, errors.New("conversation history contains corrupt correlation data")
+		}
+		if tailMax <= 0 {
+			continue
+		}
+		if len(entries) == tailMax {
+			copy(entries, entries[1:])
+			entries[len(entries)-1] = entry
+		} else {
+			entries = append(entries, entry)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, false, path, err
+	}
+	return entries, tailMax > 0 && count > tailMax, path, nil
 }
 
 // List discovers conversations from disk and reads only one bounded tail entry
@@ -668,6 +955,10 @@ func (s *Store) BranchTo(sourceChannel, sourceConversation, targetChannel string
 		conversation := "resume-" + id
 		destination := s.Path(targetChannel, conversation)
 		if err := os.Link(temporary, destination); err == nil {
+			if _, appendErr := s.Append(targetChannel, conversation, Entry{Role: "correlation", RecoveryBaseline: true}); appendErr != nil {
+				_ = os.Remove(destination)
+				return "", "", appendErr
+			}
 			return conversation, destination, nil
 		} else if !os.IsExist(err) {
 			return "", "", err

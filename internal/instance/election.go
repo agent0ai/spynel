@@ -316,6 +316,28 @@ func (e *Election) Current() (Lease, error) {
 	return e.readLease()
 }
 
+// RunWhileOwner holds the election mutation boundary while action runs, but
+// only while the caller's exact ownership term remains current. This lets an
+// owner make a short durable admission indivisible with respect to takeover.
+func (e *Election) RunWhileOwner(token string, action func() error) (bool, error) {
+	ran := false
+	err := e.withLock(func() error {
+		current, err := e.readLease()
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if current.InstanceID != e.id || current.Token != token || current.HandoffTo != "" || stale(current, e.now()) {
+			return nil
+		}
+		ran = true
+		return action()
+	})
+	return ran, err
+}
+
 func (e *Election) IsStale(lease Lease) bool { return stale(lease, e.now()) }
 
 // RunWhileNoPrimaryLease holds the ownership mutation boundary while action

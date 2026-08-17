@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/channel"
 	"github.com/agent0ai/spynel/internal/config"
@@ -591,24 +592,27 @@ func (s *Service) NoticeEvents() <-chan channel.Notice { return s.noticeEvents }
 // intentionally excludes configuration secrets, log bodies, and conversation
 // contents.
 type SharedState struct {
-	Title           string                     `json:"title"`
-	Theme           string                     `json:"theme"`
-	Connections     []channel.ConnectionStatus `json:"connections"`
-	Pairings        []channel.PairingEvent     `json:"pairings"`
-	Runtime         core.RuntimeStatus         `json:"runtime"`
-	DurableWork     core.DurableWorkCounts     `json:"durable_work"`
-	WorkDiagnostics []string                   `json:"work_count_diagnostics,omitempty"`
-	NoticeSequence  uint64                     `json:"notice_sequence"`
-	Notice          channel.Notice             `json:"notice"`
+	Title                string                     `json:"title"`
+	Theme                string                     `json:"theme"`
+	Connections          []channel.ConnectionStatus `json:"connections"`
+	Pairings             []channel.PairingEvent     `json:"pairings"`
+	Runtime              core.RuntimeStatus         `json:"runtime"`
+	DurableWork          core.DurableWorkCounts     `json:"durable_work"`
+	WorkDiagnostics      []string                   `json:"work_count_diagnostics,omitempty"`
+	NoticeSequence       uint64                     `json:"notice_sequence"`
+	Notice               channel.Notice             `json:"notice"`
+	ConversationRecovery RecoveryStatus             `json:"conversation_recovery"`
+	ConversationActivity int                        `json:"conversation_activity,omitempty"`
 }
 
 func (s *Service) SharedState() SharedState {
 	work := s.Orchestrator.WorkStatus()
 	state := SharedState{
 		Title: s.currentTitle(), Theme: s.Settings.Snapshot().Channels.TUI.Theme,
-		Runtime:         s.Runtime.Status(),
-		DurableWork:     core.DurableWorkCounts{Tasks: work.TasksActive, Goals: work.GoalsActive},
-		WorkDiagnostics: append([]string(nil), work.CountDiagnostics...),
+		Runtime:              s.Runtime.Status(),
+		DurableWork:          core.DurableWorkCounts{Tasks: work.TasksActive, Goals: work.GoalsActive},
+		WorkDiagnostics:      append([]string(nil), work.CountDiagnostics...),
+		ConversationRecovery: s.RecoveryStatus(),
 	}
 	s.connectionMu.RLock()
 	for _, name := range []string{"telegram", "whatsapp"} {
@@ -631,6 +635,20 @@ func (s *Service) SharedState() SharedState {
 	return state
 }
 
+// SharedStateForInstance adds only the caller TUI's selected-conversation
+// activity count. It never exposes conversation identities on shared state.
+func (s *Service) SharedStateForInstance(instanceID string) SharedState {
+	state := s.SharedState()
+	conversation := s.liveTUIConversation(instanceID, time.Now().UTC())
+	if conversation == "" {
+		return state
+	}
+	s.conversationActivityMu.Lock()
+	state.ConversationActivity = s.conversationActivity["tui/"+conversation]
+	s.conversationActivityMu.Unlock()
+	return state
+}
+
 func (s *Service) harnessCommand(message core.Message, remainder string, emit core.Emit) error {
 	if strings.TrimSpace(remainder) != "" {
 		name := harness.NormalizeName(remainder)
@@ -644,6 +662,10 @@ func (s *Service) harnessCommand(message core.Message, remainder string, emit co
 			definition, _ := harness.Lookup(name)
 			if definition.Custom {
 				return s.localReply(message, "Saved `harness.name` = `acp`, but the custom ACP command is unavailable. Set `harness.acp_command` and optional command-line `harness.acp_args`, then run `/harness acp` again.", emit)
+			}
+			var capabilityErr *harness.CapabilityError
+			if errors.As(err, &capabilityErr) {
+				return s.localReply(message, fmt.Sprintf("Saved `harness.name` = `%s`, but **%s** is unavailable: %s. Install it from %s, then run `/harness %s` again.", name, definition.DisplayName, err, definition.InstallURL, name), emit)
 			}
 			return s.localReply(message, fmt.Sprintf("Saved `harness.name` = `%s`. **%s** is not installed or not on PATH. Install it from %s, then run `/harness %s` again to connect.", name, definition.DisplayName, definition.InstallURL, name), emit)
 		}
@@ -994,6 +1016,9 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	}
 	if !reflect.DeepEqual(previous.Orchestrator, next.Orchestrator) || previous.Workspace.CleanupRetentionDays != next.Workspace.CleanupRetentionDays {
 		s.Orchestrator.ApplyRuntimeConfig(next)
+		if !previous.Orchestrator.RetriggerUnrespondedMessages && next.Orchestrator.RetriggerUnrespondedMessages {
+			s.triggerRecoveryScan("configuration")
+		}
 	} else if harnessAgentPolicyChanged(previous.Harness, next.Harness) {
 		s.Orchestrator.ApplyHarnessConfig(next.Harness)
 	}
@@ -1253,6 +1278,8 @@ func settingsScreen(cfg config.Config, section string) core.Screen {
 			label = "context character limit"
 		case "workspace.attachment_max_mb":
 			label = "attachment size limit (MB)"
+		case "orchestrator.retrigger_unresponded_messages":
+			label = "re-trigger unresponded messages"
 		case "startup.enabled":
 			label = "run at startup"
 		}

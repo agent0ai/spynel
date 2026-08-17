@@ -18,6 +18,14 @@ const ScopeDisciplineGuidance = `Stay within the assigned scope; prioritize the 
 
 const scopeDisciplineSection = "## Framework scope discipline\n\n" + ScopeDisciplineGuidance
 
+const DeveloperScopeDisciplineGuidance = `For implementation, apply an 80/20 standard: solve the observed problem and common realistic paths with the smallest clear, maintainable change; reuse existing mechanisms; keep verification proportional to actual risk; and stop when the requested outcome is reliably achieved. Do not add abstractions, state machines, queues, synchronization machinery, broad refactors, speculative fallbacks, or large test matrices solely for improbable hypothetical cases. Add complexity when explicit acceptance criteria or credible evidence from the affected system requires it, or when needed to preserve authorization, security, privacy, destructive-action safety, data integrity, lifecycle invariants, or another essential correctness boundary.`
+
+const developerScopeDisciplineSection = "## Framework implementation 80/20 discipline\n\n" + DeveloperScopeDisciplineGuidance
+
+const ReviewerScopeDisciplineGuidance = `For review, judge practical correctness, regressions in realistic supported use, maintainability, and scope discipline. Do not reject adequate work solely for contrived interleavings, arbitrary stress limits, unrelated flaky checks, theoretical perfection, or requirements invented beyond the task. Treat overengineering as a defect when its complexity materially harms the change, and prefer removal or simplification when that complexity has weak expected value. Explicit requirements and evidence-backed correctness, authorization, security, privacy, destructive-action safety, data-integrity, or lifecycle defects remain valid reasons to reject.`
+
+const reviewerScopeDisciplineSection = "## Framework review 80/20 discipline\n\n" + ReviewerScopeDisciplineGuidance
+
 const EpistemicTrustGuidance = `## Evidence-grounded honesty
 
 Never knowingly lie, fabricate evidence, invent a cause, imply that you inspected something you did not inspect, or present an assumption, inference, recollection, stale chat claim, or unverified external condition as established fact. Distinguish what you directly observed, what durable or source-backed evidence establishes, what you infer, what remains uncertain, and what you do not know.
@@ -55,6 +63,25 @@ func InjectScopeDiscipline(prompt string) string {
 		return prompt
 	}
 	return strings.TrimRight(prompt, "\r\n") + "\n\n" + scopeDisciplineSection
+}
+
+// InjectRoleScopeDiscipline adds the role-specific 80/20 rule used by task and
+// goal implementation or review sessions after the common framework rule.
+func InjectRoleScopeDiscipline(prompt string, role Role) string {
+	prompt = InjectScopeDiscipline(prompt)
+	section := ""
+	switch role {
+	case Developer:
+		section = developerScopeDisciplineSection
+	case Reviewer:
+		section = reviewerScopeDisciplineSection
+	default:
+		return prompt
+	}
+	if strings.Contains(prompt, section) {
+		return prompt
+	}
+	return strings.TrimRight(prompt, "\r\n") + "\n\n" + section
 }
 
 // EnsureChatGuidance enforces framework-owned chat behavior for both stock and

@@ -12,6 +12,7 @@
 - Preserve streaming message/event ordering and cancellation while keeping status, conversations, commands, configuration, logs, and job views non-secret.
 - Carry authoritative durable task/goal counts and bounded census diagnostics in shared-state snapshots so every attached TUI can refresh through ordinary polling.
 - Carry authenticated renewable TUI conversation leases to the owner so retention cleanup protects every attached idle client, including short-lived prior identities during a conversation switch. Screen actions carry the caller instance identity so a resumed branch is registered inside the owner-side creation boundary before the response exposes it. A replacement owner fences cleanup for one full lease duration while existing clients renew into its process-local registry.
+- Scope shared-state recovery activity to the authenticated caller instance's currently selected live TUI conversation and expose only its count, never a conversation identity or workspace-wide activity map. Return the first scoped snapshot with live-conversation registration so TUI startup never seeds activity from pre-registration readiness state.
 - Protocol changes require coordinated client/server tests and compatibility-aware error handling.
 - The authenticated notify request requires exactly one of explicit `origin` or boolean `recent_authorized`; recent resolution stays owner-side and responses expose only the durable event ID, never the chosen conversation or activity evidence.
 

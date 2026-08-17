@@ -139,7 +139,7 @@ func (s *Server) liveTUI(response http.ResponseWriter, request *http.Request) {
 		http.Error(response, err.Error(), http.StatusBadRequest)
 		return
 	}
-	response.WriteHeader(http.StatusNoContent)
+	writeJSON(response, http.StatusOK, s.Service.SharedStateForInstance(input.InstanceID))
 }
 
 func (s *Server) diagnostic(response http.ResponseWriter, request *http.Request) {
@@ -217,8 +217,8 @@ func (s *Server) health(response http.ResponseWriter, _ *http.Request) {
 	response.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) state(response http.ResponseWriter, _ *http.Request) {
-	writeJSON(response, http.StatusOK, s.Service.SharedState())
+func (s *Server) state(response http.ResponseWriter, request *http.Request) {
+	writeJSON(response, http.StatusOK, s.Service.SharedStateForInstance(request.URL.Query().Get("instance_id")))
 }
 
 func (s *Server) status(response http.ResponseWriter, request *http.Request) {

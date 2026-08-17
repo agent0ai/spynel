@@ -282,6 +282,39 @@ func TestStaleTakeoverFencesFormerOwner(t *testing.T) {
 	}
 }
 
+func TestRunWhileOwnerFencesFormerTermAfterStaleTakeover(t *testing.T) {
+	state := t.TempDir()
+	first, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := New(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 16, 9, 0, 0, 0, time.UTC)
+	first.now = func() time.Time { return now }
+	second.now = func() time.Time { return now }
+	firstToken, _ := first.NewToken()
+	if _, acquired, err := first.TryAcquire("127.0.0.1:10001", firstToken); err != nil || !acquired {
+		t.Fatalf("first acquire = %t, %v", acquired, err)
+	}
+
+	now = now.Add(StaleAfter)
+	secondToken, _ := second.NewToken()
+	if _, acquired, err := second.TryAcquire("127.0.0.1:10002", secondToken); err != nil || !acquired {
+		t.Fatalf("stale takeover = %t, %v", acquired, err)
+	}
+	formerRan := false
+	if ran, err := first.RunWhileOwner(firstToken, func() error { formerRan = true; return nil }); err != nil || ran || formerRan {
+		t.Fatalf("former term admission = ran %t action %t err %v", ran, formerRan, err)
+	}
+	currentRan := false
+	if ran, err := second.RunWhileOwner(secondToken, func() error { currentRan = true; return nil }); err != nil || !ran || !currentRan {
+		t.Fatalf("current term admission = ran %t action %t err %v", ran, currentRan, err)
+	}
+}
+
 func TestRenewalKeepsLeaseFreshAndReleaseIsImmediate(t *testing.T) {
 	election, err := New(t.TempDir())
 	if err != nil {

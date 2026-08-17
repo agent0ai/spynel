@@ -1,6 +1,11 @@
 package core
 
-import "time"
+import (
+	"crypto/rand"
+	"encoding/base32"
+	"strings"
+	"time"
+)
 
 const SpynelASCII = `    ████     ████     ███████ ██████  ██    ██ ███    ██ ███████ ██
   ██    ██ ██    ██   ██      ██   ██  ██  ██  ████   ██ ██      ██
@@ -19,7 +24,11 @@ const ScreenWhatsAppQR = "fullscreen:whatsapp:qr"
 type Message struct {
 	Channel      string `json:"channel"`
 	Conversation string `json:"conversation"`
-	Sender       string `json:"sender,omitempty"`
+	// SourceMessageID is the stable transport or client-owned identity for one
+	// accepted human message. It is private correlation metadata, not a public
+	// job or conversation identifier.
+	SourceMessageID string `json:"source_message_id,omitempty"`
+	Sender          string `json:"sender,omitempty"`
 	// ReplyTo is a bounded provider-neutral reference derived only from the
 	// accepted inbound event: native message ID followed by an optional preview.
 	ReplyTo      string    `json:"reply_to,omitempty"`
@@ -27,6 +36,16 @@ type Message struct {
 	FollowupOnly bool      `json:"followup_only,omitempty"`
 	Text         string    `json:"text"`
 	ReceivedAt   time.Time `json:"received_at"`
+}
+
+// NewSourceMessageID returns a private client-owned identity that survives a
+// loopback retry when retained on the Message value.
+func NewSourceMessageID() (string, error) {
+	data := make([]byte, 16)
+	if _, err := rand.Read(data); err != nil {
+		return "", err
+	}
+	return "local:" + strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(data)), nil
 }
 
 // Event is a streamed harness or application response.

@@ -46,6 +46,7 @@ func Settings(cfg Config) []Setting {
 		{Key: "channels.tui.theme", Section: "config", Description: "Active color theme from .spynel/themes", Value: cfg.Channels.TUI.Theme, Advanced: true},
 		{Key: "orchestrator.enabled", Section: "config", Description: "Run Markdown task and goal routes", Value: formatBool(cfg.Orchestrator.Enabled), Choices: []string{"on", "off"}, Advanced: true},
 		{Key: "orchestrator.interval_seconds", Section: "config", Description: "Live route scan interval; saving resets the next scan deadline", Value: strconv.Itoa(cfg.Orchestrator.IntervalSec), Advanced: true},
+		{Key: "orchestrator.retrigger_unresponded_messages", Section: "config", Description: "Automatically processes stalled messages after restarts and disconnects.", Value: formatBool(cfg.Orchestrator.RetriggerUnrespondedMessages), Choices: []string{"on", "off"}, Advanced: true},
 		{Key: "orchestrator.semantic_heartbeat_minutes", Section: "config", Description: "Fixed delay after each agent workflow audit completes; 0 disables it", Value: strconv.Itoa(cfg.Orchestrator.SemanticHeartbeatMinutes), Advanced: true},
 		{Key: "orchestrator.task_notifications", Section: "config", Description: "Live policy context for direct task notification agents", Value: cfg.Orchestrator.TaskNotifications, Choices: []string{TaskNotificationsOff, TaskNotificationsDecide, TaskNotificationsAlways}, Advanced: true},
 		{Key: "orchestrator.max_parallel", Section: "config", Description: "Live maximum concurrent Markdown jobs; lowering never cancels active work", Value: strconv.Itoa(cfg.Orchestrator.MaxParallel), Advanced: true},
@@ -187,6 +188,8 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Orchestrator.Enabled, err = parseBoolean()
 	case "orchestrator.interval_seconds":
 		cfg.Orchestrator.IntervalSec, err = parseInteger(1)
+	case "orchestrator.retrigger_unresponded_messages":
+		cfg.Orchestrator.RetriggerUnrespondedMessages, err = parseBoolean()
 	case "orchestrator.semantic_heartbeat_minutes":
 		cfg.Orchestrator.SemanticHeartbeatMinutes, err = parseInteger(0)
 	case "orchestrator.task_notifications":

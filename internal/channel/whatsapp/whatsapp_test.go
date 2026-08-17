@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -205,8 +206,8 @@ func TestWhatsAppWorkerReplyValueReachesProviderNeutralMessage(t *testing.T) {
 		return nil
 	}
 	chat := types.NewJID("15551234567", types.DefaultUserServer)
-	client.handleWithReply(time.Unix(10, 0), chat, "15557654321", "/tasks", "quoted-id referenced text", func() {})
-	if got.ReplyTo != "quoted-id referenced text" || got.Text != "/tasks" {
+	client.handleWithReplyID(time.Unix(10, 0), chat, "15557654321", "/tasks", "quoted-id referenced text", "whatsapp:chat:stanza", func() {})
+	if got.ReplyTo != "quoted-id referenced text" || got.Text != "/tasks" || got.SourceMessageID != "whatsapp:chat:stanza" {
 		t.Fatalf("provider-neutral message = %#v", got)
 	}
 }
@@ -273,6 +274,54 @@ func TestWhatsAppFormatsErrorsAsOrdinaryUnindentedResponses(t *testing.T) {
 		default:
 			t.Fatalf("WhatsApp did not send error reply %q", want)
 		}
+	}
+}
+
+func TestWhatsAppHandlerFailurePausesBeforeErrorDelivery(t *testing.T) {
+	client := New(config.WhatsApp{AllowedNumbers: []string{"15551234567"}}, filepath.Join(t.TempDir(), "whatsapp.db"))
+	client.ctx = context.Background()
+	composingRelease := make(chan struct{})
+	var mu sync.Mutex
+	var ordering []string
+	client.presence = func(_ context.Context, _ types.JID, state types.ChatPresence, _ types.ChatPresenceMedia) error {
+		if state == types.ChatPresenceComposing {
+			<-composingRelease
+			return nil
+		}
+		mu.Lock()
+		ordering = append(ordering, string(state))
+		mu.Unlock()
+		return nil
+	}
+	client.deliver = func(_ context.Context, _ types.JID, _ *waE2E.Message) (whatsmeow.SendResponse, error) {
+		mu.Lock()
+		ordering = append(ordering, "delivered")
+		mu.Unlock()
+		return whatsmeow.SendResponse{ID: types.MessageID("sent")}, nil
+	}
+	client.handler = func(_ context.Context, _ core.Message, emit core.Emit) error {
+		emit(core.Event{Kind: core.EventActivity, Active: true})
+		emit(core.Event{Kind: core.EventActivity})
+		return errors.New("provider admission failed")
+	}
+
+	chat := types.NewJID("15551234567", types.DefaultUserServer)
+	client.handle(time.Unix(10, 0), chat, "15557654321", "hello")
+	close(composingRelease)
+
+	mu.Lock()
+	defer mu.Unlock()
+	pause, delivered := -1, -1
+	for index, event := range ordering {
+		if event == string(types.ChatPresencePaused) && pause < 0 {
+			pause = index
+		}
+		if event == "delivered" {
+			delivered = index
+		}
+	}
+	if pause < 0 || delivered < 0 || pause > delivered {
+		t.Fatalf("handler failure ordering = %#v", ordering)
 	}
 }
 
@@ -631,7 +680,7 @@ func TestWhatsAppVoiceIsStreamedToAttachmentStore(t *testing.T) {
 	}
 }
 
-func TestWhatsAppTypingRefreshesThroughVoiceTranscriptionAndAgentTurn(t *testing.T) {
+func TestWhatsAppTypingStartsOnlyForAgentTurnAfterVoiceTranscription(t *testing.T) {
 	root := t.TempDir()
 	client := New(config.WhatsApp{AllowedNumbers: []string{"15551234567"}}, filepath.Join(root, "whatsapp.db"))
 	transcriptionEntered := make(chan struct{})
@@ -655,8 +704,10 @@ func TestWhatsAppTypingRefreshesThroughVoiceTranscriptionAndAgentTurn(t *testing
 		return err
 	}
 	client.handler = func(_ context.Context, _ core.Message, emit core.Emit) error {
+		emit(core.Event{Kind: core.EventActivity, Active: true})
 		close(agentEntered)
 		<-agentRelease
+		emit(core.Event{Kind: core.EventActivity})
 		emit(core.Event{Kind: core.EventFinal, Done: true})
 		return nil
 	}
@@ -672,13 +723,98 @@ func TestWhatsAppTypingRefreshesThroughVoiceTranscriptionAndAgentTurn(t *testing
 		}},
 	}
 	waitWhatsAppClosed(t, transcriptionEntered, "WhatsApp transcription")
-	waitWhatsAppPresence(t, presenceEvents, types.ChatPresenceComposing)
-	waitWhatsAppPresence(t, presenceEvents, types.ChatPresenceComposing)
+	assertNoWhatsAppPresence(t, presenceEvents, "voice transcription without an admitted agent turn")
 	close(transcriptionRelease)
 	waitWhatsAppClosed(t, agentEntered, "WhatsApp agent turn")
 	waitWhatsAppPresence(t, presenceEvents, types.ChatPresenceComposing)
 	close(agentRelease)
 	waitWhatsAppPresence(t, presenceEvents, types.ChatPresencePaused)
+}
+
+func TestWhatsAppEventlessAndFrameworkOnlyIntakeDoNotCompose(t *testing.T) {
+	client := New(config.WhatsApp{AllowedNumbers: []string{"15551234567"}}, filepath.Join(t.TempDir(), "whatsapp.db"))
+	presenceEvents := make(chan types.ChatPresence, 8)
+	client.presence = func(_ context.Context, _ types.JID, state types.ChatPresence, _ types.ChatPresenceMedia) error {
+		presenceEvents <- state
+		return nil
+	}
+	client.activity = newWhatsAppActivity(client, 10*time.Millisecond)
+	client.ctx = context.Background()
+	chat := types.NewJID("15551234567", types.DefaultUserServer)
+
+	client.handler = func(context.Context, core.Message, core.Emit) error { return nil }
+	client.handleWithReplyID(time.Unix(10, 0), chat, "15557654321", "duplicate", "", "whatsapp:chat:duplicate", nil)
+	assertNoWhatsAppPresence(t, presenceEvents, "eventless duplicate intake")
+
+	client.handler = func(_ context.Context, _ core.Message, emit core.Emit) error {
+		emit(core.Event{Kind: core.EventFinal, Text: "local result", Done: true, Local: true})
+		return nil
+	}
+	client.handleWithReplyID(time.Unix(11, 0), chat, "15557654321", "/status", "", "whatsapp:chat:command", nil)
+	assertNoWhatsAppPresence(t, presenceEvents, "framework-only command")
+}
+
+func TestWhatsAppProactiveConversationEventUsesComposingLifecycle(t *testing.T) {
+	client := New(config.WhatsApp{AllowedNumbers: []string{"15551234567"}}, filepath.Join(t.TempDir(), "whatsapp.db"))
+	presenceEvents := make(chan types.ChatPresence, 8)
+	client.presence = func(_ context.Context, _ types.JID, state types.ChatPresence, _ types.ChatPresenceMedia) error {
+		presenceEvents <- state
+		return nil
+	}
+	client.activity = newWhatsAppActivity(client, 10*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := client.DeliverEvent(ctx, "WA-15551234567", "activity", core.Event{Kind: core.EventActivity, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitWhatsAppPresence(t, presenceEvents, types.ChatPresenceComposing)
+	if err := client.DeliverEvent(ctx, "WA-15551234567", "activity", core.Event{Kind: core.EventActivity}); err != nil {
+		t.Fatal(err)
+	}
+	waitWhatsAppPresence(t, presenceEvents, types.ChatPresencePaused)
+}
+
+func TestWhatsAppRecoveredActivityPausesBeforeTerminalDelivery(t *testing.T) {
+	client := New(config.WhatsApp{AllowedNumbers: []string{"15551234567"}}, filepath.Join(t.TempDir(), "whatsapp.db"))
+	var mu sync.Mutex
+	var ordering []string
+	client.presence = func(_ context.Context, _ types.JID, state types.ChatPresence, _ types.ChatPresenceMedia) error {
+		mu.Lock()
+		ordering = append(ordering, string(state))
+		mu.Unlock()
+		return nil
+	}
+	client.deliverID = func(context.Context, types.JID, *waE2E.Message, types.MessageID) (whatsmeow.SendResponse, error) {
+		mu.Lock()
+		ordering = append(ordering, "delivered")
+		mu.Unlock()
+		return whatsmeow.SendResponse{}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := client.DeliverEvent(ctx, "WA-15551234567", "activity", core.Event{Kind: core.EventActivity, Active: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.DeliverEvent(ctx, "WA-15551234567", "activity", core.Event{Kind: core.EventActivity}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.DeliverEvent(ctx, "WA-15551234567", "terminal", core.Event{Kind: core.EventFinal, Text: "done", Done: true}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	pause, delivered := -1, -1
+	for index, event := range ordering {
+		if event == string(types.ChatPresencePaused) && pause < 0 {
+			pause = index
+		}
+		if event == "delivered" {
+			delivered = index
+		}
+	}
+	if pause < 0 || delivered < 0 || pause > delivered {
+		t.Fatalf("recovered activity ordering = %#v", ordering)
+	}
 }
 
 func waitWhatsAppPresence(t *testing.T, events <-chan types.ChatPresence, want types.ChatPresence) {
@@ -693,6 +829,15 @@ func waitWhatsAppPresence(t *testing.T, events <-chan types.ChatPresence, want t
 		case <-deadline:
 			t.Fatalf("timed out waiting for WhatsApp presence %q", want)
 		}
+	}
+}
+
+func assertNoWhatsAppPresence(t *testing.T, events <-chan types.ChatPresence, boundary string) {
+	t.Helper()
+	select {
+	case event := <-events:
+		t.Fatalf("%s emitted WhatsApp presence %q", boundary, event)
+	case <-time.After(30 * time.Millisecond):
 	}
 }
 

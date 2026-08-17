@@ -9,7 +9,26 @@ const { resolve } = require("./platform");
 const { install, validateArchiveEntries, validateExtractedTree } = require("./install");
 const { prepareRelease, releaseMetadata, rewriteReadme } = require("./prepare-release");
 const { STARTUP_PROMPT_TIMEOUT_MS, checkForUpdate, compareVersions, promptForStartupUpdate, shouldCheckAtStartup } = require("./update");
+const { createLaunchEnvironment } = require("./bin/spynel");
 const pkg = require("../package.json");
+
+const staleSnapshot = {
+  SPYNEL_NPM_PERIODIC_UPDATE_CHECKS: "1",
+  SPYNEL_NPM_UPDATE_CHECKED_AT: "2000-01-01T00:00:00Z",
+  SPYNEL_NPM_UPDATE_LATEST: "99.0.0",
+};
+const successfulSnapshot = createLaunchEnvironment(staleSnapshot, true, "2026-08-16T07:00:00Z", { latest: "0.3.0" });
+assert.strictEqual(successfulSnapshot.SPYNEL_NPM_PERIODIC_UPDATE_CHECKS, "1");
+assert.strictEqual(successfulSnapshot.SPYNEL_NPM_UPDATE_CHECKED_AT, "2026-08-16T07:00:00Z");
+assert.strictEqual(successfulSnapshot.SPYNEL_NPM_UPDATE_LATEST, "0.3.0");
+const failedSnapshot = createLaunchEnvironment(staleSnapshot, true, "2026-08-16T07:00:00Z");
+assert.strictEqual(failedSnapshot.SPYNEL_NPM_PERIODIC_UPDATE_CHECKS, "1");
+assert.strictEqual(failedSnapshot.SPYNEL_NPM_UPDATE_CHECKED_AT, "2026-08-16T07:00:00Z");
+assert.strictEqual(failedSnapshot.SPYNEL_NPM_UPDATE_LATEST, undefined);
+const skippedSnapshot = createLaunchEnvironment(staleSnapshot, false);
+assert.strictEqual(skippedSnapshot.SPYNEL_NPM_PERIODIC_UPDATE_CHECKS, undefined);
+assert.strictEqual(skippedSnapshot.SPYNEL_NPM_UPDATE_CHECKED_AT, undefined);
+assert.strictEqual(skippedSnapshot.SPYNEL_NPM_UPDATE_LATEST, undefined);
 
 assert.deepStrictEqual(resolve("linux", "x64"), { os: "linux", arch: "amd64", ext: "tar.gz" });
 assert.deepStrictEqual(resolve("linux", "arm64"), { os: "linux", arch: "arm64", ext: "tar.gz" });

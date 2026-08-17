@@ -181,8 +181,12 @@ func TestClientStreamsIndependentTUIConversationsThroughOwner(t *testing.T) {
 		_ = election.Release(lease.Token)
 	}()
 	client := NewClient(election)
-	if err := client.RegisterLiveTUI(context.Background(), "idle-live"); err != nil {
+	registeredState, err := client.RegisterLiveTUIState(context.Background(), "idle-live")
+	if err != nil {
 		t.Fatalf("register live TUI: %v", err)
+	}
+	if registeredState.Title != "Spynel" || len(registeredState.Connections) != 2 {
+		t.Fatalf("registration state = %#v", registeredState)
 	}
 	if err := client.UnregisterLiveTUI(context.Background()); err != nil {
 		t.Fatalf("unregister live TUI: %v", err)

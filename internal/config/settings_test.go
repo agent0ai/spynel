@@ -8,7 +8,7 @@ import (
 
 func TestOnlyExtensionSettingsRequireRestart(t *testing.T) {
 	cfg := Default()
-	for _, key := range []string{"orchestrator.enabled", "orchestrator.interval_seconds", "orchestrator.semantic_heartbeat_minutes", "orchestrator.task_notifications", "orchestrator.max_parallel"} {
+	for _, key := range []string{"orchestrator.enabled", "orchestrator.interval_seconds", "orchestrator.retrigger_unresponded_messages", "orchestrator.semantic_heartbeat_minutes", "orchestrator.task_notifications", "orchestrator.max_parallel"} {
 		setting, ok := SettingByKey(cfg, key)
 		if !ok || setting.Restart {
 			t.Fatalf("live setting %q = %#v, present %t", key, setting, ok)
@@ -147,6 +147,10 @@ func TestWhatsAppAllowedNumbersAreDescribedAsRequired(t *testing.T) {
 
 func TestMainSettingsExposeOnlySimpleHarnessChoicesAndPutAdvancedLast(t *testing.T) {
 	cfg := Default()
+	harnessName, ok := SettingByKey(cfg, "harness.name")
+	if !ok || len(harnessName.Choices) < 3 || strings.Join(harnessName.Choices[:3], ",") != "codex,claude-code,agent-zero" {
+		t.Fatalf("leading harness setting choices = %#v, %t", harnessName.Choices, ok)
+	}
 	var essential []string
 	advancedStarted := false
 	for _, setting := range Settings(cfg) {

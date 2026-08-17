@@ -590,7 +590,8 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 		// Admit the selected conversation before reading it. Cleanup serializes
 		// this registration with its protection snapshot and deletion, so a
 		// history cannot disappear between startup selection and live ownership.
-		if err := client.RegisterLiveTUI(ctx, conversation); err != nil {
+		shared, err = client.RegisterLiveTUIState(ctx, conversation)
+		if err != nil {
 			return serverResult(fmt.Errorf("register live TUI conversation: %w", err))
 		}
 		defer func() {
@@ -598,7 +599,7 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 			defer cancel()
 			_ = client.UnregisterLiveTUI(cleanupCtx)
 		}()
-		initialHistory, _, err := histories.RecentEntries("tui", conversation, initialTUIHistoryMessages, initialTUIHistoryChars)
+		initialHistory, historyPath, historyOffset, err := histories.RecentEntriesSnapshot("tui", conversation, initialTUIHistoryMessages, initialTUIHistoryChars)
 		if err != nil {
 			return serverResult(fmt.Errorf("load TUI history: %w", err))
 		}
@@ -610,8 +611,19 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 		if err != nil {
 			return serverResult(fmt.Errorf("load initial TUI screen: %w", err))
 		}
-		stateEvents := startTUIStatePolling(ctx, client, shared, cfg.StatePath("themes"))
-		notificationEvents := watchTaskNotifications(ctx, histories.Path("tui", conversation))
+		stateEvents := startTUIStatePolling(ctx, client, shared, cfg.StatePath("themes"), conversation)
+		notificationEvents := watchTaskNotifications(ctx, historyPath, historyOffset)
+		updateManager := updater.Detect(version)
+		var updateCheck func(context.Context) (bool, error)
+		var updateAvailable bool
+		var updateCheckedAt time.Time
+		if updateManager.PeriodicChecksEnabled() {
+			updateAvailable, updateCheckedAt, _ = updateManager.InitialAvailability()
+			updateCheck = func(checkContext context.Context) (bool, error) {
+				result, checkErr := updateManager.Check(checkContext)
+				return result.Available, checkErr
+			}
+		}
 		err = tui.Run(ctx, shared.Title, client.Handle, app.SlashCommands(), initialHistory, tui.Options{
 			Conversation: conversation,
 			Version:      version,
@@ -631,12 +643,16 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 			PairingEvents:      stateEvents.pairings,
 			NoticeEvents:       stateEvents.notices,
 			NotificationEvents: notificationEvents,
+			ConversationEvents: stateEvents.activity,
 			AckNotification:    func(id string, after int) error { return client.AckNotification(ctx, "tui/"+conversation, id, after) },
 			InitialConnections: shared.Connections,
 			RuntimeEvents:      stateEvents.runtime,
 			InitialRuntime:     shared.Runtime,
 			DurableWorkEvents:  stateEvents.durableWork,
 			InitialDurableWork: shared.DurableWork,
+			UpdateCheck:        updateCheck,
+			UpdateAvailable:    updateAvailable,
+			UpdateCheckedAt:    updateCheckedAt,
 			SaveSettings: func(values map[string]string) error {
 				return client.ApplySettings(ctx, values)
 			},
@@ -831,9 +847,13 @@ func runMessageWithOutput(ctx context.Context, handler channel.Handler, conversa
 	}
 	events := make(chan core.Event, 64)
 	dispatched := make(chan error, 1)
+	sourceMessageID, err := core.NewSourceMessageID()
+	if err != nil {
+		return err
+	}
 	go func() {
 		dispatched <- handler(ctx, core.Message{
-			Channel: "cli", Conversation: conversation, Sender: "cli", Text: messageText, FollowupOnly: options.FollowupOnly,
+			Channel: "cli", Conversation: conversation, Sender: "cli", SourceMessageID: sourceMessageID, Text: messageText, FollowupOnly: options.FollowupOnly,
 		}, func(event core.Event) {
 			select {
 			case events <- event:
@@ -1024,6 +1044,7 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 	supervisor.SetEventLogger(service.Runtime.LogEvent)
 	service.PairingControl = supervisor
 	service.DeliveryControl = supervisor
+	service.SetConversationDelivery(supervisor)
 	done := make(chan error, 1)
 	go func() {
 		defer service.Runtime.RecoverPanic("channel", "supervisor_panic")

@@ -43,40 +43,61 @@ type Service struct {
 	Settings        *config.Store
 	PairingControl  channel.PairingManager
 	DeliveryControl channel.DeliveryRouter
-	Startup         interface {
+	// ConversationDelivery is the ordinary channel response path used by
+	// communication recovery; it is intentionally separate from Notify.
+	ConversationDelivery   channel.DeliveryRouter
+	conversationDeliveryMu sync.RWMutex
+	conversationActivityMu sync.Mutex
+	conversationActivity   map[string]int
+	Startup                interface {
 		Sync(config.Config, bool) error
 	}
-	Updates              *updater.Manager
-	configurationMu      sync.Mutex
-	instanceMu           sync.RWMutex
-	primaryInstance      string
-	cleanupNotBefore     time.Time
-	titleMu              sync.Mutex
-	titleChanges         chan string
-	themeChanges         chan theme.Theme
-	connectionMu         sync.RWMutex
-	connections          map[string]channel.ConnectionStatus
-	pairingMu            sync.RWMutex
-	pairing              map[string]channel.PairingEvent
-	pairingEvents        chan channel.PairingEvent
-	noticeMu             sync.RWMutex
-	noticeSequence       uint64
-	lastNotice           channel.Notice
-	noticeEvents         chan channel.Notice
-	restartRequests      chan struct{}
-	updateRequests       chan struct{}
-	primaryRequests      chan string
-	primaryRequestMu     sync.Mutex
-	primaryRequested     bool
-	streamMu             sync.Mutex
-	liveTUIMu            sync.Mutex
-	liveTUI              map[string]map[string]time.Time
-	cleanupHistoryStep   func(string)
-	resumeAdmissionStep  func(string)
-	readJobDocument      func(string) (orchestrator.Document, error)
-	streamText           map[string]string
-	telegramIdentity     *telegram.IdentityStore
-	jobCancellationGrace time.Duration
+	Updates                *updater.Manager
+	configurationMu        sync.Mutex
+	instanceMu             sync.RWMutex
+	primaryInstance        string
+	cleanupNotBefore       time.Time
+	titleMu                sync.Mutex
+	titleChanges           chan string
+	themeChanges           chan theme.Theme
+	connectionMu           sync.RWMutex
+	connections            map[string]channel.ConnectionStatus
+	pairingMu              sync.RWMutex
+	pairing                map[string]channel.PairingEvent
+	pairingEvents          chan channel.PairingEvent
+	noticeMu               sync.RWMutex
+	noticeSequence         uint64
+	lastNotice             channel.Notice
+	noticeEvents           chan channel.Notice
+	restartRequests        chan struct{}
+	updateRequests         chan struct{}
+	primaryRequests        chan string
+	primaryRequestMu       sync.Mutex
+	primaryRequested       bool
+	streamMu               sync.Mutex
+	liveTUIMu              sync.Mutex
+	liveTUI                map[string]map[string]time.Time
+	chatActivityMu         sync.Mutex
+	chatActivity           map[int]map[*chatActivityEmitter]struct{}
+	cleanupHistoryStep     func(string)
+	resumeAdmissionStep    func(string)
+	readJobDocument        func(string) (orchestrator.Document, error)
+	streamText             map[string]string
+	telegramIdentity       *telegram.IdentityStore
+	jobCancellationGrace   time.Duration
+	recoveryActivation     time.Time
+	recoveryActivationErr  error
+	recoveryLifecycleMu    sync.Mutex
+	recoveryMu             sync.Mutex
+	recoveryCancel         context.CancelFunc
+	recoveryWG             sync.WaitGroup
+	recoveryStarted        bool
+	serviceStarted         bool
+	recoveryTrigger        chan string
+	recoveryExecution      map[string]*recoveryExecution
+	recoveryIntake         map[string]int
+	recoveryStatus         RecoveryStatus
+	recoveryOwnershipFence func(func() error) (bool, error)
 }
 
 const jobCancellationGrace = 30 * time.Second
@@ -90,6 +111,7 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	hooks := extensions.Runner{Directory: cfg.Resolve(cfg.Extensions.Directory), Timeout: cfg.Extensions.Timeout()}
 	hooks.Log = runtime.Writer("extensions")
 	store := history.New(cfg.StatePath("history"))
+	recoveryActivation, recoveryActivationErr := store.ActivateRecovery()
 	manager := orchestrator.New(cfg, target, hooks)
 	connections := map[string]channel.ConnectionStatus{
 		"telegram": {Name: "telegram", State: channel.ConnectionUnconfigured},
@@ -102,27 +124,34 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 		connections["whatsapp"] = channel.ConnectionStatus{Name: "whatsapp", State: channel.ConnectionConnecting}
 	}
 	service := &Service{
-		Config:               cfg,
-		Harness:              target,
-		History:              store,
-		Hooks:                hooks,
-		Orchestrator:         manager,
-		Runtime:              runtime,
-		Settings:             config.NewStore(cfg),
-		titleChanges:         make(chan string, 1),
-		themeChanges:         make(chan theme.Theme, 1),
-		connections:          connections,
-		pairing:              map[string]channel.PairingEvent{},
-		pairingEvents:        make(chan channel.PairingEvent, 1),
-		noticeEvents:         make(chan channel.Notice, 8),
-		restartRequests:      make(chan struct{}, 1),
-		updateRequests:       make(chan struct{}, 1),
-		primaryRequests:      make(chan string, 1),
-		streamText:           map[string]string{},
-		liveTUI:              map[string]map[string]time.Time{},
-		telegramIdentity:     telegram.NewIdentityStore(cfg.StatePath("runtime", "telegram-identities.json")),
-		readJobDocument:      readBoundedJobDocument,
-		jobCancellationGrace: jobCancellationGrace,
+		Config:                cfg,
+		Harness:               target,
+		History:               store,
+		Hooks:                 hooks,
+		Orchestrator:          manager,
+		Runtime:               runtime,
+		Settings:              config.NewStore(cfg),
+		titleChanges:          make(chan string, 1),
+		themeChanges:          make(chan theme.Theme, 1),
+		connections:           connections,
+		pairing:               map[string]channel.PairingEvent{},
+		pairingEvents:         make(chan channel.PairingEvent, 1),
+		noticeEvents:          make(chan channel.Notice, 8),
+		restartRequests:       make(chan struct{}, 1),
+		updateRequests:        make(chan struct{}, 1),
+		primaryRequests:       make(chan string, 1),
+		streamText:            map[string]string{},
+		liveTUI:               map[string]map[string]time.Time{},
+		chatActivity:          map[int]map[*chatActivityEmitter]struct{}{},
+		telegramIdentity:      telegram.NewIdentityStore(cfg.StatePath("runtime", "telegram-identities.json")),
+		readJobDocument:       readBoundedJobDocument,
+		jobCancellationGrace:  jobCancellationGrace,
+		recoveryActivation:    recoveryActivation,
+		recoveryActivationErr: recoveryActivationErr,
+		recoveryTrigger:       make(chan string, 1),
+		recoveryExecution:     map[string]*recoveryExecution{},
+		recoveryIntake:        map[string]int{},
+		conversationActivity:  map[string]int{},
 	}
 	manager.Cleanup = service.runAutomaticCleanup
 	manager.Log = func(message string) { runtime.LogEvent("info", "orchestrator", "lifecycle", message) }
@@ -169,7 +198,9 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 // Close stops the harness while its final diagnostics can still be captured,
 // then drains and closes the durable runtime log.
 func (s *Service) Close() error {
+	s.stopRecoveryScanner()
 	err := s.Harness.Close()
+	s.stopAllChatActivity()
 	s.Runtime.Close()
 	return err
 }
@@ -364,7 +395,14 @@ func remoteAuthorizedPrincipalCount(cfg config.Config) int {
 }
 
 func (s *Service) Start(ctx context.Context) error {
-	return s.Harness.Start(ctx)
+	err := s.Harness.Start(ctx)
+	s.recoveryMu.Lock()
+	s.serviceStarted = true
+	s.recoveryMu.Unlock()
+	if s.primaryInstanceID() != "" {
+		s.startRecoveryScanner()
+	}
+	return err
 }
 
 // SetPrimaryInstanceID records the workspace server owner for shared status
@@ -383,6 +421,39 @@ func (s *Service) SetPrimaryInstanceID(id string) {
 	s.primaryInstance = id
 	s.instanceMu.Unlock()
 	s.Orchestrator.SetPrimaryOwned(id != "")
+	if id == "" {
+		s.stopRecoveryScanner()
+	} else {
+		s.recoveryMu.Lock()
+		started := s.serviceStarted
+		s.recoveryMu.Unlock()
+		if started {
+			s.startRecoveryScanner()
+		}
+	}
+}
+
+// SetRecoveryOwnershipFence installs the exact cross-process ownership-term
+// fence used for the final stalled-message admission. Production owners set it
+// before starting the service; process-local tests may leave it unset.
+func (s *Service) SetRecoveryOwnershipFence(fence func(func() error) (bool, error)) {
+	s.instanceMu.Lock()
+	s.recoveryOwnershipFence = fence
+	s.instanceMu.Unlock()
+}
+
+func (s *Service) withRecoveryOwnership(action func() error) (bool, error) {
+	s.instanceMu.RLock()
+	owned := s.primaryInstance != ""
+	fence := s.recoveryOwnershipFence
+	s.instanceMu.RUnlock()
+	if !owned {
+		return false, nil
+	}
+	if fence == nil {
+		return true, action()
+	}
+	return fence(action)
 }
 
 // FenceCleanupForLiveTUIReadmission restarts the owner-transition safety
@@ -412,6 +483,22 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 	if message.Text == "" {
 		return nil
 	}
+	if message.SourceMessageID == "" {
+		var err error
+		message.SourceMessageID, err = core.NewSourceMessageID()
+		if err != nil {
+			return fmt.Errorf("create source message identity: %w", err)
+		}
+	}
+	s.beginRecoveryIntake(sessionKey(message))
+	defer s.endRecoveryIntake(sessionKey(message))
+	duplicate, err := s.History.HasUserSourceID(message.Channel, message.Conversation, message.SourceMessageID)
+	if err != nil {
+		return fmt.Errorf("validate source message identity: %w", err)
+	}
+	if duplicate {
+		return nil
+	}
 	if message.FollowupOnly && !s.Harness.IsActive(sessionKey(message)) {
 		return errors.New("there is no active execution for this conversation")
 	}
@@ -431,7 +518,7 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 		}
 	}
 	if _, err := s.History.Append(message.Channel, message.Conversation, history.Entry{
-		At: message.ReceivedAt, Role: "user", Sender: message.Sender, ReplyTo: message.ReplyTo, Content: redactSensitiveCommand(message.Text),
+		At: message.ReceivedAt, AcceptedAt: time.Now().UTC(), Role: "user", Sender: message.Sender, ReplyTo: message.ReplyTo, Content: redactSensitiveCommand(message.Text), SourceMessageID: message.SourceMessageID,
 	}); err != nil {
 		s.Runtime.LogEvent("error", "history", "append_failed", fmt.Sprintf("Persist incoming history failed (%T)", err))
 		return err
@@ -474,12 +561,21 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	}
 	prompt = preparedPrompt
 	key := sessionKey(message)
-	jobID, err := s.Runtime.TryBeginJobWithDetails(key, message.Channel, message.Conversation, message.Text, JobDetails{Kind: "conversation", Provider: s.Settings.Snapshot().Harness.Name})
+	jobID, jobCreated, err := s.Runtime.tryBeginJobWithDetails(key, message.Channel, message.Conversation, message.Text, JobDetails{Kind: "conversation", Provider: s.Settings.Snapshot().Harness.Name})
 	if err != nil {
 		return fmt.Errorf("start job: %w", err)
 	}
+	reservation, admission, err := s.reserveRecoveryExecution(message)
+	if err != nil {
+		if jobCreated {
+			s.Runtime.EndJob(jobID)
+		}
+		return err
+	}
+	executionID := reservation.executionID
 	s.Runtime.LogEvent("info", "harness", "turn_started", "Harness turn started")
 	activity := newChatActivityEmitter(emit)
+	s.trackChatActivity(jobID, activity)
 	activity.start()
 	wrapped := s.wrapEmit(message, jobID, activity.emit)
 	var threadID string
@@ -491,6 +587,7 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	}
 	if err != nil {
 		activity.stop()
+		s.rollbackRecoveryReservation(message, reservation)
 		s.Runtime.RecordJobEvent(jobID, core.Event{Kind: core.EventError, Text: err.Error(), Done: true})
 		s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobError), Detail: err.Error()})
 		s.Runtime.LogEvent("error", "harness", "start_failed", "Harness turn failed to start ("+harnessFailureEvidence(err)+")")
@@ -498,6 +595,13 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 			s.Runtime.EndJob(jobID)
 		}
 		return err
+	}
+	actualAdmission := "new"
+	if steered {
+		actualAdmission = "steered"
+	}
+	if admission == "followup" && admission != actualAdmission {
+		_, _ = s.History.Append(message.Channel, message.Conversation, history.Entry{Role: "correlation", SourceMessageID: message.SourceMessageID, ExecutionID: executionID, Admission: actualAdmission})
 	}
 	s.Runtime.SetJobRunningIfStarting(jobID)
 	if emit != nil {
@@ -546,6 +650,7 @@ func (s *Service) creationCommandPrompt(message core.Message, kind, userMessage 
 	// Replace user data last so template-looking text inside the request is
 	// never interpreted as another framework placeholder.
 	directive = strings.ReplaceAll(directive, "{{USER_MESSAGE}}", userMessage)
+	directive += "\n\nFramework source correlation: when creating the durable " + kind + ", include `source_message_ids: [\"" + message.SourceMessageID + "\"]` in YAML front matter. Preserve this exact private identifier; do not show it in the user-facing response."
 	return base + "\n\n---\n\n" + directive, nil
 }
 
@@ -587,7 +692,19 @@ func (s *Service) chatPrompt(message core.Message) (string, error) {
 }
 
 func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit) core.Emit {
+	var terminalMu sync.Mutex
+	terminalDelivered := false
 	return func(event core.Event) {
+		terminal := event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError)
+		if terminal {
+			terminalMu.Lock()
+			if terminalDelivered {
+				terminalMu.Unlock()
+				return
+			}
+			terminalDelivered = true
+			terminalMu.Unlock()
+		}
 		key := sessionKey(message)
 		if event.Execution != nil {
 			s.Runtime.UpdateJob(jobID, *event.Execution)
@@ -677,8 +794,16 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 					s.Runtime.LogEvent("error", "history", "partial_append_failed", fmt.Sprintf("Persist partial history failed (%T)", err))
 				}
 			}
-			if _, err := s.History.Append(message.Channel, message.Conversation, history.Entry{At: time.Now().UTC(), Role: map[bool]string{true: "error", false: "assistant"}[event.Kind == core.EventError], Content: historyText, Terminal: true}); err != nil {
+			entry := history.Entry{At: time.Now().UTC(), Role: map[bool]string{true: "error", false: "assistant"}[event.Kind == core.EventError], Content: historyText, Terminal: true}
+			if message.Sender == "recovery" {
+				entry.Sender = "Spy"
+				entry.Recovery = true
+			}
+			if _, err := s.History.Append(message.Channel, message.Conversation, entry); err != nil {
 				s.Runtime.LogEvent("error", "history", "terminal_append_failed", fmt.Sprintf("Persist terminal history failed (%T)", err))
+			}
+			if !event.Continues {
+				s.finishRecoveryExecution(message, map[bool]string{true: "terminal_error", false: "terminal_assistant"}[event.Kind == core.EventError])
 			}
 		}
 		// Capture after extension and outbound-media processing so validated
@@ -817,6 +942,7 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		return nil
 	case "stop":
 		key := sessionKey(message)
+		cancellation := s.recoveryCancellationSnapshot(key)
 		job, hasJob := s.Runtime.JobForSession(key)
 		if hasJob {
 			job, hasJob = s.Runtime.ReserveJobCancellation(job.ID)
@@ -837,6 +963,7 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		if hasJob {
 			s.finishCancelledJobAfterGrace(job)
 		}
+		s.commitRecoveryCancellation(key, message.Channel, message.Conversation, cancellation)
 		return s.localReply(message, "Stop requested for the active execution.", emit)
 	case "restart":
 		if err := s.localReply(message, "Restarting Spynel...", emit); err != nil {
@@ -885,9 +1012,49 @@ func (s *Service) finishCancelledJobAfterGrace(job Job) {
 	time.AfterFunc(grace, func() {
 		current, ok := s.Runtime.Job(job.ID)
 		if ok && current.StableID == job.StableID && current.Execution == JobCancelling {
+			s.stopJobChatActivity(job.ID)
 			s.Runtime.EndJob(job.ID)
 		}
 	})
+}
+
+func (s *Service) trackChatActivity(jobID int, activity *chatActivityEmitter) {
+	activity.onStop = func() {
+		s.chatActivityMu.Lock()
+		delete(s.chatActivity[jobID], activity)
+		if len(s.chatActivity[jobID]) == 0 {
+			delete(s.chatActivity, jobID)
+		}
+		s.chatActivityMu.Unlock()
+	}
+	s.chatActivityMu.Lock()
+	if s.chatActivity[jobID] == nil {
+		s.chatActivity[jobID] = map[*chatActivityEmitter]struct{}{}
+	}
+	s.chatActivity[jobID][activity] = struct{}{}
+	s.chatActivityMu.Unlock()
+}
+
+func (s *Service) stopJobChatActivity(jobID int) {
+	s.chatActivityMu.Lock()
+	activities := s.chatActivity[jobID]
+	delete(s.chatActivity, jobID)
+	s.chatActivityMu.Unlock()
+	for activity := range activities {
+		activity.stop()
+	}
+}
+
+func (s *Service) stopAllChatActivity() {
+	s.chatActivityMu.Lock()
+	activities := s.chatActivity
+	s.chatActivity = map[int]map[*chatActivityEmitter]struct{}{}
+	s.chatActivityMu.Unlock()
+	for _, jobActivities := range activities {
+		for activity := range jobActivities {
+			activity.stop()
+		}
+	}
 }
 
 func (s *Service) triggerCommand(ctx context.Context, message core.Message, remainder string, emit core.Emit) error {
@@ -930,7 +1097,10 @@ func (s *Service) triggerCommand(ctx context.Context, message core.Message, rema
 // status releases an emitter whose output ownership moved to a newer turn.
 type chatActivityEmitter struct {
 	downstream core.Emit
-	once       sync.Once
+	mu         sync.Mutex
+	started    bool
+	stopped    bool
+	onStop     func()
 }
 
 func newChatActivityEmitter(downstream core.Emit) *chatActivityEmitter {
@@ -938,17 +1108,32 @@ func newChatActivityEmitter(downstream core.Emit) *chatActivityEmitter {
 }
 
 func (e *chatActivityEmitter) start() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.started || e.stopped {
+		return
+	}
+	e.started = true
 	if e.downstream != nil {
 		e.downstream(core.Event{Kind: core.EventActivity, Active: true})
 	}
 }
 
 func (e *chatActivityEmitter) stop() {
-	e.once.Do(func() {
-		if e.downstream != nil {
-			e.downstream(core.Event{Kind: core.EventActivity})
-		}
-	})
+	e.mu.Lock()
+	if e.stopped {
+		e.mu.Unlock()
+		return
+	}
+	e.stopped = true
+	if e.started && e.downstream != nil {
+		e.downstream(core.Event{Kind: core.EventActivity})
+	}
+	onStop := e.onStop
+	e.mu.Unlock()
+	if onStop != nil {
+		onStop()
+	}
 }
 
 func (e *chatActivityEmitter) emit(event core.Event) {
@@ -1093,6 +1278,7 @@ func (s *Service) jobCommand(ctx context.Context, message core.Message, remainde
 		return s.localReply(message, fmt.Sprintf("Job %d is not running. Use /jobs to list running jobs.", id), emit)
 	}
 	cancellationLeaseID := s.Orchestrator.MarkControlCancellation(job.SessionKey)
+	correlationCancellation := s.recoveryCancellationSnapshot(job.SessionKey)
 	stopped, err := s.Harness.Interrupt(ctx, job.SessionKey)
 	if err != nil {
 		s.Runtime.RestoreJobAfterFailedCancellation(job)
@@ -1105,10 +1291,12 @@ func (s *Service) jobCommand(ctx context.Context, message core.Message, remainde
 		if s.Harness.IsActive(job.SessionKey) {
 			return s.localReply(message, fmt.Sprintf("Cannot kill job %d: the provider did not accept the interrupt request.", id), emit)
 		}
+		s.stopJobChatActivity(job.ID)
 		s.Runtime.EndJob(job.ID)
 		return s.localReply(message, fmt.Sprintf("Job %d was already finished.", id), emit)
 	}
 	s.Runtime.LogEvent("info", "jobs", "job_stop_requested", fmt.Sprintf("job_id=%d channel=%s kind=%s", job.Number, logField(job.Channel, "unknown"), logField(job.Kind, "chat")))
+	s.commitRecoveryCancellation(job.SessionKey, job.Channel, job.Conversation, correlationCancellation)
 	s.finishCancelledJobAfterGrace(job)
 	return s.localReply(message, fmt.Sprintf("Kill requested for job %d.", id), emit)
 }
@@ -1300,8 +1488,12 @@ func (s *Service) SetConnectionStatus(status channel.ConnectionStatus) {
 		return
 	}
 	s.connectionMu.Lock()
+	previous := s.connections[status.Name]
 	s.connections[status.Name] = status
 	s.connectionMu.Unlock()
+	if status.State == channel.ConnectionConnected && previous.State != channel.ConnectionConnected {
+		s.triggerRecoveryScan("reconnect")
+	}
 }
 
 func (s *Service) connectionStatus(name string) channel.ConnectionStatus {
@@ -1314,30 +1506,48 @@ func (s *Service) connectionStatus(name string) channel.ConnectionStatus {
 	return status
 }
 
+// SetConversationDelivery installs the ordinary remote response router used
+// by conversation recovery. Recovery admission separately requires a live
+// connected transport so startup and disconnected scans cannot consume a
+// source before its eventual response has a delivery path.
+func (s *Service) SetConversationDelivery(router channel.DeliveryRouter) {
+	s.conversationDeliveryMu.Lock()
+	s.ConversationDelivery = router
+	s.conversationDeliveryMu.Unlock()
+}
+
+func (s *Service) conversationDelivery() channel.DeliveryRouter {
+	s.conversationDeliveryMu.RLock()
+	router := s.ConversationDelivery
+	s.conversationDeliveryMu.RUnlock()
+	return router
+}
+
 // StatusSnapshot is the bounded, non-secret operational state exposed to
 // plain CLI clients and rendered by /status on every channel.
 type StatusSnapshot struct {
-	Title             string                             `json:"title"`
-	Instance          string                             `json:"instance,omitempty"`
-	PrimaryInstance   string                             `json:"primary_instance,omitempty"`
-	Connections       []channel.ConnectionStatus         `json:"connections"`
-	Runtime           core.RuntimeStatus                 `json:"runtime"`
-	Harness           string                             `json:"harness,omitempty"`
-	HarnessState      string                             `json:"harness_state"`
-	HarnessDetail     string                             `json:"harness_detail,omitempty"`
-	Model             string                             `json:"model,omitempty"`
-	Sandbox           string                             `json:"sandbox"`
-	StartupEnabled    bool                               `json:"startup_enabled"`
-	TurnActive        bool                               `json:"turn_active"`
-	OrchestratorLease int                                `json:"orchestrator_leases"`
-	OrchestratorRuns  int                                `json:"orchestrator_dispatches"`
-	TasksActive       int                                `json:"tasks_active"`
-	TasksWaiting      int                                `json:"tasks_waiting"`
-	GoalsActive       int                                `json:"goals_active"`
-	WorkDiagnostics   []string                           `json:"work_count_diagnostics,omitempty"`
-	HeartbeatState    string                             `json:"heartbeat_state"`
-	NextHeartbeatAt   *time.Time                         `json:"next_heartbeat_at,omitempty"`
-	ScheduledGoals    []orchestrator.ScheduledCheckpoint `json:"scheduled_goal_checkpoints,omitempty"`
+	Title                string                             `json:"title"`
+	Instance             string                             `json:"instance,omitempty"`
+	PrimaryInstance      string                             `json:"primary_instance,omitempty"`
+	Connections          []channel.ConnectionStatus         `json:"connections"`
+	Runtime              core.RuntimeStatus                 `json:"runtime"`
+	Harness              string                             `json:"harness,omitempty"`
+	HarnessState         string                             `json:"harness_state"`
+	HarnessDetail        string                             `json:"harness_detail,omitempty"`
+	Model                string                             `json:"model,omitempty"`
+	Sandbox              string                             `json:"sandbox"`
+	StartupEnabled       bool                               `json:"startup_enabled"`
+	TurnActive           bool                               `json:"turn_active"`
+	OrchestratorLease    int                                `json:"orchestrator_leases"`
+	OrchestratorRuns     int                                `json:"orchestrator_dispatches"`
+	TasksActive          int                                `json:"tasks_active"`
+	TasksWaiting         int                                `json:"tasks_waiting"`
+	GoalsActive          int                                `json:"goals_active"`
+	WorkDiagnostics      []string                           `json:"work_count_diagnostics,omitempty"`
+	HeartbeatState       string                             `json:"heartbeat_state"`
+	NextHeartbeatAt      *time.Time                         `json:"next_heartbeat_at,omitempty"`
+	ScheduledGoals       []orchestrator.ScheduledCheckpoint `json:"scheduled_goal_checkpoints,omitempty"`
+	ConversationRecovery RecoveryStatus                     `json:"conversation_recovery"`
 }
 
 // Status returns the same status contract used by /status without requiring a
@@ -1383,7 +1593,8 @@ func (s *Service) Status(message core.Message) (StatusSnapshot, error) {
 		OrchestratorLease: leases, OrchestratorRuns: dispatches,
 		TasksActive: work.TasksActive, TasksWaiting: work.TasksWaiting, GoalsActive: work.GoalsActive, WorkDiagnostics: work.CountDiagnostics,
 		HeartbeatState: work.HeartbeatState, NextHeartbeatAt: nextHeartbeatAt,
-		ScheduledGoals: scheduledGoals,
+		ScheduledGoals:       scheduledGoals,
+		ConversationRecovery: s.RecoveryStatus(),
 	}, nil
 }
 
@@ -1434,6 +1645,10 @@ func FormatStatus(status StatusSnapshot) string {
 		"- Run at startup: " + enabledText(status.StartupEnabled),
 		fmt.Sprintf("- Logs: %d — `/log`", status.Runtime.Logs),
 		"- Turn: " + turn,
+	}
+	if !status.ConversationRecovery.ScannedAt.IsZero() {
+		recovery := status.ConversationRecovery
+		lines = append(lines, fmt.Sprintf("- Conversation recovery: %d eligible, %d dispatched, %d fail-closed (last %s)", recovery.Eligible, recovery.Dispatched, recovery.FailedClosed, recovery.ScannedAt.UTC().Format(time.RFC3339)))
 	}
 	for _, diagnostic := range status.WorkDiagnostics {
 		lines = append(lines, "- Work count diagnostic: "+diagnostic)

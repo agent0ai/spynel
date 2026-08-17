@@ -448,6 +448,9 @@ func (a *ACP) ensureSession(ctx context.Context, key, model string) (acpSession,
 		result, err = a.call(ctx, "session/new", params)
 	}
 	if err != nil {
+		if cfg.Name == "agent-zero" {
+			return acpSession{}, fmt.Errorf("Agent Zero CLI could not create an ACP session; ensure Agent Zero is running and reachable, and authenticate or configure the connection through A0 CLI if required: %w", err)
+		}
 		return acpSession{}, fmt.Errorf("create or resume ACP session: %w", err)
 	}
 	var setup acpSessionResult
@@ -798,6 +801,9 @@ func (a *ACP) waitLoop() {
 }
 
 func (a *ACP) fail(err error) {
+	if a.config.Name == "agent-zero" {
+		err = fmt.Errorf("Agent Zero CLI ACP process exited; run `a0 acp --check`, verify Agent Zero is reachable, and inspect Spynel's attributed harness logs: %w", err)
+	}
 	a.mu.Lock()
 	if a.closed {
 		a.mu.Unlock()

@@ -113,7 +113,7 @@ func runHarnessFixture(mode string) int {
 		return runClaudeFixture(mode)
 	case "pi-lifecycle", "pi-steer", "pi-interrupt", "pi-state-missing-session":
 		return runPiFixture(mode)
-	case "acp-lifecycle", "acp-interrupt", "acp-version-mismatch":
+	case "acp-lifecycle", "acp-interrupt", "acp-version-mismatch", "acp-session-error":
 		return runACPFixture(mode)
 	default:
 		_, _ = fmt.Fprintf(os.Stderr, "unknown harness fixture mode %q\n", mode)
@@ -250,6 +250,10 @@ func runACPFixture(mode string) int {
 				"agentInfo":         map[string]string{"name": "fixture", "version": "1"},
 			})
 		case "session/new":
+			if mode == "acp-session-error" {
+				write(map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": -32603, "message": "Internal error"}})
+				continue
+			}
 			respond(request, map[string]any{
 				"sessionId": "acp-session",
 				"configOptions": []any{

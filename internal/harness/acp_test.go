@@ -146,6 +146,24 @@ func TestACPCancelNotificationTerminatesPrompt(t *testing.T) {
 	}
 }
 
+func TestAgentZeroSessionFailureAddsSafeReachabilityAndAuthenticationGuidance(t *testing.T) {
+	command, root, _ := portableHarnessFixture(t, "acp-session-error")
+	adapter, err := NewACP(HarnessConfig{Name: "agent-zero", Command: command, Args: []string{"acp"}, Cwd: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := adapter.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Close()
+	_, _, err = adapter.Send(ctx, "chat", "work", func(core.Event) {})
+	if err == nil || !strings.Contains(err.Error(), "ensure Agent Zero is running and reachable") || !strings.Contains(err.Error(), "authenticate or configure the connection through A0 CLI") || !strings.Contains(err.Error(), "Internal error") {
+		t.Fatalf("Agent Zero session error = %v", err)
+	}
+}
+
 func boolInt(value bool) int {
 	if value {
 		return 1

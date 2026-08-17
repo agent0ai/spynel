@@ -71,6 +71,61 @@ func TestRecentBoundedUsesNewestMessageAndCharacterWindow(t *testing.T) {
 	}
 }
 
+func TestRecentEntriesSnapshotReturnsExactFollowerBoundary(t *testing.T) {
+	store := New(t.TempDir())
+	if _, err := store.Append("tui", "local", Entry{Role: "assistant", Content: "before boundary"}); err != nil {
+		t.Fatal(err)
+	}
+	entries, path, boundary, err := store.RecentEntriesSnapshot("tui", "local", 10, 1000)
+	if err != nil || len(entries) != 1 || entries[0].Content != "before boundary" {
+		t.Fatalf("snapshot = %#v, %v", entries, err)
+	}
+	if _, err := store.Append("tui", "local", Entry{Role: "assistant", Content: "after boundary"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Size() <= boundary {
+		t.Fatalf("follower boundary = %d, size %v, err %v", boundary, info, err)
+	}
+}
+
+func TestSourceIdentityDeduplicationStrictlyScansLongHistory(t *testing.T) {
+	store := New(t.TempDir())
+	if _, err := store.Append("telegram", "person", Entry{Role: "user", SourceMessageID: "telegram:old", Content: "original"}); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 600; index++ {
+		if _, err := store.Append("telegram", "person", Entry{Role: "assistant", Content: fmt.Sprintf("reply-%03d", index)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	found, err := store.HasUserSourceID("telegram", "person", "telegram:old")
+	if err != nil || !found {
+		t.Fatalf("older source identity = %t, %v", found, err)
+	}
+}
+
+func TestSourceIdentityDeduplicationFailsClosedOnCorruptHistory(t *testing.T) {
+	store := New(t.TempDir())
+	if _, err := store.Append("whatsapp", "person", Entry{Role: "user", SourceMessageID: "whatsapp:old", Content: "original"}); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(store.Path("whatsapp", "person"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("{corrupt}\n"); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := store.HasUserSourceID("whatsapp", "person", "whatsapp:new"); err == nil || found {
+		t.Fatalf("corrupt duplicate check did not fail closed: found=%t err=%v", found, err)
+	}
+}
+
 func TestReplyContextSerializesAndRendersWithinBounds(t *testing.T) {
 	store := New(t.TempDir())
 	_, err := store.Append("telegram", "person", Entry{Role: "user", ReplyTo: "123 referenced text", Content: strings.Repeat("界", 200)})
