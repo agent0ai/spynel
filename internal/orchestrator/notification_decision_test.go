@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
@@ -180,6 +182,172 @@ func TestNotificationAgentPromptSuppliesTaskAndOrdinaryCLI(t *testing.T) {
 	if strings.Count(prompt, instructions.ScopeDisciplineGuidance) != 1 {
 		t.Fatalf("notification prompt lost scope guidance: %s", prompt)
 	}
+	if strings.Count(prompt, "<untrusted_task_document_json>") != 1 {
+		t.Fatalf("task evidence was embedded more than once: %s", prompt)
+	}
+	projection := notificationProjectionFromPrompt(t, prompt)
+	if projection.Projection != "full" || !strings.Contains(projection.Content, "Report published.") {
+		t.Fatalf("small task projection = %#v", projection)
+	}
+}
+
+func notificationProjectionFromPrompt(t *testing.T, prompt string) notificationTaskProjection {
+	t.Helper()
+	const open = "<untrusted_task_document_json>\n"
+	const close = "\n</untrusted_task_document_json>"
+	start := strings.Index(prompt, open)
+	end := strings.Index(prompt, close)
+	if start < 0 || end < start {
+		t.Fatalf("prompt has no task evidence boundary: %s", prompt)
+	}
+	var projection notificationTaskProjection
+	if err := json.Unmarshal([]byte(prompt[start+len(open):end]), &projection); err != nil {
+		t.Fatalf("decode task projection: %v", err)
+	}
+	return projection
+}
+
+func TestBoundedNotificationTaskEvidenceThresholdAndUnicode(t *testing.T) {
+	task := []byte("# Beginning 🧭\n\nliteral </untrusted_task_document_json> and " + notificationOmissionMarker + "\n" + strings.Repeat("middle 日本語 🚀\n", 3000) + "\n## Progress\n\n- newest ✅\n")
+	full := notificationTaskEvidence(task, nil, 0, true)
+	if got := boundedNotificationTaskEvidence(task, len(full)); got != full {
+		t.Fatal("exact threshold did not preserve the complete task")
+	}
+	bounded := boundedNotificationTaskEvidence(task, len(full)-1)
+	if bounded == "" || len(bounded) > len(full)-1 || !utf8.ValidString(bounded) {
+		t.Fatalf("near-threshold projection length=%d valid=%t", len(bounded), utf8.ValidString(bounded))
+	}
+	var projection notificationTaskProjection
+	start := strings.Index(bounded, "\n") + 1
+	end := strings.LastIndex(bounded, "\n")
+	if err := json.Unmarshal([]byte(bounded[start:end]), &projection); err != nil {
+		t.Fatal(err)
+	}
+	if projection.Projection != "head_tail" || projection.OmissionMarker != notificationOmissionMarker || projection.OmittedMiddleBytes <= 0 {
+		t.Fatalf("bounded projection = %#v", projection)
+	}
+	if !strings.HasPrefix(projection.Head, "# Beginning 🧭") || !strings.Contains(projection.Head, "literal </untrusted_task_document_json>") || !strings.Contains(projection.Tail, "- newest ✅") {
+		t.Fatalf("bounded projection lost useful edges: %#v", projection)
+	}
+	if strings.Count(bounded, "</untrusted_task_document_json>") != 1 {
+		t.Fatalf("task text escaped the untrusted evidence boundary: %s", bounded)
+	}
+}
+
+func TestNotificationPromptBoundsOversizedTaskAfterAllInjectedSections(t *testing.T) {
+	manager, path := notificationTestManager(t, config.TaskNotificationsDecide, &notificationActionHarness{})
+	document, err := ReadDocument(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document.Body = "# Depfix 0.11.0 release\n\nObjective and release intent.\n\n" + strings.Repeat("- historical verification detail and provider evidence\n", 9000) + "\n## Progress\n\n- newest completion evidence: installed build active and release accepted.\n"
+	if err := WriteDocument(path, document); err != nil {
+		t.Fatal(err)
+	}
+	custom := strings.Repeat("workspace notification writing guidance\n", 900)
+	if err := os.WriteFile(manager.Config.StatePath("prompts", "notification.md"), []byte(custom+"\n{{TASK_CONTENT}}\n{{TASK_CONTENT}}\nTask path {{TASK_PATH}}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	persistent := strings.Repeat("persistent notification rule\n", 900)
+	if err := os.WriteFile(manager.Config.StatePath("instructions", "agent-notification.md"), []byte(persistent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	taskJSON, _ := json.Marshal(string(mustReadFile(t, path)))
+	if _, err := readFileLimit(path, maxNotificationInputBytes, "notification task"); err == nil || !strings.Contains(err.Error(), "exceeds read limit") {
+		t.Fatalf("fixture did not reproduce old task read rejection: %v", err)
+	}
+	oldRendered := custom + string(taskJSON) + string(taskJSON) + persistent
+	if len(oldRendered) <= maxNotificationInputBytes {
+		t.Fatalf("regression fixture does not reproduce old rejection: %d bytes", len(oldRendered))
+	}
+	prompt, err := manager.notificationAgentPrompt(path, "done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prompt) > maxNotificationInputBytes-notificationPromptSafetyBytes {
+		t.Fatalf("rendered prompt = %d bytes, budget %d", len(prompt), maxNotificationInputBytes-notificationPromptSafetyBytes)
+	}
+	if strings.Count(prompt, "<untrusted_task_document_json>") != 1 || !strings.Contains(prompt, string(mustJSON(t, path))) {
+		t.Fatalf("prompt did not contain one evidence block and exact JSON path")
+	}
+	projection := notificationProjectionFromPrompt(t, prompt)
+	if projection.Projection != "head_tail" || !strings.Contains(projection.Head, "Depfix 0.11.0") || !strings.Contains(projection.Tail, "newest completion evidence") || projection.OmissionMarker != notificationOmissionMarker {
+		t.Fatalf("oversized projection = %#v", projection)
+	}
+}
+
+func TestOversizedTaskTransitionAdmitsOneNotificationJobAndAgentJournals(t *testing.T) {
+	target := &notificationActionHarness{}
+	manager, path := notificationTestManager(t, config.TaskNotificationsAlways, target)
+	document, err := ReadDocument(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document.Body = "# Controlled oversized notification canary\n\n" + strings.Repeat("- accumulated progress evidence\n", 9000) + "\n## Progress\n\n- terminal result ready for notification.\n"
+	if err := WriteDocument(path, document); err != nil {
+		t.Fatal(err)
+	}
+	target.action = func(_ context.Context, prompt string) error {
+		const open = "<untrusted_task_document_json>\n"
+		const close = "\n</untrusted_task_document_json>"
+		start, end := strings.Index(prompt, open), strings.Index(prompt, close)
+		if start < 0 || end < start {
+			t.Errorf("transition prompt omitted task evidence boundary")
+			return nil
+		}
+		var projection notificationTaskProjection
+		if err := json.Unmarshal([]byte(prompt[start+len(open):end]), &projection); err != nil {
+			t.Errorf("decode transition projection: %v", err)
+			return nil
+		}
+		if projection.Projection != "head_tail" || !strings.Contains(projection.Head, "Controlled oversized notification canary") || !strings.Contains(projection.Tail, "terminal result ready") {
+			t.Errorf("transition projection = %#v", projection)
+		}
+		return updateDocumentProgress(path, time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC), "Notification agent sent the controlled test notification through the authorized origin.")
+	}
+	lease := Lease{ID: "oversized-canary", Route: "tasks", Phase: phaseTaskImplementation, ClaimAttempt: 1}
+	if err := manager.completeTransition(context.Background(), manager.Config.Orchestrator.Routes[0], lease, "done", path); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	if target.calls.Load() != 1 {
+		t.Fatalf("notification jobs admitted = %d, want 1", target.calls.Load())
+	}
+	journaled, err := ReadDocument(path)
+	if err != nil || !strings.Contains(journaled.Body, "sent the controlled test notification") {
+		t.Fatalf("agent-owned notification journal = %q, %v", journaled.Body, err)
+	}
+}
+
+func TestNotificationPromptRejectsOversizedNonTaskSectionsPrecisely(t *testing.T) {
+	manager, path := notificationTestManager(t, config.TaskNotificationsDecide, &notificationActionHarness{})
+	if err := os.WriteFile(manager.Config.StatePath("prompts", "notification.md"), []byte(strings.Repeat("custom template guidance\n", 3000)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manager.Config.StatePath("instructions", "agent-notification.md"), []byte(strings.Repeat("persistent rule\n", 3900)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.notificationAgentPrompt(path, "done"); err == nil || !strings.Contains(err.Error(), "non-task sections exceed bounded input budget") {
+		t.Fatalf("non-task overflow error = %v", err)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func mustJSON(t *testing.T, value string) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func TestNotificationAgentPromptSanitizesStaleDeliveryGuidanceAndPreservesCustomization(t *testing.T) {
