@@ -6,6 +6,8 @@ Every setting below is exposed by the shared typed catalog used by the TUI, slas
 | --- | --- | --- | --- | --- |
 | `harness.name` | Live, idle-only | Harness supervisor replaces the adapter before commit | Old harness restored if persistence fails | harness supervisor and service tests |
 | `harness.model` | Live, active-safe | Persistence commit and provider-dispatch snapshot share one supervisor fence; admitted turns keep their model and later dispatches use the new value | No runtime model publication if persistence fails | active-turn, continuation, and dispatch-race tests |
+| `harness.reasoning_effort` | Live, active-safe | Shares the atomic inference-selection commit and dispatch snapshot with model/service mode | Unsupported model combinations reject; a model change clears stale effort to inherit | capability, adapter, continuation, and dispatch-race tests |
+| `harness.service_mode` | Live, active-safe | Shares the atomic inference-selection commit; Codex maps the catalog value to app-server `serviceTier` | Unsupported harness/model combinations reject; a model change clears stale mode to inherit | capability, adapter, continuation, and dispatch-race tests |
 | `harness.sandbox` | Live, idle-only | Harness supervisor applies provider policy before commit | Old harness restored if persistence fails | harness policy tests |
 | `harness.reviews` | Live | Application and orchestrator read the accepted policy for the next decision | Validation/persistence is all-or-nothing | review-policy tests |
 | `harness.chat_agent_prefix` | Live | Application snapshots it immediately before chat dispatch | Validation/persistence is all-or-nothing | prompt-prefix tests |

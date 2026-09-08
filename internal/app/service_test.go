@@ -67,6 +67,22 @@ type observingServiceHarness struct {
 	beforeSend func()
 }
 
+type propertyServiceHarness struct {
+	*serviceHarness
+	selection harness.InferenceSelection
+}
+
+func (r *propertyServiceHarness) Models(context.Context) ([]harness.Model, error) {
+	return []harness.Model{{ID: "model-a", DisplayName: "Model A", Default: true, Efforts: []string{"low", "high", "ultra"}, DefaultEffort: "high", ServiceModes: []harness.ModelPropertyOption{{ID: "fast", DisplayName: "Fast", Description: "Priority processing"}}}}, nil
+}
+func (r *propertyServiceHarness) SetInference(selection harness.InferenceSelection) {
+	r.selection = selection
+}
+func (r *propertyServiceHarness) SendWithInference(ctx context.Context, key, prompt string, selection harness.InferenceSelection, emit core.Emit) (string, bool, error) {
+	r.selection = selection
+	return r.Send(ctx, key, prompt, emit)
+}
+
 type synchronousInterruptHarness struct {
 	*heldServiceHarness
 	err    error
@@ -1383,6 +1399,8 @@ func TestFormatStatusGroupsWorkAndRoundsHeartbeatUp(t *testing.T) {
 		"- WhatsApp: ○ not configured",
 		"- Coding harness: codex (connected)",
 		"- Model: harness default",
+		"- Reasoning effort: inherit",
+		"- Service mode: inherit",
 		"- Agent filesystem access: danger-full-access",
 		"- Run at startup: disabled",
 		"- Logs: 4 — `/log`",
@@ -2586,6 +2604,189 @@ func TestModelCommandPersistsDuringActiveHarnessTurnForNextDispatch(t *testing.T
 		t.Fatalf("subsequent model snapshots = %#v", nextModels)
 	}
 	target.finish("next")
+}
+
+func TestModelSelectionDefersAtomicPropertyCommitUntilFinalStep(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "codex"
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	target := &propertyServiceHarness{serviceHarness: newServiceHarness()}
+	registry := harness.NewRegistry()
+	registry.Register("codex", func(harness.HarnessConfig) (harness.Harness, error) { return target, nil })
+	supervisor := harness.NewSupervisor(registry, harness.HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, supervisor)
+	effort, err := service.ScreenAction(context.Background(), "model", "select:model-a", nil)
+	if err != nil || effort == nil || !strings.HasPrefix(effort.ID, "model-effort:") {
+		t.Fatalf("effort screen = %#v, %v", effort, err)
+	}
+	if got := service.Settings.Snapshot().Harness; got.Model != "" || got.ReasoningEffort != "" || got.ServiceMode != "" {
+		t.Fatalf("selection committed before final step: %#v", got)
+	}
+	serviceMode, err := service.ScreenAction(context.Background(), effort.ID, "select:high", nil)
+	if err != nil || serviceMode == nil || !strings.HasPrefix(serviceMode.ID, "model-service:") {
+		t.Fatalf("service screen = %#v, %v", serviceMode, err)
+	}
+	if got := service.Settings.Snapshot().Harness; got.Model != "" {
+		t.Fatalf("effort committed before final step: %#v", got)
+	}
+	result, err := service.ScreenAction(context.Background(), serviceMode.ID, "select:fast", nil)
+	if err != nil || result == nil || !strings.Contains(result.ActionMessage, "subsequent harness turns") {
+		t.Fatalf("result = %#v, %v", result, err)
+	}
+	if result.SavedControl == nil || !reflect.DeepEqual(*result.SavedControl, modelSettingControl("model-a", "high", "fast")) {
+		t.Fatalf("saved model control = %#v", result.SavedControl)
+	}
+	got := service.Settings.Snapshot().Harness
+	if got.Model != "model-a" || got.ReasoningEffort != "high" || got.ServiceMode != "fast" {
+		t.Fatalf("atomic selection = %#v", got)
+	}
+	reloaded, err := config.Load(config.PathForRoot(root))
+	if err != nil || !reflect.DeepEqual(reloaded.Harness, got) {
+		t.Fatalf("persisted selection = %#v, %v", reloaded.Harness, err)
+	}
+}
+
+func TestUnsupportedModelPropertyIsRejectedAndModelChangeClearsStaleValues(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	cfg.Harness.Name = "claude-code"
+	cfg.Harness.Model = "sonnet"
+	cfg.Harness.ReasoningEffort = "high"
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	if _, err := service.ApplySettings(map[string]string{"harness.service_mode": "fast"}); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("unsupported service error = %v", err)
+	}
+	if _, err := service.ApplySettings(map[string]string{"harness.model": "opus"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := service.Settings.Snapshot().Harness; got.Model != "opus" || got.ReasoningEffort != "" || got.ServiceMode != "" {
+		t.Fatalf("model-change normalization = %#v", got)
+	}
+}
+
+func TestProviderAdvertisedReasoningEffortPersistsEndToEnd(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name = "codex"
+	cfg.Harness.Model = "model-a"
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, &propertyServiceHarness{serviceHarness: newServiceHarness()})
+	if _, err := service.ApplySettings(map[string]string{"harness.reasoning_effort": "ultra"}); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := config.Load(config.PathForRoot(root))
+	if err != nil || reloaded.Harness.ReasoningEffort != "ultra" {
+		t.Fatalf("persisted advertised effort = %q, %v", reloaded.Harness.ReasoningEffort, err)
+	}
+	if _, err := service.ApplySettings(map[string]string{"harness.reasoning_effort": "turbo"}); err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("unadvertised effort error = %v", err)
+	}
+}
+
+func TestHarnessChangePersistsStalePropertyNormalizationBeforeValidation(t *testing.T) {
+	// Only command discovery runs: the synthetic harness owns reconfiguration.
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "claude"), nil, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	cfg.Harness.Name = "codex"
+	cfg.Harness.ReasoningEffort = "high"
+	cfg.Harness.ServiceMode = "fast"
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	target := &reconfigurableServiceHarness{serviceHarness: newServiceHarness(), config: harness.HarnessConfig{Name: "codex"}}
+	service := New(cfg, target)
+
+	changed, err := service.ApplySettings(map[string]string{"harness.name": "claude-code"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := service.Settings.Snapshot().Harness; got.Name != "claude-code" || got.ReasoningEffort != "high" || got.ServiceMode != "" {
+		t.Fatalf("persisted Codex to Claude normalization = %#v", got)
+	}
+	if len(changed) != 2 || changed[1].Key != "harness.service_mode" {
+		t.Fatalf("reported Codex to Claude changes = %#v", changed)
+	}
+
+	if _, err := service.ApplySettings(map[string]string{"harness.name": "acp", "harness.acp_command": "/bin/true"}); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Harness.Name != "acp" || reloaded.Harness.ReasoningEffort != "" || reloaded.Harness.ServiceMode != "" {
+		t.Fatalf("persisted ACP normalization = %#v", reloaded.Harness)
+	}
+}
+
+func TestModelChangePersistsExplicitInheritWhenInvalidatingLegacyOmittedEffort(t *testing.T) {
+	root := t.TempDir()
+	path := config.PathForRoot(root)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("version: 1\nharness:\n  name: codex\n  model: legacy-model\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Harness.ReasoningEffort != "medium" {
+		t.Fatalf("legacy omitted effort = %q, want medium", cfg.Harness.ReasoningEffort)
+	}
+	service := New(cfg, &propertyServiceHarness{serviceHarness: newServiceHarness()})
+	if _, err := service.ApplySettings(map[string]string{"harness.model": "model-a"}); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Harness.Model != "model-a" || reloaded.Harness.ReasoningEffort != "" {
+		t.Fatalf("persisted invalidation = model %q effort %q, want model-a/inherit", reloaded.Harness.Model, reloaded.Harness.ReasoningEffort)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(saved), "reasoning_effort:") {
+		t.Fatalf("invalidated legacy effort remained omitted and would reload as medium:\n%s", saved)
+	}
 }
 
 func TestInactiveCustomACPFieldsDoNotReconfigureAnotherHarness(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 
 	"github.com/agent0ai/spynel/internal/channel"
@@ -59,6 +60,8 @@ func TestVisualCapture(t *testing.T) {
 		"welcome":               visualWelcomeModel(),
 		"welcome-manual":        visualManualWelcomeModel(),
 		"config":                visualConfigModel(),
+		"model-effort":          visualModelEffortModel(74),
+		"model-effort-narrow":   visualModelEffortModel(32),
 		"config-advanced":       visualAdvancedConfigModel(),
 		"config-discard-dialog": visualConfigDiscardDialogModel(),
 		"telegram-config":       visualTelegramConfigModel(),
@@ -76,6 +79,29 @@ func TestVisualCapture(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(directory, name+".ansi"), []byte(value.View()), 0o600); err != nil {
 			t.Fatalf("write %s capture: %v", name, err)
 		}
+	}
+}
+
+func visualModelEffortModel(width int) model {
+	value := visualBaseModel()
+	next, _ := value.Update(tea.WindowSizeMsg{Width: width, Height: 18})
+	value = next.(model)
+	value.openScreen(core.Screen{ID: "model-effort:fixture", Title: "Reasoning effort", SaveDisabled: true, Subtitle: "Choose effort for GPT-5. Inherit uses its default.", Hints: []core.ScreenHint{{Key: "↑↓/⇥", Action: "nav"}, {Key: "␠/↵", Action: "select"}, {Key: "␛", Action: "cancel"}}, Controls: []core.ScreenControl{{Key: "select:", Kind: "action", Value: "Inherit", Description: "Use the model default"}, {Key: "select:low", Kind: "action", Value: "low", Description: "Low reasoning"}, {Key: "select:high", Kind: "action", Value: "high", Description: "High reasoning"}, {Key: "select:xhigh", Kind: "action", Value: "xhigh", Description: "Extra-high reasoning"}}})
+	return value
+}
+
+func TestVisualModelEffortNarrowStaysWithinTerminal(t *testing.T) {
+	const width = 32
+	rendered := visualModelEffortModel(width).View()
+	lines := strings.Split(rendered, "\n")
+	for index, line := range lines {
+		if got := lipgloss.Width(ansi.Strip(line)); got > width {
+			t.Fatalf("narrow model effort row %d width = %d, want <= %d: %q", index, got, width, ansi.Strip(line))
+		}
+	}
+	footer := ansi.Strip(lines[len(lines)-1])
+	if !strings.Contains(footer, "↑↓/⇥ nav") || !strings.Contains(footer, "␠/↵ select") || !strings.Contains(footer, "␛ cancel") {
+		t.Fatalf("narrow model effort footer lost a control hint: %q", footer)
 	}
 }
 

@@ -20,6 +20,15 @@ func TestCatalogKeepsLeadingHarnessChoicesInProductOrder(t *testing.T) {
 	}
 }
 
+func TestEveryBuiltinHasExplicitInferenceCapabilityClassification(t *testing.T) {
+	for _, definition := range Catalog() {
+		reasoning, service := StaticCapabilities(definition.Name)
+		if reasoning == "unknown" || service == "unknown" {
+			t.Fatalf("%s capability mapping = %q / %q", definition.Name, reasoning, service)
+		}
+	}
+}
+
 func TestAgentZeroRequiresSuccessfulACPCapabilityCheck(t *testing.T) {
 	lookPath := func(name string) (string, error) {
 		if name == "a0" {

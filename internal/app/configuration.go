@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -777,10 +778,52 @@ func (s *Service) modelCommand(ctx context.Context, message core.Message, remain
 		if model.Default {
 			marker = " (default)"
 		}
+		properties := []string{}
+		if len(model.Efforts) > 0 {
+			properties = append(properties, "effort: "+strings.Join(model.Efforts, "/"))
+		}
+		if len(model.ServiceModes) > 0 {
+			modes := make([]string, 0, len(model.ServiceModes))
+			for _, mode := range model.ServiceModes {
+				modes = append(modes, mode.ID)
+			}
+			properties = append(properties, "service: "+strings.Join(modes, "/"))
+		}
+		if len(properties) > 0 {
+			marker += " · " + strings.Join(properties, " · ")
+		}
 		lines = append(lines, fmt.Sprintf("- `%s` — %s%s", model.ID, model.DisplayName, marker))
 	}
 	lines = append(lines, "", "Select one with `/model <name>`.")
 	return s.localReply(message, strings.Join(lines, "\n"), emit)
+}
+
+func (s *Service) modelPropertyCommand(ctx context.Context, message core.Message, property, remainder string, emit core.Emit) error {
+	key, label := "harness.reasoning_effort", "reasoning effort"
+	if property == "speed" {
+		key, label = "harness.service_mode", "service mode"
+	}
+	if strings.TrimSpace(remainder) != "" {
+		return s.setSetting(message, key, remainder, emit)
+	}
+	cfg := s.Settings.Snapshot().Harness
+	model, err := s.catalogModel(ctx, cfg.Model)
+	if err != nil {
+		return s.localReply(message, "Cannot inspect "+label+": "+err.Error(), emit)
+	}
+	choices := append([]string{"inherit"}, model.Efforts...)
+	current := cfg.ReasoningEffort
+	if property == "speed" {
+		choices = []string{"inherit"}
+		for _, mode := range model.ServiceModes {
+			choices = append(choices, mode.ID)
+		}
+		current = cfg.ServiceMode
+	}
+	if len(choices) == 1 {
+		return s.localReply(message, "The selected model does not expose a supported "+label+" control.", emit)
+	}
+	return s.localReply(message, fmt.Sprintf("Current %s: `%s`. Supported: `%s`. Set with `/%s <value>` or reset with `/%s inherit`.", label, emptyAs(current, "inherit"), strings.Join(choices, "`, `"), property, property), emit)
 }
 
 func (s *Service) modelScreen(ctx context.Context) (*core.Screen, error) {
@@ -796,7 +839,7 @@ func (s *Service) modelScreen(ctx context.Context) (*core.Screen, error) {
 	screen := &core.Screen{
 		ID: "model", Title: "Harness model", SaveDisabled: true,
 		Hints:          selectionScreenHints(),
-		Subtitle:       "Choose a model supplied by " + s.Settings.Snapshot().Harness.Name + ". Enter applies the highlighted model immediately.",
+		Subtitle:       "Choose a model supplied by " + s.Settings.Snapshot().Harness.Name + ". Supported properties follow before the selection is saved.",
 		InitialControl: "select:" + current,
 		Controls: []core.ScreenControl{{
 			Key: "select:", Kind: "action", Value: "Harness default",
@@ -847,13 +890,54 @@ func modelChoiceDescription(description string, current, defaultModel bool) stri
 }
 
 func (s *Service) selectionScreenAction(ctx context.Context, screenID, action string) (*core.Screen, bool, error) {
-	if screenID != "harness" && screenID != "model" {
+	if screenID != "harness" && screenID != "model" && !strings.HasPrefix(screenID, "model-effort:") && !strings.HasPrefix(screenID, "model-service:") {
 		return nil, false, nil
 	}
 	if !strings.HasPrefix(action, "select:") {
 		return nil, true, fmt.Errorf("invalid %s selection action %q", screenID, action)
 	}
 	selected := strings.TrimPrefix(action, "select:")
+	if strings.HasPrefix(screenID, "model-effort:") {
+		modelID, err := decodeSelectionID(strings.TrimPrefix(screenID, "model-effort:"))
+		if err != nil {
+			return nil, true, err
+		}
+		model, err := s.catalogModel(ctx, modelID)
+		if err != nil {
+			return nil, true, err
+		}
+		if selected != "" && !containsString(model.Efforts, selected) {
+			return nil, true, fmt.Errorf("reasoning effort %q is no longer supported", selected)
+		}
+		if len(model.ServiceModes) > 0 {
+			return s.serviceModeScreen(modelID, selected, *model), true, nil
+		}
+		_, err = s.ApplySettings(map[string]string{"harness.model": modelID, "harness.reasoning_effort": selected, "harness.service_mode": "inherit"})
+		return selectionSavedScreen(modelID, selected, ""), true, err
+	}
+	if strings.HasPrefix(screenID, "model-service:") {
+		parts := strings.Split(strings.TrimPrefix(screenID, "model-service:"), ".")
+		if len(parts) != 2 {
+			return nil, true, errors.New("invalid model service selection")
+		}
+		modelID, err := decodeSelectionID(parts[0])
+		if err != nil {
+			return nil, true, err
+		}
+		effort, err := decodeSelectionID(parts[1])
+		if err != nil {
+			return nil, true, err
+		}
+		model, err := s.catalogModel(ctx, modelID)
+		if err != nil {
+			return nil, true, err
+		}
+		if selected != "" && !containsProperty(model.ServiceModes, selected) {
+			return nil, true, fmt.Errorf("service mode %q is no longer supported", selected)
+		}
+		_, err = s.ApplySettings(map[string]string{"harness.model": modelID, "harness.reasoning_effort": effort, "harness.service_mode": selected})
+		return selectionSavedScreen(modelID, effort, selected), true, err
+	}
 	key := "harness.model"
 	if screenID == "harness" {
 		key = "harness.name"
@@ -865,7 +949,7 @@ func (s *Service) selectionScreenAction(ctx context.Context, screenID, action st
 		if !valid {
 			return nil, true, fmt.Errorf("unknown harness %q", selected)
 		}
-	} else if selected != "" && selected != s.Settings.Snapshot().Harness.Model {
+	} else {
 		provider, ok := s.Harness.(harness.ModelProvider)
 		if !ok {
 			return nil, true, errors.New("the active harness does not provide a model catalog")
@@ -874,15 +958,29 @@ func (s *Service) selectionScreenAction(ctx context.Context, screenID, action st
 		if err != nil {
 			return nil, true, fmt.Errorf("load models: %w", err)
 		}
-		valid := false
+		valid := selected == ""
 		for _, model := range models {
 			valid = valid || model.ID == selected
 		}
 		if !valid {
 			return nil, true, fmt.Errorf("model %q is no longer in the harness catalog", selected)
 		}
+		model, err := s.catalogModel(ctx, selected)
+		if err != nil {
+			return nil, true, err
+		}
+		if len(model.Efforts) > 0 {
+			return s.effortScreen(selected, *model), true, nil
+		}
+		if len(model.ServiceModes) > 0 {
+			return s.serviceModeScreen(selected, "", *model), true, nil
+		}
 	}
-	_, err := s.ApplySettings(map[string]string{key: selected})
+	values := map[string]string{key: selected}
+	if screenID == "model" {
+		values["harness.reasoning_effort"], values["harness.service_mode"] = "inherit", "inherit"
+	}
+	_, err := s.ApplySettings(values)
 	if err != nil {
 		return nil, true, err
 	}
@@ -902,7 +1000,77 @@ func (s *Service) selectionScreenAction(ctx context.Context, screenID, action st
 		}
 		return &core.Screen{ActionMessage: harnessSelectionMessage(selected)}, true, nil
 	}
-	return &core.Screen{ActionMessage: fmt.Sprintf("Saved `harness.model` = `%s`. It will apply to subsequent harness turns.", selected)}, true, nil
+	return selectionSavedScreen(selected, "", ""), true, nil
+}
+
+func (s *Service) catalogModel(ctx context.Context, id string) (*harness.Model, error) {
+	provider, ok := s.Harness.(harness.ModelProvider)
+	if !ok {
+		return nil, errors.New("the active harness does not provide a model catalog")
+	}
+	models, err := provider.Models(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load models: %w", err)
+	}
+	for index := range models {
+		if models[index].ID == id || id == "" && models[index].Default {
+			return &models[index], nil
+		}
+	}
+	if id == "" {
+		return &harness.Model{DisplayName: "Harness default"}, nil
+	}
+	return nil, fmt.Errorf("model %q is no longer in the harness catalog", id)
+}
+
+func encodeSelectionID(value string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(value))
+}
+func decodeSelectionID(value string) (string, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return "", errors.New("invalid model-property selection")
+	}
+	return string(decoded), nil
+}
+
+func (s *Service) effortScreen(modelID string, model harness.Model) *core.Screen {
+	current := ""
+	if cfg := s.Settings.Snapshot().Harness; cfg.Model == modelID {
+		current = cfg.ReasoningEffort
+	}
+	screen := &core.Screen{ID: "model-effort:" + encodeSelectionID(modelID), Title: "Reasoning effort", SaveDisabled: true, Hints: selectionScreenHints(), Subtitle: "Choose effort for " + model.DisplayName + ". Inherit uses its default.", InitialControl: "select:" + current}
+	screen.Controls = append(screen.Controls, core.ScreenControl{Key: "select:", Kind: "action", Value: "Inherit", Description: modelChoiceDescription("Use the model default", current == "", false)})
+	for _, effort := range model.Efforts {
+		screen.Controls = append(screen.Controls, core.ScreenControl{Key: "select:" + effort, Kind: "action", Value: effort, Description: modelChoiceDescription(strings.Title(effort), effort == current, effort == model.DefaultEffort)})
+	}
+	return screen
+}
+
+func (s *Service) serviceModeScreen(modelID, effort string, model harness.Model) *core.Screen {
+	current := ""
+	if cfg := s.Settings.Snapshot().Harness; cfg.Model == modelID {
+		current = cfg.ServiceMode
+	}
+	screen := &core.Screen{ID: "model-service:" + encodeSelectionID(modelID) + "." + encodeSelectionID(effort), Title: "Speed / service mode", SaveDisabled: true, Hints: selectionScreenHints(), Subtitle: "Choose service speed for " + model.DisplayName + ". Inherit uses the provider default.", InitialControl: "select:" + current}
+	screen.Controls = append(screen.Controls, core.ScreenControl{Key: "select:", Kind: "action", Value: "Inherit", Description: modelChoiceDescription("Use the provider default", current == "", false)})
+	for _, mode := range model.ServiceModes {
+		label := mode.DisplayName
+		if label == "" {
+			label = mode.ID
+		}
+		description := mode.Description
+		if description == "" {
+			description = mode.ID
+		}
+		screen.Controls = append(screen.Controls, core.ScreenControl{Key: "select:" + mode.ID, Kind: "action", Value: label, Description: modelChoiceDescription(description, mode.ID == current, mode.ID == model.DefaultServiceMode)})
+	}
+	return screen
+}
+
+func selectionSavedScreen(model, effort, service string) *core.Screen {
+	control := modelSettingControl(model, effort, service)
+	return &core.Screen{SavedControl: &control, ActionMessage: fmt.Sprintf("Saved model `%s`, reasoning effort `%s`, and service mode `%s`. The selection applies to subsequent harness turns.", emptyAs(model, "harness default"), emptyAs(effort, "inherit"), emptyAs(service, "inherit"))}
 }
 
 func (s *Service) setSetting(message core.Message, key, value string, emit core.Emit) error {
@@ -920,6 +1088,17 @@ func (s *Service) setSetting(message core.Message, key, value string, emit core.
 	setting := changed[0]
 	response := fmt.Sprintf("Saved `%s` = `%s`.", setting.Key, setting.Value)
 	if setting.Key == "harness.model" {
+		var reset []string
+		for _, item := range changed[1:] {
+			if (item.Key == "harness.reasoning_effort" || item.Key == "harness.service_mode") && item.Value == "inherit" {
+				reset = append(reset, "`"+item.Key+"`")
+			}
+		}
+		if len(reset) > 0 {
+			response += " Reset " + strings.Join(reset, " and ") + " to `inherit` because the new model does not support the stored value."
+		}
+	}
+	if setting.Key == "harness.model" || setting.Key == "harness.reasoning_effort" || setting.Key == "harness.service_mode" {
 		response += " It will apply to subsequent harness turns."
 	}
 	if setting.Restart {
@@ -938,6 +1117,9 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	changed, err := config.SetSettings(&next, values)
 	if err != nil {
 		s.Runtime.LogEvent("error", "config", "validation_failed", "Configuration change was rejected")
+		return nil, err
+	}
+	if err := s.validateInferenceSettings(context.Background(), previous, &next, values, &changed); err != nil {
 		return nil, err
 	}
 	var selectedTheme theme.Theme
@@ -960,11 +1142,11 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		}
 	}
 	unchanged := reflect.DeepEqual(previous, next)
-	modelChanged := previous.Harness.Model != next.Harness.Model
-	modelCommitter, canCommitModel := s.Harness.(interface {
-		CommitModel(string, func() error) error
+	inferenceChanged := previous.Harness.Model != next.Harness.Model || previous.Harness.ReasoningEffort != next.Harness.ReasoningEffort || previous.Harness.UsesLegacyReasoningEffort() != next.Harness.UsesLegacyReasoningEffort() || previous.Harness.ServiceMode != next.Harness.ServiceMode
+	inferenceCommitter, canCommitInference := s.Harness.(interface {
+		CommitInference(harness.InferenceSelection, func() error) error
 	})
-	harnessChanged := harnessRuntimeChanged(previous.Harness, next.Harness) || modelChanged && !canCommitModel
+	harnessChanged := harnessRuntimeChanged(previous.Harness, next.Harness) || inferenceChanged && !canCommitInference
 	startupChanged := previous.Startup.Enabled != next.Startup.Enabled
 	if harnessChanged {
 		if err := s.reconfigureHarness(next); err != nil {
@@ -986,8 +1168,8 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		})
 		return updateErr
 	}
-	if modelChanged && canCommitModel && !harnessChanged {
-		err = modelCommitter.CommitModel(next.Harness.Model, update)
+	if inferenceChanged && canCommitInference && !harnessChanged {
+		err = inferenceCommitter.CommitInference(harness.InferenceSelection{Model: next.Harness.Model, Effort: next.Harness.ReasoningEffort, LegacyEffort: next.Harness.UsesLegacyReasoningEffort(), ServiceMode: next.Harness.ServiceMode}, update)
 	} else {
 		err = update()
 	}
@@ -1024,6 +1206,118 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	}
 	s.Runtime.LogEvent("info", "config", "persisted", fmt.Sprintf("Configuration persisted (%d settings changed)", len(changed)))
 	return changed, nil
+}
+
+func (s *Service) validateInferenceSettings(ctx context.Context, previous config.Config, next *config.Config, requested map[string]string, changed *[]config.Setting) error {
+	selected := harness.InferenceSelection{Model: next.Harness.Model, Effort: next.Harness.ReasoningEffort, LegacyEffort: next.Harness.UsesLegacyReasoningEffort(), ServiceMode: next.Harness.ServiceMode}
+	modelChanged := previous.Harness.Name != next.Harness.Name || previous.Harness.Model != next.Harness.Model
+	explicitEffort := requestedSetting(requested, "harness.reasoning_effort", "effort", "reasoning_effort", "reasoning-effort")
+	explicitService := requestedSetting(requested, "harness.service_mode", "speed", "service_mode", "service-mode")
+
+	var model *harness.Model
+	if previous.Harness.Name == next.Harness.Name {
+		if provider, ok := s.Harness.(harness.ModelProvider); ok {
+			checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			models, err := provider.Models(checkCtx)
+			cancel()
+			if err != nil && (explicitEffort || explicitService || modelChanged) && (selected.Effort != "" || selected.ServiceMode != "") {
+				return fmt.Errorf("cannot validate model properties: %w", err)
+			}
+			for index := range models {
+				candidate := &models[index]
+				if candidate.ID == selected.Model || selected.Model == "" && candidate.Default {
+					model = candidate
+					break
+				}
+			}
+		}
+	}
+
+	effortValid := selected.Effort == ""
+	serviceValid := selected.ServiceMode == ""
+	if model != nil {
+		effortValid = selected.Effort == "" || containsString(model.Efforts, selected.Effort)
+		if selected.LegacyEffort && !modelChanged {
+			effortValid = true
+		}
+		serviceValid = selected.ServiceMode == "" || containsProperty(model.ServiceModes, selected.ServiceMode)
+	} else if next.Harness.Name == "claude-code" {
+		effortValid = selected.Effort == "" || containsString([]string{"low", "medium", "high", "xhigh", "max"}, selected.Effort)
+	}
+	if next.Harness.Name != "codex" {
+		serviceValid = selected.ServiceMode == ""
+	}
+
+	if !effortValid && (explicitEffort || modelChanged) {
+		if explicitEffort && !modelChanged {
+			return fmt.Errorf("reasoning effort %q is not supported by model %q on %s", selected.Effort, emptyAs(selected.Model, "default"), next.Harness.Name)
+		}
+		if err := resetInvalidInferenceSetting(next, changed, "harness.reasoning_effort"); err != nil {
+			return err
+		}
+	}
+	if !serviceValid && (explicitService || modelChanged) {
+		if explicitService && !modelChanged {
+			return fmt.Errorf("service mode %q is not supported by model %q on %s", selected.ServiceMode, emptyAs(selected.Model, "default"), next.Harness.Name)
+		}
+		if err := resetInvalidInferenceSetting(next, changed, "harness.service_mode"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func requestedSetting(values map[string]string, names ...string) bool {
+	for key := range values {
+		for _, name := range names {
+			if strings.EqualFold(strings.TrimSpace(key), name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func containsProperty(values []harness.ModelPropertyOption, target string) bool {
+	for _, value := range values {
+		if value.ID == target {
+			return true
+		}
+	}
+	return false
+}
+
+func appendChangedSetting(cfg *config.Config, changed *[]config.Setting, key string) {
+	for _, setting := range *changed {
+		if setting.Key == key {
+			return
+		}
+	}
+	setting, _ := config.SettingByKey(*cfg, key)
+	*changed = append(*changed, setting)
+}
+
+func resetInvalidInferenceSetting(cfg *config.Config, changed *[]config.Setting, key string) error {
+	setting, err := config.SetSetting(cfg, key, "inherit")
+	if err != nil {
+		return fmt.Errorf("reset invalid %s: %w", key, err)
+	}
+	for _, current := range *changed {
+		if current.Key == key {
+			return nil
+		}
+	}
+	*changed = append(*changed, setting)
+	return nil
 }
 
 func (s *Service) themeCommand(message core.Message, name string, emit core.Emit) error {
@@ -1109,7 +1403,9 @@ func (s *Service) reconfigureHarness(cfg config.Config) error {
 	runtimeConfig.Name = cfg.Harness.Name
 	runtimeConfig.Cwd = cfg.Root
 	runtimeConfig.Model = cfg.Harness.Model
-	runtimeConfig.Effort = "medium"
+	runtimeConfig.Effort = cfg.Harness.ReasoningEffort
+	runtimeConfig.LegacyEffort = cfg.Harness.UsesLegacyReasoningEffort()
+	runtimeConfig.ServiceMode = cfg.Harness.ServiceMode
 	runtimeConfig.ApprovalPolicy = "never"
 	runtimeConfig.Sandbox = cfg.Harness.Sandbox
 	runtimeConfig.Network = false
@@ -1152,6 +1448,8 @@ func formatSettings(cfg config.Config, section string) string {
 		lines = append(lines,
 			"- `harness.name` = `"+emptyAs(cfg.Harness.Name, "not selected")+"` — Active coding harness; use `/harness [name]`",
 			"- `harness.model` = `"+emptyAs(cfg.Harness.Model, "harness default")+"` — Active model; use `/model [name]`",
+			"- `harness.reasoning_effort` = `"+emptyAs(cfg.Harness.ReasoningEffort, "inherit")+"` — Model reasoning effort; use `/effort [level|inherit]`",
+			"- `harness.service_mode` = `"+emptyAs(cfg.Harness.ServiceMode, "inherit")+"` — Model service/speed mode; use `/speed [mode|inherit]`",
 		)
 	}
 	advanced := false
@@ -1159,7 +1457,7 @@ func formatSettings(cfg config.Config, section string) string {
 		if setting.Section != section && !(section == "config" && setting.Section == "harness") {
 			continue
 		}
-		if section == "config" && (setting.Key == "harness.name" || setting.Key == "harness.model") {
+		if section == "config" && (setting.Key == "harness.name" || setting.Key == "harness.model" || setting.Key == "harness.reasoning_effort" || setting.Key == "harness.service_mode") {
 			continue
 		}
 		if grouped && setting.Advanced && !advanced {
@@ -1187,15 +1485,18 @@ func scopedSettingKey(section, key string) string {
 	return "channels." + section + "." + key
 }
 
+func modelSettingControl(model, effort, service string) core.ScreenControl {
+	return core.ScreenControl{Key: "model", Kind: "action", Value: "Model · " + emptyAs(model, "Harness default"), Description: "Choose the model and supported properties · effort " + emptyAs(effort, "inherit") + " · speed " + emptyAs(service, "inherit")}
+}
+
 func settingsScreen(cfg config.Config, section string) core.Screen {
 	screen := core.Screen{ID: section, Hints: formScreenHints()}
 	if section == "config" {
 		harnessName := emptyAs(cfg.Harness.Name, "Choose a harness")
-		modelName := emptyAs(cfg.Harness.Model, "Harness default")
 		screen.StartAtTop = true
 		screen.Controls = append(screen.Controls,
 			core.ScreenControl{Key: "harness", Section: "Core settings", Kind: "action", Value: "Coding harness · " + harnessName, Description: "Select a supported harness; Spynel detects built-in executables automatically"},
-			core.ScreenControl{Key: "model", Kind: "action", Value: "Model · " + modelName, Description: "Choose from the active harness model catalog"},
+			modelSettingControl(cfg.Harness.Model, cfg.Harness.ReasoningEffort, cfg.Harness.ServiceMode),
 		)
 	} else if section == "telegram" || section == "whatsapp" {
 		screen.StartAtTop = true
@@ -1238,7 +1539,7 @@ func settingsScreen(cfg config.Config, section string) core.Screen {
 		if setting.Section != section && !(section == "config" && setting.Section == "harness") {
 			continue
 		}
-		if section == "config" && (setting.Key == "harness.name" || setting.Key == "harness.model") {
+		if section == "config" && (setting.Key == "harness.name" || setting.Key == "harness.model" || setting.Key == "harness.reasoning_effort" || setting.Key == "harness.service_mode") {
 			continue
 		}
 		if setting.Advanced && !advanced {

@@ -72,6 +72,34 @@ func TestSetSettingParsesSharedCommandValues(t *testing.T) {
 	}
 }
 
+func TestInferenceSettingsResetToInheritedDefaults(t *testing.T) {
+	cfg := Default()
+	if _, err := SetSetting(&cfg, "effort", "XHIGH"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetSetting(&cfg, "speed", "fast"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Harness.ReasoningEffort != "xhigh" || cfg.Harness.ServiceMode != "fast" {
+		t.Fatalf("inference settings = %#v", cfg.Harness)
+	}
+	if setting, err := SetSetting(&cfg, "harness.reasoning_effort", "inherit"); err != nil || setting.Value != "inherit" || cfg.Harness.ReasoningEffort != "" {
+		t.Fatalf("effort reset = %#v, %v", setting, err)
+	}
+	if setting, err := SetSetting(&cfg, "harness.service_mode", "default"); err != nil || setting.Value != "inherit" || cfg.Harness.ServiceMode != "" {
+		t.Fatalf("service reset = %#v, %v", setting, err)
+	}
+	if _, err := SetSetting(&cfg, "effort", "ULTRA"); err != nil || cfg.Harness.ReasoningEffort != "ultra" {
+		t.Fatalf("provider-advertised future effort = %q, %v", cfg.Harness.ReasoningEffort, err)
+	}
+	if _, err := SetSetting(&cfg, "effort", "two words"); err == nil {
+		t.Fatal("effort containing whitespace was accepted")
+	}
+	if _, err := SetSetting(&cfg, "effort", strings.Repeat("x", 129)); err == nil {
+		t.Fatal("overlong effort was accepted")
+	}
+}
+
 func TestSpeechSettingsExposeParakeetLanguagesWithoutModelSize(t *testing.T) {
 	cfg := Default()
 	language, ok := SettingByKey(cfg, "speech.language")
@@ -254,7 +282,7 @@ func TestCustomACPSettingsParseArgumentsAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(changed) != 3 || cfg.Harness.Name != "acp" || cfg.Harness.ACPCommand != "fixture-agent" || len(cfg.Harness.ACPArgs) != 2 || cfg.Harness.ACPArgs[1] != "value with spaces" {
+	if len(changed) != 4 || cfg.Harness.Name != "acp" || cfg.Harness.ReasoningEffort != "" || cfg.Harness.ACPCommand != "fixture-agent" || len(cfg.Harness.ACPArgs) != 2 || cfg.Harness.ACPArgs[1] != "value with spaces" {
 		t.Fatalf("custom ACP settings = %#v, changes %#v", cfg.Harness, changed)
 	}
 	previous := cfg
@@ -300,6 +328,46 @@ func TestSetSettingsValidatesRelatedFormFieldsTogether(t *testing.T) {
 	}
 	if len(changed) != 3 || cfg.Channels.Telegram.Mode != "webhook" || cfg.Channels.Telegram.WebhookURL == "" || cfg.Channels.Telegram.WebhookSecret == "" {
 		t.Fatalf("related settings were not applied: %#v, %#v", changed, cfg.Channels.Telegram)
+	}
+}
+
+func TestHarnessChangeClearsStoredUnsupportedInferenceProperties(t *testing.T) {
+	cfg := Default()
+	cfg.Harness.Name = "codex"
+	cfg.Harness.ReasoningEffort = "high"
+	cfg.Harness.ServiceMode = "fast"
+	cfg.Harness.reasoningEffortOmitted = false
+
+	changed, err := SetSettings(&cfg, map[string]string{"harness.name": "claude-code"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Harness.ReasoningEffort != "high" || cfg.Harness.ServiceMode != "" {
+		t.Fatalf("Codex to Claude normalization = %#v", cfg.Harness)
+	}
+	if len(changed) != 2 || changed[0].Key != "harness.name" || changed[1].Key != "harness.service_mode" {
+		t.Fatalf("Codex to Claude changed settings = %#v", changed)
+	}
+
+	setting, err := SetSetting(&cfg, "harness.name", "agent-zero")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if setting.Key != "harness.name" || cfg.Harness.ReasoningEffort != "" || cfg.Harness.ServiceMode != "" {
+		t.Fatalf("Claude to ACP normalization = setting %#v, harness %#v", setting, cfg.Harness)
+	}
+}
+
+func TestHarnessChangeRejectsExplicitUnsupportedInferenceProperties(t *testing.T) {
+	cfg := Default()
+	cfg.Harness.Name = "codex"
+	cfg.Harness.ServiceMode = "fast"
+	previous := cfg
+	if _, err := SetSettings(&cfg, map[string]string{"harness.name": "claude-code", "harness.service_mode": "fast"}); err == nil {
+		t.Fatal("explicit unsupported cross-harness service mode was accepted")
+	}
+	if cfg.Harness.Name != previous.Harness.Name || cfg.Harness.ServiceMode != previous.Harness.ServiceMode {
+		t.Fatalf("failed harness transaction mutated config: %#v", cfg.Harness)
 	}
 }
 

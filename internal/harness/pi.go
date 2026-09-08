@@ -27,14 +27,15 @@ const piRPCMaxRecord = 16 * 1024 * 1024
 type Pi struct {
 	config HarnessConfig
 
-	mu        sync.Mutex
-	ctx       context.Context
-	cancel    context.CancelFunc
-	closed    bool
-	processes map[string]*piProcess
-	sessions  map[string]piSession
-	keyMu     sync.Mutex
-	keyLocks  map[string]*sync.Mutex
+	mu           sync.Mutex
+	ctx          context.Context
+	cancel       context.CancelFunc
+	closed       bool
+	processes    map[string]*piProcess
+	sessions     map[string]piSession
+	keyMu        sync.Mutex
+	keyLocks     map[string]*sync.Mutex
+	modelCatalog []Model
 }
 
 type piSession struct {
@@ -50,13 +51,15 @@ type piProcess struct {
 	cancel context.CancelFunc
 	stdin  io.WriteCloser
 
-	writeMu sync.Mutex
-	mu      sync.Mutex
-	nextID  uint64
-	pending map[string]chan piResponse
-	active  *piTurn
-	session piSession
-	closed  bool
+	writeMu       sync.Mutex
+	mu            sync.Mutex
+	nextID        uint64
+	pending       map[string]chan piResponse
+	active        *piTurn
+	session       piSession
+	modelID       string
+	thinkingLevel string
+	closed        bool
 }
 
 type piTurn struct {
@@ -87,9 +90,14 @@ type piWireMessage struct {
 }
 
 type piState struct {
-	SessionFile string `json:"sessionFile"`
-	SessionID   string `json:"sessionId"`
-	IsStreaming bool   `json:"isStreaming"`
+	SessionFile   string `json:"sessionFile"`
+	SessionID     string `json:"sessionId"`
+	IsStreaming   bool   `json:"isStreaming"`
+	ThinkingLevel string `json:"thinkingLevel"`
+	Model         struct {
+		ID       string `json:"id"`
+		Provider string `json:"provider"`
+	} `json:"model"`
 }
 
 func NewPi(cfg HarnessConfig) (*Pi, error) {
@@ -151,9 +159,9 @@ func (p *Pi) Start(parent context.Context) error {
 
 func (p *Pi) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
 	p.mu.Lock()
-	model := p.config.Model
+	selection := InferenceSelection{Model: p.config.Model, Effort: p.config.Effort, LegacyEffort: p.config.LegacyEffort}
 	p.mu.Unlock()
-	return p.SendWithModel(ctx, key, prompt, model, emit)
+	return p.SendWithInference(ctx, key, prompt, selection, emit)
 }
 
 func (p *Pi) SetModel(model string) {
@@ -162,14 +170,39 @@ func (p *Pi) SetModel(model string) {
 	p.mu.Unlock()
 }
 
+func (p *Pi) SetInference(selection InferenceSelection) {
+	p.mu.Lock()
+	p.config.Model, p.config.Effort, p.config.LegacyEffort = selection.Model, selection.Effort, selection.LegacyEffort
+	p.mu.Unlock()
+}
+
 func (p *Pi) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+	p.mu.Lock()
+	selection := InferenceSelection{Model: model, Effort: p.config.Effort, LegacyEffort: p.config.LegacyEffort}
+	p.mu.Unlock()
+	return p.SendWithInference(ctx, key, prompt, selection, emit)
+}
+
+func (p *Pi) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", false, errors.New("harness prompt is empty")
+	}
+	if selection.ServiceMode != "" {
+		return "", false, errors.New("Pi does not support a Spynel service mode; reset harness.service_mode to inherit")
+	}
+	if selection.Effort != "" && !selection.LegacyEffort {
+		models, err := p.Models(ctx)
+		if err != nil {
+			return "", false, fmt.Errorf("validate Pi inference properties: %w", err)
+		}
+		if err := ValidateInferenceSelection(models, selection); err != nil {
+			return "", false, err
+		}
 	}
 	lock := p.lockForKey(key)
 	lock.Lock()
 	defer lock.Unlock()
-	process, err := p.ensureProcess(ctx, key, model)
+	process, err := p.ensureProcess(ctx, key, selection.Model, selection.Effort)
 	if err != nil {
 		return "", false, err
 	}
@@ -358,9 +391,13 @@ func (p *Pi) Close() error {
 
 func (p *Pi) Models(ctx context.Context) ([]Model, error) {
 	p.mu.Lock()
-	model := p.config.Model
+	if p.modelCatalog != nil {
+		models := append([]Model(nil), p.modelCatalog...)
+		p.mu.Unlock()
+		return models, nil
+	}
 	p.mu.Unlock()
-	process, err := p.startProcess(ctx, "", piSession{}, true, model)
+	process, err := p.startProcess(ctx, "", piSession{}, true, "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -389,20 +426,54 @@ func (p *Pi) Models(ctx context.Context) ([]Model, error) {
 		if id == "" {
 			continue
 		}
-		model := Model{ID: id, DisplayName: item.Name}
+		model := Model{ID: id, DisplayName: item.Name, Default: id == process.modelID}
 		if model.DisplayName == "" {
 			model.DisplayName = id
 		}
-		if item.Reasoning {
-			model.Efforts = []string{"off", "minimal", "low", "medium", "high", "xhigh", "max"}
-			model.DefaultEffort = "medium"
+		// Pi's set_model RPC persists the selected model as Pi's global default.
+		// Probe each model in its own no-session process instead: the --model CLI
+		// option is a runtime override and does not mutate Pi's settings.
+		modelProcess, err := p.startProcess(ctx, "", piSession{}, true, id, "")
+		if err != nil {
+			return nil, fmt.Errorf("start Pi capability discovery for model %q: %w", id, err)
+		}
+		levelsData, err := modelProcess.call(ctx, map[string]any{"type": "get_available_thinking_levels"}, nil)
+		modelProcess.close()
+		if err != nil {
+			return nil, fmt.Errorf("list Pi thinking levels for model %q: %w", id, err)
+		}
+		var levelsResponse struct {
+			Levels []string `json:"levels"`
+		}
+		if err := json.Unmarshal(levelsData, &levelsResponse); err != nil {
+			return nil, fmt.Errorf("decode Pi thinking levels for model %q: %w", id, err)
+		}
+		// Pi documents ["off"] as the sentinel for a model without reasoning.
+		// Such a model should keep the dependent selection flow short.
+		if !(len(levelsResponse.Levels) == 1 && levelsResponse.Levels[0] == "off") {
+			model.Efforts = append([]string(nil), levelsResponse.Levels...)
+			if model.Default && containsString(model.Efforts, process.thinkingLevel) {
+				model.DefaultEffort = process.thinkingLevel
+			}
 		}
 		models = append(models, model)
 	}
+	p.mu.Lock()
+	p.modelCatalog = append([]Model(nil), models...)
+	p.mu.Unlock()
 	return models, nil
 }
 
-func (p *Pi) ensureProcess(ctx context.Context, key, model string) (*piProcess, error) {
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Pi) ensureProcess(ctx context.Context, key, model, effort string) (*piProcess, error) {
 	p.mu.Lock()
 	if p.closed || p.ctx == nil {
 		p.mu.Unlock()
@@ -411,7 +482,7 @@ func (p *Pi) ensureProcess(ctx context.Context, key, model string) (*piProcess, 
 	if process := p.processes[key]; process != nil {
 		process.mu.Lock()
 		active := process.active != nil
-		policyMatches := process.session.Policy == p.sessionPolicyLocked(model)
+		policyMatches := process.session.Policy == p.sessionPolicyLocked(model, effort)
 		process.mu.Unlock()
 		if active || policyMatches {
 			p.mu.Unlock()
@@ -423,12 +494,12 @@ func (p *Pi) ensureProcess(ctx context.Context, key, model string) (*piProcess, 
 		p.mu.Lock()
 	}
 	session := p.sessions[key]
-	if session.Policy != p.sessionPolicyLocked(model) {
+	if session.Policy != p.sessionPolicyLocked(model, effort) {
 		session = piSession{}
 		delete(p.sessions, key)
 	}
 	p.mu.Unlock()
-	process, err := p.startProcess(ctx, key, session, false, model)
+	process, err := p.startProcess(ctx, key, session, false, model, effort)
 	if err != nil {
 		return nil, err
 	}
@@ -448,12 +519,13 @@ func (p *Pi) ensureProcess(ctx context.Context, key, model string) (*piProcess, 
 	return process, nil
 }
 
-func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ephemeral bool, model string) (*piProcess, error) {
+func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ephemeral bool, model, effort string) (*piProcess, error) {
 	p.mu.Lock()
 	baseContext := p.ctx
 	closed := p.closed
 	cfg := p.config
 	cfg.Model = model
+	cfg.Effort = effort
 	p.mu.Unlock()
 	if ephemeral {
 		baseContext = ctx
@@ -523,6 +595,8 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 		return nil, fmt.Errorf("Pi executable %q returned an incompatible get_state result with missing sessionId or sessionFile", cfg.Command)
 	}
 	process.session = piSession{ID: state.SessionID, Path: state.SessionFile, Policy: piSessionPolicy(cfg)}
+	process.modelID = piCatalogModelID(state.Model.Provider, state.Model.ID)
+	process.thinkingLevel = state.ThinkingLevel
 	if _, err := process.call(ctx, map[string]any{"type": "set_steering_mode", "mode": "all"}, nil); err != nil {
 		process.close()
 		return nil, fmt.Errorf("configure Pi steering queue: %w", err)
@@ -542,6 +616,13 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 		}
 	}
 	return process, nil
+}
+
+func piCatalogModelID(provider, id string) string {
+	if provider != "" && id != "" && !strings.Contains(id, "/") {
+		return provider + "/" + id
+	}
+	return id
 }
 
 func (process *piProcess) call(ctx context.Context, message map[string]any, beforeWrite func() bool) (json.RawMessage, error) {
@@ -887,9 +968,10 @@ func (p *Pi) lockForKey(key string) *sync.Mutex {
 	return lock
 }
 
-func (p *Pi) sessionPolicyLocked(model string) string {
+func (p *Pi) sessionPolicyLocked(model, effort string) string {
 	cfg := p.config
 	cfg.Model = model
+	cfg.Effort = effort
 	return piSessionPolicy(cfg)
 }
 

@@ -57,16 +57,27 @@ type Workspace struct {
 // executables and the workspace directory remain derived by Spynel; only the
 // explicit custom ACP profile accepts a command and shell-free argument list.
 type Harness struct {
-	Name                 string   `yaml:"name"`
-	Model                string   `yaml:"model,omitempty"`
-	Sandbox              string   `yaml:"sandbox"`
-	ChatAgentPrefix      string   `yaml:"chat_agent_prefix"`
-	DeveloperAgentPrefix string   `yaml:"developer_agent_prefix"`
-	ReviewerAgentPrefix  string   `yaml:"reviewer_agent_prefix"`
-	HeartbeatAgentPrefix string   `yaml:"heartbeat_agent_prefix"`
-	Reviews              string   `yaml:"reviews"`
-	ACPCommand           string   `yaml:"acp_command,omitempty"`
-	ACPArgs              []string `yaml:"acp_args,omitempty"`
+	Name                   string   `yaml:"name"`
+	Model                  string   `yaml:"model,omitempty"`
+	ReasoningEffort        string   `yaml:"reasoning_effort"`
+	ServiceMode            string   `yaml:"service_mode"`
+	Sandbox                string   `yaml:"sandbox"`
+	ChatAgentPrefix        string   `yaml:"chat_agent_prefix"`
+	DeveloperAgentPrefix   string   `yaml:"developer_agent_prefix"`
+	ReviewerAgentPrefix    string   `yaml:"reviewer_agent_prefix"`
+	HeartbeatAgentPrefix   string   `yaml:"heartbeat_agent_prefix"`
+	Reviews                string   `yaml:"reviews"`
+	ACPCommand             string   `yaml:"acp_command,omitempty"`
+	ACPArgs                []string `yaml:"acp_args,omitempty"`
+	reasoningEffortOmitted bool
+}
+
+// UsesLegacyReasoningEffort reports whether the historical medium value came
+// from a configuration that predates the reasoning_effort key. Providers may
+// need this provenance to preserve their former compatibility behavior while
+// still validating an explicitly selected medium strictly.
+func (h Harness) UsesLegacyReasoningEffort() bool {
+	return h.reasoningEffortOmitted && h.ReasoningEffort == "medium"
 }
 
 // EffectiveTaskReviewRequired applies the workspace-wide task review mode to
@@ -216,7 +227,10 @@ func Default() Config {
 		Version:   1,
 		Workspace: Workspace{HistoryMaxMessages: 50, HistoryCharLimit: 12000, AttachmentMaxMB: 100, CleanupRetentionDays: 30},
 		Harness: Harness{
-			Name: "", Model: "", Sandbox: "danger-full-access",
+			// Before reasoning_effort was configurable, every runtime adapter was
+			// constructed with medium. Keeping that decode default distinguishes an
+			// omitted legacy key from an explicit empty/inherit value in current YAML.
+			Name: "", Model: "", ReasoningEffort: "medium", Sandbox: "danger-full-access", reasoningEffortOmitted: true,
 			Reviews: TaskReviewsSkipTrivial,
 		},
 		Channels: Channels{
@@ -287,12 +301,21 @@ func decode(data []byte, abs string) (Config, error) {
 		return Config{}, fmt.Errorf("parse %s: %w", abs, err)
 	}
 	cfg := Default()
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return Config{}, fmt.Errorf("parse %s: %w", abs, err)
+	}
+	if len(document.Content) > 0 {
+		cfg.Harness.reasoningEffortOmitted = mappingValue(mappingValue(document.Content[0], "harness"), "reasoning_effort") == nil
+	}
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", abs, err)
 	}
 	cfg.Harness.Name = harness.NormalizeName(cfg.Harness.Name)
+	cfg.Harness.ReasoningEffort = normalizeInheritedValue(cfg.Harness.ReasoningEffort)
+	cfg.Harness.ServiceMode = normalizeServiceMode(cfg.Harness.ServiceMode)
 	cfg.Harness.Sandbox = normalizeSandbox(cfg.Harness.Sandbox)
 	cfg.Harness.ChatAgentPrefix = strings.TrimSpace(cfg.Harness.ChatAgentPrefix)
 	cfg.Harness.DeveloperAgentPrefix = strings.TrimSpace(cfg.Harness.DeveloperAgentPrefix)
@@ -416,6 +439,18 @@ func (c Config) Validate() error {
 	if c.Harness.Name == "acp" && strings.TrimSpace(c.Harness.ACPCommand) == "" {
 		problems = append(problems, "harness.acp_command is required when harness.name is acp")
 	}
+	if !validReasoningEffort(c.Harness.ReasoningEffort) {
+		problems = append(problems, "harness.reasoning_effort must be inherit or a one-line identifier of at most 128 bytes")
+	}
+	if len(c.Harness.ServiceMode) > 128 || strings.IndexFunc(c.Harness.ServiceMode, unicode.IsControl) >= 0 {
+		problems = append(problems, "harness.service_mode must be one line of at most 128 bytes")
+	}
+	if acpHarnessName(c.Harness.Name) && c.Harness.ReasoningEffort != "" && !(c.Harness.reasoningEffortOmitted && c.Harness.ReasoningEffort == "medium") {
+		problems = append(problems, "harness.reasoning_effort is not supported for ACP harnesses; use inherit (legacy omitted configurations may retain medium without sending it)")
+	}
+	if c.Harness.Name != "" && c.Harness.Name != "codex" && c.Harness.ServiceMode != "" {
+		problems = append(problems, "harness.service_mode is not supported for "+c.Harness.Name+"; use inherit")
+	}
 	if strings.ContainsRune(c.Harness.ACPCommand, '\x00') {
 		problems = append(problems, "harness.acp_command contains an invalid NUL byte")
 	}
@@ -535,6 +570,38 @@ func (c Config) Validate() error {
 		return errors.New(strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+func normalizeInheritedValue(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "default" || value == "inherit" || value == "auto" {
+		return ""
+	}
+	return value
+}
+
+func normalizeServiceMode(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.EqualFold(value, "default") || strings.EqualFold(value, "inherit") || strings.EqualFold(value, "auto") {
+		return ""
+	}
+	return value
+}
+
+func validReasoningEffort(value string) bool {
+	value = normalizeInheritedValue(value)
+	return len(value) <= 128 && strings.IndexFunc(value, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.IsSpace(r)
+	}) < 0
+}
+
+func acpHarnessName(name string) bool {
+	switch harness.NormalizeName(name) {
+	case "agent-zero", "opencode", "qwen-code", "kimi", "goose", "cursor", "gemini-cli", "github-copilot", "factory-droid", "acp":
+		return true
+	default:
+		return false
+	}
 }
 
 // HasAllowedTelegramUser reports whether an allow-list contains at least one
@@ -688,6 +755,19 @@ func Save(cfg Config) error {
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", cfg.Path, err)
+	}
+	if cfg.Harness.reasoningEffortOmitted {
+		var document yaml.Node
+		if err := yaml.Unmarshal(data, &document); err != nil {
+			return fmt.Errorf("encode %s: %w", cfg.Path, err)
+		}
+		if len(document.Content) > 0 {
+			removeMappingKey(mappingValue(document.Content[0], "harness"), "reasoning_effort")
+		}
+		data, err = yaml.Marshal(&document)
+		if err != nil {
+			return fmt.Errorf("encode %s: %w", cfg.Path, err)
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o700); err != nil {
 		return fmt.Errorf("prepare %s: %w", cfg.Path, err)

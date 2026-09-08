@@ -893,6 +893,10 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		return s.harnessCommand(message, remainder, emit)
 	case "model":
 		return s.modelCommand(ctx, message, remainder, emit)
+	case "effort":
+		return s.modelPropertyCommand(ctx, message, "effort", remainder, emit)
+	case "speed":
+		return s.modelPropertyCommand(ctx, message, "speed", remainder, emit)
 	case "theme":
 		return s.themeCommand(message, remainder, emit)
 	case "title":
@@ -1535,6 +1539,8 @@ type StatusSnapshot struct {
 	HarnessState         string                             `json:"harness_state"`
 	HarnessDetail        string                             `json:"harness_detail,omitempty"`
 	Model                string                             `json:"model,omitempty"`
+	ReasoningEffort      string                             `json:"reasoning_effort,omitempty"`
+	ServiceMode          string                             `json:"service_mode,omitempty"`
 	Sandbox              string                             `json:"sandbox"`
 	StartupEnabled       bool                               `json:"startup_enabled"`
 	TurnActive           bool                               `json:"turn_active"`
@@ -1588,7 +1594,7 @@ func (s *Service) Status(message core.Message) (StatusSnapshot, error) {
 		Instance: shortid.Display(instanceID), PrimaryInstance: shortid.Display(primaryInstanceID),
 		Connections: []channel.ConnectionStatus{s.connectionStatus("telegram"), s.connectionStatus("whatsapp")},
 		Runtime:     s.Runtime.Status(), Harness: cfg.Harness.Name, HarnessState: harnessState,
-		HarnessDetail: harnessDetail, Model: cfg.Harness.Model, Sandbox: cfg.Harness.Sandbox,
+		HarnessDetail: harnessDetail, Model: cfg.Harness.Model, ReasoningEffort: cfg.Harness.ReasoningEffort, ServiceMode: cfg.Harness.ServiceMode, Sandbox: cfg.Harness.Sandbox,
 		StartupEnabled: cfg.Startup.Enabled, TurnActive: s.Harness.IsActive(sessionKey(message)),
 		OrchestratorLease: leases, OrchestratorRuns: dispatches,
 		TasksActive: work.TasksActive, TasksWaiting: work.TasksWaiting, GoalsActive: work.GoalsActive, WorkDiagnostics: work.CountDiagnostics,
@@ -1641,6 +1647,8 @@ func FormatStatus(status StatusSnapshot) string {
 		"- WhatsApp: " + connectionIndicator(whatsapp),
 		"- Coding harness: " + emptyAs(status.Harness, "not selected") + " (" + harnessStatus + ")",
 		"- Model: " + emptyAs(status.Model, "harness default"),
+		"- Reasoning effort: " + emptyAs(status.ReasoningEffort, "inherit"),
+		"- Service mode: " + emptyAs(status.ServiceMode, "inherit"),
 		"- Agent filesystem access: " + status.Sandbox,
 		"- Run at startup: " + enabledText(status.StartupEnabled),
 		fmt.Sprintf("- Logs: %d — `/log`", status.Runtime.Logs),
@@ -1811,6 +1819,8 @@ var slashCommands = []core.SlashCommand{
 	{Value: "/config set ", Usage: "/config set <key> <value>", Description: "Persist one configuration value"},
 	{Value: "/harness ", Usage: "/harness [name]", Description: "Show or select the coding harness"},
 	{Value: "/model ", Usage: "/model [name]", Description: "Show or select the harness model"},
+	{Value: "/effort ", Usage: "/effort [level|inherit]", Description: "Show, select, or reset reasoning effort"},
+	{Value: "/speed ", Usage: "/speed [mode|inherit]", Description: "Show, select, or reset a model service mode"},
 	{Value: "/theme", Usage: "/theme [name]", Description: "Preview or select a color theme"},
 	{Value: "/telegram", Usage: "/telegram", Description: "Open or show Telegram configuration"},
 	{Value: "/telegram on", Usage: "/telegram on", Description: "Enable Telegram"},
@@ -1881,7 +1891,7 @@ var helpTopics = []struct {
 	{
 		name:        "config",
 		description: ".spynel/config.yaml settings and path resolution",
-		body:        "# Configuration\n\n`.spynel/config.yaml` controls the workspace, harness, channels, speech processing, orchestration routes, and extensions. `/config` shows the shared settings, `/config get <key>` reads one value, and `/config set <key> <value>` atomically validates and persists a change from any channel. `/harness [name]` and `/model [name]` are concise selectors. Model changes can be saved during active work: the current turn keeps its model and subsequent provider dispatches use the new one. `/theme [name]` previews/lists or selects a semantic palette from `.spynel/themes`. All harness settings live in the `harness` group. `harness.sandbox` accepts `danger-full-access`, `workspace-write`, or `read-only`; unrestricted access is the default. Chat, developer, reviewer, and heartbeat prefixes default empty; optional harness-native commands such as `/goal` are outer-trimmed and separated from the original prompt by one ASCII space. `harness.reviews` accepts `skip-trivial`, `always`, or `never` for task reviews. Relative paths resolve from the workspace root, one directory above `.spynel`, so a project can be moved without rewriting local paths.",
+		body:        "# Configuration\n\n`.spynel/config.yaml` controls the workspace, harness, channels, speech processing, orchestration routes, and extensions. `/config` shows the shared settings, `/config get <key>` reads one value, and `/config set <key> <value>` atomically validates and persists a change from any channel. `/harness [name]` and `/model [name]` are concise selectors; `/effort` and `/speed` inspect or select only properties supported by the current model, and `inherit` resets either property. Model-property changes can be saved during active work: the current turn keeps its captured model, effort, and service mode, while subsequent provider dispatches use the new atomic selection. `/theme [name]` previews/lists or selects a semantic palette from `.spynel/themes`. All harness settings live in the `harness` group. `harness.sandbox` accepts `danger-full-access`, `workspace-write`, or `read-only`; unrestricted access is the default. Chat, developer, reviewer, and heartbeat prefixes default empty; optional harness-native commands such as `/goal` are outer-trimmed and separated from the original prompt by one ASCII space. `harness.reviews` accepts `skip-trivial`, `always`, or `never` for task reviews. Relative paths resolve from the workspace root, one directory above `.spynel`, so a project can be moved without rewriting local paths.",
 	},
 	{
 		name:        "channels",

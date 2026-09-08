@@ -1890,6 +1890,19 @@ func TestHelpMarkdownHeadingsStayOnOneChatRow(t *testing.T) {
 	}
 }
 
+func TestModelPropertySelectorFitsNarrowTerminal(t *testing.T) {
+	m := visualModelEffortModel(32)
+	view := m.View()
+	if !strings.Contains(ansi.Strip(view), "Reasoning effort") || !strings.Contains(ansi.Strip(view), "Inherit") {
+		t.Fatalf("narrow model-property selector lost content: %q", ansi.Strip(view))
+	}
+	for row, line := range strings.Split(view, "\n") {
+		if width := lipgloss.Width(line); width != 32 {
+			t.Fatalf("row %d width = %d, want 32: %q", row, width, ansi.Strip(line))
+		}
+	}
+}
+
 func TestWizardTabsUseBoldLabelsAndActiveUnderline(t *testing.T) {
 	m := testModel()
 	m.openScreen(core.Screen{ID: "wizard:telegram:token", Title: "Telegram setup", Tabs: []string{"Start", "Create", "Token", "Access"}, ActiveTab: 2})
@@ -5115,4 +5128,44 @@ func runCommandAt(command tea.Cmd, index int) tea.Msg {
 func inputCursorColumn(m model) int {
 	_, column := m.inputCursorPosition()
 	return column
+}
+
+func TestDependentModelSelectionPreservesParentAndRefreshesCommittedControl(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%t", cancel), func(t *testing.T) {
+			m := testModel()
+			m.openScreen(core.Screen{ID: "config", Controls: []core.ScreenControl{
+				{Key: "model", Kind: "action", Value: "Model · old", Description: "old effort"},
+				{Key: "notes", Kind: "text", Value: "original"},
+			}})
+			m.screen.Controls[1].Value = "unsaved edit"
+			m.screenIndex = 1
+			m.openScreen(core.Screen{ID: "model", ParentID: "config", SaveDisabled: true})
+			for _, id := range []string{"model-effort:bW9kZWwtYQ", "model-service:bW9kZWwtYQ.aGlnaA"} {
+				next, _ := m.Update(screenActionResult{action: "select:model-a", screen: &core.Screen{ID: id, SaveDisabled: true}})
+				m = next.(model)
+				if m.screen == nil || m.screen.ID != id || len(m.screenStack) != 1 {
+					t.Fatalf("dependent step returned early: screen=%#v stack=%d", m.screen, len(m.screenStack))
+				}
+			}
+			saved := core.ScreenControl{Key: "model", Kind: "action", Value: "Model · model-a", Description: "effort high · speed inherit"}
+			var next tea.Model
+			if cancel {
+				next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			} else {
+				next, _ = m.Update(screenActionResult{action: "select:", screen: &core.Screen{ActionMessage: "Saved selection", SavedControl: &saved}})
+			}
+			m = next.(model)
+			if m.screen == nil || m.screen.ID != "config" || len(m.screenStack) != 0 || m.screenIndex != 1 || m.screen.Controls[1].Value != "unsaved edit" {
+				t.Fatalf("parent state lost: screen=%#v index=%d", m.screen, m.screenIndex)
+			}
+			if cancel {
+				if m.screen.Controls[0].Value != "Model · old" || m.screen.Controls[0].Description != "old effort" || len(m.transcript) != 0 {
+					t.Fatal("cancel changed the parent selection")
+				}
+			} else if m.screen.Controls[0].Value != saved.Value || m.screen.Controls[0].Description != saved.Description || len(m.transcript) != 1 {
+				t.Fatalf("committed model row was not refreshed: %#v", m.screen.Controls[0])
+			}
+		})
+	}
 }

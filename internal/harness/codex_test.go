@@ -291,7 +291,49 @@ func TestCodexDiscoversPickerVisibleModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 1 || models[0].ID != "model-a" || models[0].DisplayName != "Model A" || !models[0].Default || strings.Join(models[0].Efforts, ",") != "low,medium" {
+	if len(models) != 1 || models[0].ID != "model-a" || models[0].DisplayName != "Model A" || !models[0].Default || strings.Join(models[0].Efforts, ",") != "low,medium,ultra" || len(models[0].ServiceModes) != 1 || models[0].ServiceModes[0].ID != "fast" {
 		t.Fatalf("Models() = %#v", models)
 	}
+}
+
+func TestCodexPassesCapturedEffortAndServiceTier(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "codex-lifecycle")
+	codex, err := NewCodex(CodexConfig{Command: command, Cwd: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := codex.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{}, 1)
+	selection := InferenceSelection{Model: "model-a", Effort: "medium", ServiceMode: "fast"}
+	if _, _, err := codex.SendWithInference(ctx, "chat", "test", selection, func(event core.Event) {
+		if event.Done {
+			done <- struct{}{}
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("timed out")
+	}
+	_ = codex.Close()
+	for _, record := range readFixtureRecords(t, logPath) {
+		if record.Method != "turn/start" {
+			continue
+		}
+		var params map[string]any
+		if err := json.Unmarshal(record.Params, &params); err != nil {
+			t.Fatal(err)
+		}
+		if params["model"] != "model-a" || params["effort"] != "medium" || params["serviceTier"] != "fast" {
+			t.Fatalf("turn/start params = %#v", params)
+		}
+		return
+	}
+	t.Fatal("turn/start request not recorded")
 }

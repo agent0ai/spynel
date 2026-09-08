@@ -1335,7 +1335,9 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		actionMessage := ""
+		var savedControl *core.ScreenControl
 		if value.screen != nil {
+			savedControl = value.screen.SavedControl
 			actionMessage = strings.TrimSpace(value.screen.ActionMessage)
 			value.screen.ActionMessage = ""
 			if value.screen.ID == "" {
@@ -1355,8 +1357,9 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "Editing " + title
 			break
 		}
-		selectionScreen := m.screen != nil && (m.screen.ID == "harness" || m.screen.ID == "model")
-		if selectionScreen && len(m.screenStack) > 0 && (value.screen == nil || value.screen.ID != m.screen.ID) {
+		selectionScreen := m.screen != nil && (m.screen.ID == "harness" || m.screen.ID == "model" || strings.HasPrefix(m.screen.ID, "model-effort:") || strings.HasPrefix(m.screen.ID, "model-service:"))
+		dependentModelScreen := value.screen != nil && (strings.HasPrefix(value.screen.ID, "model-effort:") || strings.HasPrefix(value.screen.ID, "model-service:"))
+		if selectionScreen && !dependentModelScreen && len(m.screenStack) > 0 && (value.screen == nil || value.screen.ID != m.screen.ID) {
 			selectionScreenID := m.screen.ID
 			m.restoreParentScreen()
 			selection := strings.TrimPrefix(value.action, "select:")
@@ -1365,6 +1368,15 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.refreshRestoredSelection(selectionScreenID, selection)
 			m.status = "Selected " + selection
+			if savedControl != nil && m.screen.ID == "config" {
+				for index := range m.screen.Controls {
+					control := &m.screen.Controls[index]
+					if control.Key == savedControl.Key && control.Kind == "action" {
+						control.Value, control.Description = savedControl.Value, savedControl.Description
+					}
+				}
+				m.status = "Configuration saved"
+			}
 			break
 		}
 		if value.screen != nil {

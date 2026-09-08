@@ -91,9 +91,28 @@ func acpDefinitionWithCheck(name, displayName, command string, args, checkArgs [
 func newCodexFromHarnessConfig(cfg HarnessConfig) (Harness, error) {
 	return NewCodex(CodexConfig{
 		Command: cfg.Command, Cwd: cfg.Cwd, Model: cfg.Model, Effort: cfg.Effort,
+		ServiceMode:    cfg.ServiceMode,
 		ApprovalPolicy: cfg.ApprovalPolicy, Sandbox: cfg.Sandbox, Network: cfg.Network,
 		SessionsFile: cfg.SessionsFile, Version: cfg.Version, Stderr: cfg.Stderr,
 	})
+}
+
+// StaticCapabilities documents model-associated controls that are known
+// before a provider process is started. Dynamic model catalogs remain the
+// authority for the exact choices of Codex and Pi.
+func StaticCapabilities(name string) (reasoning, service string) {
+	switch NormalizeName(name) {
+	case "codex":
+		return "per-model catalog", "per-model service tiers"
+	case "claude-code":
+		return "low, medium, high, xhigh, max", "unsupported"
+	case "pi":
+		return "per-model catalog", "unsupported"
+	case "agent-zero", "opencode", "qwen-code", "kimi", "goose", "cursor", "gemini-cli", "github-copilot", "factory-droid", "acp":
+		return "unsupported (choices are unavailable before ACP session creation)", "unsupported (no standard ACP speed category)"
+	default:
+		return "unknown", "unknown"
+	}
 }
 
 // NewBuiltinRegistry returns factories for every entry in Catalog. Adding a

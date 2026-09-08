@@ -256,6 +256,75 @@ func TestLoadMergesUserValuesWithDefaults(t *testing.T) {
 	}
 }
 
+func TestReasoningEffortOmissionPreservesLegacyMediumAndExplicitInherit(t *testing.T) {
+	root := t.TempDir()
+	path := writeTestConfig(t, root, []byte("version: 1\nharness:\n  name: codex\n"))
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Harness.ReasoningEffort != "medium" {
+		t.Fatalf("omitted reasoning effort = %q, want legacy medium", cfg.Harness.ReasoningEffort)
+	}
+	if !cfg.Harness.UsesLegacyReasoningEffort() {
+		t.Fatal("omitted reasoning effort lost its legacy provenance")
+	}
+	if err := Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(saved), "reasoning_effort:") {
+		t.Fatalf("legacy omission was materialized during unrelated save:\n%s", saved)
+	}
+	cfg, err = Load(path)
+	if err != nil || cfg.Harness.ReasoningEffort != "medium" {
+		t.Fatalf("saved omitted reasoning effort = %q, %v", cfg.Harness.ReasoningEffort, err)
+	}
+
+	path = writeTestConfig(t, root, []byte("version: 1\nharness:\n  name: codex\n  reasoning_effort: inherit\n"))
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Harness.ReasoningEffort != "" {
+		t.Fatalf("explicit inherited reasoning effort = %q, want empty provider default", cfg.Harness.ReasoningEffort)
+	}
+	if cfg.Harness.UsesLegacyReasoningEffort() {
+		t.Fatal("explicit inherit was marked as a legacy omitted effort")
+	}
+	if err := Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil || cfg.Harness.ReasoningEffort != "" {
+		t.Fatalf("saved inherited reasoning effort = %q, %v", cfg.Harness.ReasoningEffort, err)
+	}
+}
+
+func TestDirectConfigRejectsUnsupportedACPInferenceProperties(t *testing.T) {
+	root := t.TempDir()
+	for _, test := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{name: "reasoning", yaml: "reasoning_effort: high", want: "reasoning_effort is not supported for ACP"},
+		{name: "reasoning medium", yaml: "reasoning_effort: medium", want: "reasoning_effort is not supported for ACP"},
+		{name: "speed", yaml: "service_mode: fast", want: "service_mode is not supported for agent-zero"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := writeTestConfig(t, root, []byte("version: 1\nharness:\n  name: agent-zero\n  "+test.yaml+"\n"))
+			_, err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("unsupported ACP property error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsUnknownConfigurationFields(t *testing.T) {
 	root := t.TempDir()
 	path := writeTestConfig(t, root, []byte("version: 1\nspeech:\n  command: retired-speech-command\n"))

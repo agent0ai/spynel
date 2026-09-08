@@ -34,6 +34,34 @@ type supervisorHarness struct {
 	isActiveOnce     sync.Once
 }
 
+type inferenceSupervisorHarness struct {
+	*supervisorHarness
+	selection  InferenceSelection
+	selections map[string][]InferenceSelection
+}
+
+func (r *inferenceSupervisorHarness) SetInference(selection InferenceSelection) {
+	r.mu.Lock()
+	r.selection = selection
+	r.configuredModel = selection.Model
+	r.mu.Unlock()
+}
+
+func (r *inferenceSupervisorHarness) SendWithInference(_ context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
+	r.mu.Lock()
+	if r.prompts == nil {
+		r.prompts = map[string][]string{}
+	}
+	if r.selections == nil {
+		r.selections = map[string][]InferenceSelection{}
+	}
+	r.prompts[key] = append(r.prompts[key], prompt)
+	r.selections[key] = append(r.selections[key], selection)
+	r.active[key], r.emits[key] = true, emit
+	r.mu.Unlock()
+	return r.name + "-thread", false, nil
+}
+
 func waitSupervisorState(t *testing.T, predicate func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
@@ -281,6 +309,37 @@ func TestSupervisorCommitsModelDuringActiveTurnAndUsesItForQueuedContinuation(t 
 	target.mu.Unlock()
 	if !reflect.DeepEqual(models, []string{"model-old", "model-new"}) {
 		t.Fatalf("dispatch model snapshots = %#v", models)
+	}
+	target.finish("chat")
+}
+
+func TestSupervisorSnapshotsAllInferencePropertiesAcrossQueuedContinuation(t *testing.T) {
+	base := &supervisorHarness{name: "codex", followUp: FollowUpQueue, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	target := &inferenceSupervisorHarness{supervisorHarness: base, selection: InferenceSelection{Model: "old", Effort: "medium", LegacyEffort: true, ServiceMode: "default"}}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex", Model: "old", Effort: "medium", LegacyEffort: true, ServiceMode: "default"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "chat", "active", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, queued, err := supervisor.Send(context.Background(), "chat", "queued", nil); err != nil || !queued {
+		t.Fatalf("queue = %t, %v", queued, err)
+	}
+	next := InferenceSelection{Model: "new", Effort: "xhigh", ServiceMode: "fast"}
+	if err := supervisor.CommitInference(next, func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	target.finish("chat")
+	waitSupervisorState(t, func() bool { target.mu.Lock(); defer target.mu.Unlock(); return len(target.selections["chat"]) == 2 })
+	target.mu.Lock()
+	got := append([]InferenceSelection(nil), target.selections["chat"]...)
+	target.mu.Unlock()
+	want := []InferenceSelection{{Model: "old", Effort: "medium", LegacyEffort: true, ServiceMode: "default"}, next}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("inference snapshots = %#v, want %#v", got, want)
 	}
 	target.finish("chat")
 }

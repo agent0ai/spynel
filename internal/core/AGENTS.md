@@ -11,6 +11,8 @@
 - Carry private stable source-message identity across transport, loopback, application, and history boundaries without exposing it in public status or job projections.
 - Keep compact count formatting deterministic for constrained status surfaces.
 
+- Screen action results may carry an optional `SavedControl` to refresh the committed action row in a preserved parent form without replacing unsaved fields.
+
 ## Child DOX Index
 
 No child DOX files.

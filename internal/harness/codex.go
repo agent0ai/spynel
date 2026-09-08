@@ -23,6 +23,7 @@ type CodexConfig struct {
 	Cwd            string
 	Model          string
 	Effort         string
+	ServiceMode    string
 	ApprovalPolicy string
 	Sandbox        string
 	Network        bool
@@ -117,7 +118,13 @@ type codexModelList struct {
 			Effort      string `json:"reasoningEffort"`
 			Description string `json:"description"`
 		} `json:"supportedReasoningEfforts"`
-		IsDefault bool `json:"isDefault"`
+		ServiceTiers []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"serviceTiers"`
+		DefaultServiceTier *string `json:"defaultServiceTier"`
+		IsDefault          bool    `json:"isDefault"`
 	} `json:"data"`
 	NextCursor *string `json:"nextCursor"`
 }
@@ -187,6 +194,12 @@ func (c *Codex) Models(ctx context.Context) ([]Model, error) {
 			for _, effort := range item.SupportedEfforts {
 				model.Efforts = append(model.Efforts, effort.Effort)
 			}
+			for _, tier := range item.ServiceTiers {
+				model.ServiceModes = append(model.ServiceModes, ModelPropertyOption{ID: tier.ID, DisplayName: tier.Name, Description: tier.Description})
+			}
+			if item.DefaultServiceTier != nil {
+				model.DefaultServiceMode = *item.DefaultServiceTier
+			}
 			models = append(models, model)
 		}
 		if page.NextCursor == nil || *page.NextCursor == "" {
@@ -248,9 +261,9 @@ func (c *Codex) Start(parent context.Context) error {
 
 func (c *Codex) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
 	c.mu.Lock()
-	model := c.config.Model
+	selection := InferenceSelection{Model: c.config.Model, Effort: c.config.Effort, ServiceMode: c.config.ServiceMode}
 	c.mu.Unlock()
-	return c.SendWithModel(ctx, key, prompt, model, emit)
+	return c.SendWithInference(ctx, key, prompt, selection, emit)
 }
 
 func (c *Codex) SetModel(model string) {
@@ -259,14 +272,36 @@ func (c *Codex) SetModel(model string) {
 	c.mu.Unlock()
 }
 
+func (c *Codex) SetInference(selection InferenceSelection) {
+	c.mu.Lock()
+	c.config.Model, c.config.Effort, c.config.ServiceMode = selection.Model, selection.Effort, selection.ServiceMode
+	c.mu.Unlock()
+}
+
 func (c *Codex) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+	c.mu.Lock()
+	selection := InferenceSelection{Model: model, Effort: c.config.Effort, ServiceMode: c.config.ServiceMode}
+	c.mu.Unlock()
+	return c.SendWithInference(ctx, key, prompt, selection, emit)
+}
+
+func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", false, errors.New("harness prompt is empty")
+	}
+	if selection.Effort != "" || selection.ServiceMode != "" {
+		models, err := c.Models(ctx)
+		if err != nil {
+			return "", false, fmt.Errorf("validate Codex inference properties: %w", err)
+		}
+		if err := ValidateInferenceSelection(models, selection); err != nil {
+			return "", false, err
+		}
 	}
 	lock := c.lockForKey(key)
 	lock.Lock()
 	defer lock.Unlock()
-	threadID, err := c.ensureThread(ctx, key, model)
+	threadID, err := c.ensureThread(ctx, key, selection.Model)
 	if err != nil {
 		return "", false, err
 	}
@@ -308,11 +343,14 @@ func (c *Codex) SendWithModel(ctx context.Context, key, prompt, model string, em
 		"approvalPolicy": c.config.ApprovalPolicy,
 		"sandboxPolicy":  c.sandboxPolicy(),
 	}
-	if model != "" {
-		params["model"] = model
+	if selection.Model != "" {
+		params["model"] = selection.Model
 	}
-	if c.config.Effort != "" {
-		params["effort"] = c.config.Effort
+	if selection.Effort != "" {
+		params["effort"] = selection.Effort
+	}
+	if selection.ServiceMode != "" {
+		params["serviceTier"] = selection.ServiceMode
 	}
 	result, err := c.call(ctx, "turn/start", params)
 	if err != nil {

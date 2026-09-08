@@ -21,6 +21,8 @@ type HarnessConfig struct {
 	Cwd            string
 	Model          string
 	Effort         string
+	LegacyEffort   bool
+	ServiceMode    string
 	ApprovalPolicy string
 	Sandbox        string
 	Network        bool
@@ -32,12 +34,76 @@ type HarnessConfig struct {
 // Model describes one model choice exposed by a harness. IDs are the exact
 // values accepted by SetModel or by the harness command line.
 type Model struct {
-	ID            string
-	DisplayName   string
-	Description   string
-	Efforts       []string
-	DefaultEffort string
-	Default       bool
+	ID                 string
+	DisplayName        string
+	Description        string
+	Efforts            []string
+	DefaultEffort      string
+	ServiceModes       []ModelPropertyOption
+	DefaultServiceMode string
+	Default            bool
+}
+
+// ModelPropertyOption is one provider-supplied value for a model-associated
+// inference or service property. Values are passed through exactly as exposed.
+type ModelPropertyOption struct {
+	ID          string
+	DisplayName string
+	Description string
+}
+
+// InferenceSelection is captured at provider-dispatch admission. Empty values
+// mean inherit the harness/model default.
+type InferenceSelection struct {
+	Model        string
+	Effort       string
+	LegacyEffort bool
+	ServiceMode  string
+}
+
+// InferenceDispatcher lets adapters atomically snapshot every forward-looking
+// model-associated property rather than consulting mutable process config.
+type InferenceDispatcher interface {
+	SendWithInference(context.Context, string, string, InferenceSelection, core.Emit) (threadID string, steered bool, err error)
+	SetInference(InferenceSelection)
+}
+
+// ValidateInferenceSelection rejects stale or unsupported properties without
+// passing them to a provider. A custom model remains usable only with inherited
+// properties because its capabilities are unknown.
+func ValidateInferenceSelection(models []Model, selection InferenceSelection) error {
+	if selection.Effort == "" && selection.ServiceMode == "" {
+		return nil
+	}
+	var selected *Model
+	for index := range models {
+		if models[index].ID == selection.Model || selection.Model == "" && models[index].Default {
+			selected = &models[index]
+			break
+		}
+	}
+	if selected == nil {
+		return fmt.Errorf("model %q has no verified inference-property capabilities; reset effort and service mode to inherit", selection.Model)
+	}
+	if selection.Effort != "" {
+		valid := false
+		for _, value := range selected.Efforts {
+			valid = valid || value == selection.Effort
+		}
+		if !valid {
+			return fmt.Errorf("reasoning effort %q is not supported by model %q", selection.Effort, selected.ID)
+		}
+	}
+	if selection.ServiceMode != "" {
+		valid := false
+		for _, value := range selected.ServiceModes {
+			valid = valid || value.ID == selection.ServiceMode
+		}
+		if !valid {
+			return fmt.Errorf("service mode %q is not supported by model %q", selection.ServiceMode, selected.ID)
+		}
+	}
+	return nil
 }
 
 // ModelProvider is optional because some third-party harness extensions may

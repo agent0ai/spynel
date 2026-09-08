@@ -29,6 +29,8 @@ func Settings(cfg Config) []Setting {
 	values := []Setting{
 		{Key: "harness.name", Section: "harness", Description: "Active coding harness", Value: cfg.Harness.Name, Choices: harness.Names()},
 		{Key: "harness.model", Section: "harness", Description: "Harness model override", Value: cfg.Harness.Model},
+		{Key: "harness.reasoning_effort", Section: "harness", Description: "Reasoning effort; inherit uses the selected model default", Value: emptyAsInherit(cfg.Harness.ReasoningEffort)},
+		{Key: "harness.service_mode", Section: "harness", Description: "Optional model service/speed mode; inherit uses the provider default", Value: emptyAsInherit(cfg.Harness.ServiceMode)},
 		{Key: "harness.sandbox", Section: "harness", Description: "Coding-agent filesystem access; danger-full-access removes workspace confinement", Value: cfg.Harness.Sandbox, Choices: []string{"danger-full-access", "workspace-write", "read-only"}},
 		{Key: "harness.reviews", Section: "harness", Description: "Task review policy; skip-trivial lets agents decide, always forces review, and never disables task review", Value: cfg.Harness.Reviews, Choices: []string{TaskReviewsSkipTrivial, TaskReviewsAlways, TaskReviewsNever}},
 		{Key: "workspace.history_max_messages", Section: "config", Description: "Maximum recent messages passed to the harness (0 disables history)", Value: strconv.Itoa(cfg.Workspace.HistoryMaxMessages)},
@@ -104,6 +106,7 @@ func SetSetting(cfg *Config, key, value string) (Setting, error) {
 	if err != nil {
 		return Setting{}, err
 	}
+	normalizeHarnessInferenceChange(*cfg, &next, map[string]bool{normalizeSettingKey(key): true}, nil)
 	if err := next.Validate(); err != nil {
 		return Setting{}, err
 	}
@@ -128,6 +131,11 @@ func SetSettings(cfg *Config, values map[string]string) ([]Setting, error) {
 		}
 		changed = append(changed, setting)
 	}
+	explicit := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		explicit[normalizeSettingKey(key)] = true
+	}
+	normalizeHarnessInferenceChange(*cfg, &next, explicit, &changed)
 	if err := next.Validate(); err != nil {
 		return nil, err
 	}
@@ -136,6 +144,33 @@ func SetSettings(cfg *Config, values map[string]string) ([]Setting, error) {
 		changed[index], _ = SettingByKey(next, changed[index].Key)
 	}
 	return changed, nil
+}
+
+// normalizeHarnessInferenceChange clears stored provider-specific properties
+// that are known to be unsupported by a newly selected harness. Explicitly
+// requested combinations still reach validation and return a clear error.
+func normalizeHarnessInferenceChange(previous Config, next *Config, explicit map[string]bool, changed *[]Setting) {
+	if previous.Harness.Name == next.Harness.Name {
+		return
+	}
+	reset := func(key string) {
+		setting, err := setSetting(next, key, "inherit")
+		if err != nil || changed == nil {
+			return
+		}
+		for _, current := range *changed {
+			if current.Key == key {
+				return
+			}
+		}
+		*changed = append(*changed, setting)
+	}
+	if next.Harness.Name != "" && next.Harness.Name != "codex" && next.Harness.ServiceMode != "" && !explicit["harness.service_mode"] {
+		reset("harness.service_mode")
+	}
+	if acpHarnessName(next.Harness.Name) && next.Harness.ReasoningEffort != "" && !explicit["harness.reasoning_effort"] {
+		reset("harness.reasoning_effort")
+	}
 }
 
 func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocyclo
@@ -164,6 +199,11 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Harness.Name = harness.NormalizeName(value)
 	case "harness.model":
 		cfg.Harness.Model = value
+	case "harness.reasoning_effort":
+		cfg.Harness.ReasoningEffort = normalizeInheritedValue(value)
+		cfg.Harness.reasoningEffortOmitted = false
+	case "harness.service_mode":
+		cfg.Harness.ServiceMode = normalizeServiceMode(value)
 	case "harness.sandbox":
 		cfg.Harness.Sandbox = normalizeSandbox(value)
 	case "harness.chat_agent_prefix":
@@ -284,9 +324,20 @@ func normalizeSettingKey(key string) string {
 		return "harness.name"
 	case "model", "harness.model":
 		return "harness.model"
+	case "effort", "reasoning-effort", "reasoning_effort", "harness.reasoning_effort":
+		return "harness.reasoning_effort"
+	case "speed", "service-mode", "service_mode", "harness.service_mode":
+		return "harness.service_mode"
 	default:
 		return key
 	}
+}
+
+func emptyAsInherit(value string) string {
+	if value == "" {
+		return "inherit"
+	}
+	return value
 }
 
 func normalizeTaskReviewMode(value string) string {

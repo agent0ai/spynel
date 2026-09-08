@@ -241,8 +241,8 @@ func checkClaudeCapabilities(parent context.Context, cfg HarnessConfig) error {
 func (c *Claude) Models(context.Context) ([]Model, error) {
 	allEfforts := []string{"low", "medium", "high", "xhigh", "max"}
 	models := []Model{
-		{ID: "default", DisplayName: "Default", Description: "Recommended model for this account", Default: true},
-		{ID: "best", DisplayName: "Best", Description: "Most capable available model"},
+		{ID: "default", DisplayName: "Default", Description: "Recommended model for this account", Default: true, Efforts: allEfforts},
+		{ID: "best", DisplayName: "Best", Description: "Most capable available model", Efforts: allEfforts},
 		{ID: "fable", DisplayName: "Fable", Description: "Fable for the hardest and longest-running tasks", Efforts: allEfforts, DefaultEffort: "high"},
 		{ID: "sonnet", DisplayName: "Sonnet", Description: "Latest Sonnet for daily coding", Efforts: allEfforts},
 		{ID: "opus", DisplayName: "Opus", Description: "Latest Opus for complex reasoning", Efforts: allEfforts},
@@ -271,9 +271,9 @@ func (c *Claude) Models(context.Context) ([]Model, error) {
 
 func (c *Claude) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
 	c.mu.Lock()
-	model := c.config.Model
+	selection := InferenceSelection{Model: c.config.Model, Effort: c.config.Effort}
 	c.mu.Unlock()
-	return c.SendWithModel(ctx, key, prompt, model, emit)
+	return c.SendWithInference(ctx, key, prompt, selection, emit)
 }
 
 func (c *Claude) SetModel(model string) {
@@ -282,9 +282,31 @@ func (c *Claude) SetModel(model string) {
 	c.mu.Unlock()
 }
 
+func (c *Claude) SetInference(selection InferenceSelection) {
+	c.mu.Lock()
+	c.config.Model, c.config.Effort = selection.Model, selection.Effort
+	c.mu.Unlock()
+}
+
 func (c *Claude) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+	c.mu.Lock()
+	selection := InferenceSelection{Model: model, Effort: c.config.Effort}
+	c.mu.Unlock()
+	return c.SendWithInference(ctx, key, prompt, selection, emit)
+}
+
+func (c *Claude) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", false, errors.New("harness prompt is empty")
+	}
+	if selection.ServiceMode != "" {
+		return "", false, errors.New("Claude Code does not support a Spynel service mode; reset harness.service_mode to inherit")
+	}
+	if selection.Effort != "" {
+		models, _ := c.Models(ctx)
+		if err := ValidateInferenceSelection(models, selection); err != nil {
+			return "", false, err
+		}
 	}
 	lock := c.lockForKey(key)
 	lock.Lock()
@@ -323,7 +345,8 @@ func (c *Claude) SendWithModel(ctx context.Context, key, prompt, model string, e
 		}
 		baseContext := c.ctx
 		cfg := c.config
-		cfg.Model = model
+		cfg.Model = selection.Model
+		cfg.Effort = selection.Effort
 		previousSession := c.resumeSessionLocked(key, cfg)
 		c.mu.Unlock()
 		return c.startTurn(ctx, baseContext, key, prompt, previousSession, cfg, emit)

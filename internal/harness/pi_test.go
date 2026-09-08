@@ -68,7 +68,7 @@ func TestPiRPCStreamsSettlesAndResumes(t *testing.T) {
 		t.Fatalf("Pi final = %#v, active %t", final, pi.IsActive("chat"))
 	}
 	models, err := pi.Models(ctx)
-	if err != nil || len(models) != 1 || models[0].ID != "fixture/model-a" || models[0].DefaultEffort != "medium" {
+	if err != nil || len(models) != 1 || models[0].ID != "fixture/model-a" || models[0].DefaultEffort != "high" || strings.Join(models[0].Efforts, ",") != "off,low,medium,high" {
 		t.Fatalf("Pi models = %#v, %v", models, err)
 	}
 	if err := pi.Close(); err != nil {
@@ -111,8 +111,97 @@ func TestPiRPCStreamsSettlesAndResumes(t *testing.T) {
 			resumed++
 		}
 	}
-	if rpcInvocations != 3 || resumed != 1 {
+	if rpcInvocations != 6 || resumed != 1 {
 		t.Fatalf("Pi RPC invocations = %d, resumed = %d", rpcInvocations, resumed)
+	}
+}
+
+func TestPiModelsUseRPCThinkingLevelsPerModel(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "pi-model-capabilities")
+	pi, err := NewPi(HarnessConfig{Command: command, Cwd: root, SessionsFile: filepath.Join(root, "sessions.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := pi.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer pi.Close()
+
+	models, err := pi.Models(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 3 {
+		t.Fatalf("Pi model count = %d, want 3: %#v", len(models), models)
+	}
+	if got := strings.Join(models[0].Efforts, ","); got != "off,low,medium,high" || models[0].DefaultEffort != "high" {
+		t.Fatalf("model-a efforts/default = %q/%q", got, models[0].DefaultEffort)
+	}
+	if len(models[1].Efforts) != 0 || models[1].DefaultEffort != "" {
+		t.Fatalf("non-reasoning model properties = %#v", models[1])
+	}
+	if got := strings.Join(models[2].Efforts, ","); got != "off,medium,xhigh,max" || models[2].DefaultEffort != "" {
+		t.Fatalf("model-max efforts/default = %q/%q", got, models[2].DefaultEffort)
+	}
+	if !models[0].Default || models[1].Default || models[2].Default {
+		t.Fatalf("Pi current/default model mapping = %#v", models)
+	}
+	if err := ValidateInferenceSelection(models, InferenceSelection{Model: "fixture/model-a", Effort: "xhigh"}); err == nil {
+		t.Fatal("Pi accepted an effort absent from the selected model's RPC levels")
+	}
+	if err := ValidateInferenceSelection(models, InferenceSelection{Model: "fixture/model-max", Effort: "max"}); err != nil {
+		t.Fatalf("Pi rejected an RPC-advertised effort: %v", err)
+	}
+
+	var sets, levelQueries, modelProbes int
+	for _, record := range readFixtureRecords(t, logPath) {
+		switch record.Method {
+		case "set_model":
+			sets++
+		case "get_available_thinking_levels":
+			levelQueries++
+		}
+		if record.Kind == "invocation" {
+			for index, arg := range record.Args {
+				if arg == "--model" && index+1 < len(record.Args) && strings.HasPrefix(record.Args[index+1], "fixture/model-") {
+					modelProbes++
+				}
+			}
+		}
+	}
+	if sets != 0 || levelQueries != 3 || modelProbes != 3 {
+		t.Fatalf("Pi capability discovery = %d persistent set_model calls, %d level queries, %d runtime model probes; want 0, 3, 3", sets, levelQueries, modelProbes)
+	}
+}
+
+func TestPiLegacyOmittedModelAndEffortUseCurrentModelCapabilities(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "pi-off-default")
+	pi, err := NewPi(HarnessConfig{Command: command, Cwd: root, Effort: "medium", LegacyEffort: true, SessionsFile: filepath.Join(root, "sessions.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := pi.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer pi.Close()
+	if _, _, err := pi.Send(ctx, "legacy", "legacy defaults", nil); err != nil {
+		t.Fatalf("Pi rejected omitted model with legacy medium effort: %v", err)
+	}
+	if _, _, err := pi.SendWithInference(ctx, "explicit", "strict explicit value", InferenceSelection{Effort: "medium"}, nil); err == nil {
+		t.Fatal("Pi accepted explicit medium for an off-only default model")
+	}
+	var mediumInvocations int
+	for _, record := range readFixtureRecords(t, logPath) {
+		if record.Kind == "invocation" && containsArgument(record.Args, "--thinking") && containsArgument(record.Args, "medium") {
+			mediumInvocations++
+		}
+	}
+	if mediumInvocations != 1 {
+		t.Fatalf("legacy Pi --thinking medium invocations = %d, want 1", mediumInvocations)
 	}
 }
 

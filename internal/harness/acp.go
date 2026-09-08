@@ -223,9 +223,9 @@ func (a *ACP) Start(parent context.Context) error {
 
 func (a *ACP) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
 	a.mu.Lock()
-	model := a.config.Model
+	selection := InferenceSelection{Model: a.config.Model}
 	a.mu.Unlock()
-	return a.SendWithModel(ctx, key, prompt, model, emit)
+	return a.SendWithInference(ctx, key, prompt, selection, emit)
 }
 
 func (a *ACP) SetModel(model string) {
@@ -234,14 +234,24 @@ func (a *ACP) SetModel(model string) {
 	a.mu.Unlock()
 }
 
+func (a *ACP) SetInference(selection InferenceSelection) {
+	a.mu.Lock()
+	a.config.Model = selection.Model
+	a.mu.Unlock()
+}
+
 func (a *ACP) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+	return a.SendWithInference(ctx, key, prompt, InferenceSelection{Model: model}, emit)
+}
+
+func (a *ACP) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", false, errors.New("harness prompt is empty")
 	}
 	lock := a.lockForKey(key)
 	lock.Lock()
 	defer lock.Unlock()
-	session, err := a.ensureSession(ctx, key, model)
+	session, err := a.ensureSession(ctx, key, selection.Model)
 	if err != nil {
 		return "", false, err
 	}
@@ -485,7 +495,6 @@ func capabilityPresent(value json.RawMessage) bool {
 
 func (a *ACP) applySessionOptions(ctx context.Context, sessionID string, options []acpConfigOption, requireModel bool, cfg HarnessConfig) error {
 	modelSet := strings.TrimSpace(cfg.Model) == ""
-	effortSet := false
 	for _, option := range options {
 		value := ""
 		switch option.Category {
@@ -494,11 +503,6 @@ func (a *ACP) applySessionOptions(ctx context.Context, sessionID string, options
 				continue
 			}
 			value = strings.TrimSpace(cfg.Model)
-		case "thought_level":
-			if effortSet {
-				continue
-			}
-			value = strings.TrimSpace(cfg.Effort)
 		}
 		if value == "" || option.Type != "select" {
 			continue
@@ -510,9 +514,6 @@ func (a *ACP) applySessionOptions(ctx context.Context, sessionID string, options
 		}
 		if option.Category == "model" {
 			modelSet = true
-		}
-		if option.Category == "thought_level" {
-			effortSet = true
 		}
 	}
 	if requireModel && !modelSet {

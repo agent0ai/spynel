@@ -81,6 +81,14 @@ func (s *Supervisor) HarnessConfig() HarnessConfig {
 // retains the model captured by its dispatch, while snapshots taken after the
 // commit returns observe model.
 func (s *Supervisor) CommitModel(model string, commit func() error) error {
+	cfg := s.HarnessConfig()
+	selection := InferenceSelection{Model: model, Effort: cfg.Effort, LegacyEffort: cfg.LegacyEffort, ServiceMode: cfg.ServiceMode}
+	return s.CommitInference(selection, commit)
+}
+
+// CommitInference atomically orders persistence and all future inference
+// snapshots. Already-admitted provider work retains its captured selection.
+func (s *Supervisor) CommitInference(selection InferenceSelection, commit func() error) error {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	s.mu.Lock()
@@ -89,8 +97,11 @@ func (s *Supervisor) CommitModel(model string, commit func() error) error {
 		return errors.New("harness supervisor is closed")
 	}
 	if s.current != nil {
-		if _, ok := s.current.(ModelDispatcher); !ok {
-			return errors.New("the active harness does not support forward-looking model changes")
+		if _, ok := s.current.(InferenceDispatcher); !ok {
+			_, legacy := s.current.(ModelDispatcher)
+			if !legacy || selection.Effort != s.config.Effort || selection.ServiceMode != s.config.ServiceMode {
+				return errors.New("the active harness does not support forward-looking inference changes")
+			}
 		}
 	}
 	if commit == nil {
@@ -99,9 +110,11 @@ func (s *Supervisor) CommitModel(model string, commit func() error) error {
 	if err := commit(); err != nil {
 		return err
 	}
-	s.config.Model = model
-	if target, ok := s.current.(ModelDispatcher); ok {
-		target.SetModel(model)
+	s.config.Model, s.config.Effort, s.config.LegacyEffort, s.config.ServiceMode = selection.Model, selection.Effort, selection.LegacyEffort, selection.ServiceMode
+	if target, ok := s.current.(InferenceDispatcher); ok {
+		target.SetInference(selection)
+	} else if target, ok := s.current.(ModelDispatcher); ok {
+		target.SetModel(selection.Model)
 	}
 	return nil
 }
@@ -307,7 +320,7 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 		return "", false, err
 	}
 	wasActive := target.IsActive(key)
-	model := s.config.Model
+	selection := inferenceSelection(s.config)
 	logicalActive := s.active[key] > 0
 	if (!wasActive && logicalActive) || (wasActive && followUpMode(target) == FollowUpQueue) {
 		threadID := target.ThreadID(key)
@@ -325,7 +338,7 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 	wrapper := s.executionEmit(key, target, emit)
 	s.controlEmit[key] = wrapper
 	s.mu.Unlock()
-	threadID, steered, err := sendWithModel(target, ctx, key, prompt, model, wrapper)
+	threadID, steered, err := sendWithInference(target, ctx, key, prompt, selection, wrapper)
 	if err != nil {
 		if wasActive && steered {
 			// The active turn finished during the failed steering attempt. Retry
@@ -454,11 +467,18 @@ func followUpMode(target Harness) FollowUpMode {
 	return FollowUpSteer
 }
 
-func sendWithModel(target Harness, ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+func sendWithInference(target Harness, ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
+	if dispatcher, ok := target.(InferenceDispatcher); ok {
+		return dispatcher.SendWithInference(ctx, key, prompt, selection, emit)
+	}
 	if dispatcher, ok := target.(ModelDispatcher); ok {
-		return dispatcher.SendWithModel(ctx, key, prompt, model, emit)
+		return dispatcher.SendWithModel(ctx, key, prompt, selection.Model, emit)
 	}
 	return target.Send(ctx, key, prompt, emit)
+}
+
+func inferenceSelection(cfg HarnessConfig) InferenceSelection {
+	return InferenceSelection{Model: cfg.Model, Effort: cfg.Effort, LegacyEffort: cfg.LegacyEffort, ServiceMode: cfg.ServiceMode}
 }
 
 func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) core.Emit {
@@ -654,7 +674,7 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 	}
 	s.mu.RLock()
 	validStart = !s.closed && s.active[key] > 0 && s.controlGeneration[key] == next.generation
-	model := s.config.Model
+	selection := inferenceSelection(s.config)
 	s.mu.RUnlock()
 	if !validStart {
 		return
@@ -695,7 +715,7 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 	for _, release := range next.release {
 		release(core.Event{Kind: core.EventStatus, Text: "Response continued on a newer queued message", ThreadID: threadID, Done: true})
 	}
-	threadID, _, err := sendWithModel(target, ctx, key, next.prompt, model, wrapper)
+	threadID, _, err := sendWithInference(target, ctx, key, next.prompt, selection, wrapper)
 	if err != nil {
 		wrapper(core.Event{Kind: core.EventError, Text: "queued follow-up failed: " + err.Error(), ThreadID: threadID, Done: true})
 		return

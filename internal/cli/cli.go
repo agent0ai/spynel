@@ -172,7 +172,7 @@ func run(args []string, version string) error {
 		return runFrameworkCLICommand("", args[1:], version)
 	case "status":
 		return runStatusCLICommand(args[1:], version, os.Stdout)
-	case "jobs", "tasks", "goals", "job", "log", "logs", "stop", "new", "clear", "history", "harness", "model", "telegram", "restart", "update":
+	case "jobs", "tasks", "goals", "job", "log", "logs", "stop", "new", "clear", "history", "harness", "model", "effort", "speed", "telegram", "restart", "update":
 		return runFrameworkCLICommand(args[0], args[1:], version)
 	case "conversation", "conversations":
 		return runConversationCommand(args[1:], os.Stdout)
@@ -968,7 +968,7 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 	}
 	target := harness.NewSupervisor(registry, harness.HarnessConfig{
 		Name: cfg.Harness.Name, Command: command, Args: cfg.HarnessArgs(), Cwd: cfg.Root,
-		Model: cfg.Harness.Model, Effort: "medium",
+		Model: cfg.Harness.Model, Effort: cfg.Harness.ReasoningEffort, LegacyEffort: cfg.Harness.UsesLegacyReasoningEffort(), ServiceMode: cfg.Harness.ServiceMode,
 		ApprovalPolicy: "never", Sandbox: cfg.Harness.Sandbox,
 		Network: false, SessionsFile: cfg.HarnessSessionsPath(cfg.Harness.Name),
 		Version: version, Stderr: runtimeState.Writer("harness"),
@@ -1201,6 +1201,7 @@ Usage:
   spynel conversations resume   Branch any saved conversation into CLI
   spynel status [flags]          Show workspace and current conversation status
   spynel command [flags] NAME    Run any non-visual framework slash command
+  spynel model|effort|speed ... Inspect or select model inference properties
   spynel tasks [flags] [VIEW]   List durable tasks (open by default)
   spynel goals [flags] [VIEW]   List durable goals (open by default)
     VIEW                        open|recent|active|review|waiting|done|failed|all

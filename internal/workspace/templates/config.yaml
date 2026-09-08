@@ -9,6 +9,9 @@ workspace:
 harness:
   name: ""
   model: ""
+  # Empty inherits the selected model/provider default.
+  reasoning_effort: ""
+  service_mode: ""
   sandbox: danger-full-access
   chat_agent_prefix: ""
   developer_agent_prefix: ""

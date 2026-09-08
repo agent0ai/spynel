@@ -90,8 +90,7 @@ func TestACPStreamsPersistsAndResumesSessions(t *testing.T) {
 			configured++
 			params := string(record.Params)
 			model := strings.Contains(params, `"configId":"model"`) && strings.Contains(params, `"value":"model-a"`)
-			thought := strings.Contains(params, `"configId":"thought"`) && strings.Contains(params, `"value":"high"`)
-			if !strings.Contains(params, `"sessionId":"acp-session"`) || (!model && !thought) {
+			if !strings.Contains(params, `"sessionId":"acp-session"`) || !model || strings.Contains(params, `"configId":"thought"`) {
 				t.Fatalf("ACP config option request = %s", record.Params)
 			}
 		}
@@ -99,7 +98,7 @@ func TestACPStreamsPersistsAndResumesSessions(t *testing.T) {
 			rejected = true
 		}
 	}
-	if invocations != 2 || resumed != 1 || configured != 2 || !rejected {
+	if invocations != 2 || resumed != 1 || configured != 1 || !rejected {
 		t.Fatalf("ACP evidence = invocations %d, resumes %d, config options %d, read-only rejected edit %t", invocations, resumed, configured, rejected)
 	}
 }

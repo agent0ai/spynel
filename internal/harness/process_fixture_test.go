@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -111,7 +112,7 @@ func runHarnessFixture(mode string) int {
 		return runCodexFixture(mode)
 	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero":
 		return runClaudeFixture(mode)
-	case "pi-lifecycle", "pi-steer", "pi-interrupt", "pi-state-missing-session":
+	case "pi-lifecycle", "pi-steer", "pi-interrupt", "pi-state-missing-session", "pi-model-capabilities", "pi-off-default":
 		return runPiFixture(mode)
 	case "acp-lifecycle", "acp-interrupt", "acp-version-mismatch", "acp-session-error":
 		return runACPFixture(mode)
@@ -127,9 +128,20 @@ func runPiFixture(mode string) int {
 		return 0
 	}
 	type request struct {
-		ID      string          `json:"id"`
-		Type    string          `json:"type"`
-		Message json.RawMessage `json:"message"`
+		ID       string          `json:"id"`
+		Type     string          `json:"type"`
+		Message  json.RawMessage `json:"message"`
+		Provider string          `json:"provider"`
+		ModelID  string          `json:"modelId"`
+	}
+	currentModel := "model-a"
+	if mode == "pi-off-default" {
+		currentModel = "model-off"
+	}
+	for index, arg := range os.Args[1:] {
+		if arg == "--model" && index+2 <= len(os.Args[1:]) {
+			currentModel = strings.TrimPrefix(os.Args[index+2], "fixture/")
+		}
 	}
 	var outputMu sync.Mutex
 	write := func(value any) {
@@ -163,12 +175,37 @@ func runPiFixture(mode string) int {
 			if mode == "pi-state-missing-session" {
 				respond(message, map[string]any{"isStreaming": false})
 			} else {
-				respond(message, map[string]any{"sessionId": "pi-session", "sessionFile": sessionFile, "isStreaming": false})
+				thinkingLevel := "high"
+				if currentModel == "model-off" {
+					thinkingLevel = "off"
+				} else if currentModel == "model-max" {
+					thinkingLevel = "max"
+				}
+				respond(message, map[string]any{"sessionId": "pi-session", "sessionFile": sessionFile, "isStreaming": false, "thinkingLevel": thinkingLevel, "model": map[string]any{"id": currentModel, "provider": "fixture"}})
 			}
 		case "set_steering_mode", "set_follow_up_mode":
 			respond(message, map[string]any{})
 		case "get_available_models":
-			respond(message, map[string]any{"models": []any{map[string]any{"id": "model-a", "name": "Model A", "provider": "fixture", "reasoning": true}}})
+			models := []any{map[string]any{"id": "model-a", "name": "Model A", "provider": "fixture", "reasoning": true}}
+			if mode == "pi-off-default" {
+				models = []any{map[string]any{"id": "model-off", "name": "Model Off", "provider": "fixture", "reasoning": false}}
+			}
+			if mode == "pi-model-capabilities" {
+				models = append(models,
+					map[string]any{"id": "model-off", "name": "Model Off", "provider": "fixture", "reasoning": false},
+					map[string]any{"id": "model-max", "name": "Model Max", "provider": "fixture", "reasoning": false},
+				)
+			}
+			respond(message, map[string]any{"models": models})
+		case "get_available_thinking_levels":
+			levels := []string{"off", "low", "medium", "high"}
+			switch currentModel {
+			case "model-off":
+				levels = []string{"off"}
+			case "model-max":
+				levels = []string{"off", "medium", "xhigh", "max"}
+			}
+			respond(message, map[string]any{"levels": levels})
 		case "prompt":
 			respond(message, map[string]any{})
 			messageStart()
@@ -389,7 +426,7 @@ func runCodexFixture(mode string) int {
 			write(map[string]any{"id": message.ID, "result": map[string]any{}})
 			write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thr_stop", "turn": map[string]any{"id": "turn_stop", "status": "interrupted"}}})
 		case "model/list":
-			write(map[string]any{"id": message.ID, "result": map[string]any{"data": []any{map[string]any{"id": "model-a", "model": "model-a", "displayName": "Model A", "defaultReasoningEffort": "medium", "supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}, map[string]any{"reasoningEffort": "medium"}}, "isDefault": true}}, "nextCursor": nil}})
+			write(map[string]any{"id": message.ID, "result": map[string]any{"data": []any{map[string]any{"id": "model-a", "model": "model-a", "displayName": "Model A", "defaultReasoningEffort": "medium", "supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}, map[string]any{"reasoningEffort": "medium"}, map[string]any{"reasoningEffort": "ultra"}}, "serviceTiers": []any{map[string]any{"id": "fast", "name": "Fast", "description": "Priority processing"}}, "defaultServiceTier": nil, "isDefault": true}}, "nextCursor": nil}})
 		}
 	}
 	return 0
