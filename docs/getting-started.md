@@ -7,13 +7,14 @@ Spynel supports standalone script installation and the unscoped npm package on L
 Standalone installation needs POSIX `sh`, curl, tar, and sha256sum or shasum; it needs no Node.js, Go, or compiler:
 
 ```sh
-curl -LsSf https://spynel.agent-zero.ai/install.sh | sh && . "$HOME/.local/share/spynel/env"
-spynel
+curl -LsSf https://spynel.agent-zero.ai/install.sh | sh
 ```
+
+Run the launch command printed by the installer, normally `spynel`.
 
 Standalone installation requires release 0.12.0 or newer; earlier releases do not contain its native installer.
 
-The installer shows download progress, verifies the release, and places complete native bundles and licenses under `~/.local/share/spynel`. It installs the launcher into a writable directory already on PATH, preferring `/usr/local/bin` for root and `~/.local/bin` when that user directory is already on PATH. This makes `spynel` available in the current terminal. If no PATH directory is writable, it uses `~/.local/bin` and automatically configures Bash/sh or zsh startup files, or fish's persistent user paths. A piped child process cannot change its parent shell's environment; the quick-start command loads the generated `env` file into the current shell to cover that case immediately. A bare pipe also prints an absolute command usable without restarting the terminal. Repeated profile setup does not duplicate the same entry.
+The installer shows download progress, verifies the release, and places complete native bundles and licenses under `~/.local/share/spynel`. It installs the launcher into a writable directory already on PATH, preferring `/usr/local/bin` for root and `~/.local/bin` when that user directory is already on PATH. This makes `spynel` available in the current terminal. If no PATH directory is writable, it uses `~/.local/bin` and automatically configures Bash/sh or zsh startup files, or fish's persistent user paths. For that case, it prints an absolute launch command usable immediately without restarting the terminal or editing PATH. Repeated profile setup does not duplicate the same entry.
 
 Existing executables, including npm launchers, are preserved; if the selected name is occupied, use the printed standalone path. `SPYNEL_INSTALL_DIR` and `SPYNEL_BIN_DIR` select absolute alternative directories. `SPYNEL_VERSION` selects a stable version for the bootstrap. `SPYNEL_DOWNLOAD_BASE` may select a trusted compatible release-asset mirror; `SPYNEL_GITHUB_API_URL` overrides runtime release discovery. Mirrors supply executable code and must be trusted.
 

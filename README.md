@@ -85,11 +85,10 @@ It is for people who want the leverage of several coding agents without personal
 Install on Linux or macOS (amd64 or arm64), without Node.js, Go, or a compiler:
 
 ```sh
-curl -LsSf https://spynel.agent-zero.ai/install.sh | sh && . "$HOME/.local/share/spynel/env"
-spynel
+curl -LsSf https://spynel.agent-zero.ai/install.sh | sh
 ```
 
-The installer shows download progress and puts `spynel` in a writable directory already on PATH (`/usr/local/bin` for root). If no such directory exists, it configures your shell automatically and prints the command you can run immediately. Existing installations are preserved. See [getting started](docs/getting-started.md) for details. Windows is temporarily unsupported.
+Run the launch command printed by the installer, normally `spynel`. The installer shows download progress and puts `spynel` in a writable directory already on PATH (`/usr/local/bin` for root). If no such directory exists, it configures your shell automatically and prints the command you can run immediately. Existing installations are preserved. See [getting started](docs/getting-started.md) for details. Windows is temporarily unsupported.
 
 Or install the latest stable release from npm (Node.js 18+):
 

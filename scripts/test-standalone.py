@@ -200,7 +200,7 @@ def main():
             for mode in ("plain", "json"):
                 offline_install = temp / (mode + " installation")
                 offline_bin = temp / (mode + r" user bin Ω $value 'quote' `ticks` \backslash")
-                # The README's current-shell activation also handles an
+                # Optional current-shell activation also handles an
                 # explicitly off-PATH destination, including shell metacharacters.
                 result = subprocess.run(["sh", "-c", 'curl -LsSf "$1/install.sh" | sh && . "$SPYNEL_INSTALL_DIR/env" && spynel --version', "sh", base], cwd=workspace, env={**env, "SPYNEL_INSTALL_DIR": str(offline_install), "SPYNEL_BIN_DIR": str(offline_bin)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
                 assert result.returncode == 0, result.stderr.decode()
