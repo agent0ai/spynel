@@ -615,6 +615,89 @@ func TestServiceKeepsChannelContextsSeparateAndLinksFullHistory(t *testing.T) {
 	}
 }
 
+func TestAcceptedErrorsAndCommandsRemainInHistoryAndAgentContext(t *testing.T) {
+	for _, channelName := range []string{"tui", "cli", "telegram", "whatsapp"} {
+		t.Run(channelName, func(t *testing.T) {
+			root := t.TempDir()
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, _ := config.Load(config.PathForRoot(root))
+			target := newServiceHarness()
+			service := New(cfg, &failingServiceHarness{serviceHarness: target, err: errors.New("provider failed to start")})
+			defer service.Close()
+			message := core.Message{Channel: channelName, Conversation: "history-parity", Text: "first request"}
+			if err := service.Handle(context.Background(), message, nil); err == nil {
+				t.Fatal("expected failed provider admission")
+			}
+			message.Text = "/extension remove ../escape"
+			if err := service.Handle(context.Background(), message, nil); err == nil {
+				t.Fatal("expected failed command")
+			}
+			message.Text = "/help about"
+			var reply core.Event
+			if err := service.Handle(context.Background(), message, func(event core.Event) { reply = event }); err != nil {
+				t.Fatal(err)
+			}
+			want := []core.ChatEntry{
+				{Role: "user", Text: "first request"},
+				{Role: "error", Text: "provider failed to start"},
+				{Role: "user", Text: "/extension remove ../escape"},
+				{Role: "error", Text: "invalid extension name"},
+				{Role: "user", Text: "/help about"},
+				{Role: "assistant", Text: reply.Text},
+			}
+			// Reopen the store through the same bounded path used at TUI startup.
+			reopened := history.New(cfg.StatePath("history"))
+			entries, _, err := reopened.RecentEntries(channelName, message.Conversation, 500, 500000)
+			if err != nil || len(entries) != len(want) {
+				t.Fatalf("reloaded entries = %#v, %v", entries, err)
+			}
+			for index, entry := range entries {
+				if entry.Role != want[index].Role || entry.Content != want[index].Text {
+					t.Fatalf("reloaded entry %d = %#v, want %#v", index, entry, want[index])
+				}
+				if entry.Role == "error" && (!entry.Terminal || entry.SourceMessageID != entries[index-1].SourceMessageID) {
+					t.Fatalf("error lost request correlation: %#v", entry)
+				}
+			}
+			service.Harness = target
+			message.Text = "explain the errors and command output"
+			if err := service.Handle(context.Background(), message, nil); err != nil {
+				t.Fatal(err)
+			}
+			prompts := target.prompts[sessionKey(message)]
+			prompt := prompts[len(prompts)-1]
+			for _, entry := range want {
+				if !strings.Contains(prompt, entry.Role+": "+entry.Text) {
+					t.Fatalf("agent prompt missing %s message %q", entry.Role, entry.Text)
+				}
+			}
+		})
+	}
+}
+
+func TestScreenSelectionConfirmationIsSavedForItsTUIConversation(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	service := New(cfg, newServiceHarness())
+	defer service.Close()
+	if err := service.RegisterLiveTUI("instance", "selected", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	screen, err := service.ScreenActionForInstance(context.Background(), "instance", "model", "select:sonnet", nil)
+	if err != nil || screen == nil || screen.ActionMessage == "" {
+		t.Fatalf("selection = %#v, %v", screen, err)
+	}
+	entries, _, err := service.History.Entries("tui", "selected")
+	if err != nil || len(entries) != 1 || entries[0].Role != "assistant" || entries[0].Content != screen.ActionMessage {
+		t.Fatalf("selection history = %#v, %v", entries, err)
+	}
+}
+
 func TestEveryChatTransportFreshLoadsTheSameChatInstructionsAtPromptEnd(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {

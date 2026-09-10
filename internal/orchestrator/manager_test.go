@@ -464,6 +464,80 @@ func TestClaimLeasePreventsDuplicatesAndStaleLeaseRecovers(t *testing.T) {
 	}
 }
 
+func TestRecoveryDispatchStateTracksProviderLifecycle(t *testing.T) {
+	for _, test := range []struct {
+		name, priorState, wantState, wantError string
+		events                                 []core.Event
+	}{
+		{name: "admission", priorState: "error", wantState: "processing", events: []core.Event{}},
+		{name: "running", priorState: "awaiting_transition", wantState: "processing", events: []core.Event{
+			{Kind: core.EventStatus, Execution: &core.ExecutionStatus{State: "running"}},
+			{Kind: core.EventDelta, Text: "resumed work"},
+		}},
+		{name: "readmitted", priorState: "recovering", wantState: "processing", events: []core.Event{}},
+		{name: "completed", priorState: "processing", wantState: "awaiting_transition", events: []core.Event{
+			{Kind: core.EventFinal, Done: true},
+		}},
+		{name: "failed", priorState: "error", wantState: "awaiting_transition", wantError: "new failure", events: []core.Event{
+			{Kind: core.EventError, Text: "new failure", Done: true},
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(config.PathForRoot(root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Create(cfg, "tasks", "recovery state", ""); err != nil {
+				t.Fatal(err)
+			}
+			fake := newFakeRecipient()
+			manager := New(cfg, fake, extensions.Runner{})
+			if err := manager.ScanOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			manager.Wait()
+			leases, err := manager.loadLeases()
+			if err != nil || len(leases) != 1 {
+				t.Fatalf("leases = %#v, %v", leases, err)
+			}
+			lease := leases[0]
+			lease.State, lease.LastError = test.priorState, "previous failure"
+			if err := manager.saveLease(lease); err != nil {
+				t.Fatal(err)
+			}
+			fake.events = test.events
+			manager.JobStarted = func(current Lease, _ string, _ time.Time, _, _ int) (int, error) {
+				if current.State != "recovering" || current.LastError != "" {
+					t.Errorf("recovery admission retained previous state: %#v", current)
+				}
+				return 1, nil
+			}
+			var updates []Lease
+			manager.JobUpdated = func(_ int, current Lease) { updates = append(updates, current) }
+			manager.dispatch(context.Background(), cfg.Orchestrator.Routes[0], lease, true)
+			manager.Wait()
+			current, err := manager.loadLease(lease.ID)
+			if err != nil || current.State != test.wantState || current.LastError != test.wantError || current.RecoveryCount != 1 {
+				t.Fatalf("recovered lease = %#v, %v", current, err)
+			}
+			if len(updates) == 0 || !reflect.DeepEqual(updates[len(updates)-1], current) {
+				t.Fatalf("job updates did not publish the persisted lease: %#v", updates)
+			}
+			if test.name == "running" {
+				for _, update := range updates {
+					if update.State != "processing" {
+						t.Fatalf("provider activity retained recovery state: %#v", update)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestFutureDispatchTimeDefersGoalPlanning(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {

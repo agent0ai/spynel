@@ -1,10 +1,21 @@
 # Getting started and development
 
-Spynel is distributed through the unscoped npm package on Linux and macOS. Both amd64 and arm64 are supported; Windows distribution is temporarily stubbed and fails before downloading an artifact.
+Spynel supports standalone script installation and the unscoped npm package on Linux and macOS. Both amd64 and arm64 are supported; Windows distribution is temporarily stubbed and fails before downloading an artifact.
 
 ## Public-release quick start
 
-Node.js 18 or newer is required. From the directory you want to initialize as a Spynel workspace, run:
+Standalone installation needs POSIX `sh`, curl, tar, and sha256sum or shasum; it needs no Node.js, Go, or compiler:
+
+```sh
+curl -LsSf https://spynel.agent-zero.ai/install.sh | sh
+spynel
+```
+
+**Availability:** the new script path requires a GitHub release containing the native standalone installer and the public URL routing. Releases predating that support cannot complete the bootstrap. Routing is managed separately from this repository; this documentation does not certify that the URL is live.
+
+The installer places complete native bundles and licenses under `~/.local/share/spynel`, with an entry point at `~/.local/bin/spynel`. It prints PATH and shadowing guidance without editing shell profiles. Existing executables, including npm launchers, are preserved; if the user-bin name is occupied, use the printed standalone path. `SPYNEL_INSTALL_DIR` and `SPYNEL_BIN_DIR` select absolute alternative directories. `SPYNEL_VERSION` selects a stable version for the bootstrap. `SPYNEL_DOWNLOAD_BASE` may select a trusted compatible release-asset mirror; `SPYNEL_GITHUB_API_URL` overrides runtime release discovery. Mirrors supply executable code and must be trusted.
+
+Alternatively, npm requires Node.js 18 or newer:
 
 ```bash
 npm install -g spynel
@@ -28,6 +39,14 @@ spynel init --no-start --dir /path/to/workspace
 ```
 
 Spynel detects supported coding harnesses. If none is available, setup shows installation guidance; authentication remains the responsibility of the selected harness. Run `spynel doctor` after setup to check the configured environment. See [configuration](configuration.md) and [harness compatibility](harness-compatibility.md) for the supported profiles and exact settings.
+
+## Updates
+
+`/update` (or `spynel update`) checks the installation that owns the workspace primary: npm installations check npm; script installations check stable GitHub Releases. `/update install` downloads, verifies, updates and restarts that installation through the shared application command. When no primary is running, the standalone CLI updates its own installation and prints the restarted version. Saved workspace configuration, histories and task/job state remain in place.
+
+Only interactive TUI starts perform proactive checks, bounded to ten seconds and refreshed asynchronously at most hourly. npm retains its existing explicit startup offer; the standalone TUI shows update availability and waits for `/update install`. Headless services and noninteractive commands do not check automatically. `SPYNEL_SKIP_UPDATE_CHECK=1` suppresses proactive checks. No unattended upgrade is introduced.
+
+Standalone updates stage a complete verified bundle before switching the stable launcher; failed downloads or validation leave the previous bundle usable. Older bundles and any interrupted temporary stages are retained so running processes keep their libraries. If reclaiming that space manually, stop every process using that installation first and preserve the bundle targeted by `current`. A concurrent installer returns a retry message; a crashed install automatically releases its lock. Development builds and manually extracted archives remain unmanaged and must be replaced using their original installation method.
 
 ## Run from a development checkout
 

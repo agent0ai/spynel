@@ -23,11 +23,10 @@ const (
 	latestVersionEnv    = "SPYNEL_NPM_UPDATE_LATEST"
 )
 
-// Result describes the installed and published npm versions. InstalledViaNPM
-// is false for release archives and development builds, where Spynel must not
-// suggest an npm-owned update operation.
+// Result describes versions from the owning installation source.
 type Result struct {
 	InstalledViaNPM bool
+	Source          string
 	Current         string
 	Latest          string
 	Available       bool
@@ -35,19 +34,17 @@ type Result struct {
 	Command         string
 }
 
-// PeriodicChecksEnabled reports whether the validated npm package is running
-// under an interactive launch that authorized proactive checks. Archive,
-// directly invoked, automatic-startup, and noninteractive processes must not
-// claim npm-owned periodic update state.
+// PeriodicChecksEnabled reports whether this managed installation is running
+// under an interactive launch that authorized proactive checks.
 func (m *Manager) PeriodicChecksEnabled() bool {
-	return m != nil && m.PackageRoot != "" && m.LauncherManaged && m.PeriodicChecks
+	return m != nil && m.PeriodicChecks && (m.InstallRoot != "" || (m.PackageRoot != "" && m.LauncherManaged))
 }
 
 // InitialAvailability reads the launcher's bounded startup-check snapshot.
 // A valid timestamp records an attempted check even when the registry failed;
 // in that case availability remains false until the next hourly refresh.
 func (m *Manager) InitialAvailability() (available bool, checkedAt time.Time, ok bool) {
-	if !m.PeriodicChecksEnabled() {
+	if !m.PeriodicChecksEnabled() || m.InstallRoot != "" {
 		return false, time.Time{}, false
 	}
 	checkedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(os.Getenv(checkedAtEnv)))
@@ -61,9 +58,11 @@ func (m *Manager) InitialAvailability() (available bool, checkedAt time.Time, ok
 	return available, checkedAt, true
 }
 
-// Manager owns npm release discovery and launcher-managed updates.
+// Manager owns source-specific release discovery and installation.
 type Manager struct {
 	CurrentVersion  string
+	InstallRoot     string
+	GitHubURL       string
 	PackageRoot     string
 	LauncherManaged bool
 	PeriodicChecks  bool
@@ -81,8 +80,15 @@ type installedMarker struct {
 	Version string `json:"version"`
 }
 
-// Detect constructs an update manager and recognizes the npm wrapper either
-// from its explicit launcher environment or from the executable's vendor path.
+// Pin the running bundle before any update can switch its launcher. On macOS,
+// os.Executable may retain the invoked symlink rather than its original target.
+var processExecutable = func() string {
+	executable, _ := os.Executable()
+	resolved, _ := filepath.EvalSymlinks(executable)
+	return resolved
+}()
+
+// Detect constructs an update manager for the executable resolved at startup.
 func Detect(currentVersion string) *Manager {
 	manager := &Manager{
 		CurrentVersion: currentVersion,
@@ -92,23 +98,35 @@ func Detect(currentVersion string) *Manager {
 	if manager.RegistryURL == "" {
 		manager.RegistryURL = defaultRegistryURL
 	}
-	root := strings.TrimSpace(os.Getenv("SPYNEL_NPM_PACKAGE_ROOT"))
-	if root == "" {
-		root = npmRootFromExecutable()
+	executable := processExecutable
+	manager.InstallRoot = scriptRootFromExecutable(executable, currentVersion)
+	manager.GitHubURL = strings.TrimSpace(os.Getenv("SPYNEL_GITHUB_API_URL"))
+	if manager.InstallRoot != "" {
+		return manager
 	}
-	if validNPMRoot(root, currentVersion) {
+	launcherRoot := strings.TrimSpace(os.Getenv("SPYNEL_NPM_PACKAGE_ROOT"))
+	root := npmRootFromExecutable(executable)
+	if root == "" {
+		root = launcherRoot
+	}
+	if validNPMRoot(root, currentVersion) && sameFile(executable, filepath.Join(root, "npm", "vendor", "spynel")) {
 		manager.PackageRoot = root
-		manager.LauncherManaged = os.Getenv("SPYNEL_NPM_LAUNCHER_MANAGED") == "1"
+		manager.LauncherManaged = os.Getenv("SPYNEL_NPM_LAUNCHER_MANAGED") == "1" && sameFile(root, launcherRoot)
 		manager.PeriodicChecks = os.Getenv(periodicChecksEnv) == "1"
 	}
 	return manager
 }
 
-func npmRootFromExecutable() string {
-	executable, err := os.Executable()
+func sameFile(left, right string) bool {
+	a, err := os.Stat(left)
 	if err != nil {
-		return ""
+		return false
 	}
+	b, err := os.Stat(right)
+	return err == nil && os.SameFile(a, b)
+}
+
+func npmRootFromExecutable(executable string) string {
 	vendor := filepath.Dir(executable)
 	if filepath.Base(vendor) != "vendor" || filepath.Base(filepath.Dir(vendor)) != "npm" {
 		return ""
@@ -139,7 +157,7 @@ func validNPMRoot(root, currentVersion string) bool {
 	return currentVersion == "" || currentVersion == "dev" || currentVersion == metadata.Version
 }
 
-// Check queries npm's small latest-version endpoint with a hard deadline.
+// Check queries the owning source with a hard deadline.
 func (m *Manager) Check(ctx context.Context) (Result, error) {
 	result := Result{
 		InstalledViaNPM: m != nil && m.PackageRoot != "",
@@ -151,6 +169,18 @@ func (m *Manager) Check(ctx context.Context) (Result, error) {
 		return result, nil
 	}
 	result.Current = m.CurrentVersion
+	if m.InstallRoot != "" {
+		if _, ok := parseVersion(m.CurrentVersion); !ok {
+			return result, fmt.Errorf("installed Spynel version %q is not semantic", m.CurrentVersion)
+		}
+		result.Source = "GitHub"
+		result.CanAutoInstall = true
+		result.Command = "/update install"
+		return m.checkGitHub(ctx, result)
+	}
+	if result.InstalledViaNPM {
+		result.Source = "npm"
+	}
 	if !result.InstalledViaNPM {
 		return result, nil
 	}

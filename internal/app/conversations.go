@@ -106,7 +106,12 @@ func (s *Service) ScreenAction(ctx context.Context, screenID, action string, val
 // authenticated TUI instance. Resume branch creation and live registration
 // share cleanup's mutex so the branch cannot be deleted before it is exposed.
 func (s *Service) ScreenActionForInstance(ctx context.Context, instanceID, screenID, action string, values map[string]string) (*core.Screen, error) {
-	return s.screenAction(ctx, instanceID, screenID, action, values)
+	conversation := s.liveTUIConversation(instanceID, time.Now().UTC())
+	screen, err := s.screenAction(ctx, instanceID, screenID, action, values)
+	if err == nil && screen != nil && strings.TrimSpace(screen.ActionMessage) != "" && conversation != "" {
+		err = s.localReply(core.Message{Channel: "tui", Conversation: conversation}, strings.TrimSpace(screen.ActionMessage), nil)
+	}
+	return screen, err
 }
 
 func (s *Service) screenAction(ctx context.Context, instanceID, screenID, action string, values map[string]string) (*core.Screen, error) {

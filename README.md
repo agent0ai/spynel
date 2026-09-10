@@ -82,12 +82,23 @@ It is for people who want the leverage of several coding agents without personal
 
 ## Quick start
 
-Install the latest stable release from npm:
+Install on Linux or macOS (amd64 or arm64), without Node.js, Go, or a compiler:
+
+```sh
+curl -LsSf https://spynel.agent-zero.ai/install.sh | sh
+spynel
+```
+
+The installer prints PATH guidance and preserves existing installations. This new path requires a release containing standalone installer support and public URL routing; see [getting started](docs/getting-started.md). Windows is temporarily unsupported.
+
+Or install the latest stable release from npm (Node.js 18+):
 
 ```bash
 npm install -g spynel
 spynel
 ```
+
+Use `/update` to check the owning installation source and `/update install` to update and restart.
 
 Run `spynel` from the directory you want to initialize as a Spynel workspace. This can be your existing work folder. 
 

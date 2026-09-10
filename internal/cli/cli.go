@@ -117,11 +117,24 @@ func run(args []string, version string) error {
 	case "help", "--help", "-h":
 		fmt.Print(helpText)
 		return nil
+	case "install-bundle":
+		return runInstallBundle(args[1:], version)
 	case "docs":
 		return runDocsCommand(args[1:], os.Stdout)
 	case "instructions":
 		return runInstructionsCommand(args[1:], os.Stdout)
 	case "version", "--version", "-v":
+		flags := flag.NewFlagSet("version", flag.ContinueOnError)
+		quiet := flags.Bool("quiet", false, "verify execution without printing the version")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return errors.New("usage: spynel version [--quiet]")
+		}
+		if *quiet {
+			return nil
+		}
 		fmt.Println("spynel " + version)
 		return nil
 	case "init":
@@ -426,10 +439,11 @@ func (r *restartRequest) Error() string {
 }
 
 type updateRequest struct {
-	args []string
+	args       []string
+	standalone bool
 }
 
-func (*updateRequest) Error() string { return "update Spynel through npm" }
+func (*updateRequest) Error() string { return "update and restart Spynel" }
 func (r *updateRequest) ExitCode() int {
 	r.writeRestartArgs()
 	return npmUpdateExitCode
@@ -455,6 +469,10 @@ func (r *updateRequest) writeRestartArgs() {
 }
 
 func completeRun(err error, restart func([]string) error) error {
+	var update *updateRequest
+	if errors.As(err, &update) && update.standalone {
+		return restart(append([]string(nil), update.args...))
+	}
 	var request *restartRequest
 	if !errors.As(err, &request) {
 		return err
@@ -545,7 +563,7 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			}
 		}
 		if updating.Load() {
-			return &updateRequest{args: append([]string(nil), restartArgs...)}
+			return &updateRequest{args: append([]string(nil), restartArgs...), standalone: updater.Detect(version).InstallRoot != ""}
 		}
 		if restarting.Load() {
 			return &restartRequest{args: append([]string(nil), restartArgs...)}
@@ -629,6 +647,9 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 		stateEvents := startTUIStatePolling(ctx, client, shared, cfg.StatePath("themes"), conversation)
 		notificationEvents := watchTaskNotifications(ctx, historyPath, historyOffset)
 		updateManager := updater.Detect(version)
+		if updateManager.InstallRoot != "" {
+			updateManager.PeriodicChecks = standaloneChecksEligible(restartArgs, interactiveTerminal())
+		}
 		var updateCheck func(context.Context) (bool, error)
 		var updateAvailable bool
 		var updateCheckedAt time.Time
@@ -1269,7 +1290,7 @@ Usage:
     --format text|json           Select plain Markdown or versioned JSON
   spynel instructions            Validate role instruction files without showing contents
   spynel jobs|log...             Other concise framework-command aliases
-  spynel update                 Check npm for an update (/update install applies it)
+  spynel update                 Check the installation source for an update (/update install applies it)
   spynel run --once              Dispatch one orchestration scan and wait
   spynel task [--no-review] REQUEST
                                 Create a task (reviewed by default)
@@ -1281,3 +1302,34 @@ Usage:
   spynel doctor                  Check local configuration and prerequisites
   spynel version                 Print the binary version
 `
+
+// runInstallBundle is a workspace-independent entry point used by install.sh.
+func runInstallBundle(args []string, buildVersion string) error {
+	flags := flag.NewFlagSet("install-bundle", flag.ContinueOnError)
+	root := flags.String("root", "", "installation directory")
+	archive := flags.String("archive", "", "release archive")
+	checksums := flags.String("checksums", "", "release checksums")
+	version := flags.String("version", "", "stable release version")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *root == "" || *archive == "" || *checksums == "" || *version != buildVersion {
+		return errors.New("install-bundle requires root, archive, checksums and the executing release version")
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	_, err := updater.InstallArchive(ctx, *root, *archive, *checksums, *version)
+	return err
+}
+
+func standaloneChecksEligible(args []string, interactive bool) bool {
+	if !interactive || os.Getenv("SPYNEL_SKIP_UPDATE_CHECK") == "1" {
+		return false
+	}
+	for _, arg := range args {
+		if arg == "--automatic-startup" || strings.HasPrefix(arg, "--automatic-startup=") {
+			return false
+		}
+	}
+	return true // Called only by the actual TUI launch path.
+}

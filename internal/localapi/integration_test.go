@@ -111,6 +111,46 @@ func receiveEnvelope(t *testing.T, events <-chan EventEnvelope) EventEnvelope {
 
 type burstHarness struct{ *apiHarness }
 
+func TestReturnedCommandErrorIsDurableAcrossTUIClientReconnect(t *testing.T) {
+	election, server, _, stop, done := startTestServer(t, t.TempDir())
+	defer func() { stop(); <-done; _ = server.Service.Close(); _ = election.Release(server.Token) }()
+	ctx := context.Background()
+	message := core.Message{Channel: "tui", Conversation: "errors", Text: "/extension remove ../escape", SourceMessageID: "error-request"}
+	client := NewClient(election)
+	if err := client.Handle(ctx, message, nil); err == nil || err.Error() != "invalid extension name" {
+		t.Fatalf("TUI client error = %v", err)
+	}
+	// A new client reads the same committed error without sending it again.
+	client = NewClient(election)
+	var screen core.Event
+	message.Text, message.SourceMessageID = "/resume", "resume-request"
+	if err := client.Handle(ctx, message, func(event core.Event) { screen = event }); err != nil {
+		t.Fatal(err)
+	}
+	if screen.Screen == nil {
+		t.Fatal("missing resume picker")
+	}
+	for _, control := range screen.Screen.Controls {
+		if strings.Contains(control.Value, "errors") && strings.HasPrefix(control.Key, "resume:") {
+			branch, err := client.ScreenAction(ctx, "resume", control.Key, nil)
+			if err != nil || branch == nil {
+				t.Fatalf("resume = %#v, %v", branch, err)
+			}
+			var count int
+			for _, entry := range branch.Transcript {
+				if entry.Role == "error" && entry.Text == "invalid extension name" {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatalf("resumed TUI contains %d error messages", count)
+			}
+			return
+		}
+	}
+	t.Fatal("saved error conversation missing from resume picker")
+}
+
 func (h burstHarness) Send(_ context.Context, _, _ string, emit core.Emit) (string, bool, error) {
 	for i := 0; i < 300; i++ {
 		emit(core.Event{Kind: core.EventDelta, Text: "x"})

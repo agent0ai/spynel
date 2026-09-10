@@ -767,6 +767,13 @@ func TestOfflineUpdateInstallReturnsControlToNPMLauncher(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(packageRoot, "npm", "vendor", ".installed.json"), []byte(`{"version":"1.2.0"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(executable, filepath.Join(packageRoot, "npm", "vendor", "spynel")); err != nil {
+		t.Fatal(err)
+	}
 	registry := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		_, _ = writer.Write([]byte(`{"name":"spynel","version":"1.3.0"}`))
 	}))
@@ -775,7 +782,7 @@ func TestOfflineUpdateInstallReturnsControlToNPMLauncher(t *testing.T) {
 	t.Setenv("SPYNEL_NPM_LAUNCHER_MANAGED", "1")
 	t.Setenv("SPYNEL_NPM_REGISTRY_URL", registry.URL)
 	var output bytes.Buffer
-	err := runFrameworkMessageMode(config.PathForRoot(root), "updates", "/update install", "1.2.0", messageRunOptions{Output: &output})
+	err = runFrameworkMessageMode(config.PathForRoot(root), "updates", "/update install", "1.2.0", messageRunOptions{Output: &output})
 	exit, ok := err.(interface{ ExitCode() int })
 	if !ok || exit.ExitCode() != npmUpdateExitCode || !strings.Contains(output.String(), "Updating Spynel") {
 		t.Fatalf("offline update = %T %v, output %q", err, err, output.String())
@@ -1691,5 +1698,30 @@ func TestPromotionRecordsConfigurationReloadFailure(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("configuration reload failure evidence missing: %#v", runtimeState.Logs())
+	}
+}
+
+func TestStandaloneUpdateRestartAndProactiveEligibility(t *testing.T) {
+	for _, args := range [][]string{nil, {"version"}, {"version", "--quiet"}, {"serve", "--tui", "--config", "/project/.spynel/config.yaml"}} {
+		called := false
+		err := completeRun(&updateRequest{args: args, standalone: true}, func(got []string) error {
+			called = true
+			want := args
+			if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+				t.Fatalf("restart args: %q", got)
+			}
+			return nil
+		})
+		if err != nil || !called {
+			t.Fatalf("restart: %v, %t", err, called)
+		}
+	}
+	t.Setenv("SPYNEL_SKIP_UPDATE_CHECK", "")
+	if !standaloneChecksEligible(nil, true) || standaloneChecksEligible(nil, false) || standaloneChecksEligible([]string{"serve", "--automatic-startup"}, true) {
+		t.Fatal("incorrect standalone check eligibility")
+	}
+	t.Setenv("SPYNEL_SKIP_UPDATE_CHECK", "1")
+	if standaloneChecksEligible(nil, true) {
+		t.Fatal("ignored check suppression")
 	}
 }

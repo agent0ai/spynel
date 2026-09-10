@@ -22,6 +22,8 @@
 - `capture-tui.sh` owns deterministic true-color screenshots of representative TUI states. It captures every stock theme with the same 120-by-34 fixture and produces a labeled light/dark/accessibility contact sheet. Keep its fixtures synchronized with durable layout contracts and inspect the PNGs after meaningful visual changes.
 - `terminal-copy-screen.mjs` replays the synthetic TUI PTY's optional F6/exit captures through a disposable pinned headless xterm installation. Assert visible rows, cursor, complete long text and retained history across cycles/resize/return under native and modeled ED 2 archival policies; the policy model is not a live Warp/macOS test. Exit replay inspects visible alternate cells before restoration, exact normal-screen/history/cursor content afterward, modes, styles, and surviving diagnostics/echo; it does not infer emulator retention from escape emission. Installation and replay commands live in `docs/tui-editing.md`.
 
+- `test-standalone.py` exercises piped bootstrap, user-bin symlink creation, ownership, rejected/corrupt downloads, and native isolated primary and ownerless update/restart against local candidate releases. Cover both plain and NDJSON ownerless completion, with exactly one correlated terminal JSON acknowledgment. It uses only synthetic workspace state and an unavailable harness, never the live installation or public release mutation.
+
 ## Child DOX Index
 
 Direct child DOX files:

@@ -52,3 +52,9 @@ npm pack --dry-run
 ```
 
 Extract the host archive and execute `spynel --version` with its companion libraries still in the staged layout. The release workflow performs that execution before it creates every archive.
+
+## Standalone bootstrap
+
+The root `install.sh` uses the same native archives and `checksums.txt` as npm, preserving the complete runtime and license layout. Its public invocation is `curl -LsSf https://spynel.agent-zero.ai/install.sh | sh`. Public URL routing is managed separately; checking in the script does not make that URL live. The first compatible release must include the native `install-bundle` entry point and GitHub updater. Older published bundles cannot acquire this behavior just by downloading the new shell script. Do not claim the one-liner works against an older release.
+
+Before publishing that first release, build two isolated stable candidate versions with `scripts/package-native.sh`, put their checksums beside each archive, and run `python3 scripts/test-standalone.py <older-archive> <newer-archive>`. This starts only local release fixtures and a synthetic workspace with an unavailable harness, tests piped bootstrap and failed-download preservation, then exercises the real primary update/restart path. Native macOS verification requires running the same test with macOS candidates on a Mac; a Linux result does not establish that boundary.

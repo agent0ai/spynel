@@ -353,7 +353,14 @@ func runFrameworkMessageMode(configPath, conversation, text, version string, opt
 	}
 	select {
 	case <-service.UpdateRequests():
-		return &updateRequest{}
+		request := &updateRequest{standalone: service.Updates != nil && service.Updates.InstallRoot != ""}
+		if request.standalone {
+			request.args = []string{"version"}
+			if options.JSON {
+				request.args = append(request.args, "--quiet")
+			}
+		}
+		return request
 	default:
 		return nil
 	}

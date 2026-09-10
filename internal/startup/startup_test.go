@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/xml"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -78,7 +80,7 @@ func TestLinuxStartupRegistrationIsWorkspaceSpecificAndReversible(t *testing.T) 
 		t.Fatal(err)
 	}
 	unit := string(data)
-	if !strings.Contains(unit, `ExecStart="`+manager.Executable+`" "serve" "--automatic-startup" "--config" "`+cfg.Path+`"`) || !strings.Contains(unit, `WorkingDirectory="`+cfg.Root+`"`) {
+	if !strings.Contains(unit, `ExecStart=:"`+manager.Executable+`" "serve" "--automatic-startup" "--config" "`+cfg.Path+`"`) || !strings.Contains(unit, "WorkingDirectory="+cfg.Root+"\n") {
 		t.Fatalf("unit = %q", unit)
 	}
 	link := filepath.Join(home, ".config", "systemd", "user", "default.target.wants", name)
@@ -95,14 +97,63 @@ func TestLinuxStartupRegistrationIsWorkspaceSpecificAndReversible(t *testing.T) 
 	}
 }
 
+func TestLinuxStartupUnitPassesSystemdValidation(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("systemd validation requires Linux")
+	}
+	analyze, err := exec.LookPath("systemd-analyze")
+	if err != nil {
+		t.Skip("systemd-analyze is unavailable")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, systemWide := range []bool{false, true} {
+		t.Run(strconv.FormatBool(systemWide), func(t *testing.T) {
+			cfg := startupTestConfig(filepath.Join(t.TempDir(), `project café with "quotes" %h ${HOME} $USER #;& and \backslash`))
+			if systemWide {
+				cfg.Root += " "
+			} else {
+				cfg.Root += `\`
+			}
+			cfg.Path = config.PathForRoot(cfg.Root)
+			manager := &Manager{GOOS: "linux", Home: t.TempDir(), Executable: executable,
+				SystemWide: systemWide, SystemUnitDirectory: t.TempDir()}
+			if err := manager.Sync(cfg, true); err != nil {
+				t.Fatal(err)
+			}
+			directory := filepath.Join(manager.Home, ".config", "systemd", "user")
+			if systemWide {
+				directory = manager.SystemUnitDirectory
+			}
+			path := filepath.Join(directory, "spynel-"+workspaceID(cfg)+".service")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(data), "WorkingDirectory="+strings.ReplaceAll(cfg.Root, "%", "%%")+"/\n") {
+				t.Fatalf("working directory was changed by command quoting: %s", data)
+			}
+			if !strings.Contains(string(data), `ExecStart=:"`) || !strings.Contains(string(data), `${HOME} $USER`) {
+				t.Fatalf("startup command does not preserve literal environment-like path text: %s", data)
+			}
+			command := exec.CommandContext(t.Context(), analyze, "verify", "--man=no", path)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("systemd rejected generated unit: %v\n%s", err, output)
+			}
+		})
+	}
+}
+
 func TestLinuxStartupEscapesControlCharactersInUnitValues(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "project\nInjected=bad\tvalue")
+	root := filepath.Join(t.TempDir(), "project")
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	cfg := startupTestConfig(root)
 	home := t.TempDir()
-	manager := &Manager{GOOS: "linux", Home: home, Executable: filepath.Join(root, "spynel")}
+	manager := &Manager{GOOS: "linux", Home: home, Executable: filepath.Join(root, "spynel\nInjected=bad\tvalue")}
 	if err := manager.Sync(cfg, true); err != nil {
 		t.Fatal(err)
 	}
@@ -115,8 +166,21 @@ func TestLinuxStartupEscapesControlCharactersInUnitValues(t *testing.T) {
 	if strings.Contains(unit, "\nInjected=bad") || strings.Contains(unit, "\tvalue") {
 		t.Fatalf("unit contains unescaped control characters: %q", unit)
 	}
-	if !strings.Contains(unit, `project\nInjected=bad\tvalue`) {
+	if !strings.Contains(unit, `spynel\nInjected=bad\tvalue`) {
 		t.Fatalf("unit does not contain escaped path: %q", unit)
+	}
+}
+
+func TestLinuxStartupRejectsControlCharactersInWorkingDirectory(t *testing.T) {
+	for _, character := range []string{"\n", "\r", "\t", "\x00", "\x7f"} {
+		cfg := startupTestConfig(filepath.Join(t.TempDir(), "project"+character+"Injected=bad"))
+		manager := &Manager{GOOS: "linux", Home: t.TempDir(), Executable: "/bin/true"}
+		if err := manager.Sync(cfg, true); err == nil || !strings.Contains(err.Error(), "control characters") {
+			t.Fatalf("workspace containing %q was not rejected: %v", character, err)
+		}
+		if _, err := os.Stat(filepath.Join(manager.Home, ".config")); !os.IsNotExist(err) {
+			t.Fatalf("rejected workspace created startup artifacts: %v", err)
+		}
 	}
 }
 

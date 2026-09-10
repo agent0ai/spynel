@@ -4565,8 +4565,16 @@ func TestPersistedHistoryBuildsInitialTranscript(t *testing.T) {
 	transcript := transcriptFromHistory([]history.Entry{
 		{Role: "user", Content: "remember this"},
 		{Role: "assistant", Content: "remembered"},
+		{Role: "user", Content: "/extension remove ../escape"},
+		{Role: "error", Content: "invalid extension name"},
 	})
-	if len(transcript) != 2 || transcript[0].role != "user" || transcript[0].text != "remember this" || transcript[1].role != "assistant" || transcript[1].text != "remembered" {
+	want := []transcriptEntry{
+		{role: "user", text: "remember this"},
+		{role: "assistant", text: "remembered"},
+		{role: "user", text: "/extension remove ../escape"},
+		{role: "error", text: "invalid extension name"},
+	}
+	if !reflect.DeepEqual(transcript, want) {
 		t.Fatalf("transcript = %#v", transcript)
 	}
 }

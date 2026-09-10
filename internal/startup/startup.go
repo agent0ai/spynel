@@ -15,9 +15,11 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/updater"
 )
 
 type CommandRunner func(context.Context, string, ...string) error
@@ -69,6 +71,7 @@ func New(executable string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	executable = updater.RestartExecutable(executable)
 	systemWide := false
 	if runtime.GOOS != "windows" {
 		systemWide = os.Geteuid() == 0
@@ -82,7 +85,7 @@ func New(executable string) (*Manager, error) {
 	}
 	nodeExecutable := strings.TrimSpace(os.Getenv("SPYNEL_NPM_NODE"))
 	npmLauncher := strings.TrimSpace(os.Getenv("SPYNEL_NPM_LAUNCHER"))
-	if nodeExecutable != "" && npmLauncher != "" {
+	if nodeExecutable != "" && npmLauncher != "" && updater.Detect("").LauncherManaged {
 		if nodeExecutable, err = filepath.Abs(nodeExecutable); err != nil {
 			return nil, err
 		}
@@ -134,6 +137,10 @@ func (m *Manager) startupCommand(cfg config.Config) (string, []string) {
 }
 
 func (m *Manager) enableLinux(cfg config.Config) error {
+	workingDirectory, err := systemdWorkingDirectory(cfg.Root)
+	if err != nil {
+		return err
+	}
 	unitName := "spynel-" + workspaceID(cfg) + ".service"
 	unitDirectory := filepath.Join(m.Home, ".config", "systemd", "user")
 	target := "default.target"
@@ -146,19 +153,20 @@ func (m *Manager) enableLinux(cfg config.Config) error {
 		return err
 	}
 	executable, arguments := m.startupCommand(cfg)
-	execStart := systemdQuote(executable)
+	// Paths are literal; ':' disables systemd's $VAR/${VAR} substitution.
+	execStart := ":" + systemdQuote(executable)
 	for _, argument := range arguments {
 		execStart += " " + systemdQuote(argument)
 	}
 	unit := strings.Join([]string{
 		"[Unit]",
-		"Description=" + systemdQuote("Spynel workspace "+cfg.Root),
+		"Description=Spynel workspace " + workingDirectory,
 		"Wants=network-online.target",
 		"After=network-online.target",
 		"",
 		"[Service]",
 		"Type=simple",
-		"WorkingDirectory=" + systemdQuote(cfg.Root),
+		"WorkingDirectory=" + workingDirectory,
 		"ExecStart=" + execStart,
 		"Restart=on-failure",
 		"RestartSec=5",
@@ -293,6 +301,21 @@ func writeCommandOutput(logWriter io.Writer, commandName, stream string, output 
 	_, _ = fmt.Fprintf(logWriter, "process=%s stream=%s truncated=%t output=%s\n", commandName, stream, output.truncated, strings.TrimSpace(output.String()))
 }
 
+// WorkingDirectory is a literal path with specifier expansion, not a quoted
+// command argument. Backslash escapes would change the selected directory.
+func systemdWorkingDirectory(value string) (string, error) {
+	if !filepath.IsAbs(value) || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return "", errors.New("systemd startup requires an absolute workspace path without control characters")
+	}
+	value = strings.ReplaceAll(value, "%", "%%")
+	// A final slash preserves trailing spaces and prevents line continuation.
+	if strings.HasSuffix(value, " ") || strings.HasSuffix(value, `\`) {
+		value += "/"
+	}
+	return value, nil
+}
+
+// systemdQuote encodes an ExecStart argument, whose parser unquotes it.
 func systemdQuote(value string) string {
 	var escaped strings.Builder
 	escaped.WriteByte('"')

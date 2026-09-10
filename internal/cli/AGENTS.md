@@ -22,6 +22,9 @@
 - Expose `events --conversation NAME [--after CURSOR]` as a long-lived single-attempt NDJSON subscription to an existing primary. `send`/`followup --request-id` retain client correlation; `send`, `followup` and `events --socket` explicitly select one private socket without local configuration/election discovery. JSON dispatched errors stay on protocol stdout with generic stderr failure, and continuing finals/errors do not end a request.
 - `serve --socket PATH` adds the optional Unix listener only when this process acquires a new primary. Keep the loopback listener, all TUI attachment semantics and election fences. Headless primary terms opt into the Runtime operational stderr projection; TUI-hosting terms do not.
 
+- Keep standalone bootstrap `install-bundle` independent of workspace initialization. Reuse updater ownership to route explicit update completion and ordinary restart through the stable installed entry point, preserving primary/job shutdown and init continuation arguments. Authorize proactive standalone checks only in an actual interactive TUI launch without automatic-startup or skip-check flags.
+- An ownerless standalone update restarts into `version`; for NDJSON output, use `version --quiet` so the new executable runs successfully without appending plain text or another terminal event after the correlated update acknowledgment.
+
 ## Child DOX Index
 
 No child DOX files.

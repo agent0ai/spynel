@@ -477,7 +477,7 @@ func (s *Service) primaryInstanceID() string {
 	return id
 }
 
-func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Emit) error {
+func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Emit) (resultErr error) {
 	if message.Channel == "cli" || message.Channel == "tui" {
 		if err := ValidateLocalMessage(message); err != nil {
 			return err
@@ -520,14 +520,50 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 	if message.FollowupOnly && !s.Harness.IsActive(sessionKey(message)) {
 		return errors.New("there is no active execution for this conversation")
 	}
+	recorded := false
+	var recordErr error
+	recordUser := func() error {
+		_, recordErr = s.History.Append(message.Channel, message.Conversation, history.Entry{
+			At: message.ReceivedAt, AcceptedAt: time.Now().UTC(), Role: "user", Sender: message.Sender, ReplyTo: message.ReplyTo, Content: redactSensitiveCommand(message.Text), SourceMessageID: message.SourceMessageID,
+		})
+		recorded = recordErr == nil
+		return recordErr
+	}
+	// Returned failures are rendered by the transport, while provider error
+	// events are persisted by wrapEmit. Save rejected requests here so reloads
+	// and the next agent prompt include the same error the user saw.
+	defer func() {
+		if resultErr != nil {
+			if recordErr != nil {
+				s.Runtime.LogEvent("error", "history", "append_failed", fmt.Sprintf("Persist incoming history failed (%T)", recordErr))
+				return
+			}
+			if !recorded {
+				if err := recordUser(); err != nil {
+					s.Runtime.LogEvent("error", "history", "append_failed", fmt.Sprintf("Persist incoming history failed (%T)", err))
+					resultErr = errors.Join(resultErr, fmt.Errorf("save request to conversation history: %w", err))
+					return
+				}
+			}
+			if _, err := s.History.Append(message.Channel, message.Conversation, history.Entry{
+				Role: "error", Content: resultErr.Error(), SourceMessageID: message.SourceMessageID, Terminal: true,
+			}); err != nil {
+				s.Runtime.LogEvent("error", "history", "error_append_failed", fmt.Sprintf("Persist error history failed (%T)", err))
+				resultErr = errors.Join(resultErr, fmt.Errorf("save error to conversation history: %w", err))
+			}
+		}
+	}()
 	if s.Config.Extensions.Enabled {
 		output, err := s.Hooks.Run(ctx, "message.received", messageHookPayload(message))
 		if err != nil {
 			return err
 		}
 		if output.Cancel {
-			if output.Message != "" && emit != nil {
-				emit(core.Event{Kind: core.EventFinal, Text: output.Message, Done: true, Local: true})
+			if err := recordUser(); err != nil {
+				return err
+			}
+			if output.Message != "" {
+				return s.localReply(message, output.Message, emit)
 			}
 			return nil
 		}
@@ -535,10 +571,7 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 			message.Text = text
 		}
 	}
-	if _, err := s.History.Append(message.Channel, message.Conversation, history.Entry{
-		At: message.ReceivedAt, AcceptedAt: time.Now().UTC(), Role: "user", Sender: message.Sender, ReplyTo: message.ReplyTo, Content: redactSensitiveCommand(message.Text), SourceMessageID: message.SourceMessageID,
-	}); err != nil {
-		s.Runtime.LogEvent("error", "history", "append_failed", fmt.Sprintf("Persist incoming history failed (%T)", err))
+	if err := recordUser(); err != nil {
 		return err
 	}
 	if strings.HasPrefix(message.Text, "/") {
@@ -1417,9 +1450,8 @@ func (s *Service) requestRestart() {
 	}
 }
 
-// UpdateRequests publishes npm update-and-restart requests after the command
-// acknowledgement has been persisted. The npm launcher performs the package
-// replacement only after the Go process has exited, which is safe on Windows.
+// UpdateRequests publishes source-specific update/restart requests after the
+// acknowledgement is persisted. The CLI owns complete runtime shutdown.
 func (s *Service) UpdateRequests() <-chan struct{} {
 	return s.updateRequests
 }
@@ -1433,7 +1465,7 @@ func (s *Service) requestUpdate() {
 
 func (s *Service) updateCommand(ctx context.Context, message core.Message, remainder string, emit core.Emit) error {
 	if s.Updates == nil {
-		return s.localReply(message, "npm updates are unavailable in this build. Install Spynel through npm to use `/update`.", emit)
+		return s.localReply(message, "Updates are unavailable in this build. Install Spynel through npm or the install script to use `/update`.", emit)
 	}
 	action := strings.ToLower(strings.TrimSpace(remainder))
 	if action != "" && action != "install" {
@@ -1443,26 +1475,31 @@ func (s *Service) updateCommand(ctx context.Context, message core.Message, remai
 	if err != nil {
 		return s.localReply(message, "Update check skipped: "+err.Error()+". Try `/update` again later.", emit)
 	}
-	if !result.InstalledViaNPM {
-		return s.localReply(message, "This Spynel binary is not managed by npm. Download a newer release using the same installation method.", emit)
+	if result.Source == "" {
+		return s.localReply(message, "This Spynel binary is unmanaged. Download a newer release using the same installation method.", emit)
 	}
 	if !result.Available {
 		latest := result.Latest
 		if latest == "" {
 			latest = result.Current
 		}
-		return s.localReply(message, fmt.Sprintf("Spynel %s is current; npm also reports %s.", result.Current, latest), emit)
+		return s.localReply(message, fmt.Sprintf("Spynel %s is current; %s also reports %s.", result.Current, result.Source, latest), emit)
 	}
 	if action == "" {
 		if result.CanAutoInstall {
-			return s.localReply(message, fmt.Sprintf("Spynel %s is installed through npm; %s is available. Run `/update install` to run npm update and restart Spynel safely.", result.Current, result.Latest), emit)
+			return s.localReply(message, fmt.Sprintf("Spynel %s is installed through %s; %s is available. Run `/update install` to update and restart Spynel safely.", result.Current, result.Source, result.Latest), emit)
 		}
 		return s.localReply(message, fmt.Sprintf("Spynel %s is installed through npm; %s is available. Run `%s`, then `/restart`. This process was not launched by the npm wrapper, so it cannot replace itself safely.", result.Current, result.Latest, result.Command), emit)
 	}
 	if !result.CanAutoInstall {
 		return s.localReply(message, fmt.Sprintf("Run `%s`, then `/restart`. Updating in place is unavailable because this process was not launched by the npm wrapper.", result.Command), emit)
 	}
-	if err := s.localReply(message, fmt.Sprintf("Updating Spynel from %s to %s with npm, then restarting. Saved workspace state will remain in place.", result.Current, result.Latest), emit); err != nil {
+	if result.Source == "GitHub" {
+		if err := s.Updates.Install(ctx, result.Latest); err != nil {
+			return s.localReply(message, "Update installation failed: "+err.Error()+". The previous installation remains usable.", emit)
+		}
+	}
+	if err := s.localReply(message, fmt.Sprintf("Updating Spynel from %s to %s with %s, then restarting. Saved workspace state will remain in place.", result.Current, result.Latest, result.Source), emit); err != nil {
 		return err
 	}
 	s.requestUpdate()
@@ -1859,8 +1896,8 @@ var slashCommands = []core.SlashCommand{
 	{Value: "/new", Usage: "/new", Description: "Start a distinct TUI conversation and preserve this one"},
 	{Value: "/stop", Usage: "/stop", Description: "Stop the active execution for this conversation"},
 	{Value: "/restart", Usage: "/restart", Description: "Restart Spynel and restore saved state"},
-	{Value: "/update", Usage: "/update", Description: "Check npm for a newer Spynel release"},
-	{Value: "/update install", Usage: "/update install", Description: "Install an npm update and restart safely"},
+	{Value: "/update", Usage: "/update", Description: "Check for a newer Spynel release"},
+	{Value: "/update install", Usage: "/update install", Description: "Install an update and restart safely"},
 	{Value: "/history", Usage: "/history", Description: "Show the complete history file"},
 	{Value: "/resume", Usage: "/resume", Description: "Browse saved conversations and branch one into the TUI"},
 	{Value: "/log", Usage: "/log", Description: "Show the newest page of captured runtime logs"},
@@ -1921,7 +1958,7 @@ var helpTopics = []struct {
 	{
 		name:        "channels",
 		description: "The TUI, Telegram, and WhatsApp",
-		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, instance, and orchestrator indicators. From an idle local TUI, `/primary` safely hands workspace ownership to that TUI instance. Use `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to switch the TUI to a distinct conversation while preserving the prior one for `/resume`. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/update` checks npm with a ten-second deadline, and `/update install` lets a supervising npm launcher update after shutdown and then restart. `/log` shows bounded runtime diagnostics. `/jobs` lists active executions and `/jobs recent` lists archived executions by the same numeric reference; `/job info <number>` and `/job output <number>` inspect bounded metadata or captured output. `/tasks` and `/goals` list open durable work by default. `/job message <number> <text>` sends nonterminal guidance through the existing job session, `/job ping <number>` requests a durable progress update, and `/job kill <number>` stops one live job.",
+		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, instance, and orchestrator indicators. From an idle local TUI, `/primary` safely hands workspace ownership to that TUI instance. Use `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to switch the TUI to a distinct conversation while preserving the prior one for `/resume`. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/update` checks the owning npm or GitHub installation source with a ten-second deadline. `/update install` verifies and installs an update and restarts safely; npm replacement runs through its supervising launcher after shutdown. `/log` shows bounded runtime diagnostics. `/jobs` lists active executions and `/jobs recent` lists archived executions by the same numeric reference; `/job info <number>` and `/job output <number>` inspect bounded metadata or captured output. `/tasks` and `/goals` list open durable work by default. `/job message <number> <text>` sends nonterminal guidance through the existing job session, `/job ping <number>` requests a durable progress update, and `/job kill <number>` stops one live job.",
 	},
 	{
 		name:        "workflows",

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
@@ -16,6 +17,14 @@ import (
 // exercises its provider-neutral sequence through real orchestration, leases,
 // runtime/archive persistence, and the commands shared by every interface.
 func TestJobReconnectAcrossSharedInspection(t *testing.T) {
+	for _, recovery := range []string{"none", "restart", "stale"} {
+		t.Run(recovery, func(t *testing.T) {
+			testJobReconnectAcrossSharedInspection(t, recovery)
+		})
+	}
+}
+
+func testJobReconnectAcrossSharedInspection(t *testing.T, recovery string) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
@@ -39,6 +48,45 @@ func TestJobReconnectAcrossSharedInspection(t *testing.T) {
 		t.Fatalf("jobs = %#v", jobs)
 	}
 	job := jobs[0]
+	var retiredEmit core.Emit
+	if recovery == "restart" {
+		if err := service.Close(); err != nil {
+			t.Fatal(err)
+		}
+		service.Runtime.archive.close() // release the ownership locks as process exit would
+		provider = newHeldServiceHarness()
+		service = New(cfg, provider)
+		defer service.Close()
+	}
+	if recovery == "stale" {
+		provider.mu.Lock()
+		emit := provider.emits[job.SessionKey]
+		retiredEmit = emit
+		provider.active[job.SessionKey] = false
+		provider.mu.Unlock()
+		emit(core.Event{Kind: core.EventError, Text: "previous execution failed", Done: true,
+			Execution: &core.ExecutionStatus{State: "error", Detail: "previous execution failed"}})
+		lease, ok := service.Orchestrator.LeaseForSession(job.SessionKey)
+		if !ok {
+			t.Fatal("missing stale lease")
+		}
+		lease.HeartbeatAt = time.Now().UTC().Add(-time.Hour)
+		writeJobLease(t, service, lease)
+	}
+	if recovery != "none" {
+		if err := service.Orchestrator.ScanOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		service.Orchestrator.Wait()
+		jobs = service.Runtime.Jobs()
+		if len(jobs) != 1 || jobs[0].Number != job.Number || jobs[0].StableID != job.StableID || jobs[0].RecoveryCount != 1 || jobs[0].ProviderIterations != job.ProviderIterations+1 {
+			t.Fatalf("recovery lost job identity or accounting: %#v", jobs)
+		}
+		if recovery == "stale" && (jobs[0].ID == job.ID || !jobs[0].StartedAt.After(job.StartedAt)) {
+			t.Fatal("recovery reused the ended execution handle")
+		}
+		job = jobs[0]
+	}
 	provider.mu.Lock()
 	emit := provider.emits[job.SessionKey]
 	provider.mu.Unlock()
@@ -56,7 +104,7 @@ func TestJobReconnectAcrossSharedInspection(t *testing.T) {
 			t.Fatalf("archive state = %q, err = %v", archived.State, err)
 		}
 		for _, channel := range []string{"tui", "cli", "telegram", "whatsapp"} {
-			for _, command := range []string{"/jobs", "/jobs recent", fmt.Sprintf("/job info %d", job.Number)} {
+			for _, command := range []string{"/jobs", "/jobs recent", fmt.Sprintf("/job info %d", job.Number), "/tasks active"} {
 				var output string
 				if err := service.Handle(context.Background(), core.Message{Channel: channel, Conversation: "fixture", Text: command}, func(event core.Event) {
 					if event.Kind == core.EventFinal {
@@ -68,12 +116,19 @@ func TestJobReconnectAcrossSharedInspection(t *testing.T) {
 				want := string(state)
 				if strings.HasPrefix(command, "/job info") {
 					want = "Execution status: " + strings.ReplaceAll(want, "_", " ")
+				} else if command == "/tasks active" {
+					want = "working"
 				}
 				if !strings.Contains(output, want) {
 					t.Fatalf("%s %s missing %q: %s", channel, command, want, output)
 				}
 			}
 		}
+	}
+	check(JobRunning)
+	if retiredEmit != nil {
+		retiredEmit(core.Event{Kind: core.EventError, Text: "late previous failure", Done: true})
+		check(JobRunning)
 	}
 	for range 2 {
 		emit(core.Event{Kind: core.EventStatus, Text: "synthetic connection failure", Execution: &core.ExecutionStatus{State: "reconnecting", Detail: "synthetic connection failure"}})

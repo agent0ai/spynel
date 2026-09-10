@@ -40,6 +40,8 @@ spynel send [--config PATH] [--conversation NAME] [--stream|--json] [--stdin] [-
 
 The default conversation is `cli/local`; each other `--conversation` value owns an independent append-only history and harness session.
 
+Accepted requests, commands and their text replies, and command/hook/harness errors are saved in that conversation's history. TUI `Err` messages for these failures survive restart and `/resume`; model and harness selection confirmations are saved too. Subsequent agent prompts include these same records within the configured history limits and link the complete history file. Secret command values remain redacted. `/clear` and normal retention cleanup still remove history explicitly; status indicators and form contents are not chat messages.
+
 - Default output is only the last assistant-message item followed by a newline. Harness progress/preamble items remain in durable history but do not pollute final-only shell output.
 - `--stream` writes every text delta as it arrives, including any provider progress items, and avoids repeating the complete final response.
 - `--json` writes every `core.Event` as one NDJSON object. This already streams and cannot be combined with `--stream`.
@@ -147,7 +149,7 @@ Options such as `--config`, `--conversation`, and `--json` must precede alias ar
 
 TUI-only visual or ownership operations—theme preview, title, welcome, resume screen, primary-window promotion, and quit—are intentionally rejected. Conversation resume has the disk-backed command above. `spynel whatsapp pair` remains the plain QR-pairing command.
 
-`spynel update` uses the shared `/update` handler and reports the npm registry result. It makes no network request for an archive/development binary. An npm registry request has a hard ten-second deadline. `spynel update install` returns control to the npm launcher, which updates only after the Go executable exits and then restarts it; when an older or direct launch has no supervising wrapper, the response provides the manual `npm update` plus `/restart` path instead.
+`spynel update` uses the shared `/update` handler and checks the owning npm or standalone GitHub installation with a ten-second deadline. It makes no update request for an unmanaged archive/development binary. `spynel update install` explicitly installs and restarts: standalone downloads are checksummed, validated and published as complete immutable bundles before graceful shutdown; npm returns to its supervising launcher for replacement after Go exits. When no primary is running, standalone installation restarts into `version` rather than replaying the install command. Commands sent to a running primary update that primary's installation, which may differ from the caller's. An npm process launched without its wrapper gets manual update guidance. See [installation and updates](getting-started.md#updates).
 
 ## Tasks, goals, and extensions
 

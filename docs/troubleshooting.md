@@ -16,7 +16,7 @@ After a job finishes or the primary restarts, use `/jobs recent`, then `/job inf
 
 ## Installation or startup
 
-- The public `npm install -g spynel` path is not available until the first public npm and GitHub release. For an authorized checkout, use the development steps in [getting started](getting-started.md).
+- The standalone public one-liner requires URL routing and a release containing standalone installer support. If it is unavailable, use npm or the development steps in [getting started](getting-started.md).
 - Run `spynel` from the directory that should own the workspace. Its private configuration and state live in that directory's fixed `.spynel/` folder.
 - If a development install is not found, follow the exact PATH guidance printed by `scripts/install-dev.sh`, or choose a writable directory already on PATH with `--bin-dir`.
 - The configuration must be `.spynel/config.yaml` and match the current schema. Unknown or obsolete fields fail validation with their source location.
@@ -39,7 +39,7 @@ After a job finishes or the primary restarts, use `/jobs recent`, then `/job inf
 
 ## Updates, speech, and automation
 
-- Automatic npm update checks occur only for interactive npm-launched starts. When a new version is available, the startup offer shows both versions and skips automatically after a ten-second countdown unless you answer Yes; No or any other answer also skips safely. `/update` reports availability explicitly; `/update install` requires an npm-supervised owner. Development and release-archive binaries report that npm updates are unavailable.
+- Automatic npm update checks occur only for interactive npm-launched starts. When a new version is available, the startup offer shows both versions and skips automatically after a ten-second countdown unless you answer Yes; No or any other answer also skips safely. `/update` reports availability explicitly; `/update install` uses an npm-supervised owner or a script-managed GitHub installation. Development and manually extracted archive binaries remain unmanaged. Script installation failures preserve the prior runtime; if another installer is active, wait for it to finish and retry.
 - Speech accepts WAV, FLAC, MP3, and Telegram/WhatsApp Ogg/Opus voice notes. M4A/AAC, WebM, and other formats return an unsupported-format error. First supported use downloads a checksum-pinned model into the operating system's per-user cache unless `speech.model_dir` is configured.
 - Plain CLI flags precede positional command arguments. Add `--stream` for text deltas or `--json` for NDJSON events; default `send` output is only the final assistant message.
 

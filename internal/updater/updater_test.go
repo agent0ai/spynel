@@ -95,3 +95,19 @@ func TestPeriodicAvailabilityRequiresValidatedLauncherAndSemanticSnapshot(t *tes
 		t.Fatal("validated npm tree without its launcher enabled periodic checks")
 	}
 }
+
+func TestStandaloneChecksIgnoreInheritedNPMSnapshot(t *testing.T) {
+	manager := &Manager{InstallRoot: t.TempDir(), CurrentVersion: "1.0.0", PeriodicChecks: true}
+	t.Setenv(checkedAtEnv, time.Now().Format(time.RFC3339))
+	t.Setenv(latestVersionEnv, "99.0.0")
+	if !manager.PeriodicChecksEnabled() {
+		t.Fatal("eligible standalone checks disabled")
+	}
+	if _, _, ok := manager.InitialAvailability(); ok {
+		t.Fatal("standalone accepted inherited npm snapshot")
+	}
+	manager.PeriodicChecks = false
+	if manager.PeriodicChecksEnabled() {
+		t.Fatal("headless standalone checks enabled")
+	}
+}

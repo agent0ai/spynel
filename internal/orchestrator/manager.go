@@ -786,6 +786,17 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 			promptPath = route.ReviewPrompt
 		}
 		if recovery {
+			// Recovery owns a new execution; retire any ended local handle so
+			// its terminal status cannot fence the resumed job. The archive
+			// preserves this workflow dispatch's public number and history.
+			m.finishRuntimeJob(lease.ID)
+			lease.State = "recovering"
+			lease.LastError = ""
+			lease.HeartbeatAt = time.Now().UTC()
+			if err := m.saveLease(lease); err != nil {
+				m.recordError(lease, err)
+				return
+			}
 			recoveryAttempt := lease.RecoveryCount + 1
 			note := fmt.Sprintf("Spynel started recovery attempt %d for %s after its durable execution ownership required reconciliation; the recovery agent must record its findings and outcome here.", recoveryAttempt, strings.ReplaceAll(normalizeLeasePhase(route.Name, lease.Phase), "_", " "))
 			if err := updateDocumentProgress(lease.File, time.Now().UTC(), note); err != nil {
@@ -821,7 +832,15 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 			m.setRuntimeJob(lease.ID, jobID)
 		}
 		finish := func() { m.finishRuntimeJob(lease.ID) }
+		// Admission and asynchronous events must not overwrite each other's
+		// lease state (especially a terminal event racing Send's return).
+		var lifecycleMu sync.Mutex
 		emit := func(event core.Event) {
+			lifecycleMu.Lock()
+			defer lifecycleMu.Unlock()
+			if jobID > 0 && m.runtimeJob(lease.ID) != jobID {
+				return
+			}
 			terminal := event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError)
 			if jobID > 0 && m.JobEvent != nil {
 				m.JobEvent(jobID, event)
@@ -846,6 +865,8 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 			}
 			if terminal {
 				current.State = "awaiting_transition"
+			} else if current.State == "recovering" && event.Execution != nil && event.Execution.State == "running" {
+				current.State = "processing"
 			}
 			if err := m.saveLease(current); err != nil {
 				m.log("save lease event state: " + err.Error())
@@ -860,6 +881,8 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 			// until reconciliation observes the agent-authored durable file move.
 		}
 		threadID, steered, err := m.Harness.Send(ctx, lease.SessionKey, prompt, emit)
+		lifecycleMu.Lock()
+		defer lifecycleMu.Unlock()
 		if err != nil {
 			if jobID > 0 && m.JobEvent != nil {
 				m.JobEvent(jobID, core.Event{Kind: core.EventError, Text: err.Error(), Done: true})
@@ -882,8 +905,8 @@ func (m *Manager) dispatch(ctx context.Context, route config.Route, lease Lease,
 		lease.HeartbeatAt = time.Now().UTC()
 		if recovery {
 			lease.RecoveryCount++
-			if lease.State != "awaiting_transition" {
-				lease.State = "recovering"
+			if lease.State == "recovering" {
+				lease.State = "processing"
 			}
 		}
 		if err := m.saveLease(lease); err != nil {

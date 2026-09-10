@@ -11,13 +11,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/workspace"
 	"gopkg.in/yaml.v3"
 )
 
 const runtimeProcessFixtureEnv = "SPYNEL_RUNTIME_PROCESS_FIXTURE"
 
 func TestRuntimeProcessFixture(t *testing.T) {
+	if os.Getenv(runtimeProcessFixtureEnv) == "history-cancel" {
+		_, _ = fmt.Fprintln(os.Stdout, `{"cancel":true,"message":"Stopped by workspace hook"}`)
+		os.Exit(0)
+	}
 	if os.Getenv(runtimeProcessFixtureEnv) != "extension-protocol" {
 		return
 	}
@@ -25,6 +32,54 @@ func TestRuntimeProcessFixture(t *testing.T) {
 	_, _ = fmt.Fprintln(os.Stderr, "authorization: Bearer subprocess-secret")
 	_, _ = fmt.Fprintln(os.Stderr, "diagnostic-stderr")
 	os.Exit(0)
+}
+
+func TestMessageHookOutcomesPreserveVisibleHistory(t *testing.T) {
+	for _, mode := range []string{"history-cancel", "extension-protocol", "failure"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, _ := config.Load(config.PathForRoot(root))
+			service := New(cfg, newServiceHarness())
+			defer service.Close()
+			command := []string{os.Args[0], "-test.run=^TestRuntimeProcessFixture$"}
+			if mode == "failure" {
+				command = []string{root + "/missing-hook"}
+			}
+			manifest, _ := yaml.Marshal(extensions.Manifest{Name: "fixture", Hooks: map[string][]string{"message.received": command}})
+			directory := filepath.Join(service.Hooks.Directory, "fixture")
+			if err := os.MkdirAll(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(directory, extensions.ManifestName), manifest, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(runtimeProcessFixtureEnv, mode)
+			var response core.Event
+			err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "hooks", Text: "original visible request"}, func(event core.Event) {
+				if event.Kind == core.EventFinal {
+					response = event
+				}
+			})
+			entries, _, readErr := service.History.Entries("tui", "hooks")
+			wantRequest := "original visible request"
+			if mode == "extension-protocol" {
+				wantRequest = "protocol-output-must-not-be-logged"
+			}
+			if readErr != nil || len(entries) != 2 || entries[0].Content != wantRequest {
+				t.Fatalf("hook history = %#v, %v", entries, readErr)
+			}
+			if mode == "failure" {
+				if err == nil || entries[1].Role != "error" || entries[1].Content != err.Error() {
+					t.Fatalf("hook error not saved: %#v, %v", entries, err)
+				}
+			} else if err != nil || entries[1].Role != "assistant" || entries[1].Content != response.Text {
+				t.Fatalf("hook reply not saved: %#v, %v", entries, err)
+			}
+		})
+	}
 }
 
 func TestProductionSubprocessWiringCapturesDiagnosticStderrWithoutProtocolDuplication(t *testing.T) {
