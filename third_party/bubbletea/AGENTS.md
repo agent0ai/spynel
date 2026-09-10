@@ -6,10 +6,11 @@
 
 ## Local Contracts
 
-- Keep upstream source, tests, module metadata and LICENSE intact except for the documented terminal output fix and complete-key decoding adapter. Examples, upstream automation and README are omitted.
+- Keep upstream source, tests, module metadata and LICENSE intact except for the documented terminal output/exit fixes and complete-key decoding adapter. Examples, upstream automation and README are omitted.
 - The terminal ownership patch discovers `ttyOutput` in `NewProgram` after options/default output are resolved, before any resize reader starts; Unix and Windows `initInput` no longer reassign it. `ReleaseTerminal`/`RestoreTerminal`, Exec and SIGWINCH share this immutable descriptor. Preserve raw-mode, initial-size and nil-renderer behavior.
+- The shared renderer `exitAltScreen` resets styles and clears visible alternate-screen cells before switching to the normal screen, under the flush mutex. Shutdown and Exec release stop/flush (or cancel) the renderer first; no caller may clear after restoring the shell or erase saved lines. Preserve normal-screen output, diagnostics, input restoration and nil-renderer behavior. The real TUI PTY/cell replay covers Ctrl+C, /quit, context cancellation and quitting after repeated F6/resize.
 - `DecodeKey` exposes the existing Program decoder for an already framed complete event; Spynel owns framing and Escape timing. The static terminal-copy path uses this adapter instead of maintaining a second function-key table. Keep upstream key semantics unchanged and retain the table-parity regression.
-- This local module avoids editing the shared module cache or adding caller timing workarounds. Remove the replacement when an adopted upstream version fixes this ownership race and exposes equivalent key decoding; a v2 migration is outside this fix.
+- This local module avoids editing the shared module cache or adding caller timing workarounds. Remove the replacement when an adopted upstream version fixes these terminal ownership/exit boundaries and exposes equivalent key decoding; a v2 migration is outside this fix.
 - Run `go test -race github.com/charmbracelet/bubbletea` and the real Spynel PTY regression from the repository root. `scripts/dev.sh test` includes this dependency's tests and vet because `./...` skips nested modules. `tty_race_linux_test.go` is the local owning-layer regression; the full application PTY verifies actual raw startup, F6 restore and SIGWINCH.
 
 ## Child DOX Index

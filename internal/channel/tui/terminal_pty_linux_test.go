@@ -3,6 +3,7 @@
 package tui
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -71,7 +73,7 @@ func TestSemanticPTYFixture(t *testing.T) {
 	if path == "" {
 		t.Skip("PTY subprocess only")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer cancel()
 	lipgloss.SetColorProfile(termenv.TrueColor)
 	m := testModel()
@@ -84,12 +86,29 @@ func TestSemanticPTYFixture(t *testing.T) {
 	out := &terminalOutput{File: os.Stdout}
 	m.writeClipboard = out
 	p := tea.NewProgram(ptyFixtureModel{m, path}, tea.WithInput(&terminalInput{file: os.Stdin}), tea.WithOutput(out), tea.WithAltScreen(), tea.WithContext(ctx), tea.WithFilter(filterTerminalEvents))
-	if _, err := p.Run(); err != nil {
+	if _, err := p.Run(); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
+	// Exercise restored canonical input/echo after Tea has returned, and leave
+	// genuine post-shutdown stderr visible. Late messages must not render.
+	p.Send(tea.WindowSizeMsg{Width: 60, Height: 24})
+	time.Sleep(50 * time.Millisecond)
+	fmt.Fprintln(os.Stderr, "shutdown diagnostic")
+	fmt.Fprint(os.Stdout, "shell-ready> ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil || line != "shell input\n" {
+		t.Fatalf("restored shell input: %q, %v", line, err)
+	}
+	fmt.Fprint(os.Stdout, "shell-read: "+line)
 }
 
 func TestRealPTYSemanticInputAndModeRestoration(t *testing.T) {
+	for _, exit := range []string{"ctrl-c", "after-f6", "slash-quit", "sigterm"} {
+		t.Run(exit, func(t *testing.T) { runSemanticPTY(t, exit) })
+	}
+}
+
+func runSemanticPTY(t *testing.T, exit string) {
 	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_NOCTTY, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +250,65 @@ func TestRealPTYSemanticInputAndModeRestoration(t *testing.T) {
 		t.Fatalf("PTY resize to %dx%d not delivered", width, height)
 		return ptySnapshot{}
 	}
+	finish := func() {
+		waitForTerminalQuiescence(t, capture, 40*time.Millisecond)
+		recordScreen("before-exit", 0, 0, "")
+		if exit == "sigterm" {
+			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+		} else if exit == "slash-quit" {
+			write("/quit\r")
+		} else {
+			write("\x03") // Real idle Ctrl+C dispatch, not the fixture's Ctrl+Q.
+		}
+		waitForTerminalOutput(t, capture, func(text string) bool { return strings.Contains(text, "shell-ready> ") })
+		write("shell input\n")
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("PTY didn't exit")
+		}
+		restored, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+		if err != nil || *restored != *original {
+			t.Fatalf("PTY exit did not restore original termios: %v", err)
+		}
+		output := capture.String()
+		for _, mode := range []string{"\x1b[?1006h", "\x1b[?1006l", "\x1b[?2004h", "\x1b[?2004l", "\x1b[?1004h", "\x1b[?1004l", "\x1b[?1049l"} {
+			if !strings.Contains(output, mode) {
+				t.Errorf("missing mode transition %q", mode)
+			}
+		}
+		_ = slave.Close()
+		<-readDone // Closing the parent slave permits real PTY EOF.
+		recordScreen("exit", 0, 0, "")
+		if path := os.Getenv("SPYNEL_COPY_SCREEN_CAPTURE"); path != "" {
+			if exit != "after-f6" {
+				path += "." + exit
+			}
+			data, err := json.Marshal(screenEvents)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	s = resize(42, 20)
+	if exit != "after-f6" {
+		write("\x1b[6~") // Quit with a populated, scrolled transcript after resize.
+		if snapshot().OutputScroll == 0 {
+			t.Fatal("exit fixture did not scroll")
+		}
+		finish()
+		return
+	}
 	// Raw Ctrl+Z/Ctrl+Y travel through terminalFrames, Tea, and the actual
 	// composer route. One Unicode multiline replacement is one undo action.
 	undoDraft := "undo 界é👩🏽‍💻\n  second line"
@@ -551,7 +628,7 @@ func TestRealPTYSemanticInputAndModeRestoration(t *testing.T) {
 				t.Fatalf("copy view did not release %q", mode)
 			}
 		}
-		clearAt := strings.Index(released, "\x1b[H\x1b[J")
+		clearAt := strings.LastIndex(released, "\x1b[H\x1b[J")
 		if clearAt < strings.Index(released, "\x1b[?1049l") || released[clearAt:] != terminalCopyText(before.Selected) || strings.Contains(released, "\x1b[3J") {
 			t.Fatal("copy output was not cleared after normal-screen entry, contained chrome, or erased scrollback")
 		}
@@ -594,37 +671,11 @@ func TestRealPTYSemanticInputAndModeRestoration(t *testing.T) {
 	if strings.Contains(strings.ToLower(capture.String()), "copy requested") {
 		t.Fatal("routine copy notice remains")
 	}
-	write("\x11")
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("PTY didn't exit")
+	write("\x1b")
+	time.Sleep(90 * time.Millisecond)
+	write("\x03") // Clear the restored nonempty draft before actual quit.
+	if state := snapshot(); state.Input != "" || state.Selected != "" {
+		t.Fatal("exit setup retained draft or selection")
 	}
-	restored, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
-	if err != nil || *restored != *original {
-		t.Fatalf("PTY exit did not restore original termios: %v", err)
-	}
-	output := capture.String()
-	for _, mode := range []string{"\x1b[?1006h", "\x1b[?1006l", "\x1b[?2004h", "\x1b[?2004l", "\x1b[?1004h", "\x1b[?1004l", "\x1b[?1049l"} {
-		if !strings.Contains(output, mode) {
-			t.Errorf("missing mode transition %q", mode)
-		}
-	}
-	_ = slave.Close()
-	_ = master.Close()
-	<-readDone
-	if path := os.Getenv("SPYNEL_COPY_SCREEN_CAPTURE"); path != "" {
-		data, err := json.Marshal(screenEvents)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, data, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
+	finish()
 }

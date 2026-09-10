@@ -381,6 +381,11 @@ func (r *standardRenderer) exitAltScreen() {
 		return
 	}
 
+	// Clear only the application-owned screen before an emulator can retain
+	// its final frame. Shutdown/ReleaseTerminal have already stopped rendering;
+	// keep the clear and switch under the same lock as every renderer flush.
+	// Reset styles first so erased cells cannot retain the TUI background.
+	r.execute(ansi.ResetStyle + ansi.CursorHomePosition + ansi.EraseScreenBelow)
 	r.altScreenActive = false
 	r.execute(ansi.ResetAltScreenSaveCursorMode)
 

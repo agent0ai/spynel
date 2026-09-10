@@ -140,7 +140,14 @@ unmarked Enter bytes from acting as send keys.
 
 Drag cancellation outside the terminal window requires the emulator to deliver
 a release or focus-loss report. Escape always cancels it on return. Mouse capture
-is restored on return from F6 and disabled on ordinary exit. Linux
+is restored on return from F6 and disabled on ordinary exit. On actual quit,
+Tea stops rendering, resets styles and clears its visible alternate display
+before returning to the ordinary screen. It preserves that screen and saved
+shell history; diagnostics printed after shutdown remain visible. The same
+cleanup covers `/quit`, context cancellation and F6 terminal release.
+This prevents the final visible TUI frame from remaining in the alternate
+buffer; it cannot remove content a terminal already archived earlier. Actual
+Warp block retention still needs the local check below. Linux
 and macOS are the supported distribution targets; Windows remains unsupported.
 
 ## Local acceptance checklist
@@ -148,9 +155,8 @@ and macOS are the supported distribution targets; Windows remains unsupported.
 Build with the repository's supported Go toolchain:
 
 ```sh
-mkdir -p .tmp-bin
-go build -o .tmp-bin/spynel ./cmd/spynel
-.tmp-bin/spynel --config /path/to/workspace/.spynel/config.yaml
+scripts/dev.sh build
+.tmp-bin/spynel serve --tui --config /path/to/workspace/.spynel/config.yaml
 ```
 
 Use a synthetic conversation for these checks:
@@ -208,8 +214,12 @@ Use a synthetic conversation for these checks:
    Undo/redo a multiline selection replacement, cut and word deletion, then type
    after undo to clear redo. Verify send, clear and conversation changes reset
    history; an unfinished attachment paste must not overwrite an undone draft.
-   After exit, confirm
-   the shell has normal echo, cursor, scrolling, paste, and mouse behavior.
+   Before launching, print a recognizable shell line. Quit idle chat with Ctrl+C
+   after populating and scrolling a transcript, then repeat after F6/Enter and
+   resizing the terminal. Confirm there is no new retained TUI frame, the earlier
+   shell history remains, and echo, cursor, colors, scrolling, paste and mouse
+   behavior are normal. Also check `/quit`. In Warp, distinguish an old archived
+   frame from new output produced by this development binary.
 
 ## Runnable verification boundary
 
@@ -228,14 +238,24 @@ mkdir -p .tmp-artifacts/f6-screen
 npm install --prefix .tmp-artifacts/f6-screen/emulator --ignore-scripts --no-audit --no-fund @xterm/headless@5.5.0
 SPYNEL_COPY_SCREEN_CAPTURE="$PWD/.tmp-artifacts/f6-screen/pty.json" \
   go test ./internal/channel/tui -run '^TestRealPTYSemanticInputAndModeRestoration$' -count=1
-node scripts/terminal-copy-screen.mjs \
-  .tmp-artifacts/f6-screen/emulator/node_modules/@xterm/headless \
-  .tmp-artifacts/f6-screen/pty.json
+for suffix in '' .ctrl-c .slash-quit .sigterm; do
+  node scripts/terminal-copy-screen.mjs \
+    .tmp-artifacts/f6-screen/emulator/node_modules/@xterm/headless \
+    ".tmp-artifacts/f6-screen/pty.json$suffix"
+done
 ```
 
 Replay checks three consecutive short selections, longer-to-shorter output,
 wrapping, resize, over-height text, cursor placement, preserved shell history
-and return-screen isolation. It runs xterm's native erase behavior and a
+and return-screen isolation. Exit captures cover real Ctrl+C, `/quit`,
+SIGTERM/context cancellation and Ctrl+C after F6. They verify blank visible
+alternate cells before the final screen switch, exact ordinary-screen/history
+and cursor content, restored mouse/focus/paste modes and colors, preserved
+shutdown stderr, normal echo/input and no late renderer output. The pre-fix
+exit capture fails the alternate-cell assertion even though xterm itself does
+not copy that frame to normal scrollback. This is evidence of uncleared
+application state, not proof of the cause of a particular Warp screenshot.
+It runs xterm's native erase behavior and a
 separately labeled model of normal-screen ED 2 archiving. The model demonstrates
 the policy difference; neither replay runs Warp or establishes its block/UI
 behavior. The former ED 2 copy output fails the archival regression on the

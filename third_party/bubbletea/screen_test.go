@@ -19,12 +19,12 @@ func TestClearMsg(t *testing.T) {
 		{
 			name:     "altscreen",
 			cmds:     []Cmd{EnterAltScreen, ExitAltScreen},
-			expected: "\x1b[?25l\x1b[?2004h\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[?1049l\x1b[?25l\rsuccess\x1b[K\r\n\x1b[K\r\x1b[2K\r\x1b[?2004l\x1b[?25h\x1b[?1002l\x1b[?1003l\x1b[?1006l",
+			expected: "\x1b[?25l\x1b[?2004h\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[m\x1b[H\x1b[J\x1b[?1049l\x1b[?25l\rsuccess\x1b[K\r\n\x1b[K\r\x1b[2K\r\x1b[?2004l\x1b[?25h\x1b[?1002l\x1b[?1003l\x1b[?1006l",
 		},
 		{
 			name:     "altscreen_autoexit",
 			cmds:     []Cmd{EnterAltScreen},
-			expected: "\x1b[?25l\x1b[?2004h\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[H\rsuccess\x1b[K\r\n\x1b[K\x1b[2;H\x1b[2K\r\x1b[?2004l\x1b[?25h\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1049l\x1b[?25h",
+			expected: "\x1b[?25l\x1b[?2004h\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l\x1b[H\rsuccess\x1b[K\r\n\x1b[K\x1b[2;H\x1b[2K\r\x1b[?2004l\x1b[?25h\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[m\x1b[H\x1b[J\x1b[?1049l\x1b[?25h",
 		},
 		{
 			name:     "mouse_cellmotion",
