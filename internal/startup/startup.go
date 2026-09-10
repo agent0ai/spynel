@@ -266,6 +266,11 @@ func windowsQuote(value string) string {
 }
 
 func runCommand(ctx context.Context, logWriter io.Writer, name string, arguments ...string) error {
+	_, err := runCommandOutput(ctx, logWriter, name, arguments...)
+	return err
+}
+
+func runCommandOutput(ctx context.Context, logWriter io.Writer, name string, arguments ...string) (string, error) {
 	command := exec.CommandContext(ctx, name, arguments...)
 	stdout := &boundedOutput{}
 	stderr := &boundedOutput{}
@@ -279,12 +284,15 @@ func runCommand(ctx context.Context, logWriter io.Writer, name string, arguments
 		if logWriter != nil {
 			_, _ = fmt.Fprintf(logWriter, "process=%s event=exit status=failed exit_code=%d error=%v\n", commandName, processExitCode(command), err)
 		}
-		return fmt.Errorf("%s: %w", name, err)
+		return stdout.String() + stderr.String(), fmt.Errorf("%s: %w", name, err)
 	}
 	if logWriter != nil {
 		_, _ = fmt.Fprintf(logWriter, "process=%s event=exit status=success exit_code=0\n", commandName)
 	}
-	return nil
+	if stdout.truncated || stderr.truncated {
+		return "", errors.New("startup command output exceeds size limit")
+	}
+	return stdout.String(), nil
 }
 
 func processExitCode(command *exec.Cmd) int {

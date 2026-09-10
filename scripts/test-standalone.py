@@ -24,7 +24,7 @@ def main():
     repo = Path(__file__).resolve().parent.parent
     script = (repo / "install.sh").read_bytes()
     with tempfile.TemporaryDirectory(prefix=".tmp-standalone-", dir=repo) as temporary:
-        temp = Path(temporary)
+        temp = Path(temporary).resolve()
         install = temp / "installed runtime Ω"
         user_bin = temp / "user bin"
         user_bin.mkdir()
@@ -56,6 +56,8 @@ def main():
             def do_GET(self):
                 if self.path == "/install.sh":
                     data = script
+                elif self.path == "/uninstall.sh":
+                    data = uninstall_script
                 elif self.path == "/latest":
                     fixture["checks"] += 1
                     data = json.dumps({"tag_name": "v" + (new_version if fixture["new"] else old_version), "prerelease": False, "draft": False}).encode()
@@ -86,6 +88,7 @@ def main():
         worker.start()
         base = f"http://127.0.0.1:{server.server_port}"
         env.update(SPYNEL_DOWNLOAD_BASE=base, SPYNEL_GITHUB_API_URL=base + "/latest", SPYNEL_NPM_REGISTRY_URL=base + "/forbidden-npm")
+        uninstall_script = (repo / "uninstall.sh").read_bytes().replace(b"https://spynel.agent-zero.ai/install.sh", (base + "/install.sh").encode()).replace(b"=https", b"=http,https")
         process = None
         try:
             def run(*args, executable=None):
@@ -115,13 +118,46 @@ def main():
             assert b"%" in progress and b"Verifying" in progress and b"Installing Spynel" in progress, progress.decode()
             assert not (user_home / ".bashrc").exists(), "on-PATH install edited shell profiles"
             fixture["failure"] = ""
-            removed = subprocess.run(["sh", "-c", 'curl -LsSf "$1/install.sh" | sh -s -- --uninstall && ! command -v spynel', "sh", base], cwd=workspace, env=immediate_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            removed = subprocess.run(["sh", "-c", 'curl -LsSf "$1/uninstall.sh" | sh && ! command -v spynel', "sh", base], cwd=workspace, env={**immediate_env, "SPYNEL_VERSION": new_version}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
             assert removed.returncode == 0, removed.stderr.decode()
             assert not immediate.exists() and not (tools / "spynel").is_symlink()
 
+            # A regular user with no writable PATH entry needs only the native
+            # authorization request, never a parent-shell PATH mutation. This
+            # fixture models authorization; it does not test a sudo password UI.
+            if target_os in ("linux", "darwin"):
+                # The repository may be on a virtual filesystem that ignores
+                # access modes. Use a test-managed native temporary directory.
+                with tempfile.TemporaryDirectory(prefix="spynel-user-test-") as regular_temporary:
+                    nonroot = Path(regular_temporary).resolve()
+                    nonroot_home = nonroot / "home"
+                    nonroot_home.mkdir()
+                    readonly_tools = nonroot / "tools"
+                    readonly_tools.mkdir()
+                    for tool in tools.iterdir():
+                        (readonly_tools / tool.name).symlink_to(tool.resolve())
+                    sudo = readonly_tools / "sudo"
+                    sudo.write_text('#!/bin/sh\necho "$*" >> "$HOME/sudo.calls"\n[ "$1" != -v ] || exit 0\nchmod 755 "$PATH"\nexec "$@"\n')
+                    sudo.chmod(0o755)
+                    identity = {}
+                    if os.geteuid() == 0:
+                        identity = {"user": 65534, "group": 65534}
+                        for directory in (nonroot, nonroot_home, readonly_tools):
+                            os.chown(directory, 65534, 65534)
+                    temp.chmod(0o755)
+                    readonly_tools.chmod(0o555)
+                    regular_env = {**env, "HOME": str(nonroot_home), "PATH": str(readonly_tools), "SPYNEL_INSTALL_DIR": str(nonroot / "installation"), "SPYNEL_VERSION": new_version}
+                    regular_env.pop("SPYNEL_BIN_DIR")
+                    command = 'before=$PATH; curl -LsSf "$1/install.sh" | sh && [ "$PATH" = "$before" ] && spynel --version && curl -LsSf "$1/uninstall.sh" | sh && hash -r && ! command -v spynel'
+                    result = subprocess.run(["sh", "-c", command, "sh", base], cwd=nonroot, env=regular_env, **identity, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+                    assert result.returncode == 0, result.stderr.decode()
+                    assert ("spynel " + new_version).encode() in result.stdout
+                    assert "-v" in (nonroot_home / "sudo.calls").read_text()
+                    assert not (nonroot / "installation").exists()
+
             # Piped stdin; no checkout-relative imports, Node, Go or compiler.
             result = subprocess.run(["sh"], input=script, cwd=workspace, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-            assert result.returncode == 0, result.stderr.decode()
+            assert result.returncode != 0, "conflicting launcher was reported as a successful installation"
             assert unrelated.read_text() == "preserve this executable\n"
             assert "Preserved the existing" in result.stdout.decode()
             assert run("--version").strip() == "spynel " + old_version
@@ -223,20 +259,62 @@ def main():
                 assert run("--version", executable=offline_launcher).strip() == "spynel " + new_version
                 assert (install / "spynel").resolve() == previous_primary_bundle
                 assert "GitHub" in run("update", executable=offline_launcher)
-                removed = subprocess.run(["sh", "-s", "--", "--uninstall"], input=script, cwd=workspace, env={**env, "SPYNEL_INSTALL_DIR": str(offline_install)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                removed = subprocess.run(["sh"], input=uninstall_script, cwd=workspace, env={**env, "SPYNEL_INSTALL_DIR": str(offline_install), "SPYNEL_VERSION": new_version}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
                 assert removed.returncode == 0, removed.stderr.decode()
                 assert not offline_install.exists() and not offline_launcher.is_symlink()
                 assert config.read_bytes() == original_config and sentinel.read_bytes() == original_task
+            # Both installation sources may have active processes and future
+            # startup registrations. Public uninstall removes both automatically.
+            npm_global = temp / "npm prefix" / "lib" / "node_modules" / "spynel"
+            npm_vendor = npm_global / "npm" / "vendor"
+            shutil.copytree(archive_copy, npm_vendor)
+            (npm_global / "package.json").write_text(json.dumps({"name": "spynel", "version": old_version}))
+            npm_tool = tools / "npm"
+            npm_tool.write_text('#!/bin/sh\ncase "$*" in "root --global") printf "%s\\n" "$SPYNEL_TEST_NPM_MODULES";; *) [ "$1" = uninstall ] && [ "$2" = --global ] && [ "$3" = --prefix ] && [ "$4" = "$SPYNEL_TEST_NPM_PREFIX" ] && [ "$5" = spynel ] || exit 1; rm -rf "$SPYNEL_TEST_NPM_MODULES/spynel";; esac\n')
+            npm_tool.chmod(0o755)
+            env.update(SPYNEL_TEST_NPM_MODULES=str(npm_global.parent), SPYNEL_TEST_NPM_PREFIX=str(npm_global.parents[2]))
+            npm_workspace = temp / "npm workspace"
+            shutil.copytree(workspace, npm_workspace)
+            units = user_home / ".config" / "systemd" / "user" if target_os == "linux" else user_home / "Library" / "LaunchAgents"
+            if target_os == "linux":
+                units.mkdir(parents=True)
+                for number, launcher in enumerate((install / "spynel", npm_vendor / "spynel")):
+                    unit = units / f"spynel-{number:08d}.service"
+                    unit.write_text('[Service]\nExecStart=:' + json.dumps(str(launcher), ensure_ascii=False) + ' "serve" "--automatic-startup"\n')
+                (units / "default.target.wants").mkdir()
+                for unit in units.glob("*.service"):
+                    (units / "default.target.wants" / unit.name).symlink_to("../" + unit.name)
+            processes = []
+            try:
+                for binary, project in ((install / "spynel", workspace), (npm_vendor / "spynel", npm_workspace)):
+                    child = subprocess.Popen([str(binary), "serve", "--automatic-startup", "--config", str(project / ".spynel" / "config.yaml")], cwd=project, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    processes.append(child)
+                    deadline = time.monotonic() + 30
+                    while not (project / ".spynel" / "runtime" / "primary.json").exists():
+                        assert child.poll() is None, "uninstall fixture server exited"
+                        assert time.monotonic() < deadline, "uninstall fixture server did not start"
+                        time.sleep(.1)
+                keep = install / "user-created-file"
+                keep.write_text("keep me\n")
+                removed = subprocess.run(["sh"], input=uninstall_script, cwd=workspace, env={**env, "SPYNEL_VERSION": new_version}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                assert removed.returncode == 0, removed.stderr.decode()
+                for child in processes:
+                    child.wait(timeout=10)
+                assert not npm_global.exists(), "npm installation survived uninstall"
+                assert config.read_bytes() == original_config and sentinel.read_bytes() == original_task
+                if target_os == "linux":
+                    assert not list(units.glob("*.service")) and not list((units / "default.target.wants").iterdir())
+            finally:
+                for child in processes:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait()
             # A marker does not authorize removing unrelated siblings or files.
-            keep = install / "user-created-file"
-            keep.write_text("keep me\n")
-            removed = subprocess.run(["sh", "-s", "--", "--uninstall"], input=script, cwd=workspace, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-            assert removed.returncode == 0, removed.stderr.decode()
             assert keep.read_text() == "keep me\n" and unrelated.read_text() == "preserve this executable\n"
             assert not (install / "releases").exists()
-            rejected = subprocess.run(["sh", "-s", "--", "--uninstall"], input=script, cwd=workspace, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            rejected = subprocess.run(["sh"], input=uninstall_script, cwd=workspace, env={**env, "SPYNEL_VERSION": new_version}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
             assert rejected.returncode != 0 and keep.read_text() == "keep me\n"
-            print(json.dumps({"result": "passed", "classification": "observed-native", "target": f"{target_os}/{target_arch}", "checks": ["piped bootstrap and immediate parent-shell command", "live download progress", "unrelated executable preserved", "source ownership", "checksum and incomplete download rejected", "headless checks suppressed", "primary update and restart", "ordinary restart", "old libraries retained", "workspace state preserved", "graceful primary release", "plain and NDJSON ownerless updates", "uninstall preserves workspaces and unrelated files", "unmanaged uninstall rejected"]}))
+            print(json.dumps({"result": "passed", "classification": "observed-native", "target": f"{target_os}/{target_arch}", "checks": ["piped bootstrap and immediate parent-shell command", "live download progress", "unrelated executable preserved", "source ownership", "checksum and incomplete download rejected", "headless checks suppressed", "primary update and restart", "ordinary restart", "old libraries retained", "workspace state preserved", "graceful primary release", "plain and NDJSON ownerless updates", "uninstall stops GitHub and npm processes and removes startup", "regular-user immediate command with modeled sudo", "uninstall preserves workspaces and unrelated files", "unmanaged uninstall rejected"]}))
         finally:
             if process is not None and process.poll() is None:
                 process.terminate()

@@ -72,11 +72,30 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: Verify native installation cleanup
+        env:
+          CGO_LDFLAGS_ALLOW: '^-Wl,-rpath,@loader_path/lib$'
+        run: go test ./internal/startup ./internal/updater
+
       - name: Build native release archive
         shell: bash
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: ./scripts/package-native.sh "$RELEASE_TAG" "${{ matrix.os }}" "${{ matrix.arch }}" release
+
+      - name: Verify native install and uninstall commands
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TARGET_OS: ${{ matrix.os }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p .tmp-artifacts/standalone-prior
+          archive="spynel_0.12.1_${TARGET_OS}_${TARGET_ARCH}.tar.gz"
+          curl -LfS --retry 3 -o ".tmp-artifacts/standalone-prior/$archive" "https://github.com/agent0ai/spynel/releases/download/v0.12.1/$archive"
+          curl -LfS --retry 3 -o .tmp-artifacts/standalone-prior/checksums.txt https://github.com/agent0ai/spynel/releases/download/v0.12.1/checksums.txt
+          (cd .tmp-artifacts/standalone-prior && grep "  $archive$" checksums.txt | shasum -a 256 -c -)
+          python3 scripts/test-standalone.py ".tmp-artifacts/standalone-prior/$archive" "release/spynel_${RELEASE_TAG#v}_${TARGET_OS}_${TARGET_ARCH}.tar.gz"
 
       - name: Run native harness contract and packaged-archive smoke
         shell: bash

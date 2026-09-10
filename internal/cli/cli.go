@@ -119,6 +119,8 @@ func run(args []string, version string) error {
 		return nil
 	case "install-bundle":
 		return runInstallBundle(args[1:], version)
+	case "uninstall-bundles":
+		return runUninstallBundles(args[1:])
 	case "docs":
 		return runDocsCommand(args[1:], os.Stdout)
 	case "instructions":

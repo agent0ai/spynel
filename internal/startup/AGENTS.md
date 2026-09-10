@@ -13,6 +13,8 @@
 
 - Register script installations through updater-resolved stable entry points rather than a resolved retained release binary. npm installations keep their supervising launcher; generated services always pass `--automatic-startup` and never perform proactive checks.
 
+- Explicit installation removal scans bounded generated registrations for the exact stable executable or npm launcher, including quoted special paths. Stop/unload matching services and remove their future startup registrations before deleting binaries; ordinary preference changes retain their existing lifecycle. An absent Linux user manager allows offline removal, but an active service that cannot be stopped fails closed. Elevated removal retains the original user scope alongside system registrations.
+
 ## Child DOX Index
 
 No child DOX files.

@@ -14,6 +14,8 @@
 - Preserve least-privilege permissions, OIDC trusted publishing, provenance, and the documented token-only bootstrap fallback.
 - Archives include the executable, target-matched sherpa-onnx and ONNX Runtime libraries, license notices, a packaged-command smoke pass, and bounded target evidence.
 
+- Before publishing, every native target tests startup/updater cleanup and the plain installer/uninstaller against a verified 0.12.1 baseline archive, including simultaneous running npm/GitHub installations and modeled authorization for a regular user with no writable PATH entry.
+
 ## Child DOX Index
 
 No child DOX files.

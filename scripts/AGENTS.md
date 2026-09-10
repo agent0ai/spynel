@@ -24,6 +24,8 @@
 
 - `test-standalone.py` exercises piped bootstrap followed by immediate command lookup in the original shell, visible progress during a held-open download, shell PATH setup, ownership, rejected/corrupt downloads, native isolated primary and ownerless update/restart, and explicit uninstall against local candidate releases. Cover both plain and NDJSON ownerless completion, with exactly one correlated terminal JSON acknowledgment. Keep HOME, launcher paths, profiles, and workspace state isolated; uninstall must preserve workspaces and unrelated files and refuse unmanaged directories. Never touch the live installation or publish a release from this test.
 
+- Standalone regression checks cover root and regular-user immediate launch with an unchanged parent PATH, including modeled sudo authorization when no directory is writable. Exercise public uninstall routing, simultaneous GitHub/npm removal, live-process and startup cleanup, and workspace preservation. Native Linux/macOS release runners execute the process-removal tests.
+
 ## Child DOX Index
 
 Direct child DOX files:

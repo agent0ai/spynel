@@ -25,6 +25,8 @@
 - Keep standalone bootstrap `install-bundle` independent of workspace initialization. Reuse updater ownership to route explicit update completion and ordinary restart through the stable installed entry point, preserving primary/job shutdown and init continuation arguments. Authorize proactive standalone checks only in an actual interactive TUI launch without automatic-startup or skip-check flags.
 - An ownerless standalone update restarts into `version`; for NDJSON output, use `version --quiet` so the new executable runs successfully without appending plain text or another terminal event after the correlated update acknowledgment.
 
+- Internal `uninstall-bundles` is workspace-independent. Discover the current global npm root before elevation, retain the original HOME/PATH/user identity across one required native sudo authorization, and coordinate updater removal with startup cleanup for both standalone and npm installations. The public `uninstall.sh` uses the checksummed native bootstrap so cleanup runs outside either installation.
+
 ## Child DOX Index
 
 No child DOX files.

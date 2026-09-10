@@ -60,12 +60,6 @@
 - Spynel provides communication interface for you and orchestration framework for agents. 
 
 
-**Install and run**
-```bash
-npm install -g spynel
-spynel
-```
-
 The idea is **one human → one assistant → ALL of the work**
 
 Spynel has three pillars:
@@ -74,34 +68,29 @@ Spynel has three pillars:
 2. **Markdown task management** — keep tasks, goals, decisions, evidence, and status durable and easily inspectable by any AI harness
 3. **Agentic loops** — let agents plan, implement, review, recover, and ask for human judgment when it matters
 
-Spynel leverages coding harnesses rather than competing with them. Its deterministic core coordinates work; Codex, Claude Code or others provide inteligence and execution.
-
-It is for people who want the leverage of several coding agents without personally managing every session and handoff. The result should remain simple to operate, clear to inspect, and deliberate about quality.
-
 **Simplicity. Leverage. Quality.**
 
 ## Quick start
 
-Install on Linux or macOS (amd64 or arm64), without Node.js, Go, or a compiler:
+For macOS and Linux:
 
 ```sh
 curl -LsSf https://spynel.agent-zero.ai/install.sh | sh
+spynel
 ```
 
-Run the launch command printed by the installer, normally `spynel`. The installer shows download progress and puts `spynel` in a writable directory already on PATH (`/usr/local/bin` for root). If no such directory exists, it configures your shell automatically and prints the command you can run immediately. Existing installations are preserved. See [getting started](docs/getting-started.md) for details. Windows is temporarily unsupported.
-
-Or install the latest stable release from npm (Node.js 18+):
+Or use npm (Node.js 18+):
 
 ```bash
 npm install -g spynel
 spynel
 ```
 
-Use `/update` to check the owning installation source and `/update install` to update and restart.
+Use `/update install` to update Spynel.
 
-Run `spynel` from the directory you want to initialize as a Spynel workspace. This can be your existing work folder. 
+Run `spynel` from your project directory.
 
-Inside Spynel TUI, type `/config` for configuration. Supported coding harnesses should be automatically detected and configured, so there's a good chance Spynel will work out of the box with no additional configuration.
+Use `/config` for setup.
 
 
 ## Documentation
@@ -122,18 +111,8 @@ See the [documentation index](docs/README.md) for the complete guide map.
 
 ## Uninstall
 
-On **Linux or macOS**, first disable **Run at startup** if enabled and quit running Spynel processes.
-
-For a standalone installation:
-
 ```sh
-curl -LsSf https://spynel.agent-zero.ai/install.sh | sh -s -- --uninstall
+curl -LsSf https://spynel.agent-zero.ai/uninstall.sh | sh
 ```
 
-For an npm installation:
-
-```sh
-npm uninstall -g spynel
-```
-
-Your workspaces and their `.spynel` configuration, histories, and tasks are preserved. For a custom standalone location, pass the same `SPYNEL_INSTALL_DIR` to the uninstall script.
+Your workspace data is kept.

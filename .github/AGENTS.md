@@ -17,6 +17,8 @@
 - Cross-repository Homebrew/Scoop publishing uses an explicit release token; never embed credentials.
 - Actions must pin a stable major version and request only required workflow permissions.
 
+- Native release runners execute startup and updater removal tests on all four targets before packaging so macOS process inspection is verified on macOS, not inferred from Linux.
+
 ## Child DOX Index
 
 Direct child DOX files:

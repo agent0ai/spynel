@@ -5,11 +5,11 @@ set -eu
 
 main() {
   case "${1:-}" in
-    --help|-h) echo 'Usage: install.sh [--uninstall]'; return ;;
+    --help|-h) echo 'Usage: install.sh'; return ;;
     --uninstall|'') ;;
-    *) echo 'Usage: install.sh [--uninstall]' >&2; exit 2 ;;
+    *) echo 'Usage: install.sh' >&2; exit 2 ;;
   esac
-  [ "$#" -le 1 ] || { echo 'Usage: install.sh [--uninstall]' >&2; exit 2; }
+  [ "$#" -le 1 ] || { echo 'Usage: install.sh' >&2; exit 2; }
   : "${HOME:?HOME must identify your user directory}"
   install_root=${SPYNEL_INSTALL_DIR:-"$HOME/.local/share/spynel"}
   case "$install_root" in /*) ;; *) echo 'SPYNEL_INSTALL_DIR must be absolute.' >&2; exit 1 ;; esac
@@ -17,8 +17,9 @@ main() {
   case "$install_root" in *'
 '*) echo 'Installation paths must not contain newlines.' >&2; exit 1 ;; esac
   if [ "${1:-}" = --uninstall ]; then
-    uninstall
-    return
+    uninstalling=true
+  else
+    uninstalling=false
   fi
   for tool in curl tar awk mktemp id sed grep; do
     command -v "$tool" >/dev/null 2>&1 || { echo "Required command not found: $tool" >&2; exit 1; }
@@ -26,7 +27,7 @@ main() {
   case "$(uname -s)" in
     Linux) target_os=linux ;;
     Darwin) target_os=darwin ;;
-    *) echo 'Spynel supports Linux and macOS; Windows is temporarily unsupported.' >&2; exit 1 ;;
+    *) echo 'Spynel supports Linux and macOS.' >&2; exit 1 ;;
   esac
   case "$(uname -m)" in
     x86_64|amd64) target_arch=amd64 ;;
@@ -46,6 +47,16 @@ main() {
   case "$install_root" in /*) ;; *) echo 'SPYNEL_INSTALL_DIR must be absolute.' >&2; exit 1 ;; esac
   case "$bin_dir" in /*) ;; *) echo 'SPYNEL_BIN_DIR must be absolute.' >&2; exit 1 ;; esac
   case "$bin_dir" in *:*) echo 'SPYNEL_BIN_DIR cannot contain a PATH separator (:).' >&2; exit 1 ;; esac
+  bin_sudo=
+  if [ "$uninstalling" = false ]; then
+    if ! mkdir -p "$bin_dir" 2>/dev/null || [ ! -w "$bin_dir" ]; then
+      command -v sudo >/dev/null 2>&1 || { echo 'Administrator access is required to install Spynel on PATH; sudo is unavailable.' >&2; exit 1; }
+      echo 'Administrator access is required to install the Spynel command.' >&2
+      sudo -v
+      sudo mkdir -p "$bin_dir"
+      bin_sudo=sudo
+    fi
+  fi
   stage=$(mktemp -d "${TMPDIR:-/tmp}/spynel-install.XXXXXXXX")
   trap 'rm -rf "$stage"' 0
   trap 'exit 1' HUP INT TERM
@@ -87,26 +98,31 @@ main() {
     darwin) extract_runtime lib/libsherpa-onnx-c-api.dylib; extract_runtime lib/libonnxruntime.1.27.0.dylib ;;
   esac
   chmod 700 "$stage/runtime/spynel"
+  if [ "$uninstalling" = true ]; then
+    echo 'Uninstalling Spynel...' >&2
+    "$stage/runtime/spynel" uninstall-bundles --root "$install_root"
+    return
+  fi
   echo "Installing Spynel $version..." >&2
   if ! "$stage/runtime/spynel" install-bundle --root "$install_root" --archive "$stage/$archive" --checksums "$stage/checksums.txt" --version "$version"; then
     echo 'Installation failed. Use a release with standalone installer support; the prior bundle is retained.' >&2
     exit 1
   fi
-  mkdir -p "$bin_dir"
-  if ln -s "$install_root/spynel" "$bin_dir/spynel" 2>/dev/null; then
+  if $bin_sudo ln -s "$install_root/spynel" "$bin_dir/spynel" 2>/dev/null; then
     :
   elif [ ! -e "$bin_dir/spynel" ] && [ ! -L "$bin_dir/spynel" ]; then
     echo "Cannot create the launcher in $bin_dir; check directory permissions." >&2
     exit 1
   elif [ "$(readlink "$bin_dir/spynel" 2>/dev/null || true)" != "$install_root/spynel" ]; then
     echo "Preserved the existing $bin_dir/spynel. Run: \"$install_root/spynel\""
-    return
+    return 1
   fi
   printf '%s\n' "$bin_dir" > "$install_root/.bin-dir"
   quoted_bin=$(shell_quote "$bin_dir")
   path_line="case \":\$PATH:\" in *:$quoted_bin:*) ;; *) export PATH=$quoted_bin:\$PATH ;; esac # Spynel installer"
   printf '%s\n' "$path_line" > "$install_root/env"
   if on_path "$bin_dir"; then
+    [ "$(spynel --version)" = "spynel $version" ] || { echo 'The installed Spynel command could not be verified on PATH.' >&2; exit 1; }
     echo "Installed Spynel $version. Run: spynel"
   else
     configure_path
@@ -145,7 +161,20 @@ default_bin_dir() {
       return
     fi
   done
-  printf '%s\n' "$HOME/.local/bin"
+  # A piped process cannot change its caller's PATH. The default must use
+  # an existing PATH directory, requesting write permission when necessary.
+  if on_path /usr/local/bin; then
+    echo /usr/local/bin
+    return
+  fi
+  remaining_path=$PATH:
+  while [ -n "$remaining_path" ]; do
+    directory=${remaining_path%%:*}
+    remaining_path=${remaining_path#*:}
+    case "$directory" in /*) printf '%s\n' "$directory"; return ;; esac
+  done
+  echo 'PATH has no absolute directory for the Spynel command.' >&2
+  return 1
 }
 
 shell_quote() {
@@ -178,39 +207,6 @@ append_path() {
   if ! grep -Fqx "$path_line" "$1" 2>/dev/null; then
     (umask 077; printf '\n%s\n' "$path_line" >> "$1")
   fi
-}
-
-uninstall() {
-  if [ "$install_root" = / ] || [ "$install_root" = "$HOME" ]; then
-    echo 'Refusing to uninstall from the filesystem root or home directory.' >&2
-    exit 1
-  fi
-  if [ ! -e "$install_root" ] && [ ! -L "$install_root" ]; then
-    echo 'Spynel is already uninstalled.'
-    return
-  fi
-  if [ -L "$install_root" ] || [ -L "$install_root/.spynel-install" ] ||
-     ! printf 'spynel-github-v1\n' | cmp -s "$install_root/.spynel-install" -; then
-    echo 'Refusing to remove a directory not owned by the Spynel installer.' >&2
-    exit 1
-  fi
-  echo 'Uninstalling Spynel...' >&2
-  saved_bin=$(cat "$install_root/.bin-dir" 2>/dev/null || true)
-  remaining_path="$HOME/.local/bin:${SPYNEL_BIN_DIR:-}:$saved_bin:$PATH:"
-  while [ -n "$remaining_path" ]; do
-    directory=${remaining_path%%:*}
-    remaining_path=${remaining_path#*:}
-    case "$directory" in /*) ;; *) continue ;; esac
-    if [ "$(readlink "$directory/spynel" 2>/dev/null || true)" = "$install_root/spynel" ]; then
-      rm "$directory/spynel"
-    fi
-  done
-  # Remove only installer-owned runtime paths, retaining any workspace or
-  # unrelated files the user put beside the installation.
-  rm -rf "$install_root/releases" "$install_root"/.stage-* "$install_root"/.download-*
-  rm -f "$install_root/current" "$install_root/spynel" "$install_root/env" "$install_root/.bin-dir" "$install_root/.install.lock" "$install_root/.spynel-install"
-  rmdir "$install_root" 2>/dev/null || true
-  echo 'Spynel uninstalled. Workspace files and configuration were preserved.'
 }
 
 download() (

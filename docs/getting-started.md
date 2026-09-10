@@ -1,6 +1,6 @@
 # Getting started and development
 
-Spynel supports standalone script installation and the unscoped npm package on Linux and macOS. Both amd64 and arm64 are supported; Windows distribution is temporarily stubbed and fails before downloading an artifact.
+Spynel supports standalone script installation and the unscoped npm package on Linux and macOS. Both amd64 and arm64 are supported.
 
 ## Public-release quick start
 
@@ -8,17 +8,22 @@ Standalone installation needs POSIX `sh`, curl, tar, and sha256sum or shasum; it
 
 ```sh
 curl -LsSf https://spynel.agent-zero.ai/install.sh | sh
+spynel
 ```
-
-Run the launch command printed by the installer, normally `spynel`.
 
 Standalone installation requires release 0.12.0 or newer; earlier releases do not contain its native installer.
 
-The installer shows download progress, verifies the release, and places complete native bundles and licenses under `~/.local/share/spynel`. It installs the launcher into a writable directory already on PATH, preferring `/usr/local/bin` for root and `~/.local/bin` when that user directory is already on PATH. This makes `spynel` available in the current terminal. If no PATH directory is writable, it uses `~/.local/bin` and automatically configures Bash/sh or zsh startup files, or fish's persistent user paths. For that case, it prints an absolute launch command usable immediately without restarting the terminal or editing PATH. Repeated profile setup does not duplicate the same entry.
+The installer places its launcher on your existing PATH and verifies it before reporting success. Root and regular users can run `spynel` immediately in the same terminal. If no PATH directory is writable, it requests administrator authorization through `sudo`; no manual PATH edit or new terminal is required. Existing unrelated executables are preserved, and a conflicting command fails explicitly.
 
-Existing executables, including npm launchers, are preserved; if the selected name is occupied, use the printed standalone path. `SPYNEL_INSTALL_DIR` and `SPYNEL_BIN_DIR` select absolute alternative directories. `SPYNEL_VERSION` selects a stable version for the bootstrap. `SPYNEL_DOWNLOAD_BASE` may select a trusted compatible release-asset mirror; `SPYNEL_GITHUB_API_URL` overrides runtime release discovery. Mirrors supply executable code and must be trusted.
+`SPYNEL_INSTALL_DIR` and `SPYNEL_BIN_DIR` select absolute alternative directories. An explicit off-PATH bin override configures shell startup files and prints an immediately usable absolute command. `SPYNEL_VERSION` selects a stable version. `SPYNEL_DOWNLOAD_BASE` selects a trusted compatible release-asset mirror; `SPYNEL_GITHUB_API_URL` overrides runtime release discovery. Mirrors supply executable code and must be trusted.
 
-To uninstall on Linux or macOS, disable Run at startup and quit Spynel, then run `curl -LsSf https://spynel.agent-zero.ai/install.sh | sh -s -- --uninstall`. This removes only installer-owned runtime files and launcher symlinks that still point to that installation; workspace data, unrelated files, and shared shell PATH configuration remain. A custom installation must supply the same `SPYNEL_INSTALL_DIR`. npm installations use `npm uninstall -g spynel` instead.
+To uninstall:
+
+```sh
+curl -LsSf https://spynel.agent-zero.ai/uninstall.sh | sh
+```
+
+This stops the installations' processes, removes their startup registrations, and removes both the standalone GitHub installation and the current global npm installation when present. Workspace data and unrelated files are kept. A custom standalone installation uses the same `SPYNEL_INSTALL_DIR` during removal. Native cleanup requires release 0.12.2 or newer; the script obtains that helper independently of the installed version.
 
 Alternatively, npm requires Node.js 18 or newer:
 
