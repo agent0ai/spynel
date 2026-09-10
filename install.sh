@@ -84,7 +84,7 @@ main() {
   # only exact regular runtime members to fixed output paths, never archive paths.
   (ulimit -f 8192; ulimit -t 120; tar -tzf "$stage/$archive" > "$stage/entries")
   awk '
-    NR > 4096 || length($0) > 1024 || $0 !~ /^\.\/[A-Za-z0-9_./+-]*$/ { exit 1 }
+    NR > 4096 || length($0) > 1024 || $0 !~ /^\.\/[A-Za-z0-9_.\/+-]*$/ { exit 1 }
     { name=$0; sub(/^\.\//,"",name); sub(/\/$/,"",name) }
     name ~ /(^|\/)\.\.(\/|$)/ || seen[name]++ { exit 1 }
     END { if (NR == 0) exit 1 }
