@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -32,15 +33,19 @@ def main():
         workspace = temp / "workspace Ω"
         workspace.mkdir()
         env = {k: v for k, v in os.environ.items() if not k.startswith("SPYNEL_")}
+        user_home = temp / "home"
+        user_home.mkdir()
+        env.update(HOME=str(user_home), SHELL="/bin/bash")
         tools = temp / "system tools"
         tools.mkdir()
-        for name in ("sh", "curl", "tar", "awk", "mktemp", "uname", "sha256sum", "shasum", "wc", "mkdir", "rm", "chmod", "readlink", "ln", "gzip"):
+        for name in ("sh", "curl", "tar", "awk", "mktemp", "uname", "sha256sum", "shasum", "wc", "mkdir", "rm", "rmdir", "chmod", "readlink", "ln", "gzip", "id", "sed", "grep", "cat", "cmp"):
             source = shutil.which(name)
             if source:
                 (tools / name).symlink_to(source)
         env["PATH"] = str(tools)  # No Node, Go, compiler, or live harness on PATH.
         env.update(SPYNEL_INSTALL_DIR=str(install), SPYNEL_BIN_DIR=str(user_bin), SPYNEL_VERSION=old_version)
         fixture = {"new": False, "failure": "", "checks": 0}
+        download_started, release_download = threading.Event(), threading.Event()
         files = {p.name: p.read_bytes() for p in (older, newer)}
         sums = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}\n" for name, data in files.items()).encode()
 
@@ -49,7 +54,9 @@ def main():
                 pass
 
             def do_GET(self):
-                if self.path == "/latest":
+                if self.path == "/install.sh":
+                    data = script
+                elif self.path == "/latest":
                     fixture["checks"] += 1
                     data = json.dumps({"tag_name": "v" + (new_version if fixture["new"] else old_version), "prerelease": False, "draft": False}).encode()
                 elif self.path == "/checksums.txt":
@@ -69,6 +76,9 @@ def main():
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
+                if fixture["failure"] == "pause" and self.path[1:] in files:
+                    download_started.set()
+                    release_download.wait(15)
                 self.wfile.write(data)
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -82,6 +92,32 @@ def main():
                 result = subprocess.run([str(executable or install / "spynel"), *args], cwd=workspace, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
                 assert result.returncode == 0, (args, result.stderr)
                 return result.stdout
+
+            # When a writable PATH directory exists, even a bare pipe makes
+            # spynel available in the ORIGINAL shell without a profile reload.
+            immediate = temp / "immediate installation"
+            immediate_env = {**env, "SPYNEL_INSTALL_DIR": str(immediate)}
+            immediate_env.pop("SPYNEL_BIN_DIR")
+            fixture["failure"] = "pause"
+            child = subprocess.Popen(["sh", "-c", 'curl -LsSf "$1/install.sh" | sh && spynel --version', "sh", base], cwd=workspace, env=immediate_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                assert download_started.wait(10), "installer did not start downloading"
+                assert select.select([child.stderr], [], [], 5)[0], "installer is silent during the download"
+                first_line = child.stderr.readline()
+                assert b"Downloading Spynel" in first_line, first_line
+                assert child.poll() is None, "fixture did not hold the download open"
+            finally:
+                release_download.set()
+                output, progress = child.communicate(timeout=120)
+            assert child.returncode == 0, progress.decode()
+            assert ("spynel " + old_version) in output.decode(), output.decode()
+            assert b"Run: spynel" in output and b"open a new terminal" not in output
+            assert b"%" in progress and b"Verifying" in progress and b"Installing Spynel" in progress, progress.decode()
+            assert not (user_home / ".bashrc").exists(), "on-PATH install edited shell profiles"
+            fixture["failure"] = ""
+            removed = subprocess.run(["sh", "-c", 'curl -LsSf "$1/install.sh" | sh -s -- --uninstall && ! command -v spynel', "sh", base], cwd=workspace, env=immediate_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            assert removed.returncode == 0, removed.stderr.decode()
+            assert not immediate.exists() and not (tools / "spynel").is_symlink()
 
             # Piped stdin; no checkout-relative imports, Node, Go or compiler.
             result = subprocess.run(["sh"], input=script, cwd=workspace, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
@@ -163,13 +199,18 @@ def main():
             # and restart into version instead of repeating the install command.
             for mode in ("plain", "json"):
                 offline_install = temp / (mode + " installation")
-                offline_bin = temp / (mode + " user bin")
-                result = subprocess.run(["sh"], input=script, cwd=workspace, env={**env, "SPYNEL_INSTALL_DIR": str(offline_install), "SPYNEL_BIN_DIR": str(offline_bin)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+                offline_bin = temp / (mode + r" user bin Ω $value 'quote' `ticks` \backslash")
+                # The README's current-shell activation also handles an
+                # explicitly off-PATH destination, including shell metacharacters.
+                result = subprocess.run(["sh", "-c", 'curl -LsSf "$1/install.sh" | sh && . "$SPYNEL_INSTALL_DIR/env" && spynel --version', "sh", base], cwd=workspace, env={**env, "SPYNEL_INSTALL_DIR": str(offline_install), "SPYNEL_BIN_DIR": str(offline_bin)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
                 assert result.returncode == 0, result.stderr.decode()
+                assert ("spynel " + old_version).encode() in result.stdout, result.stdout
                 offline_launcher = offline_bin / "spynel"
                 assert offline_launcher.is_symlink()
                 assert offline_launcher.resolve() == (offline_install / "spynel").resolve()
                 assert run("--version", executable=offline_launcher).strip() == "spynel " + old_version
+                profile_check = subprocess.run(["sh", "-c", '. "$HOME/.bashrc"; spynel --version'], cwd=workspace, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                assert profile_check.returncode == 0 and profile_check.stdout.strip() == "spynel " + old_version, profile_check.stderr
                 previous_primary_bundle = (install / "spynel").resolve()
                 output = run("update", *(("--json",) if mode == "json" else ()), "install", executable=offline_launcher)
                 if mode == "json":
@@ -182,7 +223,20 @@ def main():
                 assert run("--version", executable=offline_launcher).strip() == "spynel " + new_version
                 assert (install / "spynel").resolve() == previous_primary_bundle
                 assert "GitHub" in run("update", executable=offline_launcher)
-            print(json.dumps({"result": "passed", "classification": "observed-native", "target": f"{target_os}/{target_arch}", "checks": ["piped bootstrap without Node/Go/compiler", "unrelated executable preserved", "source ownership", "checksum and incomplete download rejected", "headless checks suppressed", "primary update and restart", "ordinary restart", "old libraries retained", "workspace state preserved", "graceful primary release", "plain and NDJSON ownerless updates of separate installations"]}))
+                removed = subprocess.run(["sh", "-s", "--", "--uninstall"], input=script, cwd=workspace, env={**env, "SPYNEL_INSTALL_DIR": str(offline_install)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                assert removed.returncode == 0, removed.stderr.decode()
+                assert not offline_install.exists() and not offline_launcher.is_symlink()
+                assert config.read_bytes() == original_config and sentinel.read_bytes() == original_task
+            # A marker does not authorize removing unrelated siblings or files.
+            keep = install / "user-created-file"
+            keep.write_text("keep me\n")
+            removed = subprocess.run(["sh", "-s", "--", "--uninstall"], input=script, cwd=workspace, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            assert removed.returncode == 0, removed.stderr.decode()
+            assert keep.read_text() == "keep me\n" and unrelated.read_text() == "preserve this executable\n"
+            assert not (install / "releases").exists()
+            rejected = subprocess.run(["sh", "-s", "--", "--uninstall"], input=script, cwd=workspace, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            assert rejected.returncode != 0 and keep.read_text() == "keep me\n"
+            print(json.dumps({"result": "passed", "classification": "observed-native", "target": f"{target_os}/{target_arch}", "checks": ["piped bootstrap and immediate parent-shell command", "live download progress", "unrelated executable preserved", "source ownership", "checksum and incomplete download rejected", "headless checks suppressed", "primary update and restart", "ordinary restart", "old libraries retained", "workspace state preserved", "graceful primary release", "plain and NDJSON ownerless updates", "uninstall preserves workspaces and unrelated files", "unmanaged uninstall rejected"]}))
         finally:
             if process is not None and process.poll() is None:
                 process.terminate()

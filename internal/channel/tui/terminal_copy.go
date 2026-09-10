@@ -37,7 +37,7 @@ func terminalCopyExit(frame []byte) bool {
 		return false
 	}
 	switch k.Type {
-	case tea.KeyEsc, tea.KeyEnter, tea.KeyCtrlJ, tea.KeySpace, tea.KeyBackspace, tea.KeyCtrlH, tea.KeyDelete, tea.KeyTab:
+	case tea.KeyEsc, tea.KeyCtrlC, tea.KeyEnter, tea.KeyCtrlJ, tea.KeySpace, tea.KeyBackspace, tea.KeyCtrlH, tea.KeyDelete, tea.KeyTab:
 		return true
 	}
 	return k.Type <= tea.KeyF1 && k.Type >= tea.KeyF20

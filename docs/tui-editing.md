@@ -20,7 +20,7 @@ indentation, tabs, and empty lines remain meaningful.
 | Extend beyond a viewport | Drag above/below it. Scrolling advances at most three rows per 50 ms tick. Return inside, release, or press Escape to stop. |
 | Send / newline | Enter / Shift+Enter (or Ctrl+J). Alt+Enter retains its send behavior. |
 | Cancel / stop / quit | Escape cancels selection. Without a focused selection, Ctrl+C clears input, stops an active turn with empty input, or quits idle chat. `/quit` exits. |
-| Native terminal copy | Select text, then F6. Use ordinary terminal selection and Cmd+C / Ctrl+Shift+C; Escape, Enter, Space, Backspace, Delete, Tab or any supported F key returns. |
+| Native terminal copy | Select text, then F6. Use ordinary terminal selection and Cmd+C / Ctrl+Shift+C; Escape, Ctrl+C, Enter, Space, Backspace, Delete, Tab or any supported F key returns. |
 | Undo / redo | Ctrl+Z / Ctrl+Y in the composer, silently. These keys never suspend Spynel or edit the transcript. |
 | Redraw | Ctrl+L redraws. |
 
@@ -85,7 +85,7 @@ instructions. Earlier scrollback is not erased. Application mouse capture, the
 fullscreen renderer and focus reporting are released. Bracketed paste stays
 enabled so pasted exit keys and their remaining text are discarded together.
 Select the text with the terminal's ordinary mouse selection, scroll through its
-normal scrollback if needed, then use Cmd+C (or Ctrl+Shift+C). Escape, Enter,
+normal scrollback if needed, then use Cmd+C (or Ctrl+Shift+C). Escape, Ctrl+C, Enter,
 Space, Backspace, Delete, Tab or any terminal-supported F key restores the TUI,
 draft, selection, focus and current dimensions. Complete key frames and queued
 copy-view input are consumed before return. Tea restores the alternate screen

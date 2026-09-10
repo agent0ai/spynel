@@ -605,7 +605,7 @@ func runSemanticPTY(t *testing.T, exit string) {
 	// Ctrl+Z must never enter Tea's process-group suspension path.
 	write("\x1a")
 	_ = snapshot() // This would hang in Tea's SIGCONT waiter even in an orphan group.
-	for i, exitKey := range []string{"\x1b", "\r", " ", "\x7f", "\x08", "\t", "\x1b[3~", "\x1bOP", "\x1b[[E", "\x1b[24~", "\x1b[34~"} {
+	for i, exitKey := range []string{"\x1b", "\r", " ", "\x7f", "\x08", "\t", "\x1b[3~", "\x1bOP", "\x1b[[E", "\x1b[24~", "\x1b[34~", "\x03"} {
 		output := i == 9
 		write("\x1b")
 		time.Sleep(90 * time.Millisecond)
@@ -638,7 +638,7 @@ func runSemanticPTY(t *testing.T, exit string) {
 		recordScreen("copy", 0, 0, before.Selected)
 		staticStart := len(capture.String())
 		// Stale reports, ordinary typing and Ctrl+Z stay outside the composer.
-		write(report(64, 3, 3, false) + "ignored\x1a\x03\x1b[200~ space\r\n\t\x1bOP\x1b[3~ignored\x1b[201~")
+		write(report(64, 3, 3, false) + "ignored\x1a\x1b[200~ space\x03\r\n\t\x1bOP\x1b[3~ignored\x1b[201~")
 		recordScreen("resize", 50, 22, "")
 		if err := unix.IoctlSetWinsize(int(master.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Row: 22, Col: 50}); err != nil {
 			t.Fatal(err)

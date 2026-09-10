@@ -163,7 +163,7 @@ func TestMalformedControlResynchronizationAcrossReads(t *testing.T) {
 }
 
 func TestTerminalCopyReturnFrames(t *testing.T) {
-	keys := []string{"\x1b", "\r", "\n", " ", "\x7f", "\x08", "\t", "\x1b[3~", "\x1bOP", "\x1b[[E", "\x1b[17~", "\x1b[24~", "\x1b[34~", "\x1b[1;2P", "\x1b\x1b[23~"}
+	keys := []string{"\x1b", "\x03", "\r", "\n", " ", "\x7f", "\x08", "\t", "\x1b[3~", "\x1bOP", "\x1b[[E", "\x1b[17~", "\x1b[24~", "\x1b[34~", "\x1b[1;2P", "\x1b\x1b[23~"}
 	for _, key := range keys {
 		for split := 0; split <= len(key); split++ {
 			f := terminalFrames{}
@@ -182,7 +182,7 @@ func TestTerminalCopyReturnFrames(t *testing.T) {
 			}
 		}
 	}
-	for _, frame := range []string{"", "x", "\x03", "\x1b[A", "\x1b[6~", "\x1b[I", "\x1b[O", "\x1b[<64;3;3M", "\x1b[M !!", "\x1b[200~ \r\x1bOP\x1b[201~"} {
+	for _, frame := range []string{"", "x", "\x1b[A", "\x1b[6~", "\x1b[I", "\x1b[O", "\x1b[<64;3;3M", "\x1b[M !!", "\x1b[200~ \x03\r\x1bOP\x1b[201~"} {
 		if terminalCopyExit([]byte(frame)) {
 			t.Fatalf("non-return input %q", frame)
 		}

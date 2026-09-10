@@ -85,11 +85,11 @@ It is for people who want the leverage of several coding agents without personal
 Install on Linux or macOS (amd64 or arm64), without Node.js, Go, or a compiler:
 
 ```sh
-curl -LsSf https://spynel.agent-zero.ai/install.sh | sh
+curl -LsSf https://spynel.agent-zero.ai/install.sh | sh && . "$HOME/.local/share/spynel/env"
 spynel
 ```
 
-The installer prints PATH guidance and preserves existing installations. This new path requires a release containing standalone installer support and public URL routing; see [getting started](docs/getting-started.md). Windows is temporarily unsupported.
+The installer shows download progress and puts `spynel` in a writable directory already on PATH (`/usr/local/bin` for root). If no such directory exists, it configures your shell automatically and prints the command you can run immediately. Existing installations are preserved. See [getting started](docs/getting-started.md) for details. Windows is temporarily unsupported.
 
 Or install the latest stable release from npm (Node.js 18+):
 
@@ -102,7 +102,7 @@ Use `/update` to check the owning installation source and `/update install` to u
 
 Run `spynel` from the directory you want to initialize as a Spynel workspace. This can be your existing work folder. 
 
-Inside Spynel TUI, type `/configure` for configuration. Supported coding harnesses should be automatically detected and configured, so there's a good chance Spynel will work out of the box with no additional configuration.
+Inside Spynel TUI, type `/config` for configuration. Supported coding harnesses should be automatically detected and configured, so there's a good chance Spynel will work out of the box with no additional configuration.
 
 
 ## Documentation
@@ -120,3 +120,21 @@ Inside Spynel TUI, type `/configure` for configuration. Supported coding harness
 - **Read the product principles:** [Product vision](docs/vision.md)
 
 See the [documentation index](docs/README.md) for the complete guide map.
+
+## Uninstall
+
+On **Linux or macOS**, first disable **Run at startup** if enabled and quit running Spynel processes.
+
+For a standalone installation:
+
+```sh
+curl -LsSf https://spynel.agent-zero.ai/install.sh | sh -s -- --uninstall
+```
+
+For an npm installation:
+
+```sh
+npm uninstall -g spynel
+```
+
+Your workspaces and their `.spynel` configuration, histories, and tasks are preserved. For a custom standalone location, pass the same `SPYNEL_INSTALL_DIR` to the uninstall script.

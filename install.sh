@@ -4,7 +4,23 @@
 set -eu
 
 main() {
-  for tool in curl tar awk mktemp; do
+  case "${1:-}" in
+    --help|-h) echo 'Usage: install.sh [--uninstall]'; return ;;
+    --uninstall|'') ;;
+    *) echo 'Usage: install.sh [--uninstall]' >&2; exit 2 ;;
+  esac
+  [ "$#" -le 1 ] || { echo 'Usage: install.sh [--uninstall]' >&2; exit 2; }
+  : "${HOME:?HOME must identify your user directory}"
+  install_root=${SPYNEL_INSTALL_DIR:-"$HOME/.local/share/spynel"}
+  case "$install_root" in /*) ;; *) echo 'SPYNEL_INSTALL_DIR must be absolute.' >&2; exit 1 ;; esac
+  while [ "${install_root%/}" != "$install_root" ] && [ "$install_root" != / ]; do install_root=${install_root%/}; done
+  case "$install_root" in *'
+'*) echo 'Installation paths must not contain newlines.' >&2; exit 1 ;; esac
+  if [ "${1:-}" = --uninstall ]; then
+    uninstall
+    return
+  fi
+  for tool in curl tar awk mktemp id sed grep; do
     command -v "$tool" >/dev/null 2>&1 || { echo "Required command not found: $tool" >&2; exit 1; }
   done
   case "$(uname -s)" in
@@ -24,18 +40,18 @@ main() {
   else
     echo 'Install sha256sum or shasum to verify the release.' >&2; exit 1
   fi
-  : "${HOME:?HOME must identify your user directory}"
-  install_root=${SPYNEL_INSTALL_DIR:-"$HOME/.local/share/spynel"}
-  bin_dir=${SPYNEL_BIN_DIR:-"$HOME/.local/bin"}
+  bin_dir=${SPYNEL_BIN_DIR:-$(default_bin_dir)}
   case "$install_root:$bin_dir" in *'
 '*) echo 'Installation paths must not contain newlines.' >&2; exit 1 ;; esac
   case "$install_root" in /*) ;; *) echo 'SPYNEL_INSTALL_DIR must be absolute.' >&2; exit 1 ;; esac
   case "$bin_dir" in /*) ;; *) echo 'SPYNEL_BIN_DIR must be absolute.' >&2; exit 1 ;; esac
+  case "$bin_dir" in *:*) echo 'SPYNEL_BIN_DIR cannot contain a PATH separator (:).' >&2; exit 1 ;; esac
   stage=$(mktemp -d "${TMPDIR:-/tmp}/spynel-install.XXXXXXXX")
   trap 'rm -rf "$stage"' 0
   trap 'exit 1' HUP INT TERM
   version=${SPYNEL_VERSION:-}
   if [ -z "$version" ]; then
+    echo 'Finding the latest Spynel release...' >&2
     latest=$(curl -LsSf --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 10 --max-redirs 5 -o /dev/null -w '%{url_effective}' https://github.com/agent0ai/spynel/releases/latest)
     version=${latest##*/v}
   fi
@@ -45,8 +61,11 @@ main() {
   archive="spynel_${version}_${target_os}_${target_arch}.tar.gz"
   base=${SPYNEL_DOWNLOAD_BASE:-"https://github.com/agent0ai/spynel/releases/download/v$version"}
   base=${base%/}
+  echo "Downloading Spynel $version for $target_os/$target_arch..." >&2
   download "$base/$archive" "$stage/$archive" 536870912
+  echo 'Downloading release checksums...' >&2
   download "$base/checksums.txt" "$stage/checksums.txt" 1048576
+  echo 'Verifying and extracting the release...' >&2
   expected=$(awk -v name="$archive" '$2 == name { if (NF != 2 || ++n > 1 || length($1) != 64 || $1 ~ /[^0-9a-fA-F]/) exit 1; hash=tolower($1) } END { if (n != 1) exit 1; print hash }' "$stage/checksums.txt")
   actual=$($hash_command "$stage/$archive" | awk '{print $1}')
   [ "$expected" = "$actual" ] || { echo 'Release checksum mismatch; installation unchanged.' >&2; exit 1; }
@@ -68,6 +87,7 @@ main() {
     darwin) extract_runtime lib/libsherpa-onnx-c-api.dylib; extract_runtime lib/libonnxruntime.1.27.0.dylib ;;
   esac
   chmod 700 "$stage/runtime/spynel"
+  echo "Installing Spynel $version..." >&2
   if ! "$stage/runtime/spynel" install-bundle --root "$install_root" --archive "$stage/$archive" --checksums "$stage/checksums.txt" --version "$version"; then
     echo 'Installation failed. Use a release with standalone installer support; the prior bundle is retained.' >&2
     exit 1
@@ -75,19 +95,122 @@ main() {
   mkdir -p "$bin_dir"
   if ln -s "$install_root/spynel" "$bin_dir/spynel" 2>/dev/null; then
     :
+  elif [ ! -e "$bin_dir/spynel" ] && [ ! -L "$bin_dir/spynel" ]; then
+    echo "Cannot create the launcher in $bin_dir; check directory permissions." >&2
+    exit 1
   elif [ "$(readlink "$bin_dir/spynel" 2>/dev/null || true)" != "$install_root/spynel" ]; then
     echo "Preserved the existing $bin_dir/spynel. Run: \"$install_root/spynel\""
     return
   fi
-  echo "Installed Spynel $version. Run: \"$bin_dir/spynel\""
-  case ":$PATH:" in
-    *":$bin_dir:"*) ;;
-    *) echo "Add \"$bin_dir\" to PATH in your shell profile, then open a new terminal." ;;
-  esac
+  printf '%s\n' "$bin_dir" > "$install_root/.bin-dir"
+  quoted_bin=$(shell_quote "$bin_dir")
+  path_line="case \":\$PATH:\" in *:$quoted_bin:*) ;; *) export PATH=$quoted_bin:\$PATH ;; esac # Spynel installer"
+  printf '%s\n' "$path_line" > "$install_root/env"
+  if on_path "$bin_dir"; then
+    echo "Installed Spynel $version. Run: spynel"
+  else
+    configure_path
+    echo "Installed Spynel $version. PATH configured for your shell."
+    # A piped child cannot change its parent's environment. Show a command
+    # usable immediately when no writable directory was already on PATH.
+    printf 'Run now: %s\n' "$(shell_quote "$bin_dir/spynel")"
+  fi
   resolved=$(command -v spynel || true)
   if [ -n "$resolved" ] && [ "$resolved" != "$bin_dir/spynel" ]; then
     echo "Your PATH currently selects $resolved. Use \"$bin_dir/spynel\" for this installation."
   fi
+}
+
+on_path() {
+  case ":$PATH:" in *":$1:"*) return 0 ;; *) return 1 ;; esac
+}
+
+default_bin_dir() {
+  if [ "$(id -u)" = 0 ] && on_path /usr/local/bin &&
+     { { [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; } || { [ ! -e /usr/local/bin ] && [ -w /usr/local ]; }; }; then
+    echo /usr/local/bin
+    return
+  fi
+  if on_path "$HOME/.local/bin"; then
+    printf '%s\n' "$HOME/.local/bin"
+    return
+  fi
+  remaining_path=$PATH:
+  while [ -n "$remaining_path" ]; do
+    directory=${remaining_path%%:*}
+    remaining_path=${remaining_path#*:}
+    case "$directory" in /*) ;; *) continue ;; esac
+    if [ -d "$directory" ] && [ -w "$directory" ] && [ -x "$directory" ]; then
+      printf '%s\n' "$directory"
+      return
+    fi
+  done
+  printf '%s\n' "$HOME/.local/bin"
+}
+
+shell_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
+
+configure_path() {
+  case "${SHELL:-}" in
+    */fish)
+      "$SHELL" -c 'fish_add_path --universal --prepend -- $argv[1]' -- "$bin_dir"
+      return
+      ;;
+    */zsh)
+      append_path "${ZDOTDIR:-$HOME}/.zprofile"
+      append_path "${ZDOTDIR:-$HOME}/.zshrc"
+      ;;
+    *)
+      profile=$HOME/.profile
+      if [ -f "$HOME/.bash_profile" ]; then profile=$HOME/.bash_profile
+      elif [ -f "$HOME/.bash_login" ]; then profile=$HOME/.bash_login; fi
+      append_path "$profile"
+      append_path "$HOME/.bashrc"
+      ;;
+  esac
+}
+
+append_path() {
+  if ! grep -Fqx "$path_line" "$1" 2>/dev/null; then
+    (umask 077; printf '\n%s\n' "$path_line" >> "$1")
+  fi
+}
+
+uninstall() {
+  if [ "$install_root" = / ] || [ "$install_root" = "$HOME" ]; then
+    echo 'Refusing to uninstall from the filesystem root or home directory.' >&2
+    exit 1
+  fi
+  if [ ! -e "$install_root" ] && [ ! -L "$install_root" ]; then
+    echo 'Spynel is already uninstalled.'
+    return
+  fi
+  if [ -L "$install_root" ] || [ -L "$install_root/.spynel-install" ] ||
+     ! printf 'spynel-github-v1\n' | cmp -s "$install_root/.spynel-install" -; then
+    echo 'Refusing to remove a directory not owned by the Spynel installer.' >&2
+    exit 1
+  fi
+  echo 'Uninstalling Spynel...' >&2
+  saved_bin=$(cat "$install_root/.bin-dir" 2>/dev/null || true)
+  remaining_path="$HOME/.local/bin:${SPYNEL_BIN_DIR:-}:$saved_bin:$PATH:"
+  while [ -n "$remaining_path" ]; do
+    directory=${remaining_path%%:*}
+    remaining_path=${remaining_path#*:}
+    case "$directory" in /*) ;; *) continue ;; esac
+    if [ "$(readlink "$directory/spynel" 2>/dev/null || true)" = "$install_root/spynel" ]; then
+      rm "$directory/spynel"
+    fi
+  done
+  # Remove only installer-owned runtime paths, retaining any workspace or
+  # unrelated files the user put beside the installation.
+  rm -rf "$install_root/releases" "$install_root"/.stage-* "$install_root"/.download-*
+  rm -f "$install_root/current" "$install_root/spynel" "$install_root/env" "$install_root/.bin-dir" "$install_root/.install.lock" "$install_root/.spynel-install"
+  rmdir "$install_root" 2>/dev/null || true
+  echo 'Spynel uninstalled. Workspace files and configuration were preserved.'
 }
 
 download() (
@@ -96,7 +219,7 @@ download() (
   ulimit -f 1048576
   protocols='=https'
   case "$1" in http://*) protocols='=http,https' ;; esac
-  curl -LsSf --proto "$protocols" --proto-redir "$protocols" --connect-timeout 10 --max-time 120 --max-redirs 5 --max-filesize "$3" -o "$2" "$1"
+  curl -LfS --progress-bar --proto "$protocols" --proto-redir "$protocols" --connect-timeout 10 --max-time 120 --max-redirs 5 --max-filesize "$3" -o "$2" "$1"
   [ "$(wc -c < "$2")" -le "$3" ]
 )
 
