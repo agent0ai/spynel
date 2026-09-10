@@ -65,7 +65,17 @@ async function main() {
   const environment = createLaunchEnvironment(process.env, periodicChecks, startupUpdateCheckedAt, startupUpdate);
   for (;;) {
     const binary = path.join(__dirname, "..", "vendor", "spynel");
-    const result = childProcess.spawnSync(binary, args, { stdio: "inherit", env: environment });
+    const result = await new Promise(resolve => {
+      const child = childProcess.spawn(binary, args, { stdio: "inherit", env: environment });
+      const signals = ["SIGINT", "SIGTERM", "SIGHUP"].map(signal => [signal, () => child.kill(signal)]);
+      const finish = result => {
+        for (const [signal, forward] of signals) process.removeListener(signal, forward);
+        resolve(result);
+      };
+      for (const [signal, forward] of signals) process.on(signal, forward);
+      child.once("error", error => finish({ error }));
+      child.once("close", (status, signal) => finish({ status, signal }));
+    });
     if (result.error) {
       fs.rmSync(environment.SPYNEL_NPM_UPDATE_STATE, { force: true });
       console.error(`Unable to run Spynel: ${result.error.message}`);

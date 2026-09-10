@@ -5,6 +5,8 @@ const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const stream = require("stream");
+const { spawn } = require("child_process");
+const { once } = require("events");
 const { resolve } = require("./platform");
 const { install, validateArchiveEntries, validateExtractedTree } = require("./install");
 const { prepareRelease, releaseMetadata, rewriteReadme } = require("./prepare-release");
@@ -114,7 +116,50 @@ async function close(server) {
   await new Promise((accept, reject) => server.close(error => error ? reject(error) : accept()));
 }
 
+async function checkLauncherSignals() {
+  const directory = fs.mkdtempSync(path.join(require("os").tmpdir(), "spynel-launcher-"));
+  try {
+    fs.mkdirSync(path.join(directory, "npm", "bin"), { recursive: true });
+    fs.mkdirSync(path.join(directory, "npm", "vendor"));
+    for (const file of ["bin/spynel.js", "platform.js", "update.js"]) {
+      fs.copyFileSync(path.join(__dirname, file), path.join(directory, "npm", file));
+    }
+    fs.copyFileSync(path.join(__dirname, "..", "package.json"), path.join(directory, "package.json"));
+    const marker = path.join(directory, "stopped");
+    fs.writeFileSync(path.join(directory, "npm", "vendor", "spynel"), `#!/usr/bin/env node
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => {
+  setTimeout(() => { require("fs").writeFileSync(${JSON.stringify(marker)}, signal); process.exit(0); }, 30);
+});
+console.log(process.pid);
+setInterval(() => {}, 1000);
+`, { mode: 0o700 });
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+      const launcher = spawn(process.execPath, [path.join(directory, "npm", "bin", "spynel.js"), "serve"], { stdio: ["ignore", "pipe", "pipe"] });
+      let nativePID;
+      const exited = once(launcher, "exit");
+      const timeout = setTimeout(() => launcher.kill("SIGKILL"), 3000);
+      try {
+        const [ready] = await once(launcher.stdout, "data", { signal: AbortSignal.timeout(3000) });
+        nativePID = Number(ready.toString().trim());
+        assert(Number.isInteger(nativePID) && nativePID > 0);
+        launcher.kill(signal);
+        assert.deepStrictEqual(await exited, [0, null], "launcher must wait for graceful native shutdown");
+        assert.strictEqual(fs.readFileSync(marker, "utf8"), signal);
+      } finally {
+        clearTimeout(timeout);
+        launcher.kill("SIGKILL");
+        if (nativePID) {
+          try { process.kill(nativePID, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+        }
+      }
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 async function main() {
+  await checkLauncherSignals();
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
   try {
     Object.defineProperty(process, "platform", { value: "win32", configurable: true });
