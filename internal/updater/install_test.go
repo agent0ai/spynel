@@ -77,7 +77,11 @@ func TestInstallRetainsWorkingBundleAndRejectsInvalidCandidates(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("standalone distribution excludes Windows")
 	}
-	root := filepath.Join(t.TempDir(), "installation with spaces Ω")
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(parent, "installation with spaces Ω")
 	ctx := context.Background()
 	archive, sums := candidateArchive(t, "1.2.0", nil, nil)
 	launcher, err := InstallArchive(ctx, root, archive, sums, "1.2.0")

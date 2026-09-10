@@ -23,7 +23,7 @@ To uninstall:
 curl -LsSf https://spynel.agent-zero.ai/uninstall.sh | sh
 ```
 
-This stops the installations' processes, removes their startup registrations, and removes both the standalone GitHub installation and the current global npm installation when present. Workspace data and unrelated files are kept. A custom standalone installation uses the same `SPYNEL_INSTALL_DIR` during removal. Native cleanup requires release 0.12.2 or newer; the script obtains that helper independently of the installed version.
+This stops the installations' processes, removes their startup registrations, and removes both the standalone GitHub installation and the current global npm installation when present. Workspace data and unrelated files are kept. A custom standalone installation uses the same `SPYNEL_INSTALL_DIR` during removal. Native cleanup requires release 0.12.3 or newer; the script obtains that helper independently of the installed version.
 
 Alternatively, npm requires Node.js 18 or newer:
 

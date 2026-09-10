@@ -35,7 +35,7 @@ def main():
         env = {k: v for k, v in os.environ.items() if not k.startswith("SPYNEL_")}
         user_home = temp / "home"
         user_home.mkdir()
-        env.update(HOME=str(user_home), SHELL="/bin/bash")
+        env.update(HOME=str(user_home), SHELL="/bin/bash", XDG_RUNTIME_DIR=str(temp / "isolated runtime"))
         tools = temp / "system tools"
         tools.mkdir()
         for name in ("sh", "curl", "tar", "awk", "mktemp", "uname", "sha256sum", "shasum", "wc", "mkdir", "rm", "rmdir", "chmod", "readlink", "ln", "gzip", "id", "sed", "grep", "cat", "cmp"):
