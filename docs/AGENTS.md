@@ -29,6 +29,8 @@
 - Document Linux amd64/arm64 and macOS amd64/arm64 as the only current distribution targets, with Windows explicitly and temporarily unsupported by both native packaging and npm.
 - Keep authenticated provider canaries gated by the reviewed threat model: synthetic repositories only, disposable identities and homes, verified artifacts, bounded egress/cost/time, sanitized evidence, and per-run authorization. A plan or CI definition is not evidence that a provider was executed.
 
+- `programmatic-integration.md` owns the supported v1 HTTP/NDJSON contract, request admission/retry limits, committed subscription/replay semantics, snapshot resynchronization, private Unix socket topology/limits, and runnable adapter/local-test examples. Keep the compiled integration topic and CLI help synchronized.
+
 ## Child DOX Index
 
 No child DOX files.

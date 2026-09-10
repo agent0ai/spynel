@@ -13,6 +13,7 @@ import (
 	"github.com/agent0ai/spynel/internal/channel"
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/orchestrator"
 	"github.com/agent0ai/spynel/internal/workspace"
@@ -192,8 +193,8 @@ func TestStableSourceIdentityDeduplicatesDeliveryAndTerminalCoverage(t *testing.
 	if err := service.Handle(context.Background(), message, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.Handle(context.Background(), message, nil); err != nil {
-		t.Fatal(err)
+	if err := service.Handle(context.Background(), message, nil); !errors.Is(err, ErrDuplicateMessage) {
+		t.Fatalf("retry = %v, want explicit duplicate", err)
 	}
 	if len(target.prompts["chat:cli:duplicate"]) != 1 {
 		t.Fatalf("duplicate source reached provider %d times", len(target.prompts["chat:cli:duplicate"]))
@@ -327,30 +328,99 @@ func TestHarnessSendFailureRollsBackNewConversationCorrelation(t *testing.T) {
 	if service.conversationInFlight(sessionKey(message)) {
 		t.Fatal("harness send failure left conversation correlation in flight")
 	}
-	if service.Runtime.Status().Jobs != 0 {
+	if status := service.Runtime.Status(); status.Jobs != 0 || status.LiveJobs != 0 {
 		t.Fatalf("harness send failure left runtime job active: %#v", service.Runtime.Status())
+	}
+	archived, output, err := service.Runtime.ArchivedJob(1)
+	if err != nil || archived.State != "error" || !strings.Contains(output, "send failed") {
+		t.Fatalf("failed new dispatch must retain a settled error archive: %#v, %v", archived, err)
 	}
 }
 
-func TestFailedFollowupRollsBackOnlyItsSourceCorrelation(t *testing.T) {
+type rejectedSteerServiceHarness struct {
+	*heldServiceHarness
+	rejectNext bool
+}
+
+func (*rejectedSteerServiceHarness) FollowUpMode() harness.FollowUpMode { return harness.FollowUpSteer }
+
+func (r *rejectedSteerServiceHarness) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+	r.mu.Lock()
+	reject := r.rejectNext && r.active[key]
+	if reject {
+		r.rejectNext = false
+	}
+	r.mu.Unlock()
+	if reject {
+		// Native steering can reject a request while retaining the original emitter.
+		return r.ThreadID(key), true, errors.New("provider rejected follow-up")
+	}
+	return r.heldServiceHarness.SendWithModel(ctx, key, prompt, model, emit)
+}
+
+func TestFailedFollowupKeepsGlobalJobLiveAndRollsBackOnlyItsSource(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _ := config.Load(config.PathForRoot(root))
-	held := newHeldServiceHarness()
-	service := New(cfg, held)
-	defer service.Close()
-	first := core.Message{Channel: "cli", Conversation: "followup-failure", SourceMessageID: "local:first", Text: "first"}
-	if err := service.dispatchHarnessPrompt(context.Background(), first, "first", nil); err != nil {
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
 		t.Fatal(err)
 	}
-	service.Harness = &failingServiceHarness{serviceHarness: held.serviceHarness, err: errors.New("followup failed")}
-	second := core.Message{Channel: first.Channel, Conversation: first.Conversation, SourceMessageID: "local:second", Text: "second"}
-	if err := service.dispatchHarnessPrompt(context.Background(), second, "second", nil); err == nil {
-		t.Fatal("follow-up send failure was not returned")
+	target := &rejectedSteerServiceHarness{heldServiceHarness: newHeldServiceHarness(), rejectNext: true}
+	registry := harness.NewRegistry()
+	registry.Register("fixture", func(harness.HarnessConfig) (harness.Harness, error) { return target, nil })
+	supervisor := harness.NewSupervisor(registry, harness.HarnessConfig{Name: "fixture"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := supervisor.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, supervisor)
+	defer service.Close()
+	if err := service.RegisterLiveTUI("idle-instance", "idle-displayed", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	check := func(want int) {
+		t.Helper()
+		state := service.SharedStateForInstance("idle-instance")
+		status, err := service.Status(core.Message{Channel: "tui", Conversation: "idle-displayed"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.ConversationActivity != 0 || state.DurableWork != (core.DurableWorkCounts{}) || status.TurnActive || status.OrchestratorLease != 0 || status.OrchestratorRuns != 0 {
+			t.Fatal("displayed conversation and durable work must stay idle")
+		}
+		if state.Runtime != status.Runtime || state.Runtime.Jobs != want || state.Runtime.LiveJobs != want {
+			t.Fatalf("global jobs = %#v, status = %#v; want %d", state.Runtime, status.Runtime, want)
+		}
+	}
+	check(0)
+	first := core.Message{Channel: "cli", Conversation: "followup-failure", SourceMessageID: "local:first", Text: "first"}
+	firstEvents := &conversationEventRouter{}
+	if err := service.Handle(ctx, first, func(event core.Event) { _ = firstEvents.DeliverEvent(ctx, "", "", "", event) }); err != nil {
+		t.Fatal(err)
 	}
 	key := sessionKey(first)
+	target.mu.Lock()
+	emit := target.emits[key]
+	target.mu.Unlock()
+	emit(core.Event{Kind: core.EventStatus, Execution: &core.ExecutionStatus{State: "reconnecting", Detail: "retrying", ReconnectAttempt: 1, ReconnectTotal: 2}})
+	before, _ := service.Runtime.JobForSession(key)
+	check(1)
+	second := core.Message{Channel: first.Channel, Conversation: first.Conversation, SourceMessageID: "local:second", Text: "second"}
+	if err := service.Handle(ctx, second, nil); err == nil {
+		t.Fatal("follow-up send failure was not returned")
+	}
+	check(1)
+	job, exists := service.Runtime.JobForSession(key)
+	if !exists || job != before || !target.IsActive(key) || !supervisor.IsActive(key) {
+		t.Fatalf("failed steering changed the original live execution: before=%#v after=%#v", before, job)
+	}
+	archived, output, err := service.Runtime.ArchivedJob(job.StableID)
+	if err != nil || archived.State != "reconnecting" || !strings.Contains(output, "provider rejected follow-up") {
+		t.Fatalf("request failure must remain inspectable without settling the archive: %#v, %v", archived, err)
+	}
 	if !service.conversationInFlight(key) {
 		t.Fatal("failed follow-up removed the older active execution correlation")
 	}
@@ -364,7 +434,41 @@ func TestFailedFollowupRollsBackOnlyItsSourceCorrelation(t *testing.T) {
 	if _, ok := snapshot.sources[second.SourceMessageID]; ok {
 		t.Fatalf("failed follow-up source remained reserved: %#v", snapshot.sources)
 	}
-	held.finish(key)
+	emit(core.Event{Kind: core.EventStatus, Execution: &core.ExecutionStatus{State: "running"}})
+	emit(core.Event{Kind: core.EventDelta, Text: "original work continues"})
+	check(1)
+	job, _ = service.Runtime.JobForSession(key)
+	if job.Execution != JobRunning || job.StatusDetail != "" {
+		t.Fatalf("fresh provider output did not restore running: %#v", job)
+	}
+	events := firstEvents.snapshot()
+	if events[len(events)-1].Text != "original work continues" {
+		t.Fatal("original emitter lost continuing output")
+	}
+	for _, event := range events {
+		if event.Kind == core.EventActivity && !event.Active {
+			t.Fatal("rejected follow-up stopped original activity")
+		}
+	}
+	third := core.Message{Channel: first.Channel, Conversation: first.Conversation, SourceMessageID: "local:third", Text: "accepted follow-up"}
+	thirdEvents := &conversationEventRouter{}
+	if err := service.Handle(ctx, third, func(event core.Event) { _ = thirdEvents.DeliverEvent(ctx, "", "", "", event) }); err != nil {
+		t.Fatal(err)
+	}
+	check(1)
+	target.finish(key)
+	check(0)
+	if supervisor.IsActive(key) || service.conversationInFlight(key) {
+		t.Fatal("actual provider completion left execution ownership active")
+	}
+	events = thirdEvents.snapshot()
+	if events[len(events)-1].Kind != core.EventFinal || !events[len(events)-1].Done {
+		t.Fatal("accepted follow-up did not receive provider completion")
+	}
+	archived, _, err = service.Runtime.ArchivedJob(job.StableID)
+	if err != nil || archived.State != "completed" {
+		t.Fatalf("provider completion did not settle archive: %#v, %v", archived, err)
+	}
 }
 
 func TestRecoveryPromptAndDispatchFailuresLeaveNoExecutionCorrelation(t *testing.T) {

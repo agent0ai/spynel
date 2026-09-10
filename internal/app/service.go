@@ -75,6 +75,8 @@ type Service struct {
 	primaryRequestMu       sync.Mutex
 	primaryRequested       bool
 	streamMu               sync.Mutex
+	admissionMu            sync.Mutex
+	admissions             map[string]bool
 	liveTUIMu              sync.Mutex
 	liveTUI                map[string]map[string]time.Time
 	chatActivityMu         sync.Mutex
@@ -476,6 +478,11 @@ func (s *Service) primaryInstanceID() string {
 }
 
 func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Emit) error {
+	if message.Channel == "cli" || message.Channel == "tui" {
+		if err := ValidateLocalMessage(message); err != nil {
+			return err
+		}
+	}
 	if message.ReceivedAt.IsZero() {
 		message.ReceivedAt = time.Now().UTC()
 	}
@@ -490,6 +497,14 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 			return fmt.Errorf("create source message identity: %w", err)
 		}
 	}
+	release, err := s.admitMessage(message)
+	if err != nil {
+		if errors.Is(err, ErrDuplicateMessage) && message.Channel != "cli" && message.Channel != "tui" {
+			return nil
+		}
+		return err
+	}
+	defer release()
 	s.beginRecoveryIntake(sessionKey(message))
 	defer s.endRecoveryIntake(sessionKey(message))
 	duplicate, err := s.History.HasUserSourceID(message.Channel, message.Conversation, message.SourceMessageID)
@@ -497,7 +512,10 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 		return fmt.Errorf("validate source message identity: %w", err)
 	}
 	if duplicate {
-		return nil
+		if message.Channel != "cli" && message.Channel != "tui" {
+			return nil
+		}
+		return ErrDuplicateMessage
 	}
 	if message.FollowupOnly && !s.Harness.IsActive(sessionKey(message)) {
 		return errors.New("there is no active execution for this conversation")
@@ -589,9 +607,10 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 		activity.stop()
 		s.rollbackRecoveryReservation(message, reservation)
 		s.Runtime.RecordJobEvent(jobID, core.Event{Kind: core.EventError, Text: err.Error(), Done: true})
-		s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobError), Detail: err.Error()})
 		s.Runtime.LogEvent("error", "harness", "start_failed", "Harness turn failed to start ("+harnessFailureEvidence(err)+")")
+		// A rejected follow-up does not end the original provider execution.
 		if !s.Harness.IsActive(key) {
+			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobError), Detail: err.Error()})
 			s.Runtime.EndJob(jobID)
 		}
 		return err
@@ -706,12 +725,15 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 			terminalMu.Unlock()
 		}
 		key := sessionKey(message)
+		// A queued request can be cancelled while the shared provider turn is
+		// still active. Persist and deliver its result without settling that turn.
+		requestOnly := terminal && s.Harness.IsActive(key)
 		if event.Execution != nil {
 			s.Runtime.UpdateJob(jobID, *event.Execution)
 		} else if event.Kind == core.EventDelta {
 			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobRunning)})
 		}
-		if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+		if terminal && !requestOnly {
 			state := JobFinishing
 			if event.Kind == core.EventError {
 				state = JobError
@@ -724,10 +746,13 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 			s.streamMu.Unlock()
 		}
 		if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
-			s.streamMu.Lock()
-			streamed := s.streamText[key]
-			delete(s.streamText, key)
-			s.streamMu.Unlock()
+			var streamed string
+			if !requestOnly {
+				s.streamMu.Lock()
+				streamed = s.streamText[key]
+				delete(s.streamText, key)
+				s.streamMu.Unlock()
+			}
 			text := event.Text
 			remoteChannel := message.Channel == "telegram" || message.Channel == "whatsapp"
 			hookText := text
@@ -794,7 +819,7 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 					s.Runtime.LogEvent("error", "history", "partial_append_failed", fmt.Sprintf("Persist partial history failed (%T)", err))
 				}
 			}
-			entry := history.Entry{At: time.Now().UTC(), Role: map[bool]string{true: "error", false: "assistant"}[event.Kind == core.EventError], Content: historyText, Terminal: true}
+			entry := history.Entry{At: time.Now().UTC(), Role: map[bool]string{true: "error", false: "assistant"}[event.Kind == core.EventError], Content: historyText, Terminal: true, SourceMessageID: message.SourceMessageID, FinalText: event.FinalText, Continues: event.Continues}
 			if message.Sender == "recovery" {
 				entry.Sender = "Spy"
 				entry.Recovery = true
@@ -802,7 +827,7 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 			if _, err := s.History.Append(message.Channel, message.Conversation, entry); err != nil {
 				s.Runtime.LogEvent("error", "history", "terminal_append_failed", fmt.Sprintf("Persist terminal history failed (%T)", err))
 			}
-			if !event.Continues {
+			if !event.Continues && !requestOnly {
 				s.finishRecoveryExecution(message, map[bool]string{true: "terminal_error", false: "terminal_assistant"}[event.Kind == core.EventError])
 			}
 		}
@@ -812,7 +837,7 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 		if downstream != nil {
 			downstream(event)
 		}
-		if event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+		if terminal && !requestOnly {
 			level, outcome := "info", "completed"
 			if event.Kind == core.EventError {
 				level, outcome = "error", "failed"
@@ -1781,7 +1806,7 @@ func (s *Service) localReply(message core.Message, text string, emit core.Emit) 
 		text = "Command completed."
 	}
 	_, err := s.History.Append(message.Channel, message.Conversation, history.Entry{
-		At: time.Now().UTC(), Role: "assistant", Content: text,
+		At: time.Now().UTC(), Role: "assistant", Content: text, SourceMessageID: message.SourceMessageID, Terminal: true,
 	})
 	if err != nil {
 		return err

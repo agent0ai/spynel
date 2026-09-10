@@ -36,8 +36,8 @@ jobs:
         run: |
           node -e 'const p=require("./package.json"); if (p.version === "0.0.0-development") process.exit(1)'
           npm pack --dry-run
-          go test ./...
-          go vet ./...
+          go test ./... github.com/charmbracelet/bubbletea
+          go vet ./... github.com/charmbracelet/bubbletea
           mkdir -p .tmp-bin
           go build -o .tmp-bin/spynel ./cmd/spynel
           ./scripts/smoke.sh

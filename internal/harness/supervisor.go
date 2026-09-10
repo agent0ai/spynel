@@ -489,6 +489,7 @@ func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) c
 			queue := s.pending[key]
 			if len(queue) > 0 {
 				value, consumed := mergeQueuedConversationPrompts(queue)
+				value.generation = s.controlGeneration[key]
 				next = &value
 				if len(queue) == consumed {
 					delete(s.pending, key)
@@ -501,7 +502,7 @@ func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) c
 					if emit != nil {
 						emit(event)
 					}
-					s.scheduleQueued(key, target, *next)
+					go s.startQueued(key, target, *next)
 					return
 				}
 			} else if control := s.controls[key]; control != nil && !control.continued && control.continuationPrompt != "" {
@@ -516,7 +517,7 @@ func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) c
 				s.mu.Lock()
 				if s.controls[key] == control {
 					control.continued = true
-					value := pendingSend{prompt: control.continuationPrompt, emit: s.controlEmit[key], control: control, preserveEmitter: true}
+					value := pendingSend{prompt: control.continuationPrompt, emit: s.controlEmit[key], control: control, preserveEmitter: true, generation: s.controlGeneration[key]}
 					next = &value
 					event.Continues = true
 				} else {
@@ -526,7 +527,7 @@ func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) c
 				}
 				s.mu.Unlock()
 				if next != nil {
-					s.scheduleQueued(key, target, *next)
+					go s.startQueued(key, target, *next)
 				}
 				return
 			} else {
@@ -541,7 +542,13 @@ func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) c
 			emit(event)
 		}
 		if next != nil {
-			s.scheduleQueued(key, target, *next)
+			// Ordinary queued messages transfer response ownership just like
+			// native steering. Release the preceding emitter explicitly; its
+			// continuing final describes a provider result, not stream closure.
+			if !next.preserveEmitter && emit != nil {
+				emit(core.Event{Kind: core.EventStatus, Text: "Response continued on a newer queued message", ThreadID: event.ThreadID, Done: true})
+			}
+			go s.startQueued(key, target, *next)
 		}
 	}
 }
@@ -606,11 +613,21 @@ func mergeQueuedConversationPrompts(queue []pendingSend) (pendingSend, int) {
 	return last, count
 }
 
-func (s *Supervisor) scheduleQueued(key string, target Harness, next pendingSend) {
-	s.mu.Lock()
-	next.generation = s.controlGeneration[key]
-	s.mu.Unlock()
-	go s.startQueued(key, target, next)
+// These requests never reached the provider. Settle their own emitters, not
+// the shared execution emitter retained by job controls.
+func cancelQueuedRequests(queue ...pendingSend) {
+	for _, next := range queue {
+		if next.preserveEmitter {
+			continue
+		}
+		event := core.Event{Kind: core.EventError, Text: "Queued follow-up cancelled before provider dispatch", Done: true}
+		for _, emit := range next.release {
+			emit(event)
+		}
+		if next.emit != nil {
+			next.emit(event)
+		}
+	}
 }
 
 func (s *Supervisor) controlOperation(key string) *sync.Mutex {
@@ -632,6 +649,7 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 	validStart := !s.closed && s.active[key] > 0 && s.controlGeneration[key] == next.generation
 	s.mu.RUnlock()
 	if !validStart {
+		cancelQueuedRequests(next)
 		return
 	}
 	if next.control == nil {
@@ -642,6 +660,7 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 			combined[0] = next
 			combined = append(combined, queue...)
 			merged, consumed := mergeQueuedConversationPrompts(combined)
+			merged.generation = next.generation
 			next = merged
 			consumed-- // combined[0] is the already-scheduled entry.
 			if consumed == len(queue) {
@@ -677,6 +696,7 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 	selection := inferenceSelection(s.config)
 	s.mu.RUnlock()
 	if !validStart {
+		cancelQueuedRequests(next)
 		return
 	}
 	if next.control != nil && next.control.reserveProviderTurn != nil && !next.control.reserveProviderTurn() {
@@ -737,11 +757,13 @@ func (s *Supervisor) Interrupt(ctx context.Context, key string) (bool, error) {
 	logicalActive := s.active[key] > 0
 	generation := s.controlGeneration[key] + 1
 	s.controlGeneration[key] = generation
+	queue := s.pending[key]
 	delete(s.pending, key)
 	delete(s.controls, key)
 	delete(s.seenControl, key)
 	delete(s.controlEmit, key)
 	s.mu.Unlock()
+	cancelQueuedRequests(queue...)
 	stopped, err := target.Interrupt(ctx, key)
 	if err != nil {
 		if !target.IsActive(key) {

@@ -6,6 +6,7 @@ package textarea
 import (
 	"crypto/sha256"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -19,7 +20,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
-	rw "github.com/mattn/go-runewidth"
 	"github.com/rivo/uniseg"
 )
 
@@ -74,8 +74,8 @@ type KeyMap struct {
 var DefaultKeyMap = KeyMap{
 	CharacterForward:        key.NewBinding(key.WithKeys("right", "ctrl+f"), key.WithHelp("right", "character forward")),
 	CharacterBackward:       key.NewBinding(key.WithKeys("left", "ctrl+b"), key.WithHelp("left", "character backward")),
-	WordForward:             key.NewBinding(key.WithKeys("alt+right", "alt+f"), key.WithHelp("alt+right", "word forward")),
-	WordBackward:            key.NewBinding(key.WithKeys("alt+left", "alt+b"), key.WithHelp("alt+left", "word backward")),
+	WordForward:             key.NewBinding(key.WithKeys("ctrl+right", "alt+right", "alt+f"), key.WithHelp("alt+right", "word forward")),
+	WordBackward:            key.NewBinding(key.WithKeys("ctrl+left", "alt+left", "alt+b"), key.WithHelp("alt+left", "word backward")),
 	LineNext:                key.NewBinding(key.WithKeys("down", "ctrl+n"), key.WithHelp("down", "next line")),
 	LinePrevious:            key.NewBinding(key.WithKeys("up", "ctrl+p"), key.WithHelp("up", "previous line")),
 	DeleteWordBackward:      key.NewBinding(key.WithKeys("alt+backspace", "ctrl+w"), key.WithHelp("alt+backspace", "delete word backward")),
@@ -187,6 +187,16 @@ func (w line) Hash() string {
 
 // Model is the Bubble Tea model for this text area element.
 type Model struct {
+	history           editHistory
+	editing           bool
+	editRecorded      bool
+	editBefore        editState
+	editKind          editKind
+	historyGeneration uint64
+	anchor            int
+	selecting         bool
+	SelectionStyle    lipgloss.Style
+
 	Err error
 
 	// General settings.
@@ -290,6 +300,7 @@ func New() Model {
 
 	m := Model{
 		CharLimit:            defaultCharLimit,
+		SelectionStyle:       lipgloss.NewStyle().Reverse(true),
 		MaxHeight:            defaultMaxHeight,
 		MaxWidth:             defaultMaxWidth,
 		Prompt:               lipgloss.ThickBorder().Left + " ",
@@ -343,10 +354,23 @@ func DefaultStyles() (Style, Style) {
 	return focused, blurred
 }
 
-// SetValue sets the value of the text input.
+// SetValue replaces the input atomically, preserving it when validation fails.
 func (m *Model) SetValue(s string) {
-	m.Reset()
-	m.InsertString(s)
+	next := *m
+	// Reset and insertion may scroll; validation must not mutate the live view.
+	vp := *m.viewport
+	next.viewport = &vp
+	// Validation builds a candidate, not a second editing history.
+	next.editing, next.editRecorded = true, true
+	next.Reset()
+	next.InsertString(s)
+	if next.Err != nil {
+		m.Err = next.Err
+		return
+	}
+	next.history = editHistory{}
+	next.editing, next.editRecorded = m.editing, m.editRecorded
+	*m = next
 }
 
 // InsertString inserts a string at the cursor position.
@@ -361,23 +385,36 @@ func (m *Model) InsertRune(r rune) {
 
 // insertRunesFromUserInput inserts runes at the current cursor position.
 func (m *Model) insertRunesFromUserInput(runes []rune) {
+	defer m.beginEdit()()
+	m.Err = nil
 	// Clean up any special characters in the input provided by the
 	// clipboard. This avoids bugs due to e.g. tab characters and
 	// whatnot.
 	runes = m.san().Sanitize(runes)
-
-	if m.CharLimit > 0 {
-		availSpace := m.CharLimit - m.Length()
-		// If the char limit's been reached, cancel.
-		if availSpace <= 0 {
-			return
-		}
-		// If there's not enough space to paste the whole thing cut the pasted
-		// runes down so they'll fit.
-		if availSpace < len(runes) {
-			runes = runes[:availSpace]
-		}
+	if len(runes) == 0 {
+		return
 	}
+	start, end := m.SelectionRange()
+	if m.CharLimit > 0 && len([]rune(m.Value()))-(end-start)+len(runes) > m.CharLimit {
+		m.Err = fmt.Errorf("Input exceeds %d characters; paste was not inserted", m.CharLimit)
+		return
+	}
+	selected := ""
+	if start != end {
+		selected = m.SelectedText()
+	}
+	if len(m.value)-strings.Count(selected, "\n")+strings.Count(string(runes), "\n") > maxLines {
+		m.Err = fmt.Errorf("Input exceeds %d lines; paste was not inserted", maxLines)
+		return
+	}
+	if selected == string(runes) {
+		m.ClearSelection()
+		m.setOffset(end)
+		m.repositionView()
+		return
+	}
+	m.recordEdit(len(runes))
+	m.DeleteSelection()
 
 	// Split the input into lines.
 	var lines [][]rune
@@ -396,12 +433,6 @@ func (m *Model) insertRunesFromUserInput(runes []rune) {
 		// The last line did not end with a newline character.
 		// Take it now.
 		lines = append(lines, runes[lstart:])
-	}
-
-	// Obey the maximum line limit.
-	if maxLines > 0 && len(m.value)+len(lines)-1 > maxLines {
-		allowedHeight := max(0, maxLines-len(m.value)+1)
-		lines = lines[:allowedHeight]
 	}
 
 	if len(lines) == 0 {
@@ -446,6 +477,7 @@ func (m *Model) insertRunesFromUserInput(runes []rune) {
 	m.value[m.row] = append(m.value[m.row], tail...)
 
 	m.SetCursor(m.col)
+	m.repositionView()
 }
 
 // Value returns the value of the text input.
@@ -467,7 +499,7 @@ func (m Model) Value() string {
 func (m *Model) Length() int {
 	var l int
 	for _, row := range m.value {
-		l += uniseg.StringWidth(string(row))
+		l += textWidth(string(row))
 	}
 	// We add len(m.value) to include the newline characters.
 	return l + len(m.value) - 1
@@ -485,80 +517,16 @@ func (m Model) Line() int {
 
 // CursorDown moves the cursor down by one line.
 // Returns whether or not the cursor blink should be reset.
-func (m *Model) CursorDown() {
-	li := m.LineInfo()
-	charOffset := max(m.lastCharOffset, li.CharOffset)
-	m.lastCharOffset = charOffset
-
-	if li.RowOffset+1 >= li.Height && m.row < len(m.value)-1 {
-		m.row++
-		m.col = 0
-	} else {
-		// Move the cursor to the start of the next line so that we can get
-		// the line information. We need to add 2 columns to account for the
-		// trailing space wrapping.
-		const trailingSpace = 2
-		m.col = min(li.StartColumn+li.Width+trailingSpace, len(m.value[m.row])-1)
-	}
-
-	nli := m.LineInfo()
-	m.col = nli.StartColumn
-
-	if nli.Width <= 0 {
-		return
-	}
-
-	offset := 0
-	for offset < charOffset {
-		if m.row >= len(m.value) || m.col >= len(m.value[m.row]) || offset >= nli.CharWidth-1 {
-			break
-		}
-		offset += rw.RuneWidth(m.value[m.row][m.col])
-		m.col++
-	}
-	m.col = graphemeBoundaryAtOrBefore(m.value[m.row], m.col)
-}
-
-// CursorUp moves the cursor up by one line.
-func (m *Model) CursorUp() {
-	li := m.LineInfo()
-	charOffset := max(m.lastCharOffset, li.CharOffset)
-	m.lastCharOffset = charOffset
-
-	if li.RowOffset <= 0 && m.row > 0 {
-		m.row--
-		m.col = len(m.value[m.row])
-	} else {
-		// Move the cursor to the end of the previous line.
-		// This can be done by moving the cursor to the start of the line and
-		// then subtracting 2 to account for the trailing space we keep on
-		// soft-wrapped lines.
-		const trailingSpace = 2
-		m.col = li.StartColumn - trailingSpace
-	}
-
-	nli := m.LineInfo()
-	m.col = nli.StartColumn
-
-	if nli.Width <= 0 {
-		return
-	}
-
-	offset := 0
-	for offset < charOffset {
-		if m.col >= len(m.value[m.row]) || offset >= nli.CharWidth-1 {
-			break
-		}
-		offset += rw.RuneWidth(m.value[m.row][m.col])
-		m.col++
-	}
-	m.col = graphemeBoundaryAtOrBefore(m.value[m.row], m.col)
-}
+func (m *Model) CursorDown() { m.moveVertical(1) }
+func (m *Model) CursorUp()   { m.moveVertical(-1) }
 
 // SetCursor moves the cursor to the given position. If the position is
 // out of bounds the cursor will be moved to the start or end accordingly.
 func (m *Model) SetCursor(col int) {
-	m.col = clamp(col, 0, len(m.value[m.row]))
+	if !m.editing {
+		m.BreakUndoGroup()
+	}
+	m.col = graphemeBoundaryAtOrBefore(m.value[m.row], col)
 	// Any time that we move the cursor horizontally we need to reset the last
 	// offset so that the horizontal position when navigating is adjusted.
 	m.lastCharOffset = 0
@@ -590,6 +558,7 @@ func (m *Model) Focus() tea.Cmd {
 // Blur removes the focus state on the model. When the model is blurred it can
 // not receive keyboard input and the cursor will be hidden.
 func (m *Model) Blur() {
+	m.BreakUndoGroup()
 	m.focus = false
 	m.style = &m.BlurredStyle
 	m.Cursor.Blur()
@@ -597,6 +566,10 @@ func (m *Model) Blur() {
 
 // Reset sets the input to its default state with no input.
 func (m *Model) Reset() {
+	m.historyGeneration++
+	m.history = editHistory{}
+	m.Err = nil
+	m.ClearSelection()
 	m.value = make([][]rune, minHeight, maxLines)
 	m.col = 0
 	m.row = 0
@@ -609,7 +582,7 @@ func (m *Model) san() runeutil.Sanitizer {
 	if m.rsan == nil {
 		// Textinput has all its input on a single line so collapse
 		// newlines/tabs to single spaces.
-		m.rsan = runeutil.NewSanitizer()
+		m.rsan = runeutil.NewSanitizer(runeutil.ReplaceTabs("\t"))
 	}
 	return m.rsan
 }
@@ -617,6 +590,9 @@ func (m *Model) san() runeutil.Sanitizer {
 // deleteBeforeCursor deletes all text before the cursor. Returns whether or
 // not the cursor blink should be reset.
 func (m *Model) deleteBeforeCursor() {
+	if m.col > 0 {
+		m.recordEdit(m.col)
+	}
 	m.value[m.row] = m.value[m.row][m.col:]
 	m.SetCursor(0)
 }
@@ -625,6 +601,9 @@ func (m *Model) deleteBeforeCursor() {
 // the cursor blink should be reset. If input is masked delete everything after
 // the cursor so as not to reveal word breaks in the masked input.
 func (m *Model) deleteAfterCursor() {
+	if m.col < len(m.value[m.row]) {
+		m.recordEdit(len(m.value[m.row]) - m.col)
+	}
 	m.value[m.row] = m.value[m.row][:m.col]
 	m.SetCursor(len(m.value[m.row]))
 }
@@ -650,6 +629,9 @@ func (m *Model) transposeLeft() {
 	}
 	leftStart, _ := graphemeRangeAt(line, rightStart-1)
 	_, rightEnd := graphemeRangeAt(line, rightStart)
+	if !slices.Equal(line[leftStart:rightStart], line[rightStart:rightEnd]) {
+		m.recordEdit(rightEnd - leftStart)
+	}
 
 	transposed := make([]rune, 0, len(line))
 	transposed = append(transposed, line[:leftStart]...)
@@ -663,71 +645,17 @@ func (m *Model) transposeLeft() {
 // deleteWordLeft deletes the word left to the cursor. Returns whether or not
 // the cursor blink should be reset.
 func (m *Model) deleteWordLeft() {
-	if m.col == 0 || len(m.value[m.row]) == 0 {
-		return
-	}
-
-	// Linter note: it's critical that we acquire the initial cursor position
-	// here prior to altering it via SetCursor() below. As such, moving this
-	// call into the corresponding if clause does not apply here.
-	oldCol := m.col //nolint:ifshort
-
-	m.SetCursor(m.col - 1)
-	for unicode.IsSpace(m.value[m.row][m.col]) {
-		if m.col <= 0 {
-			break
-		}
-		// ignore series of whitespace before cursor
-		m.SetCursor(m.col - 1)
-	}
-
-	for m.col > 0 {
-		if !unicode.IsSpace(m.value[m.row][m.col]) {
-			m.SetCursor(m.col - 1)
-		} else {
-			if m.col > 0 {
-				// keep the previous space
-				m.SetCursor(m.col + 1)
-			}
-			break
-		}
-	}
-
-	if oldCol > len(m.value[m.row]) {
-		m.value[m.row] = m.value[m.row][:m.col]
-	} else {
-		m.value[m.row] = append(m.value[m.row][:m.col], m.value[m.row][oldCol:]...)
-	}
+	m.anchor = m.CursorOffset()
+	m.selecting = true
+	m.moveWord(-1)
+	m.DeleteSelection()
 }
 
-// deleteWordRight deletes the word right to the cursor.
 func (m *Model) deleteWordRight() {
-	if m.col >= len(m.value[m.row]) || len(m.value[m.row]) == 0 {
-		return
-	}
-
-	oldCol := m.col
-
-	for m.col < len(m.value[m.row]) && unicode.IsSpace(m.value[m.row][m.col]) {
-		// ignore series of whitespace after cursor
-		m.SetCursor(m.col + 1)
-	}
-
-	for m.col < len(m.value[m.row]) {
-		if !unicode.IsSpace(m.value[m.row][m.col]) {
-			m.SetCursor(m.col + 1)
-		} else {
-			break
-		}
-	}
-
-	if m.col > len(m.value[m.row]) {
-		m.value[m.row] = m.value[m.row][:oldCol]
-	} else {
-		m.value[m.row] = append(m.value[m.row][:oldCol], m.value[m.row][m.col:]...)
-	}
-
-	m.SetCursor(oldCol)
+	m.anchor = m.CursorOffset()
+	m.selecting = true
+	m.moveWord(1)
+	m.DeleteSelection()
 }
 
 // characterRight moves the cursor one character to the right.
@@ -763,28 +691,8 @@ func (m *Model) characterLeft(insideLine bool) {
 // wordLeft moves the cursor one word to the left. Returns whether or not the
 // cursor blink should be reset. If input is masked, move input to the start
 // so as not to reveal word breaks in the masked input.
-func (m *Model) wordLeft() {
-	for {
-		m.characterLeft(true /* insideLine */)
-		if m.col < len(m.value[m.row]) && !unicode.IsSpace(m.value[m.row][m.col]) {
-			break
-		}
-	}
-
-	for m.col > 0 {
-		if unicode.IsSpace(m.value[m.row][m.col-1]) {
-			break
-		}
-		m.SetCursor(m.col - 1)
-	}
-}
-
-// wordRight moves the cursor one word to the right. Returns whether or not the
-// cursor blink should be reset. If the input is masked, move input to the end
-// so as not to reveal word breaks in the masked input.
-func (m *Model) wordRight() {
-	m.doWordRight(func(int, int) { /* nothing */ })
-}
+func (m *Model) wordLeft()  { m.moveWord(-1) }
+func (m *Model) wordRight() { m.moveWord(1) }
 
 func (m *Model) doWordRight(fn func(charIdx int, pos int)) {
 	// Skip spaces forward.
@@ -802,7 +710,8 @@ func (m *Model) doWordRight(fn func(charIdx int, pos int)) {
 			break
 		}
 		fn(charIdx, m.col)
-		m.SetCursor(m.col + 1)
+		_, end := graphemeRangeAt(m.value[m.row], m.col)
+		m.SetCursor(end)
 		charIdx++
 	}
 }
@@ -810,14 +719,14 @@ func (m *Model) doWordRight(fn func(charIdx int, pos int)) {
 // uppercaseRight changes the word to the right to uppercase.
 func (m *Model) uppercaseRight() {
 	m.doWordRight(func(_ int, i int) {
-		m.value[m.row][i] = unicode.ToUpper(m.value[m.row][i])
+		m.setCaseRune(i, unicode.ToUpper(m.value[m.row][i]))
 	})
 }
 
 // lowercaseRight changes the word to the right to lowercase.
 func (m *Model) lowercaseRight() {
 	m.doWordRight(func(_ int, i int) {
-		m.value[m.row][i] = unicode.ToLower(m.value[m.row][i])
+		m.setCaseRune(i, unicode.ToLower(m.value[m.row][i]))
 	})
 }
 
@@ -825,9 +734,16 @@ func (m *Model) lowercaseRight() {
 func (m *Model) capitalizeRight() {
 	m.doWordRight(func(charIdx int, i int) {
 		if charIdx == 0 {
-			m.value[m.row][i] = unicode.ToTitle(m.value[m.row][i])
+			m.setCaseRune(i, unicode.ToTitle(m.value[m.row][i]))
 		}
 	})
+}
+
+func (m *Model) setCaseRune(i int, r rune) {
+	if m.value[m.row][i] != r {
+		m.recordEdit(1)
+		m.value[m.row][i] = r
+	}
 }
 
 // LineInfo returns the number of characters from the start of the
@@ -850,19 +766,19 @@ func (m Model) LineInfo() LineInfo {
 				RowOffset:    i + 1,
 				StartColumn:  m.col,
 				Width:        len(grid[i+1]),
-				CharWidth:    uniseg.StringWidth(string(line)),
+				CharWidth:    textWidth(string(line)),
 			}
 		}
 
 		if counter+len(line) >= m.col {
 			return LineInfo{
-				CharOffset:   uniseg.StringWidth(string(line[:max(0, m.col-counter)])),
+				CharOffset:   textWidth(string(line[:max(0, m.col-counter)])),
 				ColumnOffset: m.col - counter,
 				Height:       len(grid),
 				RowOffset:    i,
 				StartColumn:  counter,
 				Width:        len(line),
-				CharWidth:    uniseg.StringWidth(string(line)),
+				CharWidth:    textWidth(string(line)),
 			}
 		}
 
@@ -874,14 +790,15 @@ func (m Model) LineInfo() LineInfo {
 // repositionView repositions the view of the viewport based on the defined
 // scrolling behavior.
 func (m *Model) repositionView() {
-	minimum := m.viewport.YOffset
-	maximum := minimum + m.viewport.Height - 1
-
-	if row := m.cursorLineNumber(); row < minimum {
-		m.viewport.ScrollUp(minimum - row)
-	} else if row > maximum {
-		m.viewport.ScrollDown(row - maximum)
+	total := len(m.VisualRows())
+	offset := clamp(m.viewport.YOffset, 0, max(0, total-m.height))
+	row := m.cursorLineNumber()
+	if row < offset {
+		offset = row
+	} else if row >= offset+m.height {
+		offset = row - m.height + 1
 	}
+	m.viewport.YOffset = clamp(offset, 0, max(0, total-m.height))
 }
 
 // Width returns the width of the textarea.
@@ -909,10 +826,12 @@ func (m *Model) moveToEnd() {
 // It is important that the width of the textarea be exactly the given width
 // and no more.
 func (m *Model) SetWidth(w int) {
+	row := m.cursorLineNumber()
+	wasVisible := row >= m.viewport.YOffset && row < m.viewport.YOffset+m.height
 	// Update prompt width only if there is no prompt function as SetPromptFunc
 	// updates the prompt width when it is called.
 	if m.promptFunc == nil {
-		m.promptWidth = uniseg.StringWidth(m.Prompt)
+		m.promptWidth = textWidth(m.Prompt)
 	}
 
 	// Add base style borders and padding to reserved outer width.
@@ -943,6 +862,11 @@ func (m *Model) SetWidth(w int) {
 
 	m.viewport.Width = inputWidth - reservedOuter
 	m.width = inputWidth - reservedOuter - reservedInner
+	if wasVisible {
+		m.repositionView()
+	} else {
+		m.ScrollBy(0) // Clamp reflow without undoing deliberate wheel scrolling.
+	}
 }
 
 // SetPromptFunc supersedes the Prompt field and sets a dynamic prompt
@@ -964,6 +888,8 @@ func (m Model) Height() int {
 
 // SetHeight sets the height of the textarea.
 func (m *Model) SetHeight(h int) {
+	row := m.cursorLineNumber()
+	wasVisible := row >= m.viewport.YOffset && row < m.viewport.YOffset+m.height
 	if m.MaxHeight > 0 {
 		m.height = clamp(h, minHeight, m.MaxHeight)
 		m.viewport.Height = clamp(h, minHeight, m.MaxHeight)
@@ -971,13 +897,37 @@ func (m *Model) SetHeight(h int) {
 		m.height = max(h, minHeight)
 		m.viewport.Height = max(h, minHeight)
 	}
+	if wasVisible {
+		m.repositionView()
+	} else {
+		m.ScrollBy(0)
+	}
 }
 
 // Update is the Bubble Tea update loop.
-func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
+func (m Model) Update(msg tea.Msg) (updated Model, command tea.Cmd) {
+	if result, ok := msg.(clipboardHistoryMsg); ok {
+		if result.generation != m.historyGeneration {
+			return m, nil
+		}
+		msg = result.message
+	}
 	if !m.focus {
 		m.Cursor.Blur()
 		return m, nil
+	}
+	switch k := msg.(type) {
+	case tea.KeyMsg:
+		if !k.Paste && !k.Alt && (k.Type == tea.KeyCtrlZ || k.Type == tea.KeyCtrlY) {
+			if k.Type == tea.KeyCtrlZ {
+				m.Undo()
+			} else {
+				m.Redo()
+			}
+			return m, nil
+		}
+		m.startEdit(m.groupingKind(k))
+		defer func() { updated.finishEdit() }()
 	}
 
 	// Used to determine if the cursor should blink.
@@ -995,6 +945,11 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		var handled bool
+		msg, handled = m.selectionKey(msg)
+		if handled {
+			break
+		}
 		switch {
 		case key.Matches(msg, m.KeyMap.DeleteAfterCursor):
 			m.col = clamp(m.col, 0, len(m.value[m.row]))
@@ -1018,13 +973,16 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			}
 			if len(m.value[m.row]) > 0 {
 				start, _ := graphemeRangeAt(m.value[m.row], m.col-1)
+				m.recordEdit(m.col - start)
 				m.value[m.row] = append(m.value[m.row][:start], m.value[m.row][m.col:]...)
 				m.SetCursor(start)
 			}
 		case key.Matches(msg, m.KeyMap.DeleteCharacterForward):
 			if len(m.value[m.row]) > 0 && m.col < len(m.value[m.row]) {
 				_, end := graphemeRangeAt(m.value[m.row], m.col)
+				m.recordEdit(end - m.col)
 				m.value[m.row] = append(m.value[m.row][:m.col], m.value[m.row][end:]...)
+				break
 			}
 			if m.col >= len(m.value[m.row]) {
 				m.mergeLineBelow(m.row)
@@ -1044,11 +1002,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			}
 			m.deleteWordRight()
 		case key.Matches(msg, m.KeyMap.InsertNewline):
-			if m.MaxHeight > 0 && len(m.value) >= m.MaxHeight {
-				return m, nil
-			}
-			m.col = clamp(m.col, 0, len(m.value[m.row]))
-			m.splitLine(m.row, m.col)
+			m.InsertString("\n")
 		case key.Matches(msg, m.KeyMap.LineEnd):
 			m.CursorEnd()
 		case key.Matches(msg, m.KeyMap.LineStart):
@@ -1060,7 +1014,8 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		case key.Matches(msg, m.KeyMap.WordForward):
 			m.wordRight()
 		case key.Matches(msg, m.KeyMap.Paste):
-			return m, Paste
+			generation := m.historyGeneration
+			return m, func() tea.Msg { return clipboardHistoryMsg{generation, Paste()} }
 		case key.Matches(msg, m.KeyMap.CharacterBackward):
 			m.characterLeft(false /* insideLine */)
 		case key.Matches(msg, m.KeyMap.LinePrevious):
@@ -1103,7 +1058,10 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	}
 	cmds = append(cmds, cmd)
 
-	m.repositionView()
+	switch msg.(type) {
+	case tea.KeyMsg, pasteMsg:
+		m.repositionView()
+	}
 
 	return m, tea.Batch(cmds...)
 }
@@ -1166,7 +1124,7 @@ func (m Model) View() string {
 				widestLineNumber = lnw
 			}
 
-			strwidth := uniseg.StringWidth(string(wrappedLine))
+			strwidth := textWidth(string(wrappedLine))
 			padding := m.width - strwidth
 			// If the trailing space causes the line to be wider than the
 			// width, we should not draw it to the screen since it will result
@@ -1179,19 +1137,19 @@ func (m Model) View() string {
 				wrappedLine = []rune(strings.TrimSuffix(string(wrappedLine), " "))
 				padding -= m.width - strwidth
 			}
+			cursorAt := -1
 			if m.row == l && lineInfo.RowOffset == wl {
-				s.WriteString(style.Render(string(wrappedLine[:lineInfo.ColumnOffset])))
-				if m.col >= len(line) && lineInfo.CharOffset >= m.width {
-					m.Cursor.SetChar(" ")
-					s.WriteString(m.Cursor.View())
-				} else {
-					m.Cursor.SetChar(string(wrappedLine[lineInfo.ColumnOffset]))
-					s.WriteString(style.Render(m.Cursor.View()))
-					s.WriteString(style.Render(string(wrappedLine[lineInfo.ColumnOffset+1:])))
-				}
-			} else {
-				s.WriteString(style.Render(string(wrappedLine)))
+				cursorAt = lineInfo.ColumnOffset
 			}
+			offset := 0
+			for _, previous := range m.value[:l] {
+				offset += len(previous) + 1
+			}
+			for _, previous := range wrappedLines[:wl] {
+				offset += len(previous)
+			}
+			s.WriteString(m.renderSelected(wrappedLine, offset, style, cursorAt))
+
 			s.WriteString(style.Render(strings.Repeat(" ", max(0, padding))))
 			s.WriteRune('\n')
 			newLines++
@@ -1233,7 +1191,7 @@ func (m Model) getPromptString(displayLine int) (prompt string) {
 		return prompt
 	}
 	prompt = m.promptFunc(displayLine)
-	pl := uniseg.StringWidth(prompt)
+	pl := textWidth(prompt)
 	if pl < m.promptWidth {
 		prompt = fmt.Sprintf("%*s%s", m.promptWidth-pl, "", prompt)
 	}
@@ -1301,7 +1259,7 @@ func (m Model) placeholderView() string {
 		case len(plines) > i:
 			// current line placeholder text
 			if len(plines) > i {
-				s.WriteString(lineStyle.Render(style.Render(plines[i] + strings.Repeat(" ", max(0, m.width-uniseg.StringWidth(plines[i]))))))
+				s.WriteString(lineStyle.Render(style.Render(plines[i] + strings.Repeat(" ", max(0, m.width-textWidth(plines[i]))))))
 			}
 		default:
 			// end of line buffer character
@@ -1350,6 +1308,7 @@ func (m *Model) mergeLineBelow(row int) {
 	if row >= len(m.value)-1 {
 		return
 	}
+	m.recordEdit(1)
 
 	// To perform a merge, we will need to combine the two lines and then
 	m.value[row] = append(m.value[row], m.value[row+1]...)
@@ -1370,6 +1329,7 @@ func (m *Model) mergeLineAbove(row int) {
 	if row <= 0 {
 		return
 	}
+	m.recordEdit(1)
 
 	m.col = len(m.value[row-1])
 	m.row = m.row - 1
@@ -1386,23 +1346,6 @@ func (m *Model) mergeLineAbove(row int) {
 	if len(m.value) > 0 {
 		m.value = m.value[:len(m.value)-1]
 	}
-}
-
-func (m *Model) splitLine(row, col int) {
-	// To perform a split, take the current line and keep the content before
-	// the cursor, take the content after the cursor and make it the content of
-	// the line underneath, and shift the remaining lines down by one
-	head, tailSrc := m.value[row][:col], m.value[row][col:]
-	tail := make([]rune, len(tailSrc))
-	copy(tail, tailSrc)
-
-	m.value = append(m.value[:row+1], m.value[row:]...)
-
-	m.value[row] = head
-	m.value[row+1] = tail
-
-	m.col = 0
-	m.row++
 }
 
 // Paste is a command for pasting from the clipboard into the text input.
@@ -1433,17 +1376,19 @@ func wrap(runes []rune, width int) [][]rune {
 		grapheme := graphemes.Str()
 		cluster := []rune(grapheme)
 		if len(cluster) == 1 && unicode.IsSpace(cluster[0]) {
+			word = append(word, cluster...)
 			spaces++
 		} else {
 			word = append(word, cluster...)
 		}
 
 		if spaces > 0 { //nolint:nestif
-			lineWidth := uniseg.StringWidth(string(lines[row]))
-			wordWidth := uniseg.StringWidth(string(word))
-			if lineWidth+wordWidth+spaces <= width {
+			word = word[:len(word)-1]
+			lineWidth := textWidth(string(lines[row]))
+			wordWidth := textWidth(string(word))
+			if lineWidth+wordWidth+textWidth(grapheme) <= width {
 				lines[row] = append(lines[row], word...)
-				lines[row] = append(lines[row], repeatSpaces(spaces)...)
+				lines[row] = append(lines[row], cluster...)
 			} else {
 				// Commit a fitting pending word before wrapping its following
 				// whitespace. Advancing first used to leave an empty leading row
@@ -1454,11 +1399,11 @@ func wrap(runes []rune, width int) [][]rune {
 				}
 				lines[row] = append(lines[row], word...)
 				for range spaces {
-					if uniseg.StringWidth(string(lines[row])) >= width {
+					if textWidth(string(lines[row]))+textWidth(grapheme) > width {
 						row++
 						lines = append(lines, []rune{})
 					}
-					lines[row] = append(lines[row], ' ')
+					lines[row] = append(lines[row], cluster...)
 				}
 			}
 			spaces = 0
@@ -1468,7 +1413,7 @@ func wrap(runes []rune, width int) [][]rune {
 			// width. Flush the prefix and retain the complete newest cluster for
 			// the next row; including its width twice here was the source of
 			// exact-fit and adjacent-cluster corruption.
-			if uniseg.StringWidth(string(word)) > width {
+			if textWidth(string(word)) > width {
 				prefix := word[:len(word)-len(cluster)]
 				if len(prefix) == 0 {
 					// A single cluster can itself be wider than an exceptionally
@@ -1490,7 +1435,7 @@ func wrap(runes []rune, width int) [][]rune {
 		}
 	}
 
-	if uniseg.StringWidth(string(lines[row]))+uniseg.StringWidth(string(word))+spaces > width && len(lines[row]) > 0 {
+	if textWidth(string(lines[row]))+textWidth(string(word))+spaces > width && len(lines[row]) > 0 {
 		row++
 		lines = append(lines, []rune{})
 	}
@@ -1498,7 +1443,7 @@ func wrap(runes []rune, width int) [][]rune {
 	lines[row] = append(lines[row], repeatSpaces(spaces)...)
 	// Keep one synthetic cursor cell. An exactly full final row places that
 	// cell on a new visual row; otherwise it remains at the end of this row.
-	if uniseg.StringWidth(string(lines[row])) >= width {
+	if textWidth(string(lines[row])) >= width {
 		lines = append(lines, []rune{' '})
 	} else {
 		lines[row] = append(lines[row], ' ')

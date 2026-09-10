@@ -19,6 +19,7 @@ import (
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
+	"github.com/agent0ai/spynel/internal/localapi"
 )
 
 const (
@@ -31,6 +32,8 @@ const (
 )
 
 type messageRunOptions struct {
+	RequestID    string
+	Socket       string
 	JSON         bool
 	Stream       bool
 	FollowupOnly bool
@@ -55,6 +58,8 @@ func runSendCommand(name string, args []string, version string, followupOnly boo
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	configPath := flags.String("config", "", "path to .spynel/config.yaml")
 	conversation := flags.String("conversation", "local", "durable CLI conversation name")
+	requestID := flags.String("request-id", "", "client-owned message identity; reuse only for a retry of the same input")
+	socket := flags.String("socket", "", "explicit private Unix socket (no local workspace discovery)")
 	stream := flags.Bool("stream", false, "print response deltas as they arrive")
 	jsonOutput := flags.Bool("json", false, "emit response events as NDJSON")
 	stdin := flags.Bool("stdin", false, "read the message body from standard input")
@@ -78,9 +83,48 @@ func runSendCommand(name string, args []string, version string, followupOnly boo
 		return fmt.Errorf("usage: spynel %s [--config PATH] [--conversation NAME] [--stream|--json] [--stdin] <text>: %w", name, err)
 	}
 	return runMessageMode(*configPath, *conversation, text, version, messageRunOptions{
+		RequestID: *requestID, Socket: *socket,
 		JSON: *jsonOutput, Stream: *stream, FollowupOnly: followupOnly,
 		Attachments: append([]string(nil), attachments...), Output: os.Stdout,
 	})
+}
+
+func runEventsCommand(args []string) error {
+	flags := flag.NewFlagSet("events", flag.ContinueOnError)
+	configPath := flags.String("config", "", "path to .spynel/config.yaml")
+	socket := flags.String("socket", "", "explicit private Unix socket")
+	conversation := flags.String("conversation", "local", "durable CLI conversation name")
+	after := flags.String("after", "", "reconnect after this processed event/checkpoint cursor")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *socket != "" && *configPath != "" {
+		return errors.New("usage: spynel events [--config PATH|--socket PATH] [--conversation NAME] [--after CURSOR]")
+	}
+	if err := app.ValidateConversationName(*conversation); err != nil {
+		return err
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	var client *localapi.Client
+	var err error
+	if *socket != "" {
+		client, err = localapi.NewSocketClient(*socket)
+	} else {
+		var cfg config.Config
+		cfg, err = config.Load(*configPath)
+		if err == nil {
+			var active bool
+			client, active, err = activeWorkspaceClient(ctx, cfg)
+			if err == nil && !active {
+				err = errors.New("events requires a running primary; start spynel serve first")
+			}
+		}
+	}
+	if err != nil {
+		return err
+	}
+	return client.Events(ctx, *conversation, *after, func(event localapi.EventEnvelope) error { return json.NewEncoder(os.Stdout).Encode(event) })
 }
 
 func runNotifyCommand(args []string, version string) error {

@@ -8,6 +8,7 @@
 
 - Route shared behavior through the same application service and local API as interactive channels; deterministic commands must not start a harness merely because no owner exists.
 - Before an ownerless plain-CLI `/cleanup`, hold the shared election mutation boundary through the destructive operation and recheck that the primary lease is absent and the durable clean-release grace period has expired. If ownership appeared or failover is still fenced, join the healthy owner or fail closed during the transition; never run cleanup from a separate process-local service beside an owner or an already-open successor awaiting promotion.
+- While running a workspace server/election, absorb SIGTSTP from startup through shutdown so terminal job control cannot suspend a shared primary. Unregister the signal channel afterward. Ctrl+Z has no shell-suspend action; explicit SIGSTOP cannot be prevented and still requires operator recovery. Never steal a fresh lease because readiness fails.
 - Preserve bounded stdin, attachments, final/stream/NDJSON output contracts, strict active-turn follow-up checks, and platform-specific restart behavior.
 - Keep `model`, `effort`, and `speed` aliases on the shared command path so noninteractive clients inspect, set, reset, and validate the same model properties as the TUI.
 - Generate one private stable source-message identity before each CLI submission and retain it across loopback dispatch so retries cannot duplicate work.
@@ -17,6 +18,9 @@
 - Keep asynchronous local recovery results durable in the named CLI/TUI conversation and surface explicitly marked recovery terminals to an already-open TUI through its exact startup-snapshot history boundary, preserving durable order and error role without treating them as acknowledged task notifications.
 - Admit each TUI's selected conversation into the owner's renewable live-conversation lease boundary before reading its startup history, seed startup from the caller-scoped state returned by that registration rather than an earlier readiness snapshot, retain that lease for its complete interactive lifetime, and renew the displayed identity after switches.
 - When an interactive TUI start observed an existing fresh primary, print one pre-alternate-screen connecting line followed by success or a sanitized actionable failure. Keep first-owner, headless, remote-channel, redirected, and automation startup output unchanged.
+
+- Expose `events --conversation NAME [--after CURSOR]` as a long-lived single-attempt NDJSON subscription to an existing primary. `send`/`followup --request-id` retain client correlation; `send`, `followup` and `events --socket` explicitly select one private socket without local configuration/election discovery. JSON dispatched errors stay on protocol stdout with generic stderr failure, and continuing finals/errors do not end a request.
+- `serve --socket PATH` adds the optional Unix listener only when this process acquires a new primary. Keep the loopback listener, all TUI attachment semantics and election fences. Headless primary terms opt into the Runtime operational stderr projection; TUI-hosting terms do not.
 
 ## Child DOX Index
 

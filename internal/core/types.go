@@ -50,8 +50,9 @@ func NewSourceMessageID() (string, error) {
 
 // Event is a streamed harness or application response.
 type Event struct {
-	Kind string `json:"kind"`
-	Text string `json:"text,omitempty"`
+	Kind      string `json:"kind"`
+	RequestID string `json:"request_id,omitempty"`
+	Text      string `json:"text,omitempty"`
 	// Active is meaningful only for EventActivity. The application emits true
 	// exactly when a main communication-agent turn takes ownership of this
 	// response stream and false before its terminal event is delivered.
@@ -165,9 +166,11 @@ type SlashCommand struct {
 
 // RuntimeStatus is the live application activity summary shown by channels.
 type RuntimeStatus struct {
-	Logs               int `json:"logs"`
-	Jobs               int `json:"jobs"`
-	LiveBackgroundJobs int `json:"live_background_jobs"`
+	Logs int `json:"logs"`
+	Jobs int `json:"jobs"`
+	// LiveJobs counts executing jobs across all channels and conversations,
+	// excluding registered records that are stalled or settling.
+	LiveJobs int `json:"live_jobs"`
 }
 
 // DurableWorkCounts is the current nonterminal task and goal census used by

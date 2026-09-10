@@ -2,7 +2,7 @@
 
 ## Purpose
 
-- Own repository-retained license notices for externally sourced native components.
+- Own repository-retained license notices and narrowly patched external dependencies.
 
 ## Local Contracts
 
@@ -15,5 +15,6 @@ Direct child DOX files:
 
 | Child | Scope |
 | --- | --- |
+| [bubbletea/AGENTS.md](bubbletea/AGENTS.md) | Pinned Bubble Tea terminal restoration fix and license. |
 | [onnxruntime/AGENTS.md](onnxruntime/AGENTS.md) | ONNX Runtime license notice. |
 | [pion-opus/AGENTS.md](pion-opus/AGENTS.md) | Pion Opus license notice. |

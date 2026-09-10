@@ -128,11 +128,12 @@ type Runtime struct {
 	partials  map[string][]byte
 	closeOnce sync.Once
 
-	persist      *runtimeLogPersistence
-	persistDone  chan struct{}
-	logEventHook func() // test-only scheduling hook at the memory/disk boundary
-	archive      *JobArchive
-	Now          func() time.Time
+	persist           *runtimeLogPersistence
+	persistDone       chan struct{}
+	logEventHook      func() // test-only scheduling hook at the memory/disk boundary
+	archive           *JobArchive
+	Now               func() time.Time
+	operationalOutput io.Writer
 }
 
 type jobCancellationReservation struct {
@@ -241,12 +242,30 @@ func (r *Runtime) appendPersistenceFailureLocked(event string, err error) {
 }
 
 func (r *Runtime) appendLocked(entry LogEntry) {
+	if r.operationalOutput != nil {
+		// Content-free projection: provider diagnostics and origins can contain
+		// private prose even after credential-pattern redaction. Full redacted
+		// entries remain available through the existing private log boundary.
+		event := entry.Event
+		if entry.Component == "tui" {
+			event = "diagnostic"
+		}
+		_, _ = fmt.Fprintf(r.operationalOutput, "%s %s %s %s\n", entry.At.UTC().Format(time.RFC3339), entry.Level, entry.Component, event)
+	}
 	if len(r.logs) < maxLogEntries {
 		r.logs = append(r.logs, entry)
 	} else {
 		r.logs[r.logStart] = entry
 		r.logStart = (r.logStart + 1) % maxLogEntries
 	}
+}
+
+// SetOperationalOutput enables ongoing lifecycle metadata for headless hosts.
+// Interactive hosts leave it nil, including an owner hosting its own TUI.
+func (r *Runtime) SetOperationalOutput(output io.Writer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.operationalOutput = output
 }
 
 // Writer returns a line-oriented writer with stable attribution. It is used
@@ -955,13 +974,13 @@ func (r *Runtime) publishLocked() {
 }
 
 func (r *Runtime) statusLocked() core.RuntimeStatus {
-	background := 0
+	live := 0
 	for _, job := range r.jobs {
-		if job.Channel == "orchestrator" && executionStateIsLive(job.Execution) {
-			background++
+		if executionStateIsLive(job.Execution) {
+			live++
 		}
 	}
-	return core.RuntimeStatus{Logs: len(r.logs), Jobs: len(r.jobs), LiveBackgroundJobs: background}
+	return core.RuntimeStatus{Logs: len(r.logs), Jobs: len(r.jobs), LiveJobs: live}
 }
 
 // executionStateIsLive deliberately follows the structured process-local job

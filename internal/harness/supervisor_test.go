@@ -220,6 +220,106 @@ func TestSupervisorSerializesSuccessorSendAfterInterruptCleanup(t *testing.T) {
 		t.Fatalf("successor turn was hidden: supervisor=%t target=%t", supervisor.IsActive("job"), target.IsActive("job"))
 	}
 }
+
+func TestSupervisorInterruptSettlesQueuedRequests(t *testing.T) {
+	for _, interruptErr := range []error{nil, errors.New("interrupt transport failed")} {
+		t.Run(fmt.Sprint(interruptErr), func(t *testing.T) {
+			target := &supervisorHarness{name: "acp", active: map[string]bool{}, emits: map[string]core.Emit{}, interruptErr: interruptErr}
+			registry := NewRegistry()
+			registry.Register("acp", func(HarnessConfig) (Harness, error) { return target, nil })
+			supervisor := NewSupervisor(registry, HarnessConfig{Name: "acp"})
+			if err := supervisor.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			ownerEvents := make(chan core.Event, 8)
+			if _, _, err := supervisor.Send(context.Background(), "chat", "held", func(event core.Event) { ownerEvents <- event }); err != nil {
+				t.Fatal(err)
+			}
+			queuedEvents := make(chan core.Event, 8)
+			for range 2 {
+				if _, queued, err := supervisor.Send(context.Background(), "chat", "pending", func(event core.Event) { queuedEvents <- event }); err != nil || !queued {
+					t.Fatalf("queue = %t, %v", queued, err)
+				}
+			}
+			if _, err := supervisor.SendControl(context.Background(), "chat", ControlRequest{ID: "control", Prompt: "guidance"}); err != nil {
+				t.Fatal(err)
+			}
+			stopped, err := supervisor.Interrupt(context.Background(), "chat")
+			if !errors.Is(err, interruptErr) || stopped != (interruptErr == nil) {
+				t.Fatalf("interrupt = %t, %v", stopped, err)
+			}
+			terminals := 0
+			for len(queuedEvents) > 0 {
+				event := <-queuedEvents
+				if event.Done && !event.Continues && event.Kind == core.EventError && strings.Contains(event.Text, "cancelled") {
+					terminals++
+				}
+			}
+			if terminals != 2 || len(ownerEvents) != 0 || len(target.prompts["chat"]) != 1 {
+				t.Fatalf("queued terminals=%d owner events=%d provider dispatches=%d", terminals, len(ownerEvents), len(target.prompts["chat"]))
+			}
+			if supervisor.IsActive("chat") != (interruptErr != nil) {
+				t.Fatal("queued cancellation changed active provider ownership")
+			}
+		})
+	}
+}
+
+func TestSupervisorInterruptSettlesDequeuedBatchBeforeSuccessor(t *testing.T) {
+	target := &supervisorHarness{name: "acp", active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("acp", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "acp"})
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	if _, _, err := supervisor.Send(context.Background(), "chat", "held", func(event core.Event) {
+		if event.Continues {
+			close(entered)
+			<-release
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	terminals := make(chan core.Event, 2)
+	for range 2 {
+		if _, _, err := supervisor.Send(context.Background(), "chat", "pending", func(event core.Event) {
+			if event.Done {
+				terminals <- event
+			}
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	go func() { target.finish("chat"); close(finished) }()
+	<-entered // The batch has left pending, but has not yet been scheduled.
+	stopped, err := supervisor.Interrupt(context.Background(), "chat")
+	if err != nil || !stopped {
+		t.Fatalf("interrupt = %t, %v", stopped, err)
+	}
+	if _, _, err := supervisor.Send(context.Background(), "chat", "successor", nil); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	<-finished
+	for range 2 {
+		select {
+		case event := <-terminals:
+			if event.Kind != core.EventError || event.Continues || !strings.Contains(event.Text, "cancelled") {
+				t.Fatalf("queued settlement = %#v", event)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("dequeued request was not settled")
+		}
+	}
+	target.mu.Lock()
+	prompts := append([]string(nil), target.prompts["chat"]...)
+	target.mu.Unlock()
+	if strings.Join(prompts, ",") != "held,successor" || !supervisor.IsActive("chat") {
+		t.Fatalf("cancelled batch interfered with successor: %#v", prompts)
+	}
+}
 func (r *supervisorHarness) ResetSession(key string) error {
 	r.mu.Lock()
 	r.resetKeys = append(r.resetKeys, key)
@@ -490,10 +590,14 @@ func TestSupervisorQueuesFollowUpWhenHarnessCannotSteer(t *testing.T) {
 		t.Fatal("queued follow-up did not become the active turn")
 	}
 	eventsMu.Lock()
-	firstContinues := len(firstEvents) > 0 && firstEvents[len(firstEvents)-1].Continues
+	firstContinues, firstReleased := false, false
+	for _, event := range firstEvents {
+		firstContinues = firstContinues || event.Kind == core.EventFinal && event.Continues
+		firstReleased = firstReleased || event.Kind == core.EventStatus && event.Done
+	}
 	firstSnapshot := append([]core.Event(nil), firstEvents...)
 	eventsMu.Unlock()
-	if !firstContinues {
+	if !firstContinues || !firstReleased {
 		t.Fatalf("first final did not preserve logical activity: %#v", firstSnapshot)
 	}
 	target.mu.Lock()

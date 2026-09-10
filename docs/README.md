@@ -7,6 +7,7 @@ Use this page to choose the shortest path to the information you need. The repos
 - [Getting started and development](getting-started.md) — install, initialize a workspace, run from source, and verify a development checkout.
 - [Configuration](configuration.md) — workspace, harness, interface, channel, speech, startup, orchestration, and extension settings.
 - [Communication integrations](integrations.md) — TUI, Telegram, WhatsApp, voice, histories, and transport behavior.
+- [TUI editing and terminal checks](tui-editing.md) — selection modes, clipboard fallback, word editing, and a local acceptance checklist.
 - [Troubleshooting](troubleshooting.md) — common installation, harness, channel, startup, update, and speech problems.
 
 ## Coordinate and automate

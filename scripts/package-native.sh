@@ -86,6 +86,9 @@ mkdir -p "$stage_dir/licenses/onnxruntime"
 cp "$project_dir/third_party/onnxruntime/LICENSE" "$stage_dir/licenses/onnxruntime/LICENSE"
 mkdir -p "$stage_dir/licenses/pion-opus"
 cp "$project_dir/third_party/pion-opus/LICENSE" "$stage_dir/licenses/pion-opus/LICENSE"
+mkdir -p "$stage_dir/licenses/bubbletea" "$stage_dir/licenses/bubbles-textarea"
+cp "$project_dir/third_party/bubbletea/LICENSE" "$stage_dir/licenses/bubbletea/LICENSE"
+cp "$project_dir/internal/channel/tui/textarea/LICENSE" "$stage_dir/licenses/bubbles-textarea/LICENSE"
 
 "$stage_dir/$binary" --version >/dev/null
 

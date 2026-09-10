@@ -41,10 +41,17 @@ func Terminal(input string, width int) string {
 // TerminalWithTheme renders Markdown with colors drawn exclusively from the
 // active semantic theme.
 func TerminalWithTheme(input string, width int, active theme.Theme) string {
-	width = max(1, width)
+	return terminalWithTheme(input, max(1, width), active)
+}
+
+func terminalWithTheme(input string, width int, active theme.Theme) string {
 	compoundMarker, inlineMarker := terminalRenderMarkers(input)
 	breakMarker := terminalBreakMarker(input)
-	renderInput := protectTerminalCompounds(input, width, compoundMarker, breakMarker)
+	renderInput := input
+	if width > 0 {
+		renderInput = protectTerminalCompounds(input, width, compoundMarker, breakMarker)
+	}
+	renderInput = protectTerminalCodeEscapes(renderInput)
 	style := terminalStyle(active, inlineMarker)
 	zero := uint(0)
 	style.Document.Margin = &zero
@@ -64,6 +71,9 @@ func TerminalWithTheme(input string, width int, active theme.Theme) string {
 	indentToken := "│ "
 	style.CodeBlock.Margin = &zero
 	style.CodeBlock.Indent = &indent
+	if width == 0 {
+		style.CodeBlock.Indent = &zero
+	}
 	style.CodeBlock.IndentToken = &indentToken
 	style.CodeBlock.BlockPrefix = codeBlockStart
 	style.CodeBlock.BlockSuffix = codeBlockEnd
@@ -72,14 +82,18 @@ func TerminalWithTheme(input string, width int, active theme.Theme) string {
 	// so the control sequence itself cannot be split across display rows.
 	style.Link.BlockPrefix = terminalLinkStart
 	style.Link.BlockSuffix = terminalLinkEnd
+	wrapWidth := width + 1
+	if width == 0 {
+		wrapWidth = 0
+	}
 	renderer, err := glamour.NewTermRenderer(
 		glamour.WithStyles(style),
 		glamour.WithColorProfile(termenv.TrueColor),
 		// Glamour's reflow writer wraps when a word reaches the boundary rather
 		// than only when it exceeds it. Give it the exclusive upper bound so the
 		// public width remains the maximum visible row width.
-		glamour.WithWordWrap(width+1),
-		glamour.WithTableWrap(true),
+		glamour.WithWordWrap(wrapWidth),
+		glamour.WithTableWrap(width > 0),
 		glamour.WithPreservedNewLines(),
 	)
 	if err != nil {
@@ -89,10 +103,60 @@ func TerminalWithTheme(input string, width int, active theme.Theme) string {
 	if err != nil {
 		return input
 	}
-	result = strings.NewReplacer(inlineMarker, " ", compoundMarker, "-", breakMarker, "\n").Replace(result)
+	inlinePadding := " "
+	if width == 0 {
+		inlinePadding = "\x00"
+	}
+	result = strings.NewReplacer(inlineMarker, inlinePadding, compoundMarker, "-", breakMarker, "\n").Replace(result)
 	result = applyTerminalLinks(result, terminalLinkTargets(input))
-	result = trimTerminalLinePadding(strings.TrimSpace(compactCodeBlockSpacing(result)))
-	return trimTerminalOuterBlankRows(result)
+	// Trim renderer margins while code markers still distinguish source blank
+	// lines at the document boundary from artificial outer rows.
+	result = trimTerminalOuterBlankRows(result)
+	result = compactCodeBlockSpacing(result)
+	if width > 0 {
+		result = trimTerminalLinePadding(strings.TrimSpace(result))
+		return trimTerminalOuterBlankRows(result)
+	}
+	return result
+}
+
+// Glamour's BaseElement applies Markdown unescaping even to fenced code.
+// Protect their literal backslashes at the rendering owner, not in a copier.
+func protectTerminalCodeEscapes(input string) string {
+	source := []byte(input)
+	document := goldmark.New(goldmark.WithExtensions(extension.GFM)).Parser().Parse(text.NewReader(source))
+	positions := make(map[int]bool)
+	mark := func(start, stop int) {
+		for i := start; i < stop; i++ {
+			if source[i] == '\\' {
+				positions[i] = true
+			}
+		}
+	}
+	_ = ast.Walk(document, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		switch node.Kind() {
+		case ast.KindCodeBlock, ast.KindFencedCodeBlock:
+			for i := 0; i < node.Lines().Len(); i++ {
+				line := node.Lines().At(i)
+				mark(line.Start, line.Stop)
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+	if len(positions) == 0 {
+		return input
+	}
+	var out strings.Builder
+	for i, b := range source {
+		if positions[i] {
+			out.WriteByte('\\')
+		}
+		out.WriteByte(b)
+	}
+	return out.String()
 }
 
 // protectTerminalCompounds removes ASCII hyphens from Glamour's discretionary
@@ -408,10 +472,10 @@ func sgrBackground(parser *charmansi.Parser, active bool) bool {
 
 func trimTerminalOuterBlankRows(value string) string {
 	lines := strings.Split(value, "\n")
-	for len(lines) > 0 && visuallyBlank(lines[0]) {
+	for len(lines) > 0 && !strings.Contains(lines[0], codeBlockStart) && visuallyBlank(lines[0]) {
 		lines = lines[1:]
 	}
-	for len(lines) > 0 && visuallyBlank(lines[len(lines)-1]) {
+	for len(lines) > 0 && !strings.Contains(lines[len(lines)-1], codeBlockEnd) && visuallyBlank(lines[len(lines)-1]) {
 		lines = lines[:len(lines)-1]
 	}
 	return strings.Join(lines, "\n")
@@ -496,12 +560,12 @@ func compactCodeBlockSpacing(value string) string {
 		hasStart := strings.Contains(line, codeBlockStart)
 		hasEnd := strings.Contains(line, codeBlockEnd)
 		line = strings.ReplaceAll(strings.ReplaceAll(line, codeBlockStart, ""), codeBlockEnd, "")
-		if hasStart {
+		if hasStart && !skipBlank {
 			for len(result) > 0 && visuallyBlank(result[len(result)-1]) {
 				result = result[:len(result)-1]
 			}
 		}
-		if skipBlank && visuallyBlank(line) {
+		if skipBlank && !hasStart && visuallyBlank(line) {
 			continue
 		}
 		skipBlank = false

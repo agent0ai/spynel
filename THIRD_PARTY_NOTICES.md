@@ -11,7 +11,7 @@ Notable runtime components include:
 - [NVIDIA Parakeet Unified EN 0.6B](https://huggingface.co/nvidia/parakeet-unified-en-0.6b), governed by the NVIDIA Open Model License Agreement. Spynel downloads the k2-fsa INT8 ONNX conversion on demand rather than redistributing the weights.
 - [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), © NVIDIA Corporation and licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Spynel downloads k2-fsa's converted and INT8-quantized ONNX form on demand; those format and quantization changes are not made by Spynel.
 - [whatsmeow](https://github.com/tulir/whatsmeow), Mozilla Public License 2.0. Spynel uses the unmodified upstream module to implement WhatsApp multi-device support. The corresponding source is available from that repository and the exact pseudo-version is recorded in `go.mod`.
-- Bubble Tea, Bubbles, and Lip Gloss, MIT License.
+- Bubble Tea, Bubbles, and Lip Gloss, MIT License. Bubble Tea v1.3.10 is retained under `third_party/bubbletea` with its full LICENSE and narrowly documented terminal restoration and key-decoding changes. Release archives include the licenses for that package and the local Bubbles textarea derivative.
 - ncruces/go-sqlite3, MIT License.
 - qrterminal, MIT License.
 - google.golang.org/protobuf, BSD 3-Clause License.

@@ -31,6 +31,8 @@ type Client struct {
 	// ReadyTimeout bounds only startup/readiness polling. Long message streams
 	// continue to use their caller context without a package deadline.
 	ReadyTimeout time.Duration
+	socketPath   string
+	workspaceID  string
 }
 
 func NewClient(election *instance.Election) *Client {
@@ -47,6 +49,13 @@ func NewClient(election *instance.Election) *Client {
 		HTTP:         &http.Client{Transport: transport},
 		ReadyTimeout: ReadinessTimeout,
 	}
+}
+
+func (c *Client) instanceID() string {
+	if c.Election == nil {
+		return ""
+	}
+	return c.Election.ID()
 }
 
 func (c *Client) WaitReady(ctx context.Context) (app.SharedState, error) {
@@ -73,18 +82,24 @@ func (c *Client) WaitReady(ctx context.Context) (app.SharedState, error) {
 			if ctx.Err() != nil {
 				return app.SharedState{}, ctx.Err()
 			}
-			lease, leaseErr := c.Election.Current()
+			lease := instance.Lease{}
+			leaseErr := os.ErrNotExist
+			if c.Election != nil {
+				lease, leaseErr = c.Election.Current()
+			}
 			if leaseErr == nil && lease.EnvironmentID == "" {
 				return app.SharedState{}, fmt.Errorf("%w: workspace primary did not become reachable within %s; its lease lacks a current environment identifier, so stop or upgrade the existing primary before retrying (the fresh owner was not replaced)", ErrReadinessTimeout, timeout)
 			}
-			return app.SharedState{}, fmt.Errorf("%w: workspace primary did not become reachable over its loopback API within %s (last condition: %s); retry after checking that the existing primary is healthy or exit it cleanly", ErrReadinessTimeout, timeout, sanitizedReadinessCondition(lastErr))
+			return app.SharedState{}, fmt.Errorf("%w: workspace primary did not become reachable over its loopback API within %s (last condition: %s); check the existing primary. If its shell reports Stopped, resume it with fg in that shell, then use /quit to exit cleanly if needed; do not delete its lease", ErrReadinessTimeout, timeout, sanitizedReadinessCondition(lastErr))
 		case <-ticker.C:
 		}
 	}
 }
 
 func (c *Client) Handle(ctx context.Context, message core.Message, emit core.Emit) error {
-	message.InstanceID = c.Election.ID()
+	if c.Election != nil {
+		message.InstanceID = c.instanceID()
+	}
 	body, err := json.Marshal(message)
 	if err != nil {
 		return err
@@ -98,9 +113,13 @@ func (c *Client) Handle(ctx context.Context, message core.Message, emit core.Emi
 		return err
 	}
 	decoder := json.NewDecoder(response.Body)
+	terminal := false
 	for {
 		var envelope streamEnvelope
 		if err := decoder.Decode(&envelope); errors.Is(err, io.EOF) {
+			if !terminal {
+				return io.ErrUnexpectedEOF
+			}
 			return nil
 		} else if err != nil {
 			return fmt.Errorf("read workspace server response: %w", err)
@@ -108,14 +127,18 @@ func (c *Client) Handle(ctx context.Context, message core.Message, emit core.Emi
 		if envelope.Error != "" {
 			return errors.New(envelope.Error)
 		}
-		if envelope.Event != nil && emit != nil {
-			emit(*envelope.Event)
+		terminal = terminal || envelope.Handled
+		if envelope.Event != nil {
+			terminal = terminal || envelope.Event.Done && !envelope.Event.Continues
+			if emit != nil {
+				emit(*envelope.Event)
+			}
 		}
 	}
 }
 
 func (c *Client) State(ctx context.Context) (app.SharedState, error) {
-	response, err := c.request(ctx, http.MethodGet, "/v1/state?instance_id="+url.QueryEscape(c.Election.ID()), nil)
+	response, err := c.request(ctx, http.MethodGet, "/v1/state?instance_id="+url.QueryEscape(c.instanceID()), nil)
 	if err != nil {
 		return app.SharedState{}, err
 	}
@@ -139,7 +162,7 @@ func (c *Client) RegisterLiveTUI(ctx context.Context, conversation string) error
 // first caller-scoped state snapshot from that same request. Startup uses this
 // instead of seeding activity from the earlier unscoped readiness response.
 func (c *Client) RegisterLiveTUIState(ctx context.Context, conversation string) (app.SharedState, error) {
-	body, err := json.Marshal(liveTUIRequest{InstanceID: c.Election.ID(), Conversation: conversation})
+	body, err := json.Marshal(liveTUIRequest{InstanceID: c.instanceID(), Conversation: conversation})
 	if err != nil {
 		return app.SharedState{}, err
 	}
@@ -159,7 +182,7 @@ func (c *Client) RegisterLiveTUIState(ctx context.Context, conversation string) 
 }
 
 func (c *Client) UnregisterLiveTUI(ctx context.Context) error {
-	body, err := json.Marshal(liveTUIRequest{InstanceID: c.Election.ID()})
+	body, err := json.Marshal(liveTUIRequest{InstanceID: c.instanceID()})
 	if err != nil {
 		return err
 	}
@@ -227,7 +250,7 @@ func (c *Client) AckNotification(ctx context.Context, origin, id string, afterCh
 func (c *Client) Status(ctx context.Context, conversation string) (app.StatusSnapshot, error) {
 	query := url.Values{}
 	query.Set("conversation", conversation)
-	query.Set("instance_id", c.Election.ID())
+	query.Set("instance_id", c.instanceID())
 	response, err := c.request(ctx, http.MethodGet, "/v1/status?"+query.Encode(), nil)
 	if err != nil {
 		return app.StatusSnapshot{}, err
@@ -261,7 +284,7 @@ func (c *Client) InitialScreen(ctx context.Context, hasHistory, forceWelcome boo
 }
 
 func (c *Client) ScreenAction(ctx context.Context, screenID, action string, values map[string]string) (*core.Screen, error) {
-	body, err := json.Marshal(screenActionRequest{InstanceID: c.Election.ID(), ScreenID: screenID, Action: action, Values: values})
+	body, err := json.Marshal(screenActionRequest{InstanceID: c.instanceID(), ScreenID: screenID, Action: action, Values: values})
 	if err != nil {
 		return nil, err
 	}
@@ -319,6 +342,22 @@ func (c *Client) RunOnce(ctx context.Context) error {
 }
 
 func (c *Client) request(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
+	if c.socketPath != "" {
+		descriptor, err := readSocketDescriptor(c.socketPath)
+		if err != nil {
+			return nil, err
+		}
+		if descriptor.WorkspaceID != c.workspaceID {
+			return nil, errors.New("socket workspace changed; explicitly reconnect to the intended workspace")
+		}
+		request, err := http.NewRequestWithContext(ctx, method, "http://spynel"+path, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Authorization", "Bearer "+descriptor.Token)
+		request.Header.Set("Content-Type", "application/json")
+		return c.HTTP.Do(request)
+	}
 	lease, err := c.Election.Current()
 	if err != nil {
 		return nil, fmt.Errorf("locate workspace server: %w", err)

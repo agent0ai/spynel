@@ -740,6 +740,58 @@ func TestNonterminalDoneEventDoesNotEndActiveJob(t *testing.T) {
 	}
 }
 
+func TestQueuedRequestTerminalPreservesActiveExecution(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := newServiceHarness()
+	service := New(cfg, target)
+	first := core.Message{Channel: "cli", Conversation: "queued", SourceMessageID: "first"}
+	queued := first
+	queued.SourceMessageID = "queued"
+	key := sessionKey(first)
+	target.active[key] = true
+	jobID := service.Runtime.BeginJob(key, first.Channel, first.Conversation, "held")
+	for _, message := range []core.Message{first, queued} {
+		if _, _, err := service.reserveRecoveryExecution(message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service.streamText[key] = "active partial"
+	var events []core.Event
+	emit := service.wrapEmit(queued, jobID, func(event core.Event) { events = append(events, event) })
+	event := core.Event{Kind: core.EventError, Text: "Queued follow-up cancelled before provider dispatch", Done: true}
+	emit(event)
+	emit(event) // A repeated terminal must not duplicate history or delivery.
+	job, exists := service.Runtime.JobForSession(key)
+	if len(events) != 1 || !exists || job.Execution == JobError || service.recoveryExecution[key] == nil || service.streamText[key] != "active partial" {
+		t.Fatalf("request settlement ended shared execution: events=%d job=%#v", len(events), job)
+	}
+	entries, _, err := service.History.Entries(first.Channel, first.Conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminals := 0
+	for _, entry := range entries {
+		if entry.Terminal && entry.SourceMessageID == queued.SourceMessageID && entry.Role == "error" {
+			terminals++
+		}
+	}
+	if terminals != 1 {
+		t.Fatalf("queued terminal history records = %d", terminals)
+	}
+	delete(target.active, key)
+	service.wrapEmit(first, jobID, nil)(core.Event{Kind: core.EventError, Text: "provider interrupted", Done: true})
+	if service.Runtime.Status().Jobs != 0 || service.recoveryExecution[key] != nil || service.streamText[key] != "" {
+		t.Fatal("provider terminal did not settle shared execution")
+	}
+}
+
 func TestChatActivityEmitterStopsBeforeTerminalDeliveryAndOnHandoff(t *testing.T) {
 	var events []core.Event
 	activity := newChatActivityEmitter(func(event core.Event) { events = append(events, event) })
@@ -832,25 +884,105 @@ func TestServiceCloseStopsActiveChatActivity(t *testing.T) {
 	}
 }
 
-func TestContinuingFinalDoesNotEndActiveJob(t *testing.T) {
-	root := t.TempDir()
-	if err := workspace.Init(root, false); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(config.PathForRoot(root))
-	if err != nil {
-		t.Fatal(err)
-	}
-	service := New(cfg, newServiceHarness())
-	jobID := service.Runtime.BeginJob("chat:tui:local", "tui", "local", "first message")
-	emit := service.wrapEmit(core.Message{Channel: "tui", Conversation: "local"}, jobID, nil)
-	emit(core.Event{Kind: core.EventFinal, Text: "first answer", Done: true, Continues: true})
-	if service.Runtime.Status().Jobs != 1 {
-		t.Fatal("continuing final ended the logical conversation job")
-	}
-	emit(core.Event{Kind: core.EventFinal, Text: "follow-up answer", Done: true})
-	if service.Runtime.Status().Jobs != 0 {
-		t.Fatal("last queued final did not end the logical conversation job")
+func TestQueuedContinuationKeepsGlobalJobLive(t *testing.T) {
+	for _, kind := range []string{core.EventFinal, core.EventError} {
+		t.Run(kind, func(t *testing.T) {
+			root := t.TempDir()
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(config.PathForRoot(root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := newHeldServiceHarness()
+			registry := harness.NewRegistry()
+			registry.Register("fixture", func(harness.HarnessConfig) (harness.Harness, error) { return target, nil })
+			supervisor := harness.NewSupervisor(registry, harness.HarnessConfig{Name: "fixture"})
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if err := supervisor.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			service := New(cfg, supervisor)
+			defer service.Close()
+			if err := service.RegisterLiveTUI("idle-instance", "idle-displayed", time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+			check := func(want int) {
+				t.Helper()
+				state := service.SharedStateForInstance("idle-instance")
+				status, err := service.Status(core.Message{Channel: "tui", Conversation: "idle-displayed"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if state.ConversationActivity != 0 || state.DurableWork != (core.DurableWorkCounts{}) || status.TurnActive || status.OrchestratorLease != 0 || status.OrchestratorRuns != 0 {
+					t.Fatal("displayed conversation and durable work must stay idle")
+				}
+				if state.Runtime != status.Runtime || state.Runtime.Jobs != want || state.Runtime.LiveJobs != want {
+					t.Fatalf("global jobs = %#v, status = %#v; want %d", state.Runtime, status.Runtime, want)
+				}
+			}
+			check(0)
+			message := core.Message{Channel: "cli", Conversation: "elsewhere", Text: "first request"}
+			key := sessionKey(message)
+			intermediate := make(chan core.RuntimeStatus, 1)
+			if err := service.Handle(ctx, message, func(event core.Event) {
+				if event.Done && event.Continues && event.Kind == kind {
+					intermediate <- service.Runtime.Status()
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			message.Text = "queued follow-up"
+			started := make(chan struct{})
+			if err := service.Handle(ctx, message, func(event core.Event) {
+				if event.Kind == core.EventStatus && event.Text == "Queued follow-up started" {
+					close(started)
+				}
+			}); err != nil {
+				t.Fatal(err)
+			}
+			check(1)
+			finish := func() core.Emit {
+				target.mu.Lock()
+				emit := target.emits[key]
+				delete(target.emits, key)
+				target.active[key] = false
+				target.mu.Unlock()
+				emit(core.Event{Kind: kind, Text: "provider result", Done: true})
+				return emit
+			}
+			finish() // The real supervisor marks this result continuing and starts its queue.
+			select {
+			case state := <-intermediate:
+				if state.Jobs != 1 || state.LiveJobs != 1 {
+					t.Errorf("continuing result stopped global activity: %#v", state)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("provider result was not marked continuing")
+			}
+			select {
+			case <-started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("queued provider did not start")
+			}
+			target.mu.Lock()
+			emit, calls := target.emits[key], len(target.prompts[key])
+			target.mu.Unlock()
+			if calls != 2 || !target.IsActive(key) || !supervisor.IsActive(key) {
+				t.Fatal("fixture must have an executing queued provider")
+			}
+			check(1)
+			emit(core.Event{Kind: core.EventStatus, Execution: &core.ExecutionStatus{State: "running"}})
+			emit(core.Event{Kind: core.EventDelta, Text: "follow-up output"})
+			check(1)
+			late := finish()
+			check(0)
+			late(core.Event{Kind: core.EventStatus, Execution: &core.ExecutionStatus{State: "running"}})
+			late(core.Event{Kind: kind, Text: "duplicate terminal", Done: true})
+			check(0)
+		})
 	}
 }
 

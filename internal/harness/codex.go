@@ -39,7 +39,10 @@ type Codex struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 
-	writeMu  sync.Mutex
+	writeMu sync.Mutex
+	// ponytail: one app-server stream serializes callbacks; use per-thread
+	// dispatch only if slow callbacks measurably limit throughput.
+	eventMu  sync.Mutex
 	keyMu    sync.Mutex
 	keyLocks map[string]*sync.Mutex
 	mu       sync.Mutex
@@ -50,6 +53,7 @@ type Codex struct {
 	active   map[string]*turnState
 	deferred map[string][]wireMessage
 	closed   bool
+	failure  error
 }
 
 func (*Codex) FollowUpMode() FollowUpMode { return FollowUpSteer }
@@ -65,6 +69,7 @@ type turnState struct {
 	messages         []string
 	currentMessage   strings.Builder
 	separatorPending bool
+	reconnecting     bool
 }
 
 func (s *turnState) emitEvent(event core.Event) {
@@ -367,18 +372,28 @@ func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selec
 	if response.Turn.ID == "" {
 		return threadID, false, errors.New("Codex app-server returned an incompatible turn/start result: required field turn.id is missing")
 	}
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	c.mu.Lock()
+	failure, closed := c.failure, c.closed
+	c.mu.Unlock()
+	if failure != nil {
+		return threadID, false, failure
+	}
+	if closed {
+		return threadID, false, errors.New("codex app-server is not running")
+	}
 	state := &turnState{key: key, threadID: threadID, turnID: response.Turn.ID, emit: emit}
+	// Publish admission before replaying any provider error/recovery events.
+	state.emitEvent(core.Event{Kind: core.EventStatus, Text: "Codex turn started", ThreadID: threadID, TurnID: response.Turn.ID,
+		Execution: &core.ExecutionStatus{State: "running"}})
 	c.mu.Lock()
 	c.active[threadID] = state
 	deferred := c.deferred[response.Turn.ID]
 	delete(c.deferred, response.Turn.ID)
 	c.mu.Unlock()
 	for _, message := range deferred {
-		c.handleNotification(message)
-	}
-	if emit != nil {
-		emit(core.Event{Kind: core.EventStatus, Text: "Codex turn started", ThreadID: threadID, TurnID: response.Turn.ID,
-			Execution: &core.ExecutionStatus{State: "running"}})
+		c.handleNotificationLocked(message)
 	}
 	return threadID, false, nil
 }
@@ -583,6 +598,14 @@ func (c *Codex) lockForKey(key string) *sync.Mutex {
 }
 
 func (c *Codex) handleNotification(message wireMessage) {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	c.handleNotificationLocked(message)
+}
+
+// eventMu spans state changes and callbacks, including admission's replay.
+// Keep mu free during callbacks so inspection and RPC replies can proceed.
+func (c *Codex) handleNotificationLocked(message wireMessage) {
 	var params map[string]any
 	if json.Unmarshal(message.Params, &params) != nil {
 		return
@@ -595,6 +618,10 @@ func (c *Codex) handleNotification(message wireMessage) {
 		}
 	}
 	c.mu.Lock()
+	if c.failure != nil || c.closed {
+		c.mu.Unlock()
+		return
+	}
 	state := c.active[threadID]
 	if state == nil && turnID != "" {
 		for _, candidate := range c.active {
@@ -613,6 +640,21 @@ func (c *Codex) handleNotification(message wireMessage) {
 			c.mu.Unlock()
 		}
 		return
+	}
+	if turnID != state.turnID {
+		return
+	}
+	// Only fresh model output for this turn establishes upstream recovery.
+	// Tool output, item completion, and generic activity may arrive during a retry.
+	if state.reconnecting {
+		switch message.Method {
+		case "item/agentMessage/delta", "item/reasoning/summaryTextDelta", "item/reasoning/textDelta", "item/plan/delta":
+			if delta, _ := params["delta"].(string); delta != "" {
+				state.reconnecting = false
+				state.emitEvent(core.Event{Kind: core.EventStatus, ThreadID: state.threadID, TurnID: state.turnID,
+					Execution: &core.ExecutionStatus{State: "running"}})
+			}
+		}
 	}
 	switch message.Method {
 	case "item/agentMessage/delta":
@@ -641,8 +683,13 @@ func (c *Codex) handleNotification(message wireMessage) {
 	case "error":
 		errorObject, _ := params["error"].(map[string]any)
 		text, _ := errorObject["message"].(string)
-		state.emitEvent(core.Event{Kind: core.EventError, Text: text, ThreadID: state.threadID, TurnID: state.turnID,
-			Execution: &core.ExecutionStatus{State: "error", Detail: text}})
+		state.reconnecting, _ = params["willRetry"].(bool)
+		kind, execution := core.EventError, "error"
+		if state.reconnecting {
+			kind, execution = core.EventStatus, "reconnecting"
+		}
+		state.emitEvent(core.Event{Kind: kind, Text: text, ThreadID: state.threadID, TurnID: state.turnID,
+			Execution: &core.ExecutionStatus{State: execution, Detail: text}})
 	case "turn/completed":
 		state.deliveryMu.Lock()
 		state.completed = true
@@ -695,6 +742,11 @@ func (c *Codex) call(ctx context.Context, method string, params any) (json.RawMe
 
 func (c *Codex) beginCall(method string, params any) (int, chan rpcResponse, error) {
 	c.mu.Lock()
+	if c.failure != nil {
+		failure := c.failure
+		c.mu.Unlock()
+		return 0, nil, failure
+	}
 	if c.closed || c.stdin == nil {
 		c.mu.Unlock()
 		return 0, nil, errors.New("codex app-server is not running")
@@ -799,11 +851,14 @@ func (c *Codex) waitLoop() {
 }
 
 func (c *Codex) failAll(err error) {
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
 	c.mu.Lock()
-	if c.closed {
+	if c.closed || c.failure != nil {
 		c.mu.Unlock()
 		return
 	}
+	c.failure = err
 	pending := c.pending
 	active := c.active
 	c.pending = map[int]chan rpcResponse{}

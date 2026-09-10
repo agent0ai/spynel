@@ -35,6 +35,20 @@ func TestVisualCapture(t *testing.T) {
 		"initialization":        visualInitializationModel(),
 		"workspace-choice":      visualWorkspaceChoiceModel(),
 		"chat":                  visualChatModel(),
+		"selection-content":     visualSelectionModel(false),
+		"selection-labels":      visualSelectionModel(true),
+		"selection-composer":    visualComposerSelectionModel(),
+		"double-click-output":   visualMultiClickModel(outputPane, 2),
+		"triple-click-output":   visualMultiClickModel(outputPane, 3),
+		"double-click-composer": visualMultiClickModel(inputPane, 2),
+		"triple-click-composer": visualMultiClickModel(inputPane, 3),
+		"word-drag-output":      visualUnitDragModel(outputPane, 2),
+		"line-drag-output":      visualUnitDragModel(outputPane, 3),
+		"word-drag-composer":    visualUnitDragModel(inputPane, 2),
+		"line-drag-composer":    visualUnitDragModel(inputPane, 3),
+		"paste-viewport":        visualPasteViewportModel(false),
+		"attachment-viewport":   visualPasteViewportModel(true),
+		"resize-composer":       visualResizedComposerModel(),
 		"history-boundary":      visualHistoryBoundaryModel(),
 		"fresh":                 visualFreshModel(),
 		"chat-scrolled":         visualScrolledChatModel(),
@@ -79,6 +93,9 @@ func TestVisualCapture(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(directory, name+".ansi"), []byte(value.View()), 0o600); err != nil {
 			t.Fatalf("write %s capture: %v", name, err)
 		}
+	}
+	if err := os.WriteFile(filepath.Join(directory, "terminal-copy.ansi"), []byte(terminalCopyText("Only selected text appears here.\n\n    Indentation and tabs\tstay meaningful.\nNo bars or return instructions.")), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -351,6 +368,16 @@ func visualBaseModel() model {
 	return value
 }
 
+func visualResizedComposerModel() model {
+	value := semanticFixture()
+	value.input.SetValue(strings.Repeat("0123456789 ", 60) + "VISIBLE-TAIL")
+	value.resizeComposer()
+	end := value.input.CursorOffset()
+	value.input.Select(end-len("VISIBLE-TAIL"), end)
+	next, _ := value.Update(tea.WindowSizeMsg{Width: 24, Height: 20})
+	return next.(model)
+}
+
 func visualChatModel() model {
 	value := visualBaseModel()
 	value.transcript = []transcriptEntry{
@@ -555,4 +582,69 @@ func visualWhatsAppQRModel() model {
 		SaveDisabled: true,
 	})
 	return value
+}
+
+func visualMultiClickModel(which pane, count int) model {
+	m := semanticFixture()
+	m.input.SetValue("Select this word and its complete wrapped logical line.\nKeep the next line separate.")
+	m.resizeComposer()
+	m.viewport.GotoTop()
+	b := m.bounds(which)
+	x := b.x + 7
+	if which == outputPane {
+		x = 12
+	}
+	for range count {
+		clickAt(&m, x, b.y)
+	}
+	return m
+}
+
+func visualUnitDragModel(which pane, count int) model {
+	m := visualMultiClickModel(which, count-1)
+	b := m.bounds(which)
+	x := b.x + 7
+	if which == outputPane {
+		x = 12
+	}
+	updateMouse(&m, tea.MouseButtonLeft, tea.MouseActionPress, x, b.y)
+	updateMouse(&m, tea.MouseButtonLeft, tea.MouseActionMotion, x+2, b.y+count-1)
+	updateMouse(&m, tea.MouseButtonLeft, tea.MouseActionRelease, x+2, b.y+count-1)
+	return m
+}
+
+func visualSelectionModel(labels bool) model {
+	m := visualBaseModel()
+	m.transcript = []transcriptEntry{
+		{role: "assistant", text: "Select **real text** across messages. Soft wraps should not create copied newlines.\n\n```go\n\n    value := \"界é👩🏽‍💻\"\n\n    return value\n\n```"},
+		{role: "user", text: "  Keep this source indentation.\nAnd this genuine newline."},
+		{role: "assistant", text: "The label-start mode includes whole messages; content-start mode omits labels."},
+	}
+	m.invalidateHistoryRender()
+	m.renderHistory()
+	m.viewport.GotoTop()
+	m.outputFocus = true
+	m.input.Blur()
+	m.selection = outputSelection{active: true, labels: labels, anchor: textPoint{0, 7}, caret: textPoint{1, 45}}
+	return m
+}
+func visualPasteViewportModel(attachment bool) model {
+	m := visualChatModel()
+	m.input.SetValue(strings.Repeat("Earlier composer row\n", 20) + "tail")
+	m.resizeComposer()
+	if attachment {
+		m.applyPreparedPaste(pastePreparedMsg{paste: pendingPaste{value: "tail", generation: m.input.HistoryGeneration()}, handled: true, tokens: []composerToken{{label: "[Attachment tail]", expansion: "synthetic"}}})
+	} else {
+		m.enqueuePaste("\nPASTED-END")
+	}
+	return m
+}
+
+func visualComposerSelectionModel() model {
+	m := visualBaseModel()
+	m.input.SetValue("Edit this multiline selection.\n    Preserve indentation and 界é👩🏽‍💻.\nReplace by typing or paste.")
+	m.input.Select(10, 77)
+	m.resizeComposer()
+	m.refresh()
+	return m
 }

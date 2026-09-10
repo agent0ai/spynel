@@ -14,7 +14,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent0ai/spynel/internal/app"
 	"github.com/agent0ai/spynel/internal/core"
@@ -28,13 +30,17 @@ const maxRequestBytes = 1 << 20
 const shutdownTimeout = 5 * time.Second
 
 type Server struct {
-	Service *app.Service
-	Token   string
+	Service     *app.Service
+	Token       string
+	subscribers atomic.Int32
 }
 
 type streamEnvelope struct {
-	Event *core.Event `json:"event,omitempty"`
-	Error string      `json:"error,omitempty"`
+	Event     *core.Event `json:"event,omitempty"`
+	Error     string      `json:"error,omitempty"`
+	Code      string      `json:"code,omitempty"`
+	RequestID string      `json:"request_id,omitempty"`
+	Handled   bool        `json:"handled,omitempty"`
 }
 
 type screenActionRequest struct {
@@ -87,6 +93,8 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	mux.HandleFunc("GET /v1/status", s.authorize(s.status))
 	mux.HandleFunc("GET /v1/initial-screen", s.authorize(s.initialScreen))
 	mux.HandleFunc("POST /v1/message", s.authorize(s.message))
+	mux.HandleFunc("GET /v1/events", s.authorize(s.events))
+	mux.HandleFunc("GET /v1/conversation", s.authorize(s.conversation))
 	mux.HandleFunc("POST /v1/screen-action", s.authorize(s.screenAction))
 	mux.HandleFunc("POST /v1/settings", s.authorize(s.settings))
 	mux.HandleFunc("POST /v1/run-once", s.authorize(s.runOnce))
@@ -270,6 +278,18 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 		http.Error(response, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := app.ValidateLocalMessage(message); err != nil {
+		http.Error(response, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if message.SourceMessageID == "" {
+		var err error
+		message.SourceMessageID, err = core.NewSourceMessageID()
+		if err != nil {
+			writeError(response, err)
+			return
+		}
+	}
 	if message.Channel == "tui" {
 		if err := s.Service.RegisterLiveTUI(message.InstanceID, message.Conversation, time.Now().UTC()); err != nil {
 			http.Error(response, err.Error(), http.StatusBadRequest)
@@ -279,34 +299,36 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 	response.Header().Set("Content-Type", "application/x-ndjson")
 	response.Header().Set("X-Content-Type-Options", "nosniff")
 	flusher, _ := response.(http.Flusher)
-	events := make(chan core.Event, 256)
+	ctx, cancel := context.WithCancel(request.Context())
+	defer cancel()
+	events := make(chan core.Event, 64)
 	emit := func(event core.Event) {
+		event.RequestID = message.SourceMessageID
 		if message.Channel == "tui" && event.Screen != nil && event.Screen.Conversation != "" {
 			_ = s.Service.RegisterLiveTUI(message.InstanceID, event.Screen.Conversation, time.Now().UTC())
 		}
 		select {
 		case events <- event:
-		case <-request.Context().Done():
+		case <-ctx.Done():
 		}
 	}
-	if err := s.Service.Handle(request.Context(), message, emit); err != nil {
-		_ = json.NewEncoder(response).Encode(streamEnvelope{Error: err.Error()})
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return
-	}
+	// Drain concurrently with Handle: synchronous providers can emit more than
+	// the bounded queue before returning their admission result.
+	dispatched := make(chan error, 1)
+	go func() { dispatched <- s.Service.Handle(ctx, message, emit) }()
 	encoder := json.NewEncoder(response)
 	awaitTerminal := false
+	handlerDone := false
 	writeEvent := func(event core.Event) bool {
 		// Service.Handle returns after starting a harness turn. Remember that
 		// synchronous start/delta event instead of polling IsActive: providers
 		// are allowed to clear active bookkeeping immediately before emitting
 		// their terminal event.
-		if !event.Done && (event.Kind == core.EventStatus || event.Kind == core.EventDelta) {
+		if event.Continues || !event.Done && (event.Kind == core.EventStatus || event.Kind == core.EventDelta) {
 			awaitTerminal = true
 		}
-		if err := encoder.Encode(streamEnvelope{Event: &event}); err != nil {
+		_ = http.NewResponseController(response).SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if err := encoder.Encode(streamEnvelope{Event: &event, RequestID: message.SourceMessageID}); err != nil {
 			return false
 		}
 		if flusher != nil {
@@ -315,23 +337,47 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 		return true
 	}
 	for {
-		select {
-		case event := <-events:
-			if !writeEvent(event) || event.Done {
-				return
-			}
-		default:
-			if !awaitTerminal {
-				return
-			}
+		if handlerDone && !awaitTerminal {
 			select {
 			case event := <-events:
-				if !writeEvent(event) || event.Done {
+				if !writeEvent(event) || event.Done && !event.Continues {
 					return
 				}
-			case <-request.Context().Done():
+				continue
+			default:
+				_ = http.NewResponseController(response).SetWriteDeadline(time.Now().Add(5 * time.Second))
+				_ = encoder.Encode(streamEnvelope{Handled: true, RequestID: message.SourceMessageID})
+				if flusher != nil {
+					flusher.Flush()
+				}
 				return
 			}
+		}
+		select {
+		case err := <-dispatched:
+			dispatched = nil
+			handlerDone = true
+			if err != nil {
+				code := "request_failed"
+				if errors.Is(err, app.ErrDuplicateMessage) {
+					code = "duplicate_request"
+				}
+				if errors.Is(err, app.ErrMessageAdmissionBusy) {
+					code = "admission_busy"
+				}
+				_ = http.NewResponseController(response).SetWriteDeadline(time.Now().Add(5 * time.Second))
+				_ = encoder.Encode(streamEnvelope{Error: err.Error(), Code: code, RequestID: message.SourceMessageID})
+				if flusher != nil {
+					flusher.Flush()
+				}
+				return
+			}
+		case event := <-events:
+			if !writeEvent(event) || event.Done && !event.Continues {
+				return
+			}
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -382,6 +428,9 @@ func decodeJSON(body io.Reader, target any) error {
 	}
 	if len(data) > maxRequestBytes {
 		return fmt.Errorf("request exceeds the %d byte limit", maxRequestBytes)
+	}
+	if !utf8.Valid(data) {
+		return errors.New("request must be valid UTF-8")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()

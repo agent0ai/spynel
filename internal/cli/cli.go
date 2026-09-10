@@ -146,11 +146,12 @@ func run(args []string, version string) error {
 		flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 		configPath := flags.String("config", "", "path to .spynel/config.yaml")
 		withTUI := flags.Bool("tui", false, "also launch the terminal UI")
+		socket := flags.String("socket", "", "optional private Unix socket path for integration clients")
 		flags.Bool("automatic-startup", false, "identify a non-interactive operating-system startup")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
-		return runServer(*configPath, *withTUI, version, append([]string(nil), args...))
+		return runServerWithSocket(*configPath, *withTUI, version, append([]string(nil), args...), *socket)
 	case "run":
 		flags := flag.NewFlagSet("run", flag.ContinueOnError)
 		configPath := flags.String("config", "", "path to .spynel/config.yaml")
@@ -166,6 +167,8 @@ func run(args []string, version string) error {
 		return runSendCommand(args[0], args[1:], version, false)
 	case "followup":
 		return runSendCommand("followup", args[1:], version, true)
+	case "events":
+		return runEventsCommand(args[1:])
 	case "notify":
 		return runNotifyCommand(args[1:], version)
 	case "command":
@@ -460,6 +463,13 @@ func completeRun(err error, restart func([]string) error) error {
 }
 
 func runServer(configPath string, withTUI bool, version string, restartArgs []string) error {
+	return runServerWithSocket(configPath, withTUI, version, restartArgs, "")
+}
+
+func runServerWithSocket(configPath string, withTUI bool, version string, restartArgs []string, socketPath string) error {
+	// This process may own the shared primary even before the TUI enters raw
+	// mode. Shell suspension must not pause its API, heartbeat and agent jobs.
+	defer preventJobSuspension()()
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -512,8 +522,13 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 		}()
 	}
 	ownerResult := make(chan error, 1)
+	options := primaryOptions{}
+	if !withTUI {
+		options.Log = os.Stderr
+	}
+	options.Socket = socketPath
 	go func() {
-		ownerErr := runOwnerElection(ctx, cfg, version, election, requestRestart, requestUpdate)
+		ownerErr := runOwnerElection(ctx, cfg, version, election, requestRestart, requestUpdate, options)
 		ownerResult <- ownerErr
 		if ownerErr != nil {
 			cancel()
@@ -761,6 +776,18 @@ func runOnce(configPath, version string) error {
 }
 
 func runMessageMode(configPath, conversation, text, version string, options messageRunOptions) error {
+	if options.Socket != "" {
+		if configPath != "" || len(options.Attachments) > 0 {
+			return errors.New("--socket cannot be combined with --config or --attach; the socket explicitly selects its workspace")
+		}
+		client, err := localapi.NewSocketClient(options.Socket)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return runMessageWithOutput(ctx, client.Handle, conversation, text, options)
+	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -841,20 +868,27 @@ func runMessageWithHandler(ctx context.Context, handler channel.Handler, convers
 }
 
 func runMessageWithOutput(ctx context.Context, handler channel.Handler, conversation, messageText string, options messageRunOptions) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	output := options.Output
 	if output == nil {
 		output = os.Stdout
 	}
 	events := make(chan core.Event, 64)
 	dispatched := make(chan error, 1)
-	sourceMessageID, err := core.NewSourceMessageID()
-	if err != nil {
-		return err
+	sourceMessageID := options.RequestID
+	if sourceMessageID == "" {
+		var err error
+		sourceMessageID, err = core.NewSourceMessageID()
+		if err != nil {
+			return err
+		}
 	}
 	go func() {
 		dispatched <- handler(ctx, core.Message{
 			Channel: "cli", Conversation: conversation, Sender: "cli", SourceMessageID: sourceMessageID, Text: messageText, FollowupOnly: options.FollowupOnly,
 		}, func(event core.Event) {
+			event.RequestID = sourceMessageID
 			select {
 			case events <- event:
 			case <-ctx.Done():
@@ -887,6 +921,12 @@ func runMessageWithOutput(ctx context.Context, handler channel.Handler, conversa
 		case err := <-dispatched:
 			dispatched = nil
 			if err != nil {
+				if options.JSON {
+					if encodeErr := json.NewEncoder(output).Encode(core.Event{Kind: core.EventError, RequestID: sourceMessageID, Text: err.Error(), Done: true}); encodeErr != nil {
+						return encodeErr
+					}
+					return errors.New("request failed; see JSON response")
+				}
 				return err
 			}
 			handlerDone = true
@@ -917,8 +957,14 @@ func writeCLIEvent(output io.Writer, streamed *strings.Builder, event core.Event
 	if !event.Done {
 		return false, nil
 	}
+	if event.Continues {
+		return false, nil
+	}
 	switch event.Kind {
 	case core.EventError:
+		if options.JSON {
+			return true, errors.New("request failed; see JSON response")
+		}
 		if options.Stream && streamed.Len() > 0 {
 			_, _ = fmt.Fprintln(output)
 		}
@@ -1183,7 +1229,8 @@ const helpText = `Spynel - non-AI orchestration for one human and many coding ag
 
 Usage:
   spynel                         Launch TUI and enabled background services
-  spynel serve [--tui]           Run Telegram, WhatsApp, and the loop as a server
+  spynel serve [--tui] [--socket PATH]
+                                Run channels and orchestration; mirror safe lifecycle logs when headless
   spynel init [--dir DIR]        Initialize and continue into the TUI
     --no-start                   Initialize only (for scripts and automation)
   spynel send [flags] TEXT       Send or stream a message
@@ -1193,6 +1240,10 @@ Usage:
     --json                       Emit every response event as NDJSON
     --stdin                      Read the message body from standard input
     --attach PATH                Copy and attach a file (repeatable)
+    --request-id ID              Retain request identity across a deliberate retry
+    --socket PATH                Use an explicit private Unix socket
+  spynel events [--config PATH|--socket PATH] [--conversation NAME] [--after CURSOR]
+                                Subscribe to committed replies and later notifications
   spynel followup [flags] TEXT   Steer an active server-side CLI conversation
   spynel notify --workdir PATH (--origin O | --recent-authorized) --message TEXT
                                 Queue a proactive assistant notification

@@ -31,6 +31,7 @@ import (
 	"github.com/agent0ai/spynel/internal/channel"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/history"
+	markdownfmt "github.com/agent0ai/spynel/internal/markdown"
 	"github.com/agent0ai/spynel/internal/theme"
 )
 
@@ -237,7 +238,7 @@ func TestInlineCodeEndPaddingSurvivesTUILayoutAndCaches(t *testing.T) {
 	}
 	next, refresh := m.Update(command())
 	m = next.(model)
-	if m.streamRendered != m.renderAgentMarkdown(message) {
+	if markdownfmt.WrapLogical(m.streamRendered, m.chatContentWidth()).View() != m.renderAgentMarkdown(message) {
 		t.Fatalf("streaming and finalized Markdown differ:\nstream=%q\nfinal=%q", m.streamRendered, m.renderAgentMarkdown(message))
 	}
 	if refresh == nil || !m.streamRefreshPending {
@@ -254,7 +255,7 @@ func TestHyphenatedCompoundMatchesStreamingAndFinalCaches(t *testing.T) {
 	message := "Use the familiar editor-style Up/Down controls."
 	want := m.renderAgentMarkdown(message)
 	plain := ansi.Strip(want)
-	if !strings.Contains(plain, "\neditor-style Up/Down\n") || strings.Contains(plain, "editor-\nstyle") {
+	if !strings.Contains(plain, "\neditor-style Up/Down \n") || strings.Contains(plain, "editor-\nstyle") {
 		t.Fatalf("final render orphaned the fitting compound: %q", plain)
 	}
 
@@ -266,7 +267,7 @@ func TestHyphenatedCompoundMatchesStreamingAndFinalCaches(t *testing.T) {
 	}
 	next, _ := m.Update(command())
 	m = next.(model)
-	if m.streamRendered != want {
+	if markdownfmt.WrapLogical(m.streamRendered, m.chatContentWidth()).View() != want {
 		t.Fatalf("streaming and final compound renders differ:\nstream=%q\nfinal=%q", m.streamRendered, want)
 	}
 }
@@ -316,7 +317,7 @@ func TestSanitizedReportedTranscriptWrapsWithoutChangingProse(t *testing.T) {
 					}
 					next, _ := m.Update(command())
 					streamed := next.(model)
-					if streamed.streamRendered != m.renderAgentMarkdown(entry.Content) {
+					if markdownfmt.WrapLogical(streamed.streamRendered, m.chatContentWidth()).View() != m.renderAgentMarkdown(entry.Content) {
 						t.Fatalf("stream/final render mismatch:\nstream=%q\nfinal=%q", streamed.streamRendered, m.renderAgentMarkdown(entry.Content))
 					}
 				}
@@ -1447,77 +1448,21 @@ func TestPageScrollsHistoryAndStaleMouseEventsAreIgnored(t *testing.T) {
 		t.Fatalf("after PageUp: bottom = %t, input line = %d", got.viewport.AtBottom(), got.input.Line())
 	}
 	pageOffset := got.viewport.YOffset
-	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyUp, Alt: true})
 	got = next.(model)
 	if got.viewport.YOffset != pageOffset-1 || got.input.Line() != inputLine {
-		t.Fatalf("after Shift+Up: offset = %d, want %d; input line = %d", got.viewport.YOffset, pageOffset-1, got.input.Line())
+		t.Fatalf("after Alt+Up: offset = %d, want %d; input line = %d", got.viewport.YOffset, pageOffset-1, got.input.Line())
 	}
-	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyShiftDown})
+	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyDown, Alt: true})
 	got = next.(model)
 	if got.viewport.YOffset != pageOffset || got.input.Line() != inputLine {
-		t.Fatalf("after Shift+Down: offset = %d, want %d; input line = %d", got.viewport.YOffset, pageOffset, got.input.Line())
+		t.Fatalf("after Alt+Down: offset = %d, want %d; input line = %d", got.viewport.YOffset, pageOffset, got.input.Line())
 	}
 
 	next, _ = got.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress})
 	got = next.(model)
 	if got.viewport.YOffset != pageOffset || got.input.Line() != inputLine {
 		t.Fatalf("after stale mouse event: offset = %d (was %d), input line = %d", got.viewport.YOffset, pageOffset, got.input.Line())
-	}
-}
-
-func TestFragmentedMouseReportsNeverEnterComposer(t *testing.T) {
-	m := testModel()
-	m.input.SetValue("draft")
-
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'['}, Alt: true})
-	got := next.(model)
-	if got.input.Value() != "draft" || got.pendingMouse != "[" {
-		t.Fatalf("mouse escape prefix was not held: input=%q pending=%q", got.input.Value(), got.pendingMouse)
-	}
-
-	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("<64;131;24M")})
-	got = next.(model)
-	if got.input.Value() != "draft" || got.pendingMouse != "" {
-		t.Fatalf("fragmented wheel report leaked into composer: input=%q pending=%q", got.input.Value(), got.pendingMouse)
-	}
-
-	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[>65;131;24M")})
-	got = next.(model)
-	if got.input.Value() != "draft" {
-		t.Fatalf("complete wheel report leaked into composer: %q", got.input.Value())
-	}
-
-	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[<32;41;9M[<0;41;9m")})
-	got = next.(model)
-	if got.input.Value() != "draft" {
-		t.Fatalf("drag reports leaked into composer: %q", got.input.Value())
-	}
-
-	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[<32;41;")})
-	got = next.(model)
-	if got.input.Value() != "draft" || got.pendingMouse != "[<32;41;" {
-		t.Fatalf("unmodified drag prefix was not held: input=%q pending=%q", got.input.Value(), got.pendingMouse)
-	}
-	next, _ = got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("9M")})
-	got = next.(model)
-	if got.input.Value() != "draft" || got.pendingMouse != "" {
-		t.Fatalf("split drag report leaked into composer: input=%q pending=%q", got.input.Value(), got.pendingMouse)
-	}
-}
-
-func TestMouseEscapeGuardPreservesOrdinaryAndPastedText(t *testing.T) {
-	m := testModel()
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'['}, Alt: true})
-	next, _ = next.(model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello")})
-	got := next.(model)
-	if got.input.Value() != "[hello" {
-		t.Fatalf("ordinary Alt-bracket text was discarded: %q", got.input.Value())
-	}
-
-	key := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[<64;1;1M"), Paste: true}
-	filtered, consumed := got.filterMouseEscape(key)
-	if consumed || string(filtered.Runes) != string(key.Runes) {
-		t.Fatalf("pasted text was treated as a mouse report: filtered=%q consumed=%t", filtered.Runes, consumed)
 	}
 }
 
@@ -2137,7 +2082,7 @@ func TestDurableWorkEventUpdatesHeaderCounts(t *testing.T) {
 func TestCommandFooterReplacesOrdinaryComposerHints(t *testing.T) {
 	m := testModel()
 	ordinary := m.footerHint()
-	if !strings.Contains(ordinary, "PgUp/⇧+↑↓ scroll") {
+	if !strings.Contains(ordinary, "PgUp/⌥↑↓ scroll") {
 		t.Fatalf("ordinary footer lacks the history scroll binding: %q", ordinary)
 	}
 	m.input.SetValue("/")
@@ -2250,30 +2195,19 @@ func TestFooterOccupiesFinalTerminalRow(t *testing.T) {
 	}
 }
 
-func TestLongPasteIsCompactAndAtomic(t *testing.T) {
+func TestLongPasteRemainsEditableText(t *testing.T) {
 	m := testModel()
 	body := strings.Repeat("paste body ", 150)
+	command := m.enqueuePaste(body)
+	if command != nil || m.input.Value() != body || len(m.tokens) != 0 {
+		t.Fatal("long text became a display token")
+	}
+	m.input.SelectAll()
+	m.input.InsertString("replacement")
+	if m.input.Value() != "replacement" {
+		t.Fatal("long paste cannot be replaced")
+	}
 
-	handled, err := m.handlePaste(body)
-	if err != nil || !handled {
-		t.Fatalf("handlePaste() = %t, %v", handled, err)
-	}
-	label := m.input.Value()
-	if label != "[Pasted 1650 chars]" {
-		t.Fatalf("input value = %q", label)
-	}
-	if got := m.expandTokens(label); got != body {
-		t.Fatalf("expanded paste length = %d, want %d", len(got), len(body))
-	}
-	if !m.handleTokenKey(tea.KeyMsg{Type: tea.KeyLeft}) || inputCursorColumn(m) != 0 {
-		t.Fatalf("Left did not jump to the start of token; column = %d", inputCursorColumn(m))
-	}
-	if !m.handleTokenKey(tea.KeyMsg{Type: tea.KeyRight}) || inputCursorColumn(m) != len([]rune(label)) {
-		t.Fatalf("Right did not jump to the end of token; column = %d", inputCursorColumn(m))
-	}
-	if !m.handleTokenKey(tea.KeyMsg{Type: tea.KeyBackspace}) || m.input.Value() != "" {
-		t.Fatalf("Backspace left input %q", m.input.Value())
-	}
 }
 
 func TestPastedFileIsCopiedIntoAttachments(t *testing.T) {
@@ -2285,10 +2219,12 @@ func TestPastedFileIsCopiedIntoAttachments(t *testing.T) {
 	m := testModel()
 	m.attachments = filepath.Join(root, ".spynel", "attachments")
 
-	handled, err := m.handlePaste(source)
-	if err != nil || !handled {
-		t.Fatalf("handlePaste() = %t, %v", handled, err)
+	command := m.enqueuePaste(source)
+	if command == nil {
+		t.Fatal("file preparation was not queued")
 	}
+	next, _ := m.Update(command())
+	m = next.(model)
 	if m.input.Value() != "[Attachment notes.txt]" {
 		t.Fatalf("input value = %q", m.input.Value())
 	}
@@ -2314,7 +2250,7 @@ func TestBlockedPastePreparationLeavesInputAndCancellationResponsive(t *testing.
 
 	next, command := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("slow-path.txt"), Paste: true})
 	got := next.(model)
-	if command == nil || !got.pasteBusy || !strings.Contains(got.input.Value(), "Preparing paste") {
+	if command == nil || !got.pasteBusy || got.input.Value() != "slow-path.txt" {
 		t.Fatalf("paste was not delegated: busy=%t input=%q command=%v", got.pasteBusy, got.input.Value(), command)
 	}
 	result := make(chan tea.Msg, 1)
@@ -2447,7 +2383,7 @@ func TestSupersededMarkdownRenderDefersReplacementWhileUIWorkContinues(t *testin
 	for index := 0; index < 200; index++ {
 		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
 		m = next.(model)
-		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp, Alt: true})
 		m = next.(model)
 		next, _ = m.Update(tea.WindowSizeMsg{Width: 90 + index%2, Height: 30})
 		m = next.(model)
@@ -2535,7 +2471,7 @@ func TestBlockedAndCPUHeavyMarkdownRenderKeepsContinuousInteractiveWorkResponsiv
 			}
 			for index := 0; index < 200; index++ {
 				update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
-				update(tea.KeyMsg{Type: tea.KeyShiftUp})
+				update(tea.KeyMsg{Type: tea.KeyUp, Alt: true})
 				update(tea.WindowSizeMsg{Width: 90 + index%2, Height: 30 + index%2})
 				update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: "x"}})
 				if !m.streamRenderBusy {
@@ -2572,7 +2508,7 @@ func TestBlockedHistoryRenderLeavesResizeScrollAndInputResponsive(t *testing.T) 
 	m.invalidateHistoryRender()
 	started := make(chan struct{})
 	release := make(chan struct{})
-	m.renderHistoryEntries = func(snapshot model) []string {
+	m.renderHistoryEntries = func(snapshot model) []transcriptRender {
 		close(started)
 		<-release
 		return renderHistoryEntries(snapshot)
@@ -2594,7 +2530,7 @@ func TestBlockedHistoryRenderLeavesResizeScrollAndInputResponsive(t *testing.T) 
 	responsive := make(chan model, 1)
 	go func() {
 		typed, _ := got.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
-		scrolled, _ := typed.(model).Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+		scrolled, _ := typed.(model).Update(tea.KeyMsg{Type: tea.KeyUp, Alt: true})
 		resized, _ := scrolled.(model).Update(tea.WindowSizeMsg{Width: 101, Height: 31})
 		responsive <- resized.(model)
 	}()
@@ -2667,7 +2603,7 @@ func TestDeltaBurstCoalescesViewportRefreshWithLargeHistory(t *testing.T) {
 	m.historyValid = true
 	m.historyWidth = m.viewport.Width
 	m.historyTheme = m.activeTheme
-	m.historyCache = []string{strings.Repeat("history\n", 60_000)}
+	m.historyCache = []transcriptRender{testTranscriptRender(strings.Repeat("history\n", 60_000))}
 	for index := 0; index <= asyncHistoryEntries; index++ {
 		m.transcript = append(m.transcript, transcriptEntry{role: "assistant", text: "cached"})
 	}
@@ -2721,7 +2657,7 @@ func TestStreamingFollowUsesOneViewportTailThreshold(t *testing.T) {
 func TestManualUpwardScrollSuppressesFollowUntilGraceExpires(t *testing.T) {
 	m, clock := streamingScrollTestModel()
 	m.viewport.GotoBottom()
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp, Alt: true})
 	m = next.(model)
 	manualOffset := m.viewport.YOffset
 	m.streaming += "\n\nnew streamed paragraph"
@@ -2741,9 +2677,9 @@ func TestManualUpwardScrollSuppressesFollowUntilGraceExpires(t *testing.T) {
 func TestManualDownwardReturnToTailResumesFollowImmediately(t *testing.T) {
 	m, _ := streamingScrollTestModel()
 	m.viewport.GotoBottom()
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp, Alt: true})
 	m = next.(model)
-	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyShiftDown})
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown, Alt: true})
 	m = next.(model)
 	if !m.viewport.AtBottom() || !m.manualScrollUpUntil.IsZero() {
 		t.Fatalf("explicit tail return did not resume follow: bottom=%t suppressed-until=%v", m.viewport.AtBottom(), m.manualScrollUpUntil)
@@ -2772,7 +2708,7 @@ func TestStreamingFollowSurvivesResizeAsyncRenderAndFinalization(t *testing.T) {
 		version: version,
 		width:   m.viewport.Width,
 		theme:   m.activeTheme,
-		entries: append(append([]string(nil), m.historyCache...), strings.Repeat("async row\n", 12)),
+		entries: append(append([]transcriptRender(nil), m.historyCache...), testTranscriptRender(strings.Repeat("async row\n", 12))),
 	})
 	m = next.(model)
 	if !m.viewport.AtBottom() {
@@ -2804,7 +2740,7 @@ func TestRapidDeltaBurstKeepsTailAdjacentViewportAttached(t *testing.T) {
 func TestRecentManualScrollPreservesOffsetAcrossFinalAndNotification(t *testing.T) {
 	m, _ := streamingScrollTestModel()
 	m.viewport.GotoBottom()
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp, Alt: true})
 	m = next.(model)
 	wantOffset := m.viewport.YOffset
 	next, _ = m.Update(uiEvent{event: core.Event{Kind: core.EventFinal, Text: m.streaming, Done: true}})
@@ -2828,7 +2764,7 @@ func streamingScrollTestModel() (model, *time.Time) {
 	m.viewport.Height = 5
 	m.width = 39
 	m.height = layoutOverhead + m.composerRows + m.viewport.Height
-	m.historyCache = []string{strings.Repeat("history row\n", 40)}
+	m.historyCache = []transcriptRender{testTranscriptRender(strings.Repeat("history row\n", 40))}
 	m.historyValid = true
 	m.historyWidth = m.viewport.Width
 	m.historyTheme = m.activeTheme
@@ -2935,7 +2871,8 @@ func TestCRLFOnEmptyComposerKeepsPlaceholderVisible(t *testing.T) {
 }
 
 func placeholderIsVisible(view, placeholder string) bool {
-	return strings.Contains(strings.Join(strings.Fields(ansi.Strip(view)), " "), placeholder)
+	visible := strings.Join(strings.Fields(ansi.Strip(view)), " ")
+	return visible != "" && (strings.HasPrefix(placeholder, visible) || strings.Contains(visible, placeholder))
 }
 
 func TestEnterSendsAndResetsComposer(t *testing.T) {
@@ -4379,7 +4316,7 @@ func TestLogoAnimationUsesForegroundBackgroundAndStoppedStateMachine(t *testing.
 
 	// Two authoritative jobs start one background ticker immediately. Their
 	// first tick schedules the next frame at exactly twice the foreground rate.
-	m.runtimeStatus.LiveBackgroundJobs = 2
+	m.runtimeStatus.LiveJobs = 2
 	start := m.syncLogoAnimation()
 	if m.logoAnimation != logoBackground || start == nil || schedules[0].after != 0 {
 		t.Fatalf("background start = mode %d schedules %#v", m.logoAnimation, schedules)
@@ -4407,12 +4344,12 @@ func TestLogoAnimationUsesForegroundBackgroundAndStoppedStateMachine(t *testing.
 
 	// Foreground completion falls back to half speed while either job remains.
 	m.mainAgentActivity = 0
-	m.runtimeStatus.LiveBackgroundJobs = 1
+	m.runtimeStatus.LiveJobs = 1
 	if command := m.syncLogoAnimation(); command == nil || m.logoAnimation != logoBackground || schedules[len(schedules)-1].after != logoBackgroundInterval {
 		t.Fatalf("foreground-to-background transition = mode %d schedules %#v", m.logoAnimation, schedules)
 	}
 	activeFrame := m.logoSpinner.View()
-	m.runtimeStatus.LiveBackgroundJobs = 0
+	m.runtimeStatus.LiveJobs = 0
 	if command := m.syncLogoAnimation(); command != nil || m.logoAnimation != logoStopped {
 		t.Fatalf("final background settlement = mode %d command %v", m.logoAnimation, command != nil)
 	}
@@ -4433,7 +4370,7 @@ func TestLogoAnimationWaitsForCanonicalMainAgentActivity(t *testing.T) {
 		t.Fatalf("pre-generation dispatch = working %t activity %d logo %d", m.working, m.mainAgentActivity, m.logoAnimation)
 	}
 
-	m.runtimeStatus.LiveBackgroundJobs = 1
+	m.runtimeStatus.LiveJobs = 1
 	m.syncLogoAnimation()
 	backgroundGeneration := m.logoGeneration
 	m.dispatchMessage("follow up", "follow up")
@@ -4557,7 +4494,7 @@ func TestRecoveredTerminalAndDelayedInactivePreserveOverlappingRecovery(t *testi
 func TestRecoveredTerminalPreservesIntentionalScrollAndShowsNewMessageStatus(t *testing.T) {
 	m, _ := streamingScrollTestModel()
 	m.viewport.GotoBottom()
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyShiftUp})
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp, Alt: true})
 	m = next.(model)
 	wantOffset := m.viewport.YOffset
 
@@ -4693,8 +4630,8 @@ func TestAsyncStartupHistoryWaitsThroughResizeThenScrollsExactlyOnce(t *testing.
 	}
 	m.initialHistoryScroll = true
 	m.invalidateHistoryRender()
-	m.historyCache = []string{strings.Repeat("provisional row\n", 80)}
-	m.viewport.SetContent(m.historyCache[0])
+	m.historyCache = []transcriptRender{testTranscriptRender(strings.Repeat("provisional row\n", 80))}
+	m.viewport.SetContent(m.historyCache[0].view)
 	m.viewport.SetYOffset(5)
 	provisionalOffset := m.viewport.YOffset
 
@@ -4955,7 +4892,7 @@ func runRealisticConcurrentLoad(tb testing.TB, iterations int) concurrentLoadMet
 			case 1:
 				message = tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")}
 			case 2:
-				message = tea.KeyMsg{Type: tea.KeyShiftUp}
+				message = tea.KeyMsg{Type: tea.KeyUp, Alt: true}
 			case 3:
 				message = tea.WindowSizeMsg{Width: 90 + index%3, Height: 30 + index%2}
 			case 4:
@@ -5045,7 +4982,7 @@ func largeHistoryBenchmarkModel() model {
 	m.historyValid = true
 	m.historyWidth = m.viewport.Width
 	m.historyTheme = m.activeTheme
-	m.historyCache = []string{strings.Repeat("history\n", 60_000)}
+	m.historyCache = []transcriptRender{testTranscriptRender(strings.Repeat("history\n", 60_000))}
 	for index := 0; index <= asyncHistoryEntries; index++ {
 		m.transcript = append(m.transcript, transcriptEntry{role: "assistant", text: "cached"})
 	}
@@ -5058,7 +4995,7 @@ func TestPersistedWelcomeLogoUsesThemePrimaryStyle(t *testing.T) {
 	t.Cleanup(func() { lipgloss.SetColorProfile(profile) })
 	m := testModel()
 	wantFirstRow := m.styles.title.Render(strings.Split(core.SpynelASCII, "\n")[0])
-	rendered := m.renderAgentMarkdown(core.SpynelLogoMarkdown + "\n\nWelcome back.")
+	rendered := renderAgentMarkdownText(core.SpynelLogoMarkdown+"\n\nWelcome back.", m.chatMarkdownWidth(), m.activeTheme)
 	if !strings.HasPrefix(rendered, wantFirstRow) || !strings.Contains(ansi.Strip(rendered), "Welcome back.") {
 		t.Fatalf("persisted welcome logo did not use the primary title style:\nwant prefix %q\ngot %q", wantFirstRow, rendered)
 	}
@@ -5067,7 +5004,7 @@ func TestPersistedWelcomeLogoUsesThemePrimaryStyle(t *testing.T) {
 func TestPersistedWelcomeTreatsLogoFenceAsSemanticMarker(t *testing.T) {
 	m := testModel()
 	storedMarker := "```spynel-logo\nIGNORED MARKER BODY\n```\n\nWelcome back."
-	rendered := ansi.Strip(m.renderAgentMarkdown(storedMarker))
+	rendered := ansi.Strip(renderAgentMarkdownText(storedMarker, m.chatMarkdownWidth(), m.activeTheme))
 	if !strings.HasPrefix(rendered, strings.Split(core.SpynelASCII, "\n")[0]) || strings.Contains(rendered, "IGNORED MARKER BODY") || !strings.Contains(rendered, "Welcome back.") {
 		t.Fatalf("stored welcome marker was not canonicalized: %q", rendered)
 	}
@@ -5168,4 +5105,8 @@ func TestDependentModelSelectionPreservesParentAndRefreshesCommittedControl(t *t
 			}
 		})
 	}
+}
+
+func testTranscriptRender(text string) transcriptRender {
+	return transcriptRender{view: text, layout: markdownfmt.WrapLogical(text, 80)}
 }

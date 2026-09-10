@@ -33,6 +33,8 @@ type Entry struct {
 	EventID          string    `json:"event_id,omitempty"`
 	AfterChars       int       `json:"after_chars,omitempty"`
 	Terminal         bool      `json:"terminal,omitempty"`
+	FinalText        *string   `json:"final_text,omitempty"`
+	Continues        bool      `json:"continues,omitempty"`
 	SourceMessageID  string    `json:"source_message_id,omitempty"`
 	AcceptedAt       time.Time `json:"accepted_at,omitempty"`
 	ExecutionID      string    `json:"execution_id,omitempty"`

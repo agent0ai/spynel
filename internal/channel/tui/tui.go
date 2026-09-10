@@ -93,8 +93,8 @@ type screenActionResult struct {
 	err           error
 }
 type pendingPaste struct {
-	placeholder string
-	value       string
+	value      string
+	generation uint64
 }
 type pastePreparedMsg struct {
 	paste   pendingPaste
@@ -115,7 +115,7 @@ type historyRenderResult struct {
 	version uint64
 	width   int
 	theme   theme.Theme
-	entries []string
+	entries []transcriptRender
 	elapsed time.Duration
 }
 type diagnosticResultMsg struct{}
@@ -245,7 +245,16 @@ type model struct {
 	updateInterval           time.Duration
 	connection               map[string]channel.ConnectionStatus
 	ignoreNextLF             bool
-	pendingMouse             string
+	selection                outputSelection
+	output                   []transcriptRender
+	drag                     dragSelection
+	clicks                   clickSequence
+	dragGeneration           uint64
+	outputFocus              bool
+	clipboardText            string
+	clipboardFallback        bool
+	editorNotice             string
+	writeClipboard           io.Writer
 	status                   string
 	width                    int
 	height                   int
@@ -253,7 +262,7 @@ type model struct {
 	liveConversation         *liveConversationTracker
 	welcome                  *core.Screen
 	welcomeFocus             bool
-	historyCache             []string
+	historyCache             []transcriptRender
 	historyWidth             int
 	historyTheme             theme.Theme
 	historyValid             bool
@@ -285,7 +294,6 @@ type model struct {
 	pasteBusy                bool
 	pasteCancelled           bool
 	pasteCancel              context.CancelFunc
-	pasteSequence            uint64
 	preparePaste             func(context.Context, string, string) ([]composerToken, bool, error)
 	streamVersion            uint64
 	streamRefreshPending     bool
@@ -295,7 +303,7 @@ type model struct {
 	renderStream             func(string, int, theme.Theme) string
 	historyVersion           uint64
 	historyRenderBusy        bool
-	renderHistoryEntries     func(model) []string
+	renderHistoryEntries     func(model) []transcriptRender
 	initialHistoryScroll     bool
 	now                      func() time.Time
 	manualScrollUpUntil      time.Time
@@ -414,8 +422,6 @@ func ribbonThemeColor(background, user string) lipgloss.Color {
 
 var unsafeAttachmentName = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 
-var mouseReportEscape = regexp.MustCompile(`\[[<>][0-9]+;[0-9]+;[0-9]+[Mm]`)
-
 var semanticBuildVersion = regexp.MustCompile(`^(?:v)?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
 
 func Run(ctx context.Context, title string, handler channel.Handler, commands []core.SlashCommand, initialHistory []history.Entry, options Options) error {
@@ -515,7 +521,14 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 	if m.logoAnimation != logoStopped {
 		m.logoGeneration = 1
 	}
-	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx), tea.WithFilter(filterTerminalEvents))
+	output := &terminalOutput{File: os.Stdout}
+	m.writeClipboard = output
+	terminal, closeInput, inputErr := terminalProgramInput()
+	if inputErr != nil {
+		return inputErr
+	}
+	defer closeInput()
+	program := tea.NewProgram(m, tea.WithInput(terminal), tea.WithOutput(output), tea.WithAltScreen(), tea.WithContext(ctx), tea.WithFilter(filterTerminalEvents))
 	_, err = program.Run()
 	return err
 }
@@ -546,6 +559,7 @@ func styleComposer(input *textarea.Model, styles uiStyles) {
 	// background block instead of swapping it away into an invisible glyph.
 	input.Cursor.Style = lipgloss.NewStyle().Foreground(styles.selectedCommand.GetBackground())
 	input.Cursor.TextStyle = plain
+	input.SelectionStyle = styles.selectedCommand
 	input.FocusedStyle.Base = plain
 	input.FocusedStyle.Text = plain
 	input.FocusedStyle.CursorLine = plain
@@ -562,65 +576,6 @@ func styleComposer(input *textarea.Model, styles uiStyles) {
 	} else {
 		input.Blur()
 	}
-}
-
-func (m *model) filterMouseEscape(key tea.KeyMsg) (tea.KeyMsg, bool) {
-	if key.Paste {
-		m.pendingMouse = ""
-		return key, false
-	}
-	if key.Type != tea.KeyRunes {
-		m.pendingMouse = ""
-		return key, false
-	}
-	text := string(key.Runes)
-	if m.pendingMouse != "" {
-		text = m.pendingMouse + text
-		m.pendingMouse = ""
-		if cleaned := mouseReportEscape.ReplaceAllString(text, ""); cleaned != text {
-			if cleaned == "" {
-				return tea.KeyMsg{}, true
-			}
-			key.Runes = []rune(cleaned)
-			key.Alt = false
-			return key, false
-		}
-		if possibleMouseReport(text) {
-			m.pendingMouse = text
-			return tea.KeyMsg{}, true
-		}
-		key.Runes = []rune(text)
-		key.Alt = false
-		return key, false
-	}
-	if key.Alt && text == "[" {
-		m.pendingMouse = "["
-		return tea.KeyMsg{}, true
-	}
-	if cleaned := mouseReportEscape.ReplaceAllString(text, ""); cleaned != text {
-		if cleaned == "" {
-			return tea.KeyMsg{}, true
-		}
-		key.Runes = []rune(cleaned)
-		key.Alt = false
-	}
-	if possibleMouseReport(string(key.Runes)) {
-		m.pendingMouse = string(key.Runes)
-		return tea.KeyMsg{}, true
-	}
-	return key, false
-}
-
-func possibleMouseReport(value string) bool {
-	if len(value) > 64 || (!strings.HasPrefix(value, "[<") && !strings.HasPrefix(value, "[>")) {
-		return false
-	}
-	for _, character := range value[2:] {
-		if (character < '0' || character > '9') && character != ';' {
-			return false
-		}
-	}
-	return true
 }
 
 func newLogoSpinner() bubblespinner.Model {
@@ -640,7 +595,7 @@ func (m *model) desiredLogoAnimation() logoAnimationMode {
 	if m.mainAgentActivity > 0 {
 		return logoForeground
 	}
-	if m.runtimeStatus.LiveBackgroundJobs > 0 {
+	if m.runtimeStatus.LiveJobs > 0 {
 		return logoBackground
 	}
 	return logoStopped
@@ -684,8 +639,7 @@ func newWorkingSpinner() bubblespinner.Model {
 }
 
 func (m model) Init() tea.Cmd {
-	// Keep terminal-native drag selection available and clear mouse reporting
-	// if a previous abnormal exit left the terminal mode enabled.
+	// Tea owns enabling and restoring mouse, paste, focus, and alternate screen modes.
 	var logo tea.Cmd
 	if m.logoAnimation != logoStopped {
 		tick := m.logoTick
@@ -694,7 +648,7 @@ func (m model) Init() tea.Cmd {
 		}
 		logo = tick(0, m.logoGeneration)
 	}
-	return tea.Batch(textarea.Blink, m.waitEvent(), tea.DisableMouse, tea.EnableReportFocus, logo, m.scheduleInitialUpdateCheck())
+	return tea.Batch(textarea.Blink, m.waitEvent(), tea.EnableMouseCellMotion, tea.EnableReportFocus, logo, m.scheduleInitialUpdateCheck())
 }
 
 // filterTerminalEvents rejects resize reports that would make Bubble Tea's
@@ -801,6 +755,11 @@ func (m model) waitEvent() tea.Cmd {
 func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	started := time.Now()
 	next, command := m.update(message)
+	if updated, ok := next.(model); ok && updated.input.Err != nil {
+		updated.editorNotice = updated.input.Err.Error()
+		updated.input.Err = nil
+		next = updated
+	}
 	elapsed := time.Since(started)
 	if elapsed < streamRefreshInterval {
 		return next, command
@@ -818,8 +777,6 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 	updateInput := true
 	updateViewport := true
 	inputBefore := m.input.Value()
-	inputWasAtEnd := m.inputCursorAtEnd()
-	inputLineRowsBefore := m.input.LineInfo().Height
 	manualScrollDirection := 0
 	manualScrollOffset := m.viewport.YOffset
 	switch value := message.(type) {
@@ -852,6 +809,7 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			updateViewport = false
 			break
 		}
+		m.cancelDrag()
 		m.width, m.height = value.Width, value.Height
 		terminalWidth := max(1, value.Width)
 		// Chat owns one left inset, one inset before the right-edge scrollbar,
@@ -865,14 +823,10 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.resizeComposerForViewport(false)
 		m.refresh()
 	case tea.KeyMsg:
+		m.clicks = clickSequence{}
+		m.editorNotice = ""
+		m.input.BreakUndoGroupForKey(value)
 		updateViewport = false
-		filtered, consumed := m.filterMouseEscape(value)
-		if consumed {
-			updateInput = false
-			break
-		}
-		value = filtered
-		message = filtered
 		if value.Type == tea.KeyCtrlC && (m.screen != nil || m.dialog != nil) {
 			updateInput = false
 			updateViewport = false
@@ -905,6 +859,10 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			updateViewport = false
 			return m, m.handleScreenKey(value)
 		}
+		if handled, command := m.handleSelectionKey(value); handled {
+			m.resizeComposer()
+			return m, command
+		}
 		if value.Type == tea.KeyCtrlL {
 			updateInput = false
 			commands = append(commands, m.repaint())
@@ -917,7 +875,6 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if m.input.Value() != "" {
 				m.ignoreNextLF = false
 				m.cancelThemeMenu()
-				m.cancelPasteWork()
 				m.resetComposer()
 				m.resizeComposer()
 				return m, nil
@@ -962,10 +919,10 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			break
 		}
-		if value.Type == tea.KeyShiftUp || value.Type == tea.KeyShiftDown {
+		if value.Alt && (value.Type == tea.KeyUp || value.Type == tea.KeyDown) {
 			updateInput = false
 			updateViewport = false
-			if value.Type == tea.KeyShiftUp {
+			if value.Type == tea.KeyUp {
 				m.viewport.ScrollUp(1)
 				m.noteManualScrollUp()
 			} else {
@@ -977,7 +934,7 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if boundaryKey, ok := m.composerBoundaryArrow(value); ok {
 			message = boundaryKey
 		}
-		if m.handleTokenKey(value) {
+		if !m.input.HasSelection() && m.handleTokenKey(value) {
 			updateInput = false
 			break
 		}
@@ -1009,10 +966,7 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			displayText := strings.TrimSpace(m.input.Value())
 			if displayText == "" {
 				m.ignoreNextLF = true
-				m.input.Reset()
-				m.tokens = nil
-				m.commandMenu = false
-				m.commandIndex = 0
+				m.resetComposer()
 				m.resizeComposer()
 				return m, tea.Batch(commands...)
 			}
@@ -1025,11 +979,33 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			commands = append(commands, m.dispatchMessage(displayText, messageText)...)
 		}
 	case tea.MouseMsg:
-		// Application mouse reporting is disabled so terminal-native drag
-		// selection and copying remain available. Ignore any queued stale event.
-		m.pendingMouse = ""
-		updateInput = false
-		updateViewport = false
+		updateInput, updateViewport = false, false
+		commands = append(commands, m.handleMouse(value))
+	case dragTick:
+		updateInput, updateViewport = false, false
+		commands = append(commands, m.autoScroll(value))
+	case clipboardResult:
+		updateInput, updateViewport = false, false
+		m.clipboardFallback = value.fallback
+		m.editorNotice = value.status
+	case terminalCopyResult:
+		updateInput, updateViewport = false, false
+		if value.err != nil {
+			m.editorNotice = "Terminal copy failed: " + value.err.Error()
+		}
+		// Exec already restored and repainted the alternate screen. Another
+		// exit/enter lets the running renderer flush into the normal copy area.
+		commands = append(commands, tea.EnableMouseCellMotion)
+	case clipboardPaste:
+		updateInput, updateViewport = false, false
+		if value.generation != m.input.HistoryGeneration() {
+			break
+		}
+		if value.err != nil {
+			m.editorNotice = "Clipboard unavailable; use Ctrl+Shift+V / Cmd+V"
+		} else {
+			commands = append(commands, m.enqueuePaste(value.text))
+		}
 	case uiEvent:
 		event := value.event
 		refreshEvent := true
@@ -1459,6 +1435,14 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case diagnosticResultMsg:
 		m.diagnosticBusy = false
+	case tea.BlurMsg:
+		m.input.BreakUndoGroup()
+		m.cancelDrag()
+		updateInput, updateViewport = false, false
+	case tea.ResumeMsg:
+		m.cancelDrag()
+		updateInput, updateViewport = false, false
+		commands = append(commands, tea.EnableMouseCellMotion, m.repaint())
 	case tea.FocusMsg:
 		updateInput = false
 		updateViewport = false
@@ -1479,21 +1463,13 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.input, cmd = m.input.Update(message)
 		commands = append(commands, cmd)
 		inputAfter := m.input.Value()
-		visualRowsAfter := composerTextareaVisualRows(m.input)
-		// Bubbles can leave its private viewport on row ten when an unfinished
-		// word creates row eleven, then correct itself only on the next delimiter.
-		// Reanchor on that visual-row transition so the first overflow character
-		// is visible in the same update.
-		wrappedPastCap := m.composerRows == maxComposerHeight && m.input.LineInfo().Height > inputLineRowsBefore
-		shrunkOverCap := len(inputAfter) < len(inputBefore) && visualRowsAfter > maxComposerHeight
-		if inputAfter != inputBefore && inputWasAtEnd && m.inputCursorAtEnd() && (wrappedPastCap || shrunkOverCap) {
-			commands = append(commands, m.reanchorComposerEnd())
-		}
 		if inputAfter != inputBefore {
 			m.pruneTokens()
 			m.syncCommandMenu()
 		}
-		m.snapCursorOutsideToken(message)
+		if !m.input.HasSelection() {
+			m.snapCursorOutsideToken(message)
+		}
 	}
 	m.resizeComposer()
 	if updateViewport {
@@ -1878,32 +1854,12 @@ func (m *model) expandComposerForNewline() {
 }
 
 func (m *model) resetComposer() {
+	m.cancelPasteWork()
 	m.input.Reset()
 	m.composerRows = minComposerHeight
 	m.commandMenu = false
 	m.commandIndex = 0
 	m.tokens = nil
-}
-
-func (m model) inputCursorAtEnd() bool {
-	lines := strings.Split(m.input.Value(), "\n")
-	if m.input.Line() != len(lines)-1 {
-		return false
-	}
-	info := m.input.LineInfo()
-	return info.StartColumn+info.ColumnOffset == len([]rune(lines[len(lines)-1]))
-}
-
-func (m *model) reanchorComposerEnd() tea.Cmd {
-	value := m.input.Value()
-	m.input.SetValue(value)
-	// SetValue resets the textarea's private viewport. Prime its content before
-	// Update asks it to reposition, otherwise the viewport still appears empty
-	// and clamps the requested bottom offset back to zero.
-	_ = m.input.View()
-	var cmd tea.Cmd
-	m.input, cmd = m.input.Update(tea.KeyMsg{Type: tea.KeyNull})
-	return cmd
 }
 
 func loadTitle(fallback, path string) (string, error) {
@@ -1935,49 +1891,35 @@ func connectionMap(statuses []channel.ConnectionStatus) map[string]channel.Conne
 	return result
 }
 
-func (m *model) handlePaste(value string) (bool, error) {
-	characters := len([]rune(value))
-	if characters >= compactPasteChars {
-		token := composerToken{
-			label:     fmt.Sprintf("[Pasted %d chars]", characters),
-			expansion: value,
-		}
-		m.tokens = append(m.tokens, token)
-		m.input.InsertString(token.label)
-		m.commandMenu = false
-		m.commandIndex = 0
-		m.status = token.label
-		return true, nil
-	}
-	tokens, handled, err := preparePaste(context.Background(), m.attachments, value)
-	if err != nil || !handled {
-		return handled, err
-	}
-	m.tokens = append(m.tokens, tokens...)
-	m.input.InsertString(tokenLabels(tokens))
-	m.commandMenu = false
-	m.commandIndex = 0
-	m.status = fmt.Sprintf("Attached %d file(s)", len(tokens))
-	return true, nil
-}
-
 func (m *model) enqueuePaste(value string) tea.Cmd {
-	if len([]rune(value)) >= compactPasteChars {
-		_, _ = m.handlePaste(value)
+	// Commit the actual text through the widget's validation before starting
+	// file I/O. Ordinary text never needs a later whole-buffer replacement.
+	if value == "" {
+		return nil
+	}
+	start, end := m.input.SelectionRange()
+	before := utf8.RuneCountInString(m.input.Value())
+	m.input.InsertString(strings.ReplaceAll(value, "\r\n", "\n"))
+	if m.input.Err != nil {
+		m.editorNotice = m.input.Err.Error()
+		return nil
+	}
+	if m.input.HasSelection() {
+		return nil
+	}
+	inserted := utf8.RuneCountInString(m.input.Value()) - before + end - start
+	value = string([]rune(m.input.Value())[start : start+inserted])
+	m.syncCommandMenu()
+	m.status = "Pasted text"
+	m.pruneTokens()
+	if value == "" || len([]rune(value)) >= compactPasteChars || strings.ContainsAny(value, "\r\n") {
 		return nil
 	}
 	if len(m.pasteQueue) >= maxPendingPastes {
-		// Pasted input is never dropped. Under pathological admission pressure it
-		// remains literal text and deliberately skips filesystem interpretation.
-		m.input.InsertString(value)
 		m.status = "Paste queue full; inserted as text"
 		return nil
 	}
-	m.pasteSequence++
-	paste := pendingPaste{placeholder: fmt.Sprintf("[Preparing paste %d]", m.pasteSequence), value: value}
-	m.tokens = append(m.tokens, composerToken{label: paste.placeholder})
-	m.input.InsertString(paste.placeholder)
-	m.pasteQueue = append(m.pasteQueue, paste)
+	m.pasteQueue = append(m.pasteQueue, pendingPaste{value: value, generation: m.input.HistoryGeneration()})
 	m.status = "Preparing paste"
 	command := m.startNextPaste()
 	if len(m.pasteQueue) >= maxPendingPastes/2 {
@@ -2035,43 +1977,47 @@ func (m *model) reportDiagnostic(event, message string) tea.Cmd {
 }
 
 func (m *model) applyPreparedPaste(result pastePreparedMsg) {
-	value := m.input.Value()
-	if !strings.Contains(value, result.paste.placeholder) {
-		m.removeComposerToken(result.paste.placeholder)
+	if result.paste.generation != m.input.HistoryGeneration() {
 		return
 	}
-	replacement := result.paste.value
-	status := "Pasted text"
 	if result.err != nil {
-		status = "Paste failed; inserted as text: " + result.err.Error()
-	} else if result.handled {
-		replacement = tokenLabels(result.tokens)
-		status = fmt.Sprintf("Attached %d file(s)", len(result.tokens))
-	}
-	m.input.SetValue(strings.Replace(value, result.paste.placeholder, replacement, 1))
-	m.replaceComposerToken(result.paste.placeholder, result.tokens)
-	m.commandMenu = false
-	m.commandIndex = 0
-	m.status = status
-	m.resizeComposer()
-}
-
-func (m *model) removeComposerToken(label string) {
-	m.replaceComposerToken(label, nil)
-}
-
-func (m *model) replaceComposerToken(label string, replacements []composerToken) {
-	for index, token := range m.tokens {
-		if token.label != label {
-			continue
-		}
-		updated := make([]composerToken, 0, len(m.tokens)-1+len(replacements))
-		updated = append(updated, m.tokens[:index]...)
-		updated = append(updated, replacements...)
-		updated = append(updated, m.tokens[index+1:]...)
-		m.tokens = updated
+		m.editorNotice = "Paste preparation failed; kept text: " + result.err.Error()
 		return
 	}
+	m.status = "Pasted text"
+	if !result.handled {
+		return
+	}
+	value := m.input.Value()
+	// Editing continues during I/O. Without a unique unchanged source range,
+	// keep the literal text instead of guessing which occurrence to attach.
+	if result.paste.value == "" || strings.Count(value, result.paste.value) != 1 {
+		m.editorNotice = "Attachment not applied: pasted text changed or is repeated; kept text"
+		return
+	}
+	start := utf8.RuneCountInString(value[:strings.Index(value, result.paste.value)])
+	// Labels identify metadata in both the live draft and retained history.
+	// Keep earlier copies restorable when another file has the same basename.
+	labels := make(map[string]bool, len(m.tokens)+len(result.tokens))
+	for _, token := range m.tokens {
+		labels[token.label] = true
+	}
+	for i := range result.tokens {
+		base := result.tokens[i].label
+		for n := 2; labels[result.tokens[i].label]; n++ {
+			result.tokens[i].label = fmt.Sprintf("%s (%d)]", strings.TrimSuffix(base, "]"), n)
+		}
+		labels[result.tokens[i].label] = true
+	}
+	if !m.input.ReplaceRange(start, start+utf8.RuneCountInString(result.paste.value), tokenLabels(result.tokens)) {
+		m.editorNotice = m.input.Err.Error()
+		return
+	}
+	m.tokens = append(m.tokens, result.tokens...)
+	m.pruneTokens()
+	m.syncCommandMenu()
+	m.status = fmt.Sprintf("Attached %d file(s)", len(result.tokens))
+	m.resizeComposer()
 }
 
 func tokenLabels(tokens []composerToken) string {
@@ -2348,21 +2294,22 @@ func (m *model) deleteInputRange(row, start, end int) {
 	if start < 0 || end > len(runes) || start >= end {
 		return
 	}
-	lines[row] = string(append(runes[:start], runes[end:]...))
-	m.input.SetValue(strings.Join(lines, "\n"))
-	for steps := 0; m.input.Line() > row && steps < 10000; steps++ {
-		m.input.CursorUp()
+	offset := start
+	for _, line := range lines[:row] {
+		offset += utf8.RuneCountInString(line) + 1
 	}
-	m.input.SetCursor(start)
+	if !m.input.ReplaceRange(offset, offset+end-start, "") {
+		m.editorNotice = m.input.Err.Error()
+		return
+	}
 	m.pruneTokens()
 	m.syncCommandMenu()
 }
 
 func (m *model) pruneTokens() {
-	value := m.input.Value()
 	remaining := make([]composerToken, 0, len(m.tokens))
 	for _, token := range m.tokens {
-		if strings.Contains(value, token.label) {
+		if m.input.RetainsText(token.label) {
 			remaining = append(remaining, token)
 		}
 	}
@@ -2370,10 +2317,12 @@ func (m *model) pruneTokens() {
 }
 
 func (m model) expandTokens(value string) string {
+	replacements := make([]string, 0, 2*len(m.tokens))
 	for _, token := range m.tokens {
-		value = strings.Replace(value, token.label, token.expansion, 1)
+		replacements = append(replacements, token.label, token.expansion)
 	}
-	return value
+	// Replacements must not scan generated Markdown as another display token.
+	return strings.NewReplacer(replacements...).Replace(value)
 }
 
 func transcriptFromHistory(entries []history.Entry) []transcriptEntry {
@@ -2398,12 +2347,15 @@ func (m *model) appendTranscript(entries ...transcriptEntry) {
 		combined = append([]transcriptEntry{{role: "status", text: transcriptOmitted}}, combined...)
 	}
 	m.transcript = trimBoundedTranscript(combined)
+	if len(m.transcript) != oldLength+len(entries) {
+		m.clearSelections()
+	}
 	if !cacheReusable || len(m.transcript) != oldLength+len(entries) || transcriptWorkLarge(entries) {
 		m.invalidateHistoryRender()
 		return
 	}
 	for _, entry := range entries {
-		m.historyCache = append(m.historyCache, m.renderTranscriptEntry(entry))
+		m.historyCache = append(m.historyCache, m.transcriptRender(entry))
 	}
 }
 
@@ -2485,13 +2437,17 @@ func (m *model) handleCommandMenuKey(key tea.KeyMsg) bool {
 		m.commandIndex = (m.commandIndex + 1) % len(matches)
 		return true
 	case tea.KeyTab:
-		m.input.SetValue(matches[m.commandIndex].Value)
+		selected := matches[m.commandIndex].Value
+		m.resetComposer()
+		m.input.SetValue(selected)
 		m.commandMenu = false
 		m.commandIndex = 0
 		return true
 	case tea.KeyEnter:
 		// Insert the selection, then let the ordinary Enter path dispatch it.
-		m.input.SetValue(matches[m.commandIndex].Value)
+		selected := matches[m.commandIndex].Value
+		m.resetComposer()
+		m.input.SetValue(selected)
 		m.commandMenu = false
 		m.commandIndex = 0
 		return false
@@ -2642,15 +2598,9 @@ func (m *model) resizeComposerForViewport(compensate bool) bool {
 	shouldFollow := m.shouldFollowTail()
 	changed := height != m.composerRows
 	m.composerRows = height
-	inputHeightChanged := m.input.Height() != capacity
+	inputHeightChanged := m.input.Height() != height
 	if inputHeightChanged {
-		m.input.SetHeight(capacity)
-		if m.inputCursorAtEnd() {
-			// SetHeight alone leaves textarea's private viewport at its previous
-			// top row until another edit. Reanchor now so a terminal shrink shows
-			// the cursor-bearing tail in this same WindowSize update.
-			_ = m.reanchorComposerEnd()
-		}
+		m.input.SetHeight(height)
 	}
 	if m.height >= layoutOverhead+minComposerHeight+1 {
 		m.viewport.Height = max(1, m.height-layoutOverhead-height-m.inlineMenuHeight())
@@ -2722,19 +2672,7 @@ func composerHeight(value string, width int) int {
 // describes the active logical line; cloned probes measure the remaining
 // explicit lines without disturbing editor state or its cursor.
 func composerTextareaVisualRows(input textarea.Model) int {
-	lines := strings.Split(input.Value(), "\n")
-	activeLine := input.Line()
-	height := 0
-	probe := newComposerProbe(input.Width())
-	for index, line := range lines {
-		if index == activeLine {
-			height += max(minComposerHeight, input.LineInfo().Height)
-			continue
-		}
-		probe.SetValue(line)
-		height += max(minComposerHeight, probe.LineInfo().Height)
-	}
-	return max(minComposerHeight, height)
+	return max(1, len(input.VisualRows()))
 }
 
 func newComposerProbe(width int) textarea.Model {
@@ -2811,6 +2749,9 @@ func (m *model) refreshStreaming() {
 // explicit upward scrolling suppresses follow mode for a short reading grace
 // period even when that scroll remains inside the zone.
 func (m *model) shouldFollowTail() bool {
+	if m.selection.active || m.drag.pane == outputPane {
+		return false
+	}
 	if !m.tailAdjacent() {
 		return false
 	}
@@ -2860,17 +2801,42 @@ func (m *model) renderHistory() {
 			m.historyValid = true
 		}
 	}
-	entries := append([]string(nil), m.historyCache...)
-	if m.streaming != "" {
-		content := m.pendingStreamContent()
+	entries := append([]transcriptRender(nil), m.historyCache...)
+	if m.streaming != "" || m.working {
+		logical := m.pendingStreamContent()
+		entry := transcriptRender{source: m.streaming, label: agentChatLabel, layout: markdownfmt.WrapLogical(logical, m.chatContentWidth())}
 		if m.working {
-			content += m.workingSpinner.View()
+			entry.spinner = m.workingSpinner.View()
 		}
-		entries = append(entries, m.renderMarkdownChatMessage(agentChatLabel, m.styles.agent, content))
-	} else if m.working {
-		entries = append(entries, m.renderChatMessage(agentChatLabel, m.styles.agent, m.workingSpinner.View()))
+		entries = append(entries, entry)
 	}
-	content := strings.Join(entries, "\n\n")
+	// Keep already selected streamed text stable if newly completed Markdown
+	// reinterprets its prefix. New source still appears, while formatting of
+	// the selected message is deferred until the selection is cleared.
+	if m.selection.active {
+		a, b := m.selection.bounds()
+		for i := max(0, a.entry); i <= b.entry && i < len(entries) && i < len(m.output); i++ {
+			previous := m.output[i]
+			if strings.HasPrefix(entries[i].layout.Text, previous.layout.Text) {
+				continue
+			}
+			if previous.label != entries[i].label {
+				continue
+			}
+			logical := previous.layout.Logical
+			if strings.HasPrefix(entries[i].source, previous.source) {
+				logical += stripUnsafeTerminalControls(entries[i].source[len(previous.source):])
+			}
+			entries[i].layout = markdownfmt.WrapLogical(logical, m.chatContentWidth())
+			entries[i].view = ""
+		}
+	}
+	m.output = entries
+	views := make([]string, len(entries))
+	for i, entry := range entries {
+		views[i] = m.transcriptView(entry)
+	}
+	content := strings.Join(views, "\n\n")
 	if content == "" {
 		content = m.styles.status.Render(emptyConversation)
 	}
@@ -2903,13 +2869,13 @@ func transcriptWorkLarge(entries []transcriptEntry) bool {
 	return false
 }
 
-func renderHistoryEntries(snapshot model) []string {
-	entries := make([]string, 0, len(snapshot.transcript)+1)
+func renderHistoryEntries(snapshot model) []transcriptRender {
+	entries := make([]transcriptRender, 0, len(snapshot.transcript)+1)
 	if snapshot.welcome != nil {
-		entries = append(entries, snapshot.renderWelcome(*snapshot.welcome))
+		entries = append(entries, transcriptRender{layout: markdownfmt.WrapLogical(snapshot.renderWelcome(*snapshot.welcome), snapshot.viewport.Width)})
 	}
 	for _, entry := range snapshot.transcript {
-		entries = append(entries, snapshot.renderTranscriptEntry(entry))
+		entries = append(entries, snapshot.transcriptRender(entry))
 	}
 	return entries
 }
@@ -2990,7 +2956,7 @@ func pendingStreamPlain(value string, width int) string {
 	if truncated {
 		value = "…" + value
 	}
-	return ansi.Hardwrap(value, max(1, width), true)
+	return value
 }
 
 func trailingRunes(value string, limit int) (string, bool) {
@@ -3021,27 +2987,17 @@ func (m model) renderWelcome(welcome core.Screen) string {
 		parts = append(parts, m.styles.title.Render(welcome.Banner))
 	}
 	if welcome.Subtitle != "" {
-		contentWidth := max(1, m.viewport.Width-1)
 		if welcome.Markdown {
-			parts = append(parts, trimRenderedPadding(markdownfmt.TerminalWithTheme(welcome.Subtitle, contentWidth, m.activeTheme)))
+			parts = append(parts, markdownfmt.TerminalLogical(stripUnsafeTerminalControls(welcome.Subtitle), m.activeTheme))
 		} else {
-			parts = append(parts, m.styles.status.Render(ansi.Hardwrap(welcome.Subtitle, contentWidth, true)))
+			parts = append(parts, m.styles.status.Render(stripUnsafeTerminalControls(welcome.Subtitle)))
 		}
 	}
 	return strings.Join(parts, "\n\n")
 }
 
 func (m model) renderTranscriptEntry(entry transcriptEntry) string {
-	switch entry.role {
-	case "user":
-		return m.renderChatMessage(userChatLabel, m.styles.user, entry.text)
-	case "assistant":
-		return m.renderMarkdownChatMessage(agentChatLabel, m.styles.agent, m.renderAgentMarkdown(entry.text))
-	case "error":
-		return m.renderChatMessage(errorChatLabel, m.styles.error, entry.text)
-	default:
-		return m.renderChatMessage(entry.role, m.styles.status, entry.text)
-	}
+	return m.transcriptView(m.transcriptRender(entry))
 }
 
 func (m model) renderChatMessage(label string, style lipgloss.Style, content string) string {
@@ -3174,18 +3130,19 @@ func (m model) chatContentWidth() int {
 }
 
 func (m model) renderAgentMarkdown(text string) string {
-	return renderAgentMarkdownText(text, m.chatMarkdownWidth(), m.activeTheme)
+	return markdownfmt.WrapLogical(renderAgentMarkdownText(text, m.chatMarkdownWidth(), m.activeTheme), m.chatContentWidth()).View()
 }
 
 func renderAgentMarkdownText(text string, width int, active theme.Theme) string {
+	text = stripUnsafeTerminalControls(text)
 	if remainder, found := cutSpynelLogoMarkdown(text); found {
 		parts := []string{stylesFor(active).title.Render(core.SpynelASCII)}
 		if remainder = strings.TrimSpace(remainder); remainder != "" {
-			parts = append(parts, trimRenderedPadding(markdownfmt.TerminalWithTheme(remainder, width, active)))
+			parts = append(parts, markdownfmt.TerminalLogical(remainder, active))
 		}
 		return strings.Join(parts, "\n\n")
 	}
-	return trimRenderedPadding(markdownfmt.TerminalWithTheme(text, width, active))
+	return markdownfmt.TerminalLogical(text, active)
 }
 
 func (m model) chatMarkdownWidth() int {
@@ -3244,7 +3201,7 @@ func (m model) viewWithoutDialog() string {
 		input := m.borderedSurface("", inputView, m.composerRows, barWidth, inputOffset, inputRows, m.styles.surface)
 		return lipgloss.JoinVertical(lipgloss.Left, header, input, m.footerView(m.footerHint(), barWidth))
 	}
-	historyView := fitContent(m.viewport.View(), m.viewport.Height, m.viewport.Width)
+	historyView := fitContent(m.selectedHistoryView(), m.viewport.Height, m.viewport.Width)
 	chat := m.historySurface(historyView, m.viewport.Height, barWidth, m.viewport.YOffset, m.viewport.TotalLineCount())
 	inputOffset, inputRows := m.inputScrollMetrics()
 	inputView := fitContent(m.renderInput(), m.composerRows, m.inputWidth)
@@ -3522,9 +3479,11 @@ func trueColorBackgroundSGR(background lipgloss.TerminalColor) string {
 }
 
 func (m *model) openScreen(screen core.Screen) {
+	m.clearSelections()
 	m.dialog = nil
 	if screen.ID == "welcome" {
 		if screen.Conversation != "" {
+			m.resetComposer()
 			m.conversation = screen.Conversation
 			if m.liveConversation != nil {
 				m.liveConversation.Set(screen.Conversation)
@@ -3552,6 +3511,7 @@ func (m *model) openScreen(screen core.Screen) {
 		return
 	}
 	if screen.ID == "chat" && screen.Conversation != "" {
+		m.resetComposer()
 		m.conversation = screen.Conversation
 		if m.liveConversation != nil {
 			m.liveConversation.Set(screen.Conversation)
@@ -4368,7 +4328,16 @@ func (m model) footerHint() string {
 	if m.commandMenu {
 		return "↑↓ choose · ⇥ insert · ↵ send · ␛ close"
 	}
-	return "↵ send · ⇧↵ line · PgUp/⇧+↑↓ scroll · ⌃C clear/stop/quit"
+	if m.editorNotice != "" {
+		return m.editorNotice
+	}
+	if m.outputFocus && m.selectedOutput() != "" {
+		return "F6 terminal copy · ⌃C copy · ␛ cancel"
+	}
+	if m.input.HasSelection() {
+		return "F6 terminal copy · ⌃C copy · ⌃X cut · ⌃V paste · ␛ cancel"
+	}
+	return "↵ send · ⇧↵ line · PgUp/⌥↑↓ scroll · ⌃C clear/stop/quit"
 }
 
 func (m model) inlineMenuView() string {
@@ -4487,17 +4456,7 @@ func (m model) renderInput() string {
 }
 
 func (m model) inputScrollMetrics() (int, int) {
-	total := composerTextareaVisualRows(m.input)
-	cursorRow := 0
-	lines := strings.Split(m.input.Value(), "\n")
-	probe := newComposerProbe(m.input.Width())
-	for index := 0; index < m.input.Line() && index < len(lines); index++ {
-		probe.SetValue(lines[index])
-		cursorRow += max(minComposerHeight, probe.LineInfo().Height)
-	}
-	cursorRow += m.input.LineInfo().RowOffset
-	offset := bounded(cursorRow-m.composerRows+1, 0, max(0, total-m.composerRows))
-	return offset, total
+	return m.input.ScrollOffset(), len(m.input.VisualRows())
 }
 
 func fitContent(content string, height, width int) string {

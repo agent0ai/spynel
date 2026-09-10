@@ -2,6 +2,9 @@ module github.com/agent0ai/spynel
 
 go 1.25.0
 
+// v1.3.10 with immutable terminal output and framed key decoding (see its AGENTS.md).
+replace github.com/charmbracelet/bubbletea => ./third_party/bubbletea
+
 require (
 	github.com/charmbracelet/bubbles v0.21.0
 	github.com/charmbracelet/bubbletea v1.3.10

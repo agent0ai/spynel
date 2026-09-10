@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -19,6 +20,11 @@ import (
 
 var errOwnershipLost = errors.New("workspace server ownership changed during startup")
 
+type primaryOptions struct {
+	Socket string
+	Log    io.Writer
+}
+
 type primaryTerm struct {
 	election *instance.Election
 	token    string
@@ -33,7 +39,7 @@ type primaryTerm struct {
 	stopOnce         sync.Once
 }
 
-func runOwnerElection(ctx context.Context, cfg config.Config, version string, election *instance.Election, restart, update func()) error {
+func runOwnerElection(ctx context.Context, cfg config.Config, version string, election *instance.Election, restart, update func(), options ...primaryOptions) error {
 	ticker := time.NewTicker(instance.RetryInterval)
 	defer ticker.Stop()
 	var term *primaryTerm
@@ -73,6 +79,9 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 
 		current, err := election.Current()
 		if err == nil && !election.CanTakeOver(current) {
+			if len(options) > 0 && options[0].Socket != "" {
+				return errors.New("--socket requires a new primary; an existing primary already owns this workspace")
+			}
 			return nil
 		}
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -89,7 +98,7 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 			listener.Close()
 			return err
 		}
-		term, err = startPrimaryTerm(ctx, cfg, version, election, listener, token, restart, update)
+		term, err = startPrimaryTerm(ctx, cfg, version, election, listener, token, restart, update, options...)
 		if err != nil {
 			_ = election.Release(token)
 			listener.Close()
@@ -127,7 +136,7 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 	}
 }
 
-func startPrimaryTerm(parent context.Context, original config.Config, version string, election *instance.Election, listener net.Listener, token string, restart, update func()) (*primaryTerm, error) {
+func startPrimaryTerm(parent context.Context, original config.Config, version string, election *instance.Election, listener net.Listener, token string, restart, update func(), options ...primaryOptions) (*primaryTerm, error) {
 	// A secondary may have waited for hours before taking over. Re-read YAML so
 	// it never resurrects the snapshot from its own startup.
 	cfg, err := config.Load(original.Path)
@@ -143,6 +152,24 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 		cancel()
 		return nil, err
 	}
+	var socket net.Listener
+	if len(options) > 0 {
+		service.Runtime.SetOperationalOutput(options[0].Log)
+		if options[0].Socket != "" {
+			socket, err = localapi.ListenSocket(options[0].Socket, cfg.Root, token)
+			if err != nil {
+				cancel()
+				_ = service.Close()
+				return nil, err
+			}
+		}
+	}
+	started := false
+	defer func() {
+		if !started && socket != nil {
+			_ = socket.Close()
+		}
+	}()
 	service.Runtime.LogEvent("info", "config", "reloaded", "Configuration loaded for primary startup")
 	service.SetRecoveryOwnershipFence(func(action func() error) (bool, error) {
 		return election.RunWhileOwner(token, action)
@@ -174,8 +201,22 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 	apiServer := &localapi.Server{Service: service, Token: token}
 	go func() {
 		defer service.Runtime.RecoverPanic("localapi", "server_panic")
-		err := apiServer.Serve(ctx, listener)
-		term.apiError <- err
+		listeners := []net.Listener{listener}
+		if socket != nil {
+			listeners = append(listeners, socket)
+		}
+		results := make(chan error, len(listeners))
+		for _, target := range listeners {
+			go func() { results <- apiServer.Serve(ctx, target) }()
+		}
+		for range listeners {
+			err := <-results
+			select {
+			case term.apiError <- err:
+			default:
+			}
+			cancel()
+		}
 		close(term.apiDone)
 	}()
 
@@ -193,6 +234,7 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 			update()
 		}
 	}()
+	started = true
 	return term, nil
 }
 

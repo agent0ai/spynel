@@ -117,35 +117,54 @@ func TestRuntimeReusesSessionJobAndKeepsNumericOrder(t *testing.T) {
 	}
 }
 
-func TestRuntimeProjectsOnlyAuthoritativeLiveBackgroundJobs(t *testing.T) {
+func TestRuntimeProjectsOnlyAuthoritativeLiveJobs(t *testing.T) {
 	runtime := NewRuntime()
-	chat := runtime.BeginJob("chat:tui:local", "tui", "local", "foreground")
+	for _, origin := range []struct{ channel, kind string }{
+		{"tui", "conversation"}, {"cli", "conversation"}, {"telegram", "conversation"}, {"whatsapp", "conversation"},
+		{"orchestrator", "task"}, {"orchestrator", "goal"}, {"orchestrator", "notification"}, {"orchestrator", "heartbeat"},
+	} {
+		id := runtime.BeginJobWithDetails("global", origin.channel, "elsewhere", "global work", JobDetails{Kind: origin.kind})
+		if status := runtime.Status(); status.Jobs != 1 || status.LiveJobs != 1 {
+			t.Fatalf("%s/%s projection = %#v, want one live job", origin.channel, origin.kind, status)
+		}
+		runtime.EndJob(id)
+		if status := <-runtime.Updates(); status.Jobs != 0 || status.LiveJobs != 0 {
+			t.Fatalf("ended job update = %#v", status)
+		}
+	}
+	chat := runtime.BeginJob("chat:tui:other", "tui", "other", "another conversation")
+	for _, state := range []JobExecutionState{JobRunning, JobReconnecting, JobRecovering, JobDegraded, JobAudit} {
+		runtime.UpdateJob(chat, core.ExecutionStatus{State: string(state)})
+		if status := <-runtime.Updates(); status.LiveJobs != 1 {
+			t.Fatalf("live state %q missing from update: %#v", state, status)
+		}
+	}
 	first := runtime.BeginJobWithDetails("task:first", "orchestrator", "markdown", "first", JobDetails{Kind: "task"})
 	second := runtime.BeginJobWithDetails("task:second", "orchestrator", "markdown", "second", JobDetails{Kind: "task"})
-	if status := runtime.Status(); status.Jobs != 3 || status.LiveBackgroundJobs != 2 {
-		t.Fatalf("initial runtime projection = %#v, want 3 registered and 2 live background jobs", status)
+	if status := runtime.Status(); status.Jobs != 3 || status.LiveJobs != 3 {
+		t.Fatalf("initial runtime projection = %#v, want 3 registered and live jobs", status)
 	}
+	runtime.EndJob(chat)
 
 	runtime.UpdateJob(first, core.ExecutionStatus{State: string(JobAwaitingTransition)})
-	if status := runtime.Status(); status.LiveBackgroundJobs != 1 {
+	if status := runtime.Status(); status.LiveJobs != 1 {
 		t.Fatalf("one settled background job projection = %#v, want one live", status)
 	}
 	runtime.UpdateJob(second, core.ExecutionStatus{State: string(JobStalled)})
-	if status := runtime.Status(); status.LiveBackgroundJobs != 0 {
+	if status := runtime.Status(); status.LiveJobs != 0 {
 		t.Fatalf("explicitly stale job kept background activity alive: %#v", status)
 	}
 
 	for _, state := range []JobExecutionState{JobCancelling, JobFinishing, JobError} {
 		id := runtime.BeginJobWithDetails("terminal:"+string(state), "orchestrator", "markdown", string(state), JobDetails{Kind: "task"})
 		runtime.UpdateJob(id, core.ExecutionStatus{State: string(state)})
-		if status := runtime.Status(); status.LiveBackgroundJobs != 0 {
+		if status := runtime.Status(); status.LiveJobs != 0 {
 			t.Fatalf("terminal state %q kept background activity alive: %#v", state, status)
 		}
 	}
-	if status := runtime.Status(); status.Jobs != 6 {
+	if status := runtime.Status(); status.Jobs != 5 {
 		t.Fatalf("registered terminal records were unexpectedly removed: %#v", status)
 	}
-	runtime.EndJob(chat)
 }
 
 func TestDurableTimingSurvivesContinuationAndJobNumberReplacement(t *testing.T) {

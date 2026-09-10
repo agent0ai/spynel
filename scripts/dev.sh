@@ -33,7 +33,7 @@ case "$action" in
     echo "$project_dir/.tmp-bin/spynel"
     ;;
   test)
-    (cd "$project_dir" && CGO_ENABLED=1 "$go_bin" test ./... && CGO_ENABLED=1 "$go_bin" vet ./...)
+    (cd "$project_dir" && CGO_ENABLED=1 "$go_bin" test ./... github.com/charmbracelet/bubbletea && CGO_ENABLED=1 "$go_bin" vet ./... github.com/charmbracelet/bubbletea)
     ;;
   dox)
     (cd "$project_dir" && "$go_bin" run ./scripts/doxcheck)

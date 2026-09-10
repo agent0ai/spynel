@@ -80,7 +80,12 @@ func RunParentWorkspaceChoiceWithVersion(ctx context.Context, launchRoot, parent
 		return nil
 	})
 	m.version = headerVersion(version)
-	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
+	terminal, closeInput, inputErr := terminalProgramInput()
+	if inputErr != nil {
+		return "", inputErr
+	}
+	defer closeInput()
+	program := tea.NewProgram(m, tea.WithInput(terminal), tea.WithAltScreen(), tea.WithContext(ctx))
 	final, err := program.Run()
 	if err != nil {
 		return WorkspaceChoiceExit, err
@@ -108,7 +113,12 @@ func RunInitialization(ctx context.Context, root string, initialize func() error
 func RunInitializationWithVersion(ctx context.Context, root, version string, initialize func() error) (bool, error) {
 	m := newInitializationModel(ctx, root, initialize)
 	m.version = headerVersion(version)
-	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithContext(ctx))
+	terminal, closeInput, inputErr := terminalProgramInput()
+	if inputErr != nil {
+		return false, inputErr
+	}
+	defer closeInput()
+	program := tea.NewProgram(m, tea.WithInput(terminal), tea.WithAltScreen(), tea.WithContext(ctx))
 	final, err := program.Run()
 	if err != nil {
 		return false, err
