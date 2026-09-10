@@ -303,9 +303,9 @@ func (p *Program) handleSignals() chan struct{} {
 				if atomic.LoadUint32(&p.ignoreSignals) == 0 {
 					switch s {
 					case syscall.SIGINT:
-						p.msgs <- InterruptMsg{}
+						p.Send(InterruptMsg{})
 					default:
-						p.msgs <- QuitMsg{}
+						p.Send(QuitMsg{})
 					}
 					return
 				}
