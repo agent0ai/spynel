@@ -37,8 +37,25 @@ func TestRemoveInstallation(t *testing.T) {
 					manager.NPMLauncher = filepath.Join(home, `npm Ω $ ' " % \`, "spynel.js")
 					manager.NodeExecutable = "/node"
 				}
-				manager.RunCommand = func(context.Context, string, ...string) error { return nil }
-				cfg := startupTestConfig(filepath.Join(home, "workspace Ω"))
+				manager.RunCommand = func(_ context.Context, name string, args ...string) (string, error) {
+					if name == "systemctl" && strings.Contains(strings.Join(args, " "), "list-unit-files") {
+						return args[len(args)-1] + " enabled enabled\n", nil
+					}
+					return "", nil
+				}
+				for _, path := range []string{manager.Executable, manager.NPMLauncher} {
+					if path == "" {
+						continue
+					}
+					if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				manager.NodeExecutable = manager.Executable
+				cfg := startupTestConfig(t, filepath.Join(home, "workspace Ω"))
 				if err := manager.Sync(cfg, true); err != nil {
 					t.Fatal(err)
 				}

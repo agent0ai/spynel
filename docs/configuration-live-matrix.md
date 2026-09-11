@@ -19,7 +19,7 @@ Every setting below is exposed by the shared typed catalog used by the TUI, slas
 | `workspace.history_max_messages` | Live | Prompt construction reads the newest bounded-history count | Validation/persistence is all-or-nothing | history prompt-limit tests |
 | `workspace.history_char_limit` | Live | Prompt construction reads the newest character limit | Validation/persistence is all-or-nothing | history prompt-limit tests |
 | `workspace.attachment_max_mb` | Live | Channel generation fingerprint and outbound parsing use the accepted limit | Invalid values reject before commit; stale adapters are revoked | channel/media limit tests |
-| `startup.enabled` | Live | Startup manager registers or removes the workspace service after the shared snapshot reload | Invalid values reject before save; OS registration errors are returned | startup application tests |
+| `startup.enabled` | Live | Immediate enable/disable actions and text commands register/remove and validate after snapshot reload, including unchanged retries | Invalid values reject before save; native errors identify unverified registration despite a saved preference | startup native-query/environment tests and application/TUI action tests |
 | `channels.tui.title` | Live | Shared-state title publication updates attached TUIs | Persistence failure publishes nothing | service title tests |
 | `channels.tui.theme` | Live | Palette validates before commit, then publishes to attached TUIs | Unknown/invalid palette rejects before commit | theme service and visual tests |
 | `orchestrator.enabled` | Live | Manager fences scheduler state and requests an immediate scan when enabled | Infallible generation publication follows durable commit | heartbeat scheduler tests |

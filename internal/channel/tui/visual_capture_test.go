@@ -86,6 +86,8 @@ func TestVisualCapture(t *testing.T) {
 		"resume":                visualResumeModel(),
 		"jobs":                  visualJobsModel(),
 	}
+	captures["config-autostart-success"] = visualAutostartResultModel(false)
+	captures["config-autostart-error"] = visualAutostartResultModel(true)
 	for _, palette := range theme.Builtins() {
 		captures["theme-"+palette.Name] = visualThemedChatModel(palette.Name)
 	}
@@ -435,7 +437,8 @@ func visualConfigModel() model {
 			{Key: "harness.sandbox", Label: "agent access", Kind: "select", Value: "danger-full-access", Options: []string{"danger-full-access", "workspace-write", "read-only"}, Description: "Filesystem access granted to the coding agent"},
 			{Key: "workspace.history_max_messages", Label: "context messages", Kind: "text", Value: "50", Description: "Maximum recent messages passed to the harness"},
 			{Key: "workspace.history_char_limit", Label: "context characters", Kind: "text", Value: "12000", Description: "Maximum total history characters passed to the harness"},
-			{Key: "startup.enabled", Label: "run at startup", Kind: "toggle", Value: "off", Options: []string{"on", "off"}, Description: "Run Spynel automatically for this workspace"},
+			{Key: "autostart:enable", Kind: "action", Value: "Enable autostart", Description: "Register this workspace for automatic startup and verify the registration now"},
+			{Key: "autostart:disable", Kind: "action", Value: "Disable autostart", Description: "Remove this workspace's automatic startup registration and verify removal now"},
 			{Key: "advanced", Section: "Advanced settings", Kind: "disclosure", Value: "Advanced settings", Description: "Show task, speech, channel, extension, and storage controls"},
 			{Key: "tasks.enabled", Label: "task loop", Kind: "toggle", Value: "on", Options: []string{"on", "off"}, Description: "Process durable task documents", Advanced: true},
 			{Key: "speech.enabled", Label: "speech transcription", Kind: "toggle", Value: "on", Options: []string{"on", "off"}, Description: "Transcribe supported voice attachments", Advanced: true},
@@ -444,10 +447,19 @@ func visualConfigModel() model {
 	return value
 }
 
+func visualAutostartResultModel(failed bool) model {
+	value := visualConfigModel()
+	value.screen.Status = "Autostart enabled. Registration verified."
+	if failed {
+		value.screen.Status = "Action failed: autostart registration unverified: reload autostart registration: systemctl: permission denied (preference saved)"
+	}
+	return value
+}
+
 func visualAdvancedConfigModel() model {
 	value := visualConfigModel()
 	value.screenAdvanced = true
-	value.screenIndex = 6
+	value.screenIndex = 7
 	return value
 }
 

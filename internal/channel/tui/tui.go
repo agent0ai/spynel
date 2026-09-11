@@ -87,6 +87,7 @@ type themeLoadResult struct {
 type streamRefreshMsg struct{}
 type streamRenderCooldownMsg struct{}
 type screenActionResult struct {
+	screenID      string
 	action        string
 	selectedIndex int
 	screen        *core.Screen
@@ -1305,9 +1306,16 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "Configuration saved"
 		}
 	case screenActionResult:
+		if value.screenID != "" && (m.screen == nil || m.screen.ID != value.screenID) {
+			break
+		}
 		m.screenSaving = false
 		if value.err != nil {
 			m.status = "Action failed: " + value.err.Error()
+			if m.screen != nil {
+				m.screen.Status = m.status
+				m.screenManual, m.screenScroll = true, 0
+			}
 			break
 		}
 		actionMessage := ""
@@ -1322,6 +1330,23 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if actionMessage != "" {
 			m.appendTranscript(transcriptEntry{role: "assistant", text: actionMessage})
+		}
+		// A committed action on the current form must preserve unrelated edits,
+		// the original save baseline, and the current keyboard selection.
+		if savedControl != nil && m.screen != nil {
+			updated := false
+			for index := range m.screen.Controls {
+				control := &m.screen.Controls[index]
+				if control.Key == savedControl.Key && control.Kind == "action" {
+					control.Value, control.Description = savedControl.Value, savedControl.Description
+					updated = true
+				}
+			}
+			if updated {
+				m.screen.Status, m.status = actionMessage, actionMessage
+				m.screenManual, m.screenScroll = true, 0
+				break
+			}
 		}
 		m.screenResult = value.action
 		if value.screen == nil && value.action == "cancel" && len(m.screenStack) > 0 {
@@ -3874,7 +3899,7 @@ func (m *model) runScreenAction(action string) tea.Cmd {
 	ctx := m.ctx
 	return func() tea.Msg {
 		next, err := callback(ctx, screenID, action, values)
-		return screenActionResult{action: action, selectedIndex: selectedIndex, screen: next, err: err}
+		return screenActionResult{screenID: screenID, action: action, selectedIndex: selectedIndex, screen: next, err: err}
 	}
 }
 
@@ -3998,7 +4023,10 @@ func (m model) screenContent(height, width int) (string, int, int) {
 		lines = append(lines, "")
 	}
 	if m.screen.Status != "" {
-		lines = append(lines, m.styles.agent.Render(ansi.Hardwrap(m.screen.Status, textWidth, true)), "")
+		for _, line := range strings.Split(ansi.Wrap(m.screen.Status, textWidth, ""), "\n") {
+			lines = append(lines, m.styles.agent.Render(line))
+		}
+		lines = append(lines, "")
 	}
 	if m.screen.Subtitle != "" {
 		if m.screen.Markdown {

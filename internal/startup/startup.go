@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -22,7 +24,7 @@ import (
 	"github.com/agent0ai/spynel/internal/updater"
 )
 
-type CommandRunner func(context.Context, string, ...string) error
+type CommandRunner func(context.Context, string, ...string) (string, error)
 
 type Manager struct {
 	GOOS                  string
@@ -80,7 +82,7 @@ func New(executable string) (*Manager, error) {
 		GOOS: runtime.GOOS, Home: home, Executable: executable, SystemWide: systemWide,
 		SystemUnitDirectory: "/etc/systemd/system", SystemLaunchDirectory: "/Library/LaunchDaemons",
 	}
-	manager.RunCommand = func(ctx context.Context, name string, arguments ...string) error {
+	manager.RunCommand = func(ctx context.Context, name string, arguments ...string) (string, error) {
 		return runCommand(ctx, manager.Log, name, arguments...)
 	}
 	nodeExecutable := strings.TrimSpace(os.Getenv("SPYNEL_NPM_NODE"))
@@ -102,22 +104,119 @@ func (m *Manager) Sync(cfg config.Config, enabled bool) error {
 	if cfg.Path == "" {
 		return errors.New("cannot configure startup without a loaded .spynel/config.yaml")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if enabled {
+		if err := m.validatePaths(cfg); err != nil {
+			return err
+		}
+	}
 	switch m.GOOS {
 	case "linux":
 		if enabled {
-			return m.enableLinux(cfg)
+			return m.enableLinux(ctx, cfg)
 		}
-		return m.disableLinux(cfg)
+		return m.disableLinux(ctx, cfg)
 	case "darwin":
+		var err error
+		action := "enable"
 		if enabled {
-			return m.enableDarwin(cfg)
+			err = m.enableDarwin(ctx, cfg)
+		} else {
+			action = "disable"
+			err = m.disableDarwin(cfg)
 		}
-		return m.disableDarwin(cfg)
+		if err != nil {
+			return err
+		}
+		domain := "gui/" + strconv.Itoa(os.Getuid())
+		if m.SystemWide {
+			domain = "system"
+		}
+		_, err = m.run(ctx, "launchctl", action, domain+"/dev.spynel.workspace."+workspaceID(cfg))
+		if err != nil {
+			return fmt.Errorf("%s autostart registration: %w", action, err)
+		}
+		return nil
 	case "windows":
-		return m.syncWindows(cfg, enabled)
+		return m.syncWindows(ctx, cfg, enabled)
 	default:
 		return fmt.Errorf("run at startup is not supported on %s", m.GOOS)
 	}
+}
+
+func (m *Manager) run(ctx context.Context, name string, arguments ...string) (string, error) {
+	if m.RunCommand != nil {
+		return m.RunCommand(ctx, name, arguments...)
+	}
+	return runCommand(ctx, m.Log, name, arguments...)
+}
+
+// Native syntax validation precedes replacement of any existing registration.
+func (m *Manager) writeValidated(ctx context.Context, path string, data []byte, command string, args ...string) error {
+	stage, err := os.MkdirTemp(filepath.Dir(path), ".spynel-verify-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stage)
+	candidate := filepath.Join(stage, filepath.Base(path))
+	if err := fsx.AtomicWriteFile(candidate, data, 0o600); err != nil {
+		return err
+	}
+	if _, err := m.run(ctx, command, append(args, candidate)...); err != nil {
+		return fmt.Errorf("validate autostart registration: %w", err)
+	}
+	return fsx.AtomicWriteFile(path, data, 0o600)
+}
+
+func (m *Manager) validatePaths(cfg config.Config) error {
+	if m.GOOS == "linux" {
+		if _, err := systemdWorkingDirectory(cfg.Root); err != nil {
+			return err
+		}
+	}
+	if !filepath.IsAbs(m.Home) {
+		return errors.New("autostart requires an absolute home directory")
+	}
+	for _, directory := range []string{m.Home, cfg.Root} {
+		info, err := os.Stat(directory)
+		if err != nil {
+			return fmt.Errorf("autostart directory %q: %w", directory, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("autostart directory %q is not a directory", directory)
+		}
+	}
+	executable, _ := m.startupCommand(cfg)
+	paths := []string{cfg.Path, executable}
+	if m.NPMLauncher != "" {
+		paths = append(paths, m.NPMLauncher)
+	}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("autostart file %q: %w", path, err)
+		}
+		if !filepath.IsAbs(path) || !info.Mode().IsRegular() {
+			return fmt.Errorf("autostart file %q must be an absolute regular file", path)
+		}
+		if path == executable && m.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
+			return fmt.Errorf("autostart executable %q is not executable", path)
+		}
+	}
+	return nil
+}
+
+// These per-user locations must agree with interactive launches, including
+// the private environment identity and the shared speech/harness caches.
+func (m *Manager) environment() map[string]string {
+	values := map[string]string{"HOME": m.Home}
+	for _, key := range []string{"XDG_CONFIG_HOME", "XDG_CACHE_HOME"} {
+		if value := os.Getenv(key); value != "" {
+			values[key] = value
+		}
+	}
+	return values
 }
 
 func workspaceID(cfg config.Config) string {
@@ -136,7 +235,7 @@ func (m *Manager) startupCommand(cfg config.Config) (string, []string) {
 	return executable, arguments
 }
 
-func (m *Manager) enableLinux(cfg config.Config) error {
+func (m *Manager) enableLinux(ctx context.Context, cfg config.Config) error {
 	workingDirectory, err := systemdWorkingDirectory(cfg.Root)
 	if err != nil {
 		return err
@@ -158,6 +257,17 @@ func (m *Manager) enableLinux(cfg config.Config) error {
 	for _, argument := range arguments {
 		execStart += " " + systemdQuote(argument)
 	}
+	serviceEnvironment := ""
+	if m.SystemWide {
+		// A system service's implicit root user does not receive login variables.
+		serviceEnvironment = "User=root\n"
+	}
+	environment := m.environment()
+	for _, key := range []string{"HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"} {
+		if value, ok := environment[key]; ok {
+			serviceEnvironment += "Environment=" + systemdQuote(key+"="+value) + "\n"
+		}
+	}
 	unit := strings.Join([]string{
 		"[Unit]",
 		"Description=Spynel workspace " + workingDirectory,
@@ -165,7 +275,7 @@ func (m *Manager) enableLinux(cfg config.Config) error {
 		"After=network-online.target",
 		"",
 		"[Service]",
-		"Type=simple",
+		serviceEnvironment + "Type=simple",
 		"WorkingDirectory=" + workingDirectory,
 		"ExecStart=" + execStart,
 		"Restart=on-failure",
@@ -176,22 +286,27 @@ func (m *Manager) enableLinux(cfg config.Config) error {
 		"",
 	}, "\n")
 	unitPath := filepath.Join(unitDirectory, unitName)
-	if err := fsx.AtomicWriteFile(unitPath, []byte(unit), 0o600); err != nil {
+	verifyArgs := []string{"verify", "--man=no"}
+	if !m.SystemWide {
+		verifyArgs = append(verifyArgs, "--user")
+	}
+	if err := m.writeValidated(ctx, unitPath, []byte(unit), "systemd-analyze", verifyArgs...); err != nil {
 		return err
 	}
 	linkPath := filepath.Join(wantsDirectory, unitName)
 	if target, err := os.Readlink(linkPath); err == nil {
-		if target == filepath.Join("..", unitName) {
-			return nil
+		if target != filepath.Join("..", unitName) {
+			return fmt.Errorf("startup link %s already points to %s", linkPath, target)
 		}
-		return fmt.Errorf("startup link %s already points to %s", linkPath, target)
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("startup target %s already exists and is not a Spynel symlink", linkPath)
+	} else if err := os.Symlink(filepath.Join("..", unitName), linkPath); err != nil {
+		return err
 	}
-	return os.Symlink(filepath.Join("..", unitName), linkPath)
+	return m.verifyLinux(ctx, unitName, true)
 }
 
-func (m *Manager) disableLinux(cfg config.Config) error {
+func (m *Manager) disableLinux(ctx context.Context, cfg config.Config) error {
 	unitName := "spynel-" + workspaceID(cfg) + ".service"
 	unitDirectory := filepath.Join(m.Home, ".config", "systemd", "user")
 	target := "default.target"
@@ -204,10 +319,40 @@ func (m *Manager) disableLinux(cfg config.Config) error {
 			return err
 		}
 	}
-	return nil
+	return m.verifyLinux(ctx, unitName, false)
 }
 
-func (m *Manager) enableDarwin(cfg config.Config) error {
+func (m *Manager) verifyLinux(ctx context.Context, unitName string, enabled bool) error {
+	arguments := []string{"--no-ask-password"}
+	if !m.SystemWide {
+		arguments = append(arguments, "--user")
+	}
+	if _, err := m.run(ctx, "systemctl", append(arguments, "daemon-reload")...); err != nil {
+		return fmt.Errorf("reload autostart registration: %w", err)
+	}
+	output, err := m.run(ctx, "systemctl", append(arguments, "list-unit-files", "--no-legend", "--no-pager", unitName)...)
+	// list-unit-files returns exit 1 without output when the exact pattern has
+	// no matches. Any diagnostic, timeout, or other failure remains an error.
+	var exit *exec.ExitError
+	if !enabled && ctx.Err() == nil && output == "" && errors.As(err, &exit) && exit.ExitCode() == 1 && len(exit.Stderr) == 0 {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("verify autostart registration: %w", err)
+	}
+	fields := strings.Fields(output)
+	if !enabled && len(fields) == 0 {
+		return nil
+	}
+	if (len(fields) == 2 || len(fields) == 3) && fields[0] == unitName {
+		if enabled && fields[1] == "enabled" || !enabled && fields[1] == "disabled" {
+			return nil
+		}
+	}
+	return fmt.Errorf("verify autostart registration: unexpected systemd registration %q", strings.TrimSpace(output))
+}
+
+func (m *Manager) enableDarwin(ctx context.Context, cfg config.Config) error {
 	label := "dev.spynel.workspace." + workspaceID(cfg)
 	executable, arguments := m.startupCommand(cfg)
 	plist := struct {
@@ -217,6 +362,7 @@ func (m *Manager) enableDarwin(cfg config.Config) error {
 	}{Version: "1.0", Dict: plistDict{
 		Label: label, ProgramArguments: append([]string{executable}, arguments...),
 		WorkingDirectory: cfg.Root, RunAtLoad: true, KeepAlive: true,
+		EnvironmentVariables: m.environment(),
 	}}
 	data, err := xml.MarshalIndent(plist, "", "  ")
 	if err != nil {
@@ -230,7 +376,8 @@ func (m *Manager) enableDarwin(cfg config.Config) error {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
-	return fsx.AtomicWriteFile(filepath.Join(directory, label+".plist"), data, 0o600)
+	path := filepath.Join(directory, label+".plist")
+	return m.writeValidated(ctx, path, data, "plutil", "-lint")
 }
 
 func (m *Manager) disableDarwin(cfg config.Config) error {
@@ -246,51 +393,61 @@ func (m *Manager) disableDarwin(cfg config.Config) error {
 	return err
 }
 
-func (m *Manager) syncWindows(cfg config.Config, enabled bool) error {
+func (m *Manager) syncWindows(ctx context.Context, cfg config.Config, enabled bool) error {
 	name := "Spynel-" + workspaceID(cfg)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	if !enabled {
-		return m.RunCommand(ctx, "schtasks.exe", "/Delete", "/TN", name, "/F")
+		_, err := m.run(ctx, "schtasks.exe", "/Delete", "/TN", name, "/F")
+		return err
 	}
 	executable, arguments := m.startupCommand(cfg)
 	action := windowsQuote(executable)
 	for _, argument := range arguments {
 		action += " " + windowsQuote(argument)
 	}
-	return m.RunCommand(ctx, "schtasks.exe", "/Create", "/SC", "ONLOGON", "/TN", name, "/TR", action, "/F")
+	if _, err := m.run(ctx, "schtasks.exe", "/Create", "/SC", "ONLOGON", "/TN", name, "/TR", action, "/F"); err != nil {
+		return err
+	}
+	_, err := m.run(ctx, "schtasks.exe", "/Query", "/TN", name)
+	return err
 }
 
 func windowsQuote(value string) string {
 	return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
 }
 
-func runCommand(ctx context.Context, logWriter io.Writer, name string, arguments ...string) error {
-	_, err := runCommandOutput(ctx, logWriter, name, arguments...)
-	return err
-}
-
-func runCommandOutput(ctx context.Context, logWriter io.Writer, name string, arguments ...string) (string, error) {
+func runCommand(ctx context.Context, logWriter io.Writer, name string, arguments ...string) (string, error) {
 	command := exec.CommandContext(ctx, name, arguments...)
 	stdout := &boundedOutput{}
 	stderr := &boundedOutput{}
 	command.Stdout = stdout
 	command.Stderr = stderr
+	command.WaitDelay = time.Second
 	err := command.Run()
 	commandName := filepath.Base(name)
 	writeCommandOutput(logWriter, commandName, "stdout", stdout)
 	writeCommandOutput(logWriter, commandName, "stderr", stderr)
 	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			exit.Stderr = bytes.Clone(stderr.Bytes())
+		}
 		if logWriter != nil {
 			_, _ = fmt.Fprintf(logWriter, "process=%s event=exit status=failed exit_code=%d error=%v\n", commandName, processExitCode(command), err)
 		}
-		return stdout.String() + stderr.String(), fmt.Errorf("%s: %w", name, err)
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = strings.TrimSpace(stdout.String())
+		}
+		if runes := []rune(detail); len(runes) > 4096 {
+			detail = string(runes[:4096]) + " (truncated)"
+		}
+		return stdout.String(), fmt.Errorf("%s: %w: %s", name, err, detail)
+	}
+	if stdout.truncated || stderr.truncated {
+		return "", fmt.Errorf("%s: command output exceeded validation limit", name)
 	}
 	if logWriter != nil {
 		_, _ = fmt.Fprintf(logWriter, "process=%s event=exit status=success exit_code=0\n", commandName)
-	}
-	if stdout.truncated || stderr.truncated {
-		return "", errors.New("startup command output exceeds size limit")
 	}
 	return stdout.String(), nil
 }
@@ -355,11 +512,12 @@ func systemdQuote(value string) string {
 }
 
 type plistDict struct {
-	Label            string
-	ProgramArguments []string
-	WorkingDirectory string
-	RunAtLoad        bool
-	KeepAlive        bool
+	Label                string
+	ProgramArguments     []string
+	WorkingDirectory     string
+	RunAtLoad            bool
+	KeepAlive            bool
+	EnvironmentVariables map[string]string
 }
 
 func (d plistDict) MarshalXML(encoder *xml.Encoder, start xml.StartElement) error {
@@ -389,6 +547,24 @@ func (d plistDict) MarshalXML(encoder *xml.Encoder, start xml.StartElement) erro
 				}
 			}
 			return encoder.EncodeToken(xml.EndElement{Name: xml.Name{Local: "array"}})
+		case map[string]string:
+			if err := encoder.EncodeToken(xml.StartElement{Name: xml.Name{Local: "dict"}}); err != nil {
+				return err
+			}
+			keys := make([]string, 0, len(typed))
+			for key := range typed {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				if err := encoder.EncodeElement(key, xml.StartElement{Name: xml.Name{Local: "key"}}); err != nil {
+					return err
+				}
+				if err := encoder.EncodeElement(typed[key], xml.StartElement{Name: xml.Name{Local: "string"}}); err != nil {
+					return err
+				}
+			}
+			return encoder.EncodeToken(xml.EndElement{Name: xml.Name{Local: "dict"}})
 		default:
 			return fmt.Errorf("unsupported plist value %T", value)
 		}
@@ -399,6 +575,7 @@ func (d plistDict) MarshalXML(encoder *xml.Encoder, start xml.StartElement) erro
 	}{
 		{"Label", d.Label}, {"ProgramArguments", d.ProgramArguments}, {"WorkingDirectory", d.WorkingDirectory},
 		{"RunAtLoad", d.RunAtLoad}, {"KeepAlive", d.KeepAlive},
+		{"EnvironmentVariables", d.EnvironmentVariables},
 	} {
 		if err := write(field.key, field.value); err != nil {
 			return err

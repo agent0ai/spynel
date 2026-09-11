@@ -1604,7 +1604,7 @@ type StatusSnapshot struct {
 	ReasoningEffort      string                             `json:"reasoning_effort,omitempty"`
 	ServiceMode          string                             `json:"service_mode,omitempty"`
 	Sandbox              string                             `json:"sandbox"`
-	StartupEnabled       bool                               `json:"startup_enabled"`
+	StartupEnabled       bool                               `json:"startup_enabled"` // Saved preference, not observed OS registration.
 	TurnActive           bool                               `json:"turn_active"`
 	OrchestratorLease    int                                `json:"orchestrator_leases"`
 	OrchestratorRuns     int                                `json:"orchestrator_dispatches"`
@@ -1712,7 +1712,7 @@ func FormatStatus(status StatusSnapshot) string {
 		"- Reasoning effort: " + emptyAs(status.ReasoningEffort, "inherit"),
 		"- Service mode: " + emptyAs(status.ServiceMode, "inherit"),
 		"- Agent filesystem access: " + status.Sandbox,
-		"- Run at startup: " + enabledText(status.StartupEnabled),
+		"- Autostart preference: " + enabledText(status.StartupEnabled) + " (use /configure to verify registration)",
 		fmt.Sprintf("- Logs: %d — `/log`", status.Runtime.Logs),
 		"- Turn: " + turn,
 	}

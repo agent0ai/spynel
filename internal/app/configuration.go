@@ -206,6 +206,14 @@ const (
 )
 
 func (s *Service) configurationScreenAction(ctx context.Context, screenID, action string, values map[string]string) (*core.Screen, bool, error) { //nolint:gocyclo
+	if screenID == "config" && (action == "autostart:enable" || action == "autostart:disable") {
+		enabled := action == "autostart:enable"
+		if _, err := s.ApplySettings(map[string]string{"startup.enabled": enabledText(enabled)}); err != nil {
+			return nil, true, err
+		}
+		control := autostartControl(enabled)
+		return &core.Screen{SavedControl: &control, ActionMessage: autostartConfirmation(enabled)}, true, nil
+	}
 	if screenID == "config" && action == "harness" {
 		screen := s.HarnessScreen(false)
 		screen.ParentID = "config"
@@ -1083,9 +1091,12 @@ func (s *Service) setSetting(message core.Message, key, value string, emit core.
 	}
 	changed, err := s.ApplySettings(map[string]string{key: value})
 	if err != nil {
-		return s.localReply(message, "Cannot save configuration: "+err.Error(), emit)
+		return fmt.Errorf("cannot save configuration: %w", err)
 	}
 	setting := changed[0]
+	if setting.Key == "startup.enabled" {
+		return s.localReply(message, autostartConfirmation(setting.Value == "on"), emit)
+	}
 	response := fmt.Sprintf("Saved `%s` = `%s`.", setting.Key, setting.Value)
 	if setting.Key == "harness.model" {
 		var reset []string
@@ -1147,13 +1158,16 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		CommitInference(harness.InferenceSelection, func() error) error
 	})
 	harnessChanged := harnessRuntimeChanged(previous.Harness, next.Harness) || inferenceChanged && !canCommitInference
-	startupChanged := previous.Startup.Enabled != next.Startup.Enabled
+	startupRequested := requestedSetting(values, "startup.enabled")
+	if startupRequested && s.Startup == nil {
+		return nil, errors.New("autostart registration is unavailable")
+	}
 	if harnessChanged {
 		if err := s.reconfigureHarness(next); err != nil {
 			return nil, err
 		}
 	}
-	if unchanged {
+	if unchanged && !startupRequested {
 		if themeChanged {
 			s.publishTheme(selectedTheme)
 		}
@@ -1182,12 +1196,6 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		return nil, errors.Join(err, wrapRollback("harness", rollback))
 	}
 	next = reloaded
-	if startupChanged && s.Startup != nil {
-		if err := s.Startup.Sync(next, next.Startup.Enabled); err != nil {
-			s.Runtime.LogEvent("error", "config", "side_effect_failed", "Configuration was saved but startup registration could not be refreshed")
-			return nil, fmt.Errorf("configure run at startup: %w", err)
-		}
-	}
 	for _, setting := range changed {
 		if setting.Key == "channels.tui.title" {
 			s.publishTitle(values[setting.Key])
@@ -1205,7 +1213,28 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		s.Orchestrator.ApplyHarnessConfig(next.Harness)
 	}
 	s.Runtime.LogEvent("info", "config", "persisted", fmt.Sprintf("Configuration persisted (%d settings changed)", len(changed)))
+	if startupRequested {
+		if err := s.Startup.Sync(next, next.Startup.Enabled); err != nil {
+			s.Runtime.LogEvent("error", "startup", "registration_failed", err.Error())
+			return nil, fmt.Errorf("autostart registration unverified: %s (preference saved)", boundAndRedactLogText(err.Error()))
+		}
+		s.Runtime.LogEvent("info", "startup", "registration_verified", autostartConfirmation(next.Startup.Enabled))
+	}
 	return changed, nil
+}
+
+func autostartControl(enabled bool) core.ScreenControl {
+	if enabled {
+		return core.ScreenControl{Key: "autostart:enable", Kind: "action", Value: "Enable autostart", Description: "Register this workspace for automatic startup and verify the registration now"}
+	}
+	return core.ScreenControl{Key: "autostart:disable", Kind: "action", Value: "Disable autostart", Description: "Remove this workspace's automatic startup registration and verify removal now"}
+}
+
+func autostartConfirmation(enabled bool) string {
+	if enabled {
+		return "Autostart enabled. Registration verified."
+	}
+	return "Autostart disabled. Removal verified."
 }
 
 func (s *Service) validateInferenceSettings(ctx context.Context, previous config.Config, next *config.Config, requested map[string]string, changed *[]config.Setting) error {
@@ -1542,6 +1571,10 @@ func settingsScreen(cfg config.Config, section string) core.Screen {
 		if section == "config" && (setting.Key == "harness.name" || setting.Key == "harness.model" || setting.Key == "harness.reasoning_effort" || setting.Key == "harness.service_mode") {
 			continue
 		}
+		if setting.Key == "startup.enabled" {
+			screen.Controls = append(screen.Controls, autostartControl(true), autostartControl(false))
+			continue
+		}
 		if setting.Advanced && !advanced {
 			description := "Show optional connection, group, notification, and storage controls"
 			if section == "config" {
@@ -1581,8 +1614,6 @@ func settingsScreen(cfg config.Config, section string) core.Screen {
 			label = "attachment size limit (MB)"
 		case "orchestrator.retrigger_unresponded_messages":
 			label = "re-trigger unresponded messages"
-		case "startup.enabled":
-			label = "run at startup"
 		}
 		value := setting.Value
 		configured := false

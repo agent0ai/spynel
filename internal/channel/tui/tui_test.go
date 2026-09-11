@@ -5075,6 +5075,54 @@ func inputCursorColumn(m model) int {
 	return column
 }
 
+func TestFormActionPreservesUnsavedEditsAndShowsValidationResults(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(strconv.FormatBool(fail), func(t *testing.T) {
+			m := testModel()
+			control := core.ScreenControl{Key: "autostart:enable", Kind: "action", Value: "Enable autostart"}
+			m.openScreen(core.Screen{ID: "config", Controls: []core.ScreenControl{control, {Key: "notes", Kind: "text", Value: "original"}}})
+			m.screen.Controls[1].Value = "unsaved edit"
+			m.screenIndex = 0
+			m.screenSaving = true
+			result := screenActionResult{screenID: "config", action: control.Key, screen: &core.Screen{SavedControl: &control, ActionMessage: "Autostart enabled. Registration verified."}}
+			if fail {
+				result.screen, result.err = nil, fmt.Errorf("systemctl: permission denied")
+			}
+			next, _ := m.Update(result)
+			m = next.(model)
+			if m.screen == nil || m.screen.ID != "config" || m.screenSaving || m.screen.Controls[1].Value != "unsaved edit" || m.screenChanges()["notes"] != "unsaved edit" {
+				t.Fatal("autostart result discarded or saved unrelated edits")
+			}
+			if fail && !strings.Contains(m.screen.Status, "permission denied") || !fail && !strings.Contains(m.screen.Status, "Registration verified") {
+				t.Fatalf("missing action result on form: %q", m.screen.Status)
+			}
+			if _, present := m.screenValues()[control.Key]; present {
+				t.Fatal("autostart button leaked into ordinary settings save")
+			}
+			content, _, rows := m.screenContent(1000, 35)
+			if rows != len(strings.Split(content, "\n")) {
+				t.Fatal("wrapped action status rows are missing from viewport geometry")
+			}
+		})
+	}
+}
+
+func TestCompletedActionDoesNotReplaceAnAbandonedForm(t *testing.T) {
+	m := testModel()
+	m.openScreen(core.Screen{ID: "config"})
+	m.screenAction = func(context.Context, string, string, map[string]string) (*core.Screen, error) {
+		return &core.Screen{ActionMessage: "Registration verified."}, nil
+	}
+	command := m.runScreenAction("autostart:enable")
+	m.clearScreen()
+	m.openScreen(core.Screen{ID: "telegram"})
+	next, _ := m.Update(command())
+	m = next.(model)
+	if m.screen == nil || m.screen.ID != "telegram" {
+		t.Fatal("completed autostart action replaced a subsequently opened form")
+	}
+}
+
 func TestDependentModelSelectionPreservesParentAndRefreshesCommittedControl(t *testing.T) {
 	for _, cancel := range []bool{false, true} {
 		t.Run(fmt.Sprintf("cancel=%t", cancel), func(t *testing.T) {

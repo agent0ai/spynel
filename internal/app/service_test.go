@@ -1617,14 +1617,14 @@ func TestFormatStatusGroupsWorkAndRoundsHeartbeatUp(t *testing.T) {
 		"- Reasoning effort: inherit",
 		"- Service mode: inherit",
 		"- Agent filesystem access: danger-full-access",
-		"- Run at startup: disabled",
+		"- Autostart preference: disabled (use /configure to verify registration)",
 		"- Logs: 4 — `/log`",
 		"- Turn: idle",
 	}, "\n")
 	if text != want {
 		t.Fatalf("exact status changed:\ngot:\n%s\nwant:\n%s", text, want)
 	}
-	ordered := []string{"Title:", "Instance ID:", "Primary instance ID:", "Jobs:", "Tasks:", "Goals:", "Orchestrator:", "Next heartbeat:", "Telegram:", "Coding harness:", "Agent filesystem access:", "Run at startup:", "Logs:", "Turn:"}
+	ordered := []string{"Title:", "Instance ID:", "Primary instance ID:", "Jobs:", "Tasks:", "Goals:", "Orchestrator:", "Next heartbeat:", "Telegram:", "Coding harness:", "Agent filesystem access:", "Autostart preference:", "Logs:", "Turn:"}
 	previous := -1
 	for _, row := range ordered {
 		index := strings.Index(text, row)
@@ -2651,8 +2651,8 @@ func TestConfigurationCommandsPersistAcrossChannelsAndProtectOwnChannel(t *testi
 	if response := run("whatsapp", "/config set channels.whatsapp.enabled off"); !strings.Contains(response.Text, "cannot be configured from WhatsApp itself") {
 		t.Fatalf("WhatsApp bypassed own-channel protection through /config: %#v", response)
 	}
-	if response := run("telegram", "/whatsapp on"); !strings.Contains(response.Text, "allowed_numbers requires at least one number") {
-		t.Fatalf("WhatsApp enabled without a whitelist: %#v", response)
+	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "settings", Text: "/whatsapp on"}, nil); err == nil || !strings.Contains(err.Error(), "allowed_numbers requires at least one number") {
+		t.Fatalf("WhatsApp enable did not return its whitelist validation error: %v", err)
 	}
 	if response := run("telegram", "/whatsapp set allowed_numbers 15551234567"); !strings.Contains(response.Text, "channels.whatsapp.allowed_numbers") {
 		t.Fatalf("WhatsApp whitelist response = %#v", response)
@@ -2666,8 +2666,8 @@ func TestConfigurationCommandsPersistAcrossChannelsAndProtectOwnChannel(t *testi
 	if response := run("telegram", `/config set harness.acp_args -a --param2 "value with spaces"`); !strings.Contains(response.Text, `-a --param2 "value with spaces"`) {
 		t.Fatalf("command-line ACP argument response = %#v", response)
 	}
-	if response := run("whatsapp", "/config set harness.acp_args \"unterminated"); !strings.Contains(response.Text, "harness.acp_args has an unmatched") {
-		t.Fatalf("malformed ACP argument response = %#v", response)
+	if err := service.Handle(context.Background(), core.Message{Channel: "whatsapp", Conversation: "settings", Text: "/config set harness.acp_args \"unterminated"}, nil); err == nil || !strings.Contains(err.Error(), "harness.acp_args has an unmatched") {
+		t.Fatalf("malformed ACP arguments did not return their validation error: %v", err)
 	}
 
 	reloaded, err := config.Load(path)
@@ -3089,18 +3089,63 @@ func TestStartupSettingReloadsBeforeRegistrationErrorReturns(t *testing.T) {
 	}
 }
 
-func TestUnchangedStartupSettingDoesNotTouchOperatingSystem(t *testing.T) {
+func TestUnchangedStartupSettingRevalidatesOperatingSystem(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
 	service := New(cfg, newServiceHarness())
-	manager := &fakeStartupManager{err: fmt.Errorf("must not be called")}
+	manager := &fakeStartupManager{}
 	service.Startup = manager
 	changed, err := service.ApplySettings(map[string]string{"startup.enabled": "off"})
-	if err != nil || len(changed) != 1 || len(manager.calls) != 0 {
+	if err != nil || len(changed) != 1 || len(manager.calls) != 1 || manager.calls[0] {
 		t.Fatalf("unchanged startup = changed %#v, calls %#v, error %v", changed, manager.calls, err)
+	}
+}
+
+func TestAutostartButtonsReportValidationAndDoNotSaveOtherFormEdits(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	service := New(cfg, newServiceHarness())
+	manager := &fakeStartupManager{}
+	service.Startup = manager
+	for _, action := range []string{"autostart:enable", "autostart:enable", "autostart:disable", "autostart:disable"} {
+		screen, err := service.ScreenAction(context.Background(), "config", action, map[string]string{"workspace.history_char_limit": "invalid unsaved edit"})
+		if err != nil || screen == nil || screen.SavedControl == nil || screen.SavedControl.Key != action || !strings.Contains(screen.ActionMessage, "verified") {
+			t.Fatalf("%s = %#v, %v", action, screen, err)
+		}
+		if service.Settings.Snapshot().Workspace.HistoryCharLimit != cfg.Workspace.HistoryCharLimit {
+			t.Fatal("autostart action saved unrelated form edits")
+		}
+	}
+	if len(manager.calls) != 4 {
+		t.Fatalf("repeated actions skipped verification: %v", manager.calls)
+	}
+	manager.err = errors.New("systemctl: permission denied; authorization: Bearer private-startup-token")
+	for _, action := range []string{"autostart:enable", "autostart:disable"} {
+		screen, err := service.ScreenAction(context.Background(), "config", action, nil)
+		if screen != nil || err == nil || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "private-startup-token") {
+			t.Fatalf("failed %s returned success or lost/redacted the wrong evidence: %#v, %v", action, screen, err)
+		}
+	}
+	if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "test", Text: "/config set startup.enabled on"}, nil); err == nil || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "private-startup-token") {
+		t.Fatalf("command hid the registration error or exposed credentials: %v", err)
+	}
+	manager.err = nil
+	var response core.Event
+	if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "test", Text: "/config set startup.enabled on"}, func(event core.Event) { response = event }); err != nil {
+		t.Fatal(err)
+	}
+	if response.Text != "Autostart enabled. Registration verified." {
+		t.Fatalf("command did not return verified registration: %#v", response)
+	}
+	service.Startup = nil
+	if _, err := service.ScreenAction(context.Background(), "config", "autostart:disable", nil); err == nil {
+		t.Fatal("missing startup manager reported success")
 	}
 }
 
@@ -3283,7 +3328,7 @@ func TestMainConfigurationStartsWithHarnessModelAndEssentials(t *testing.T) {
 	if screen.Title != "" || screen.Subtitle != "" {
 		t.Fatalf("main configuration has redundant heading copy: title %q subtitle %q", screen.Title, screen.Subtitle)
 	}
-	want := []string{"harness", "model", "harness.sandbox", "harness.reviews", "workspace.history_max_messages", "workspace.history_char_limit", "startup.enabled", "advanced"}
+	want := []string{"harness", "model", "harness.sandbox", "harness.reviews", "workspace.history_max_messages", "workspace.history_char_limit", "autostart:enable", "autostart:disable", "advanced"}
 	if len(screen.Controls) < len(want)+1 {
 		t.Fatalf("main configuration controls = %#v", screen.Controls)
 	}
@@ -3292,10 +3337,10 @@ func TestMainConfigurationStartsWithHarnessModelAndEssentials(t *testing.T) {
 			t.Fatalf("main control %d = %q, want %q", index, screen.Controls[index].Key, key)
 		}
 	}
-	if screen.Controls[0].Kind != "action" || screen.Controls[1].Kind != "action" || screen.Controls[2].Kind != "select" || screen.Controls[3].Kind != "select" || screen.Controls[7].Kind != "disclosure" || !screen.Controls[8].Advanced {
+	if screen.Controls[0].Kind != "action" || screen.Controls[1].Kind != "action" || screen.Controls[2].Kind != "select" || screen.Controls[3].Kind != "select" || screen.Controls[6].Kind != "action" || screen.Controls[7].Kind != "action" || screen.Controls[8].Kind != "disclosure" || !screen.Controls[9].Advanced {
 		t.Fatalf("main control kinds/order = %#v", screen.Controls)
 	}
-	if screen.Controls[0].Section != "Core settings" || screen.Controls[7].Section != "Advanced settings" {
+	if screen.Controls[0].Section != "Core settings" || screen.Controls[8].Section != "Advanced settings" {
 		t.Fatalf("main control sections = %#v", screen.Controls[:8])
 	}
 	harnessScreen, err := service.ScreenAction(context.Background(), "config", "harness", nil)

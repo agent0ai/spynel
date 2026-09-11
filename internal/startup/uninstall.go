@@ -59,9 +59,9 @@ func (m *Manager) RemoveInstallation(ctx context.Context, userID int) error {
 					domain = "system"
 				}
 				service := domain + "/" + strings.TrimSuffix(name, ".plist")
-				if _, err := runCommandOutput(ctx, m.Log, "launchctl", "bootout", service); err != nil {
+				if _, err := runCommand(ctx, m.Log, "launchctl", "bootout", service); err != nil {
 					// An installed plist need not have been loaded this login.
-					if output, queryErr := runCommandOutput(ctx, m.Log, "launchctl", "print", service); queryErr == nil || ctx.Err() != nil || !(strings.Contains(output, "Could not find service") || strings.Contains(output, "Could not find domain")) {
+					if output, queryErr := runCommand(ctx, m.Log, "launchctl", "print", service); queryErr == nil || ctx.Err() != nil || !(strings.Contains(output+fmt.Sprint(queryErr), "Could not find service") || strings.Contains(output+fmt.Sprint(queryErr), "Could not find domain")) {
 						return fmt.Errorf("stop startup registration %s: %w", name, err)
 					}
 				}
@@ -92,9 +92,9 @@ func (m *Manager) RemoveInstallation(ctx context.Context, userID int) error {
 				}
 				if !system && os.Geteuid() == 0 && userID != 0 {
 					prefix := []string{"-u", "#" + strconv.Itoa(userID), "--", "env", "XDG_RUNTIME_DIR=" + runtimePath, "systemctl"}
-					return runCommandOutput(ctx, m.Log, "sudo", append(prefix, arguments...)...)
+					return runCommand(ctx, m.Log, "sudo", append(prefix, arguments...)...)
 				}
-				return runCommandOutput(ctx, m.Log, "systemctl", arguments...)
+				return runCommand(ctx, m.Log, "systemctl", arguments...)
 			}
 			if _, err := run(append(args, "stop", name)...); err != nil {
 				state, queryErr := run(append(args, "show", "--property=ActiveState", "--value", name)...)

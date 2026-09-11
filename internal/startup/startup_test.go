@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,10 +15,23 @@ import (
 	"testing"
 
 	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/instance"
 )
 
 func TestStartupCommandHelper(t *testing.T) {
 	if os.Getenv("SPYNEL_STARTUP_COMMAND_HELPER") == "" {
+		return
+	}
+	if os.Getenv("SPYNEL_STARTUP_COMMAND_HELPER") == "environment" {
+		if id, err := instance.EnvironmentID(); err != nil || id != os.Getenv("SPYNEL_EXPECT_ENVIRONMENT_ID") {
+			t.Fatalf("automatic startup identity differs from the interactive identity: %v", err)
+		}
+		if _, err := os.UserCacheDir(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := New(""); err != nil {
+			t.Fatal(err)
+		}
 		return
 	}
 	_, _ = os.Stderr.WriteString("authorization: Bearer startup-secret\nstartup helper failed")
@@ -28,7 +43,7 @@ func TestRunCommandCapturesBoundedAttributedFailureEvidence(t *testing.T) {
 	t.Setenv("SPYNEL_STARTUP_COMMAND_HELPER", "1")
 	t.Setenv("SPYNEL_STARTUP_COMMAND_EXIT", "17")
 	var log bytes.Buffer
-	err := runCommand(context.Background(), &log, os.Args[0], "-test.run=TestStartupCommandHelper")
+	_, err := runCommand(context.Background(), &log, os.Args[0], "-test.run=TestStartupCommandHelper")
 	if err == nil {
 		t.Fatal("runCommand succeeded")
 	}
@@ -45,16 +60,46 @@ func TestRunCommandCapturesBoundedAttributedFailureEvidence(t *testing.T) {
 	}
 }
 
-func startupTestConfig(root string) config.Config {
+func startupTestConfig(t *testing.T, root string) config.Config {
+	t.Helper()
 	cfg := config.Default()
 	cfg.Root = root
 	cfg.Path = config.PathForRoot(root)
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
 	return cfg
+}
+
+func startupTestManager(t *testing.T, goos string) *Manager {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{GOOS: goos, Home: t.TempDir(), Executable: executable, SystemUnitDirectory: t.TempDir()}
+	manager.RunCommand = func(ctx context.Context, name string, args ...string) (string, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("autostart command has no deadline")
+		}
+		if name == "systemctl" && strings.Contains(strings.Join(args, " "), "list-unit-files") {
+			directory := filepath.Join(manager.Home, ".config", "systemd", "user")
+			if manager.SystemWide {
+				directory = manager.SystemUnitDirectory
+			}
+			if _, err := os.Stat(filepath.Join(directory, args[len(args)-1])); os.IsNotExist(err) {
+				return "", nil
+			}
+			return args[len(args)-1] + " enabled enabled\n", nil
+		}
+		return "", nil
+	}
+	return manager
 }
 
 func TestWorkspaceIDUsesCanonicalWorkspacePath(t *testing.T) {
 	root := t.TempDir()
-	first := startupTestConfig(root)
+	first := startupTestConfig(t, root)
 	second := first
 	second.Path = filepath.Join(root, "caller-supplied-alias.yaml")
 	if workspaceID(first) != workspaceID(second) {
@@ -67,9 +112,9 @@ func TestLinuxStartupRegistrationIsWorkspaceSpecificAndReversible(t *testing.T) 
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	cfg := startupTestConfig(root)
-	home := t.TempDir()
-	manager := &Manager{GOOS: "linux", Home: home, Executable: filepath.Join(root, "spynel")}
+	cfg := startupTestConfig(t, root)
+	manager := startupTestManager(t, "linux")
+	home := manager.Home
 	if err := manager.Sync(cfg, true); err != nil {
 		t.Fatal(err)
 	}
@@ -111,15 +156,15 @@ func TestLinuxStartupUnitPassesSystemdValidation(t *testing.T) {
 	}
 	for _, systemWide := range []bool{false, true} {
 		t.Run(strconv.FormatBool(systemWide), func(t *testing.T) {
-			cfg := startupTestConfig(filepath.Join(t.TempDir(), `project café with "quotes" %h ${HOME} $USER #;& and \backslash`))
+			root := filepath.Join(t.TempDir(), `project café with "quotes" %h ${HOME} $USER #;& and \backslash`)
 			if systemWide {
-				cfg.Root += " "
+				root += " "
 			} else {
-				cfg.Root += `\`
+				root += `\`
 			}
-			cfg.Path = config.PathForRoot(cfg.Root)
-			manager := &Manager{GOOS: "linux", Home: t.TempDir(), Executable: executable,
-				SystemWide: systemWide, SystemUnitDirectory: t.TempDir()}
+			cfg := startupTestConfig(t, root)
+			manager := startupTestManager(t, "linux")
+			manager.SystemWide, manager.Executable = systemWide, executable
 			if err := manager.Sync(cfg, true); err != nil {
 				t.Fatal(err)
 			}
@@ -151,9 +196,13 @@ func TestLinuxStartupEscapesControlCharactersInUnitValues(t *testing.T) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	cfg := startupTestConfig(root)
-	home := t.TempDir()
-	manager := &Manager{GOOS: "linux", Home: home, Executable: filepath.Join(root, "spynel\nInjected=bad\tvalue")}
+	cfg := startupTestConfig(t, root)
+	manager := startupTestManager(t, "linux")
+	home := manager.Home
+	manager.Executable = filepath.Join(root, "spynel\nInjected=bad\tvalue")
+	if err := os.WriteFile(manager.Executable, []byte("test executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := manager.Sync(cfg, true); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +222,9 @@ func TestLinuxStartupEscapesControlCharactersInUnitValues(t *testing.T) {
 
 func TestLinuxStartupRejectsControlCharactersInWorkingDirectory(t *testing.T) {
 	for _, character := range []string{"\n", "\r", "\t", "\x00", "\x7f"} {
-		cfg := startupTestConfig(filepath.Join(t.TempDir(), "project"+character+"Injected=bad"))
+		cfg := config.Default()
+		cfg.Root = filepath.Join(t.TempDir(), "project"+character+"Injected=bad")
+		cfg.Path = config.PathForRoot(cfg.Root)
 		manager := &Manager{GOOS: "linux", Home: t.TempDir(), Executable: "/bin/true"}
 		if err := manager.Sync(cfg, true); err == nil || !strings.Contains(err.Error(), "control characters") {
 			t.Fatalf("workspace containing %q was not rejected: %v", character, err)
@@ -186,8 +237,8 @@ func TestLinuxStartupRejectsControlCharactersInWorkingDirectory(t *testing.T) {
 
 func TestDarwinStartupWritesValidLaunchAgent(t *testing.T) {
 	root := t.TempDir()
-	cfg := startupTestConfig(root)
-	manager := &Manager{GOOS: "darwin", Home: t.TempDir(), Executable: filepath.Join(root, "spynel")}
+	cfg := startupTestConfig(t, root)
+	manager := startupTestManager(t, "darwin")
 	if err := manager.Sync(cfg, true); err != nil {
 		t.Fatal(err)
 	}
@@ -212,19 +263,25 @@ func TestDarwinStartupWritesValidLaunchAgent(t *testing.T) {
 }
 
 func TestWindowsStartupUsesTaskSchedulerArguments(t *testing.T) {
-	cfg := startupTestConfig(`C:\work\project`)
+	cfg := startupTestConfig(t, t.TempDir())
 	var command string
 	var arguments []string
-	manager := &Manager{GOOS: "windows", Home: `C:\Users\test`, Executable: `C:\bin\spynel.exe`, RunCommand: func(_ context.Context, name string, args ...string) error {
+	var queried bool
+	manager := startupTestManager(t, "windows")
+	manager.RunCommand = func(_ context.Context, name string, args ...string) (string, error) {
+		if args[0] == "/Query" {
+			queried = true
+			return "", nil
+		}
 		command = name
 		arguments = append([]string(nil), args...)
-		return nil
-	}}
+		return "", nil
+	}
 	if err := manager.Sync(cfg, true); err != nil {
 		t.Fatal(err)
 	}
 	joined := strings.Join(arguments, " ")
-	if command != "schtasks.exe" || !strings.Contains(joined, "/Create /SC ONLOGON") || !strings.Contains(joined, manager.Executable) || !strings.Contains(joined, cfg.Path) || !strings.Contains(joined, "--automatic-startup") {
+	if !queried || command != "schtasks.exe" || !strings.Contains(joined, "/Create /SC ONLOGON") || !strings.Contains(joined, manager.Executable) || !strings.Contains(joined, cfg.Path) || !strings.Contains(joined, "--automatic-startup") {
 		t.Fatalf("task scheduler call = %s %q", command, arguments)
 	}
 	if err := manager.Sync(cfg, false); err != nil {
@@ -236,7 +293,7 @@ func TestWindowsStartupUsesTaskSchedulerArguments(t *testing.T) {
 }
 
 func TestNPMStartupUsesNodeLauncherWithoutProactiveCheck(t *testing.T) {
-	cfg := startupTestConfig(filepath.Join(t.TempDir(), "workspace"))
+	cfg := startupTestConfig(t, filepath.Join(t.TempDir(), "workspace"))
 	manager := &Manager{
 		Executable:     filepath.Join(t.TempDir(), "npm", "vendor", "spynel"),
 		NodeExecutable: filepath.Join(t.TempDir(), "node"),
@@ -249,5 +306,167 @@ func TestNPMStartupUsesNodeLauncherWithoutProactiveCheck(t *testing.T) {
 	want := []string{manager.NPMLauncher, "serve", "--automatic-startup", "--config", cfg.Path}
 	if strings.Join(arguments, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("startup arguments = %#v, want %#v", arguments, want)
+	}
+}
+
+func TestSystemServiceStartsWithOnlyItsGeneratedHomeEnvironment(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux system service environment")
+	}
+	cfg := startupTestConfig(t, t.TempDir())
+	manager := startupTestManager(t, "linux")
+	manager.SystemWide = true
+	manager.Home = filepath.Join(manager.Home, `home café %h $HOME "quotes" \slash`)
+	if err := os.MkdirAll(manager.Home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", manager.Home)
+	for _, customXDG := range []bool{false, true} {
+		t.Run(strconv.FormatBool(customXDG), func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", "")
+			t.Setenv("XDG_CACHE_HOME", "")
+			if customXDG {
+				t.Setenv("XDG_CONFIG_HOME", filepath.Join(manager.Home, "custom config"))
+				t.Setenv("XDG_CACHE_HOME", filepath.Join(manager.Home, "custom cache"))
+			}
+			id, err := instance.EnvironmentID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := manager.Sync(cfg, true); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(manager.SystemUnitDirectory, "spynel-"+workspaceID(cfg)+".service"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(data), "\nUser=root\n") {
+				t.Fatal("root system service omitted its explicit login user")
+			}
+			command := exec.CommandContext(t.Context(), manager.Executable, "-test.run=^TestStartupCommandHelper$")
+			command.Env = []string{"SPYNEL_STARTUP_COMMAND_HELPER=environment", "SPYNEL_EXPECT_ENVIRONMENT_ID=" + id}
+			command.Dir = cfg.Root
+			for _, line := range strings.Split(string(data), "\n") {
+				if value, ok := strings.CutPrefix(line, "Environment="); ok {
+					decoded, err := strconv.Unquote(value)
+					if err != nil {
+						t.Fatal(err)
+					}
+					command.Env = append(command.Env, strings.ReplaceAll(decoded, "%%", "%"))
+				}
+			}
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("startup with the generated service environment failed: %v\n%s", err, output)
+			}
+		})
+	}
+}
+
+func TestLinuxActionsValidateEveryAttemptAndReportNativeFailures(t *testing.T) {
+	cfg := startupTestConfig(t, t.TempDir())
+	manager := startupTestManager(t, "linux")
+	base := manager.RunCommand
+	var calls []string
+	var fail string
+	manager.RunCommand = func(ctx context.Context, name string, args ...string) (string, error) {
+		step := name
+		if name == "systemctl" {
+			step = args[2]
+		}
+		calls = append(calls, step)
+		if step == fail {
+			return "", fmt.Errorf("%s: permission denied", step)
+		}
+		return base(ctx, name, args...)
+	}
+	for _, step := range []string{"systemd-analyze", "daemon-reload", "list-unit-files"} {
+		fail = step
+		if err := manager.Sync(cfg, true); err == nil || !strings.Contains(err.Error(), "permission denied") {
+			t.Fatalf("%s failure was hidden: %v", step, err)
+		}
+	}
+	fail = ""
+	for range 2 {
+		calls = nil
+		if err := manager.Sync(cfg, true); err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(calls, ","); got != "systemd-analyze,daemon-reload,list-unit-files" {
+			t.Fatalf("enable did not revalidate: %s", got)
+		}
+	}
+	fail = "daemon-reload"
+	if err := manager.Sync(cfg, false); err == nil {
+		t.Fatal("removal reported success without reloading systemd")
+	}
+	fail = ""
+	for range 2 {
+		if err := manager.Sync(cfg, false); err != nil {
+			t.Fatalf("repeated removal failed: %v", err)
+		}
+	}
+	for _, state := range []string{"enabled-runtime", "static", "masked", "", "enabled\ndisabled"} {
+		manager.RunCommand = func(context.Context, string, ...string) (string, error) {
+			if state == "" {
+				return "", nil
+			}
+			return "spynel-" + workspaceID(cfg) + ".service " + state + " enabled\n", nil
+		}
+		if err := manager.Sync(cfg, true); err == nil {
+			t.Fatalf("accepted unverified enable state %q", state)
+		}
+		if err := manager.Sync(cfg, false); err == nil && state != "" {
+			t.Fatalf("accepted unverified removal state %q", state)
+		}
+	}
+	manager.RunCommand = func(context.Context, string, ...string) (string, error) {
+		return "disabled", errors.New("cannot reach systemd")
+	}
+	if err := manager.Sync(cfg, false); err == nil {
+		t.Fatal("unreachable systemd was treated as verified removal")
+	}
+}
+
+func TestLinuxNativeRegistrationQueries(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("native systemd query requires Linux")
+	}
+	for _, name := range []string{"systemd-analyze", "systemctl"} {
+		if _, err := exec.LookPath(name); err != nil {
+			t.Skip(name + " is unavailable")
+		}
+	}
+	root := t.TempDir()
+	cfg := startupTestConfig(t, t.TempDir())
+	manager := startupTestManager(t, "linux")
+	manager.SystemWide = true
+	manager.SystemUnitDirectory = filepath.Join(root, "etc", "systemd", "system")
+	manager.RunCommand = func(ctx context.Context, name string, args ...string) (string, error) {
+		if name == "systemctl" {
+			if args[1] == "daemon-reload" {
+				// No system manager runs in the test container. Native file-state
+				// queries and validation operate on this private filesystem root.
+				return "", nil
+			}
+			args = append([]string{"--root", root}, args...)
+		}
+		return runCommand(ctx, nil, name, args...)
+	}
+	for _, enabled := range []bool{true, true, false, false} {
+		if err := manager.Sync(cfg, enabled); err != nil {
+			t.Fatalf("native registration enabled=%t: %v", enabled, err)
+		}
+	}
+}
+
+func TestInvalidStartupPathsDoNotRegister(t *testing.T) {
+	cfg := startupTestConfig(t, t.TempDir())
+	manager := startupTestManager(t, "linux")
+	manager.Executable = filepath.Join(t.TempDir(), "missing-spynel")
+	if err := manager.Sync(cfg, true); err == nil || !strings.Contains(err.Error(), "missing-spynel") {
+		t.Fatalf("missing executable was not reported: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(manager.Home, ".config")); !os.IsNotExist(err) {
+		t.Fatalf("invalid startup command created registration artifacts: %v", err)
 	}
 }

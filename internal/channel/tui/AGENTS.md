@@ -33,7 +33,7 @@
 - Follow explicitly marked local stalled-message recovery terminals from the private conversation history so a recovery that finishes outside an inbound TUI request stream appears exactly once in the live transcript; reconcile its observed activity placeholder without disturbing a newer response stream, do not acknowledge it as a task notification, follow it at the conversation tail, and preserve intentional upward scroll with a visible new-message status.
 - Consume the caller-scoped canonical recovery activity count from owner shared state for the selected conversation only, preserving overlap references without exposing conversation identities in shared projections. When a durable terminal arrives ahead of its polled inactive edge, settle its visible reference once and credit that exact later edge so it cannot consume another overlapping recovery.
 
-- Completing a dependent model selector refreshes the preserved configuration action row from the application-owned `SavedControl`, retaining unrelated unsaved fields; cancellation restores the parent unchanged.
+- Completing a dependent model selector refreshes the preserved configuration action row from the application-owned `SavedControl`, retaining unrelated unsaved fields; cancellation restores the parent unchanged. A result targeting an action on the current form likewise preserves its edits and save baseline. Autostart uses two immediate action buttons; show verified outcomes or wrapped native errors on the form and scroll to the result. Count each wrapped status row in viewport geometry, and ignore action results for an abandoned source screen.
 
 ## Child DOX Index
 

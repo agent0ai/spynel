@@ -102,8 +102,8 @@ type OutboundAttachment struct {
 // by a screen action; a result-only response may leave ID empty. Text-only
 // channels use the same setting keys as commands.
 type Screen struct {
-	// SavedControl refreshes a committed action row in a preserved parent form.
-	// It never replaces the parent form or its unsaved editable values.
+	// SavedControl refreshes a committed action row in the current or preserved
+	// parent form without replacing its unsaved editable values.
 	SavedControl   *ScreenControl
 	ID             string
 	ParentID       string
