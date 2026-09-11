@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-	"time"
 )
 
 // Uninstall stops the installation after its startup owner has removed any
@@ -194,7 +193,7 @@ func (m *Manager) NeedsAdministrator() bool {
 func (m *Manager) ownsProcessPath(root, path string) bool {
 	path = strings.TrimSuffix(path, " (deleted)")
 	if m.InstallRoot == "" {
-		return path == filepath.Join(root, "npm", "vendor", "spynel")
+		return npmRootFromExecutable(path) == root
 	}
 	relative, err := filepath.Rel(filepath.Join(root, "releases"), path)
 	return err == nil && filepath.Base(relative) == "spynel" && len(strings.Split(relative, string(filepath.Separator))) == 2 && !strings.HasPrefix(relative, "..")
@@ -205,56 +204,15 @@ func (m *Manager) stopProcesses(ctx context.Context, root string) error {
 	if err != nil {
 		return err
 	}
-	var processes []*os.Process
-	defer func() {
-		for _, process := range processes {
-			_ = process.Release()
-		}
-	}()
+	var records []ProcessRegistration
 	for _, pid := range ids {
 		if pid <= 1 || pid == os.Getpid() {
 			continue
 		}
-		process, err := os.FindProcess(pid)
-		if err != nil {
-			continue
-		}
 		path, err := installationProcessPath(pid)
-		if err != nil || !m.ownsProcessPath(root, path) {
-			_ = process.Release()
-			continue
-		}
-		processes = append(processes, process)
-		if err := process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
-			return fmt.Errorf("stop installed Spynel process %d: %w", pid, err)
+		if err == nil && m.ownsProcessPath(root, path) {
+			records = append(records, ProcessRegistration{PID: pid, Executable: strings.TrimSuffix(path, " (deleted)")})
 		}
 	}
-	killAt := time.Now().Add(10 * time.Second)
-	deadline := killAt.Add(5 * time.Second)
-	for {
-		live := false
-		for _, process := range processes {
-			path, err := installationProcessPath(process.Pid)
-			if err != nil || !m.ownsProcessPath(root, path) {
-				continue
-			}
-			live = true
-			if time.Now().After(killAt) {
-				if err := process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
-					return fmt.Errorf("kill installed Spynel process %d: %w", process.Pid, err)
-				}
-			}
-		}
-		if !live {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			return errors.New("Spynel processes did not stop; installation retained")
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(50 * time.Millisecond):
-		}
-	}
+	return stopProcessRecords(ctx, records)
 }

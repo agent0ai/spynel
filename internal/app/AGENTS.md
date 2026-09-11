@@ -36,6 +36,8 @@
 
 - Autostart action results refresh the same form row to its opposite action after verified completion. Native inspection failures display unknown state with a retry action; failed mutations retain their errors and return fresh state. Preserve unsaved field values and selection.
 
+- `/update` applies the owning installation update and requests coordinated restart of all its instances; `/update check` is read-only. Pass the validated updater result through the owner shutdown request so npm can skip unnecessary replacement when current. Keep slash catalog/help aligned.
+
 ## Child DOX Index
 
 No child DOX files.

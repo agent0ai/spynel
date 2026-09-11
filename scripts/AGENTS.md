@@ -26,6 +26,8 @@
 
 - Standalone regression checks cover root and regular-user immediate launch with an unchanged parent PATH, including modeled sudo authorization when no directory is writable. Exercise public uninstall routing, simultaneous GitHub/npm removal, live-process and startup cleanup, and workspace preservation. Native Linux/macOS release runners execute the process-removal tests.
 
+- `test-instance-updates.py` runs the native npm launcher against an isolated replacement package and local registry: a headless primary plus secondary and primary TUIs span two workspaces. Verify same-PID exec and working PTYs, channel-driven current-version restart without npm replacement, and legacy-instance rejection. Build only a synthetic updated executable, keep all user homes/workspaces private, and stop only fixture-owned subprocesses.
+
 ## Child DOX Index
 
 Direct child DOX files:

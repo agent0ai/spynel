@@ -86,6 +86,17 @@ func TestRemoveInstallation(t *testing.T) {
 					t.Fatal("registration lost on stop failure")
 				}
 				t.Setenv("STARTUP_TEST_FAIL", "")
+				if err := manager.StopInstallation(t.Context(), os.Getuid()); err != nil {
+					t.Fatal(err)
+				}
+				if retained, err := os.ReadFile(path); err != nil || string(retained) != string(data) {
+					t.Fatalf("stop changed future startup registration: %v", err)
+				}
+				if platform == "linux" {
+					if _, err := os.Readlink(filepath.Join(directory, "default.target.wants", name)); err != nil {
+						t.Fatal("stop removed future startup enablement:", err)
+					}
+				}
 				if err := manager.RemoveInstallation(t.Context(), os.Getuid()); err != nil {
 					t.Fatal(err)
 				}

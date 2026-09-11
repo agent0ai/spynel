@@ -121,6 +121,61 @@ func run(args []string, version string) error {
 		return runInstallBundle(args[1:], version)
 	case "uninstall-bundles":
 		return runUninstallBundles(args[1:])
+	case "killall":
+		if len(args) != 1 {
+			return errors.New("usage: spynel killall")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		count, err := updater.KillAll(ctx, func(records []updater.ProcessRegistration) error {
+			executable, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			records = append(records, updater.ProcessRegistration{Executable: executable, Installation: updater.Detect(version).InstallationRoot()})
+			seen := make(map[string]bool)
+			for _, record := range records {
+				manager, err := startupmanager.New(record.Executable)
+				if err != nil {
+					return err
+				}
+				manager.NPMLauncher = ""
+				if record.Installation != "" && filepath.Base(filepath.Dir(record.Executable)) == "vendor" {
+					manager.NPMLauncher = filepath.Join(record.Installation, "npm", "bin", "spynel.js")
+				}
+				key := manager.Executable + "\x00" + manager.NPMLauncher
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				if err := manager.StopInstallation(ctx, os.Getuid()); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err == nil {
+			fmt.Printf("Stopped %d Spynel instance(s).\n", count)
+		}
+		return err
+	case "update":
+		return runUpdateCommand(args[1:], version)
+	case "check-restartable":
+		if len(args) != 1 {
+			return errors.New("usage: spynel check-restartable")
+		}
+		return updater.Detect(version).CheckRestartable()
+	case "restart-instances":
+		if len(args) != 1 {
+			return errors.New("usage: spynel restart-instances")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		defer cancel()
+		count, err := updater.Detect(version).RestartInstances(ctx, version)
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "Restarted %d other Spynel instance(s).\n", count)
+		}
+		return err
 	case "docs":
 		return runDocsCommand(args[1:], os.Stdout)
 	case "instructions":
@@ -190,7 +245,7 @@ func run(args []string, version string) error {
 		return runFrameworkCLICommand("", args[1:], version)
 	case "status":
 		return runStatusCLICommand(args[1:], version, os.Stdout)
-	case "jobs", "tasks", "goals", "job", "log", "logs", "stop", "new", "clear", "history", "harness", "model", "effort", "speed", "telegram", "restart", "update":
+	case "jobs", "tasks", "goals", "job", "log", "logs", "stop", "new", "clear", "history", "harness", "model", "effort", "speed", "telegram", "restart":
 		return runFrameworkCLICommand(args[0], args[1:], version)
 	case "conversation", "conversations":
 		return runConversationCommand(args[1:], os.Stdout)
@@ -443,6 +498,8 @@ func (r *restartRequest) Error() string {
 type updateRequest struct {
 	args       []string
 	standalone bool
+	result     updater.Result
+	manager    *updater.Manager
 }
 
 func (*updateRequest) Error() string { return "update and restart Spynel" }
@@ -457,8 +514,10 @@ func (r *updateRequest) writeRestartArgs() {
 		return
 	}
 	data, err := json.Marshal(struct {
-		Args []string `json:"args"`
-	}{Args: append([]string(nil), r.args...)})
+		Args    []string `json:"args"`
+		Install bool     `json:"install"`
+		Version string   `json:"version"`
+	}{Args: append([]string(nil), r.args...), Install: r.result.Available, Version: r.result.Latest})
 	if err != nil {
 		return
 	}
@@ -473,6 +532,18 @@ func (r *updateRequest) writeRestartArgs() {
 func completeRun(err error, restart func([]string) error) error {
 	var update *updateRequest
 	if errors.As(err, &update) && update.standalone {
+		if update.manager == nil {
+			return errors.New("update lost its installation owner")
+		}
+		version := update.result.Current
+		if update.result.Available {
+			version = update.result.Latest
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		defer cancel()
+		if _, err := update.manager.RestartInstances(ctx, version); err != nil {
+			return err
+		}
 		return restart(append([]string(nil), update.args...))
 	}
 	var request *restartRequest
@@ -511,6 +582,7 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 	var restarting atomic.Bool
 	var updateScheduled atomic.Bool
 	var updating atomic.Bool
+	var pendingUpdate updater.Result
 	requestRestart := func() {
 		if !restartScheduled.CompareAndSwap(false, true) {
 			return
@@ -526,10 +598,11 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			}
 		}()
 	}
-	requestUpdate := func() {
+	requestUpdate := func(result updater.Result) {
 		if !updateScheduled.CompareAndSwap(false, true) {
 			return
 		}
+		pendingUpdate = result
 		go func() {
 			timer := time.NewTimer(restartNoticeDelay)
 			defer timer.Stop()
@@ -541,6 +614,22 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			}
 		}()
 	}
+	manager := updater.Detect(version)
+	restartSignals := make(chan os.Signal, 1)
+	signal.Notify(restartSignals, updater.RestartSignal())
+	defer signal.Stop(restartSignals)
+	registered, err := manager.RegisterProcess()
+	if err != nil {
+		return fmt.Errorf("register running Spynel instance: %w", err)
+	}
+	defer registered()
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-restartSignals:
+			requestRestart()
+		}
+	}()
 	ownerResult := make(chan error, 1)
 	options := primaryOptions{}
 	if !withTUI {
@@ -565,7 +654,7 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			}
 		}
 		if updating.Load() {
-			return &updateRequest{args: append([]string(nil), restartArgs...), standalone: updater.Detect(version).InstallRoot != ""}
+			return &updateRequest{args: append([]string(nil), restartArgs...), standalone: manager.InstallRoot != "", result: pendingUpdate, manager: manager}
 		}
 		if restarting.Load() {
 			return &restartRequest{args: append([]string(nil), restartArgs...)}
@@ -603,6 +692,9 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 		return serverResult(err)
 	case <-ctx.Done():
 		return serverResult(nil)
+	}
+	if err := updater.MarkProcessReady(); err != nil {
+		return serverResult(fmt.Errorf("confirm running Spynel instance: %w", err))
 	}
 	if launchTUI {
 		themes, themeErr := theme.LoadDir(cfg.StatePath("themes"))
@@ -1292,7 +1384,9 @@ Usage:
     --format text|json           Select plain Markdown or versioned JSON
   spynel instructions            Validate role instruction files without showing contents
   spynel jobs|log...             Other concise framework-command aliases
-  spynel update                 Check the installation source for an update (/update install applies it)
+  spynel update                 Update and restart every instance of this installation
+  spynel update check           Check versions without updating or restarting
+  spynel killall                Stop all running Spynel instances
   spynel run --once              Dispatch one orchestration scan and wait
   spynel task [--no-review] REQUEST
                                 Create a task (reviewed by default)

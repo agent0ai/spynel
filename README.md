@@ -86,7 +86,7 @@ npm install -g spynel
 spynel
 ```
 
-Use `/update install` to update Spynel.
+Use `spynel update` to update Spynel and restart its running instances. Use `spynel killall` to stop all running Spynel instances.
 
 Run `spynel` from your project directory.
 

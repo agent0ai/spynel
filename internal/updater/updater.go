@@ -34,6 +34,25 @@ type Result struct {
 	Command         string
 }
 
+// PrepareUpdate owns validation and publication shared by the CLI and channels.
+// npm publication follows through its launcher after the requesting Go exits.
+func (m *Manager) PrepareUpdate(ctx context.Context, result Result) error {
+	if !result.CanAutoInstall {
+		return errors.New("this installation cannot update itself; use its original installation method")
+	}
+	if err := m.CheckRestartable(); err != nil {
+		return err
+	}
+	if result.Source == "GitHub" {
+		if result.Available {
+			if err := m.Install(ctx, result.Latest); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // PeriodicChecksEnabled reports whether this managed installation is running
 // under an interactive launch that authorized proactive checks.
 func (m *Manager) PeriodicChecksEnabled() bool {
@@ -86,6 +105,15 @@ var processExecutable = func() string {
 	executable, _ := os.Executable()
 	resolved, _ := filepath.EvalSymlinks(executable)
 	return resolved
+}()
+
+// Capture npm ownership while the original vendor tree still exists.
+var processNPMRoot = func() string {
+	root := npmRootFromExecutable(processExecutable)
+	if validNPMRoot(root, "") {
+		return root
+	}
+	return ""
 }()
 
 // Detect constructs an update manager for the executable resolved at startup.

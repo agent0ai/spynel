@@ -12,6 +12,8 @@
 - Interactive TUI launches may perform the bounded update flow; noninteractive commands and generated automatic-startup services must not.
 - Keep this file dependency-light and compatible with the Node version declared by the root package manifest.
 
+- Use native check/restart coordination for both startup-offer and explicit-update paths, with bounded subprocess execution. Preserve normalized requester arguments and propagate coordination failures; never report success merely because npm exited successfully.
+
 ## Child DOX Index
 
 No child DOX files.

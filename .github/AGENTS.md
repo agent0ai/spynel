@@ -19,6 +19,8 @@
 
 - Native release runners execute startup and updater removal tests on all four targets before packaging so macOS process inspection is verified on macOS, not inferred from Linux.
 
+- Native release runners verify npm updates across two workspaces with a headless primary and two real TUI terminals before publishing.
+
 ## Child DOX Index
 
 Direct child DOX files:

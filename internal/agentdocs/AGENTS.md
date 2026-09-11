@@ -15,6 +15,8 @@
 
 - The integration topic documents committed conversation subscriptions, honest retry/completion boundaries, optional private Unix sockets, and content-free headless stderr. Distinguish explicit same-kernel socket access from unchanged foreign-loopback discovery/election fences.
 
+- Keep compiled update guidance explicit about update-by-default, `update check`, all-instance restart within the selected installation, shell `killall`, and older-instance restart limitations.
+
 ## Child DOX Index
 
 No child DOX files.

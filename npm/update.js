@@ -155,7 +155,7 @@ function runNPMUpdate(options = {}) {
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`${invocation.display} exited with status ${result.status}`);
   const after = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")).version;
-  if (compareVersions(after, before) <= 0) {
+  if (compareVersions(after, before) < 0 || (options.expectedVersion ? compareVersions(after, options.expectedVersion) < 0 : compareVersions(after, before) <= 0)) {
     throw new Error(`${invocation.display} completed but Spynel remained at ${after}; check the project's dependency range or update it manually`);
   }
   return { ...invocation, before, after };

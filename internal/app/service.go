@@ -71,7 +71,7 @@ type Service struct {
 	lastNotice             channel.Notice
 	noticeEvents           chan channel.Notice
 	restartRequests        chan struct{}
-	updateRequests         chan struct{}
+	updateRequests         chan updater.Result
 	primaryRequests        chan string
 	primaryRequestMu       sync.Mutex
 	primaryRequested       bool
@@ -141,7 +141,7 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 		pairingEvents:         make(chan channel.PairingEvent, 1),
 		noticeEvents:          make(chan channel.Notice, 8),
 		restartRequests:       make(chan struct{}, 1),
-		updateRequests:        make(chan struct{}, 1),
+		updateRequests:        make(chan updater.Result, 1),
 		primaryRequests:       make(chan string, 1),
 		streamText:            map[string]string{},
 		liveTUI:               map[string]map[string]time.Time{},
@@ -1443,13 +1443,13 @@ func (s *Service) requestRestart() {
 
 // UpdateRequests publishes source-specific update/restart requests after the
 // acknowledgement is persisted. The CLI owns complete runtime shutdown.
-func (s *Service) UpdateRequests() <-chan struct{} {
+func (s *Service) UpdateRequests() <-chan updater.Result {
 	return s.updateRequests
 }
 
-func (s *Service) requestUpdate() {
+func (s *Service) requestUpdate(result updater.Result) {
 	select {
-	case s.updateRequests <- struct{}{}:
+	case s.updateRequests <- result:
 	default:
 	}
 }
@@ -1459,8 +1459,8 @@ func (s *Service) updateCommand(ctx context.Context, message core.Message, remai
 		return s.localReply(message, "Updates are unavailable in this build. Install Spynel through npm or the install script to use `/update`.", emit)
 	}
 	action := strings.ToLower(strings.TrimSpace(remainder))
-	if action != "" && action != "install" {
-		return s.localReply(message, "Usage: /update [install]", emit)
+	if action != "" && action != "install" && action != "check" {
+		return s.localReply(message, "Usage: /update [check]", emit)
 	}
 	result, err := s.Updates.Check(ctx)
 	if err != nil {
@@ -1469,31 +1469,33 @@ func (s *Service) updateCommand(ctx context.Context, message core.Message, remai
 	if result.Source == "" {
 		return s.localReply(message, "This Spynel binary is unmanaged. Download a newer release using the same installation method.", emit)
 	}
-	if !result.Available {
+	if !result.Available && action == "check" {
 		latest := result.Latest
 		if latest == "" {
 			latest = result.Current
 		}
 		return s.localReply(message, fmt.Sprintf("Spynel %s is current; %s also reports %s.", result.Current, result.Source, latest), emit)
 	}
-	if action == "" {
+	if action == "check" {
 		if result.CanAutoInstall {
-			return s.localReply(message, fmt.Sprintf("Spynel %s is installed through %s; %s is available. Run `/update install` to update and restart Spynel safely.", result.Current, result.Source, result.Latest), emit)
+			return s.localReply(message, fmt.Sprintf("Spynel %s is installed through %s; %s is available. Run `/update` to update and restart all instances of this installation.", result.Current, result.Source, result.Latest), emit)
 		}
 		return s.localReply(message, fmt.Sprintf("Spynel %s is installed through npm; %s is available. Run `%s`, then `/restart`. This process was not launched by the npm wrapper, so it cannot replace itself safely.", result.Current, result.Latest, result.Command), emit)
 	}
 	if !result.CanAutoInstall {
 		return s.localReply(message, fmt.Sprintf("Run `%s`, then `/restart`. Updating in place is unavailable because this process was not launched by the npm wrapper.", result.Command), emit)
 	}
-	if result.Source == "GitHub" {
-		if err := s.Updates.Install(ctx, result.Latest); err != nil {
-			return s.localReply(message, "Update installation failed: "+err.Error()+". The previous installation remains usable.", emit)
-		}
-	}
-	if err := s.localReply(message, fmt.Sprintf("Updating Spynel from %s to %s with %s, then restarting. Saved workspace state will remain in place.", result.Current, result.Latest, result.Source), emit); err != nil {
+	if err := s.Updates.PrepareUpdate(ctx, result); err != nil {
 		return err
 	}
-	s.requestUpdate()
+	notice := fmt.Sprintf("Restarting all instances of this installation at Spynel %s.", result.Current)
+	if result.Available {
+		notice = fmt.Sprintf("Updating Spynel from %s to %s with %s, then restarting all instances of this installation.", result.Current, result.Latest, result.Source)
+	}
+	if err := s.localReply(message, notice, emit); err != nil {
+		return err
+	}
+	s.requestUpdate(result)
 	return nil
 }
 
@@ -1887,8 +1889,8 @@ var slashCommands = []core.SlashCommand{
 	{Value: "/new", Usage: "/new", Description: "Start a distinct TUI conversation and preserve this one"},
 	{Value: "/stop", Usage: "/stop", Description: "Stop the active execution for this conversation"},
 	{Value: "/restart", Usage: "/restart", Description: "Restart Spynel and restore saved state"},
-	{Value: "/update", Usage: "/update", Description: "Check for a newer Spynel release"},
-	{Value: "/update install", Usage: "/update install", Description: "Install an update and restart safely"},
+	{Value: "/update", Usage: "/update", Description: "Update and restart all instances of this installation"},
+	{Value: "/update check", Usage: "/update check", Description: "Check versions without updating or restarting"},
 	{Value: "/history", Usage: "/history", Description: "Show the complete history file"},
 	{Value: "/resume", Usage: "/resume", Description: "Browse saved conversations and branch one into the TUI"},
 	{Value: "/log", Usage: "/log", Description: "Show the newest page of captured runtime logs"},
@@ -1949,7 +1951,7 @@ var helpTopics = []struct {
 	{
 		name:        "channels",
 		description: "The TUI, Telegram, and WhatsApp",
-		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, instance, and orchestrator indicators. From an idle local TUI, `/primary` safely hands workspace ownership to that TUI instance. Use `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to switch the TUI to a distinct conversation while preserving the prior one for `/resume`. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/update` checks the owning npm or GitHub installation source with a ten-second deadline. `/update install` verifies and installs an update and restarts safely; npm replacement runs through its supervising launcher after shutdown. `/log` shows bounded runtime diagnostics. `/jobs` lists active executions and `/jobs recent` lists archived executions by the same numeric reference; `/job info <number>` and `/job output <number>` inspect bounded metadata or captured output. `/tasks` and `/goals` list open durable work by default. `/job message <number> <text>` sends nonterminal guidance through the existing job session, `/job ping <number>` requests a durable progress update, and `/job kill <number>` stops one live job.",
+		body:        "# Channels\n\nThe TUI, each Telegram chat, and each WhatsApp chat keep independent durable histories and harness threads. All channels share the application slash commands and Markdown-aware responses.\n\nUse `/status` to inspect shared connection, runtime, harness, instance, and orchestrator indicators. From an idle local TUI, `/primary` safely hands workspace ownership to that TUI instance. Use `/history` to locate the current conversation's history file, `/clear` to erase that history and discard its harness thread, `/stop` to interrupt its active execution, and `/new` to switch the TUI to a distinct conversation while preserving the prior one for `/resume`. `/restart` acknowledges the request, cleanly stops the current runtime, and relaunches Spynel with saved configuration and histories intact. `/update` updates the owning installation and restarts all its running instances across workspaces. `/update check` only checks versions, with a ten-second deadline. The shell command `spynel killall` stops all running Spynel instances, preserving saved workspace state and future autostart registrations. `/log` shows bounded runtime diagnostics. `/jobs` lists active executions and `/jobs recent` lists archived executions by the same numeric reference; `/job info <number>` and `/job output <number>` inspect bounded metadata or captured output. `/tasks` and `/goals` list open durable work by default. `/job message <number> <text>` sends nonterminal guidance through the existing job session, `/job ping <number>` requests a durable progress update, and `/job kill <number>` stops one live job.",
 	},
 	{
 		name:        "workflows",

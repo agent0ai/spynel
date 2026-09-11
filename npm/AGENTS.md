@@ -18,6 +18,8 @@
 - Proactive registry checks have a ten-second total deadline and run only before interactive TUI starts. Pass explicit current-launch periodic-check eligibility, the attempted lookup timestamp, and any valid latest version to the launched binary so its hourly TUI indicator does not duplicate the startup lookup. Clear inherited eligibility and snapshot state for every launch; skipped noninteractive, plain-command, and `--automatic-startup` launches must make neither immediate nor periodic proactive checks. When an update is found, present the available/current versions and an explicit styled yes/no offer with a live ten-second countdown; timeout, EOF, interruption, and unrelated answers skip safely. Never let registry failure prevent Spynel from starting.
 - The launcher supervises explicit update requests from the Go process, runs the appropriate local or global `npm update` only after that executable exits, and starts the resulting binary with npm installation metadata in its environment.
 
+- Both accepted startup offers and explicit update requests use the native updater's preflight and post-publication restart coordination. Updates restart all registered instances of this package across workspaces, then relaunch the requester. The native coordinator verifies new generations and versions; failures stay explicit. A request already at the latest version skips npm replacement but still restarts instances.
+
 ## Child DOX Index
 
 Direct child DOX files:

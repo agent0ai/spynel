@@ -72,6 +72,9 @@ func scriptRootFromExecutable(executable, version string) string {
 // os.Executable's resolved path to an older retained bundle. Unmanaged binaries
 // retain their ordinary restart behavior.
 func RestartExecutable(executable string) string {
+	if processNPMRoot != "" && processMatches(ProcessRegistration{Executable: processExecutable, Installation: processNPMRoot}, executable) {
+		return filepath.Join(processNPMRoot, "npm", "vendor", "spynel")
+	}
 	if root := scriptRootFromExecutable(executable, ""); root != "" {
 		return filepath.Join(root, "spynel")
 	}

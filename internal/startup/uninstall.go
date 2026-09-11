@@ -16,6 +16,15 @@ import (
 // RemoveInstallation stops and removes only registrations for this executable
 // or npm launcher. Ordinary preference changes retain Sync's non-stopping behavior.
 func (m *Manager) RemoveInstallation(ctx context.Context, userID int) error {
+	return m.stopInstallation(ctx, userID, true)
+}
+
+// StopInstallation unloads services without changing future startup settings.
+func (m *Manager) StopInstallation(ctx context.Context, userID int) error {
+	return m.stopInstallation(ctx, userID, false)
+}
+
+func (m *Manager) stopInstallation(ctx context.Context, userID int, remove bool) error {
 	scopes := []bool{false}
 	if m.SystemWide {
 		scopes = append(scopes, true)
@@ -65,8 +74,10 @@ func (m *Manager) RemoveInstallation(ctx context.Context, userID int) error {
 						return fmt.Errorf("stop startup registration %s: %w", name, err)
 					}
 				}
-				if err := os.Remove(path); err != nil {
-					return err
+				if remove {
+					if err := os.Remove(path); err != nil {
+						return err
+					}
 				}
 				continue
 			}
@@ -101,6 +112,9 @@ func (m *Manager) RemoveInstallation(ctx context.Context, userID int) error {
 				if queryErr != nil || strings.TrimSpace(state) != "inactive" && strings.TrimSpace(state) != "failed" {
 					return fmt.Errorf("stop startup registration %s: %w", name, err)
 				}
+			}
+			if !remove {
+				continue
 			}
 			for _, target := range []string{"default.target.wants", "multi-user.target.wants"} {
 				link := filepath.Join(directory, target, name)

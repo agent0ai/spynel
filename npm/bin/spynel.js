@@ -38,6 +38,15 @@ function createLaunchEnvironment(parentEnvironment = process.env, periodicChecks
   return environment;
 }
 
+function coordinateInstances(command, environment) {
+  const result = childProcess.spawnSync(path.join(packageRoot, "npm", "vendor", "spynel"), [command], {
+    stdio: ["ignore", "ignore", "inherit"], env: environment, timeout: 40_000
+  });
+  if (result.error || result.status !== 0) {
+    throw result.error || new Error("Spynel instance coordination failed; review the error above");
+  }
+}
+
 async function main() {
   current();
   const periodicChecks = shouldCheckAtStartup(args);
@@ -48,7 +57,10 @@ async function main() {
       startupUpdate = update;
       if (update.available && await promptForStartupUpdate(update, { packageRoot })) {
         try {
-          runNPMUpdate({ packageRoot });
+          const environment = createLaunchEnvironment(process.env, false);
+          coordinateInstances("check-restartable", environment);
+          runNPMUpdate({ packageRoot, expectedVersion: update.latest });
+          coordinateInstances("restart-instances", environment);
         } catch (error) {
           console.error(`Unable to update Spynel: ${error.message}. Starting the installed version.`);
         }
@@ -85,15 +97,18 @@ async function main() {
       fs.rmSync(environment.SPYNEL_NPM_UPDATE_STATE, { force: true });
       return result.status === null ? 1 : result.status;
     }
+    let request = {};
     try {
-      const request = JSON.parse(fs.readFileSync(environment.SPYNEL_NPM_UPDATE_STATE, "utf8"));
+      request = JSON.parse(fs.readFileSync(environment.SPYNEL_NPM_UPDATE_STATE, "utf8"));
       if (Array.isArray(request.args)) args = request.args;
     } catch (_) {
       // Older binaries do not publish restart arguments; reuse this launch.
     }
     fs.rmSync(environment.SPYNEL_NPM_UPDATE_STATE, { force: true });
     try {
-      runNPMUpdate({ packageRoot });
+      coordinateInstances("check-restartable", environment);
+      if (request.install !== false) runNPMUpdate({ packageRoot, expectedVersion: request.version });
+      coordinateInstances("restart-instances", environment);
     } catch (error) {
       console.error(`Unable to update Spynel: ${error.message}`);
       if (args.length === 0 || args[0] === "serve") continue;

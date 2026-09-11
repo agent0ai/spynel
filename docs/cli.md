@@ -134,7 +134,8 @@ spynel model gpt-5
 spynel telegram on
 spynel whatsapp off
 spynel update
-spynel update install
+spynel update check
+spynel killall
 spynel config set workspace.history_max_messages 40
 spynel command help commands
 ```
@@ -149,7 +150,7 @@ Options such as `--config`, `--conversation`, and `--json` must precede alias ar
 
 TUI-only visual or ownership operations—theme preview, title, welcome, resume screen, primary-window promotion, and quit—are intentionally rejected. Conversation resume has the disk-backed command above. `spynel whatsapp pair` remains the plain QR-pairing command.
 
-`spynel update` uses the shared `/update` handler and checks the owning npm or standalone GitHub installation with a ten-second deadline. It makes no update request for an unmanaged archive/development binary. `spynel update install` explicitly installs and restarts: standalone downloads are checksummed, validated and published as complete immutable bundles before graceful shutdown; npm returns to its supervising launcher for replacement after Go exits. When no primary is running, standalone installation restarts into `version` rather than replaying the install command. Commands sent to a running primary update that primary's installation, which may differ from the caller's. An npm process launched without its wrapper gets manual update guidance. See [installation and updates](getting-started.md#updates).
+`spynel update` checks, updates and restarts every instance of its own managed installation across workspaces. It is independent of the current workspace or primary. `/update` through a channel selects that primary's installation. `spynel update check` only reports versions; `spynel update --json check` emits structured version state, while `spynel update --json` emits a terminal update acknowledgment and reports failures through its exit status. `spynel killall` stops all verified Spynel processes the caller can control, including other installations. Matching autostart services are stopped while their future registrations and workspace data remain intact. See [installation and updates](getting-started.md#updates) for older-instance handling and per-user scope.
 
 ## Tasks, goals, and extensions
 

@@ -5,7 +5,7 @@ const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const stream = require("stream");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const { once } = require("events");
 const { resolve } = require("./platform");
 const { install, validateArchiveEntries, validateExtractedTree } = require("./install");
@@ -158,7 +158,54 @@ setInterval(() => {}, 1000);
   }
 }
 
+function checkLauncherUpdates() {
+  const directory = fs.mkdtempSync(path.join(require("os").tmpdir(), "spynel-update-"));
+  try {
+    fs.mkdirSync(path.join(directory, "npm", "bin"), { recursive: true });
+    fs.mkdirSync(path.join(directory, "npm", "vendor"));
+    fs.mkdirSync(path.join(directory, "tools"));
+    for (const file of ["bin/spynel.js", "platform.js", "update.js"]) {
+      fs.copyFileSync(path.join(__dirname, file), path.join(directory, "npm", file));
+    }
+    const native = `#!${process.execPath}
+const fs = require("fs");
+const action = process.argv[2];
+fs.appendFileSync(process.env.UPDATE_TEST_LOG, action + "\\n");
+if (action === process.env.UPDATE_TEST_FAIL) process.exit(1);
+if (action === "update") {
+  fs.writeFileSync(process.env.SPYNEL_NPM_UPDATE_STATE, JSON.stringify({args: ["version"], install: process.env.UPDATE_TEST_CURRENT !== "1", version: "2.0.0"}));
+  process.exit(75);
+}
+`;
+    fs.writeFileSync(path.join(directory, "npm", "vendor", "spynel"), native, { mode: 0o700 });
+    fs.writeFileSync(path.join(directory, "tools", "npm"), `#!${process.execPath}
+const fs = require("fs");
+if (process.argv[2] === "root") process.exit(1);
+fs.appendFileSync(process.env.UPDATE_TEST_LOG, "npm\\n");
+if (process.env.UPDATE_TEST_FAIL === "npm") process.exit(1);
+fs.writeFileSync("package.json", JSON.stringify({name: "spynel", version: "2.0.0"}));
+`, { mode: 0o700 });
+    for (const failure of ["", "check-restartable", "npm", "restart-instances", "current"]) {
+      const log = path.join(directory, "calls");
+      fs.writeFileSync(log, "");
+      fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({ name: "spynel", version: "1.0.0" }));
+      const result = spawnSync(process.execPath, [path.join(directory, "npm", "bin", "spynel.js"), "update"], {
+        encoding: "utf8", timeout: 5000,
+        env: { ...process.env, PATH: path.join(directory, "tools") + path.delimiter + process.env.PATH, UPDATE_TEST_LOG: log, UPDATE_TEST_FAIL: failure, UPDATE_TEST_CURRENT: failure === "current" ? "1" : "0" }
+      });
+      assert.ifError(result.error);
+      const expected = ["update", "check-restartable", ...(failure === "current" ? [] : ["npm"]), "restart-instances", "version"];
+      const failed = expected.indexOf(failure);
+      assert.deepStrictEqual(fs.readFileSync(log, "utf8").trim().split("\n"), failed >= 0 ? expected.slice(0, failed + 1) : expected);
+      assert.strictEqual(result.status, failed >= 0 ? 1 : 0, result.stderr);
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 async function main() {
+  checkLauncherUpdates();
   await checkLauncherSignals();
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
   try {

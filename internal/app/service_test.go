@@ -2037,10 +2037,15 @@ func TestUpdateCommandChecksNPMAndRequestsLauncherManagedInstall(t *testing.T) {
 		}
 		return response
 	}
-	if response := run("/update"); !strings.Contains(response.Text, "1.3.0") || !strings.Contains(response.Text, "/update install") {
+	if response := run("/update check"); !strings.Contains(response.Text, "1.3.0") || !strings.Contains(response.Text, "/update") {
 		t.Fatalf("update response = %#v", response)
 	}
-	if response := run("/update install"); !strings.Contains(response.Text, "Updating Spynel") {
+	select {
+	case <-service.UpdateRequests():
+		t.Fatal("check requested an update")
+	default:
+	}
+	if response := run("/update"); !strings.Contains(response.Text, "Updating Spynel") || !strings.Contains(response.Text, "all instances") {
 		t.Fatalf("install response = %#v", response)
 	}
 	select {

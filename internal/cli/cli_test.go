@@ -26,6 +26,7 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/localapi"
+	"github.com/agent0ai/spynel/internal/updater"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
 
@@ -1469,7 +1470,9 @@ func TestOwnerElectionRunsOneServerAndHandsOffOnExit(t *testing.T) {
 	}
 	firstContext, stopFirst := context.WithCancel(context.Background())
 	firstDone := make(chan error, 1)
-	go func() { firstDone <- runOwnerElection(firstContext, cfg, "test", first, func() {}, func() {}) }()
+	go func() {
+		firstDone <- runOwnerElection(firstContext, cfg, "test", first, func() {}, func(updater.Result) {})
+	}()
 	waitContext, stopWaiting := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stopWaiting()
 	client := localapi.NewClient(first)
@@ -1485,7 +1488,9 @@ func TestOwnerElectionRunsOneServerAndHandsOffOnExit(t *testing.T) {
 
 	secondContext, stopSecond := context.WithCancel(context.Background())
 	secondDone := make(chan error, 1)
-	go func() { secondDone <- runOwnerElection(secondContext, cfg, "test", second, func() {}, func() {}) }()
+	go func() {
+		secondDone <- runOwnerElection(secondContext, cfg, "test", second, func() {}, func(updater.Result) {})
+	}()
 	time.Sleep(2 * instance.RetryInterval)
 	lease, err = second.Current()
 	if err != nil || lease.InstanceID != first.ID() {
@@ -1574,7 +1579,7 @@ func TestOwnerElectionPromotesAfterObservedPrimaryBecomesStale(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- runOwnerElection(ctx, cfg, "test", contender, func() {}, func() {}) }()
+	go func() { done <- runOwnerElection(ctx, cfg, "test", contender, func() {}, func(updater.Result) {}) }()
 
 	waitContext, stopWaiting := context.WithTimeout(context.Background(), 6*time.Second)
 	defer stopWaiting()
@@ -1620,14 +1625,18 @@ func TestPrimaryCommandHandsOwnershipToRequestingTUI(t *testing.T) {
 	secondContext, stopSecond := context.WithCancel(context.Background())
 	firstDone := make(chan error, 1)
 	secondDone := make(chan error, 1)
-	go func() { firstDone <- runOwnerElection(firstContext, cfg, "test", first, func() {}, func() {}) }()
+	go func() {
+		firstDone <- runOwnerElection(firstContext, cfg, "test", first, func() {}, func(updater.Result) {})
+	}()
 	waitContext, stopWaiting := context.WithTimeout(context.Background(), 8*time.Second)
 	defer stopWaiting()
 	if _, err := localapi.NewClient(first).WaitReady(waitContext); err != nil {
 		stopFirst()
 		t.Fatal(err)
 	}
-	go func() { secondDone <- runOwnerElection(secondContext, cfg, "test", second, func() {}, func() {}) }()
+	go func() {
+		secondDone <- runOwnerElection(secondContext, cfg, "test", second, func() {}, func(updater.Result) {})
+	}()
 	defer func() {
 		stopFirst()
 		stopSecond()
@@ -1686,7 +1695,7 @@ func TestPromotionRecordsConfigurationReloadFailure(t *testing.T) {
 	if err := os.WriteFile(cfg.Path, []byte("invalid: [\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	term, startErr := startPrimaryTerm(context.Background(), cfg, "test", election, listener, "unused", func() {}, func() {})
+	term, startErr := startPrimaryTerm(context.Background(), cfg, "test", election, listener, "unused", func() {}, func(updater.Result) {})
 	if term != nil || startErr == nil {
 		t.Fatalf("promotion with invalid config = %#v, %v", term, startErr)
 	}
@@ -1704,7 +1713,7 @@ func TestPromotionRecordsConfigurationReloadFailure(t *testing.T) {
 func TestStandaloneUpdateRestartAndProactiveEligibility(t *testing.T) {
 	for _, args := range [][]string{nil, {"version"}, {"version", "--quiet"}, {"serve", "--tui", "--config", "/project/.spynel/config.yaml"}} {
 		called := false
-		err := completeRun(&updateRequest{args: args, standalone: true}, func(got []string) error {
+		err := completeRun(&updateRequest{args: args, standalone: true, manager: &updater.Manager{InstallRoot: t.TempDir()}}, func(got []string) error {
 			called = true
 			want := args
 			if strings.Join(got, "\x00") != strings.Join(want, "\x00") {

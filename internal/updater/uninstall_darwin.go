@@ -15,6 +15,8 @@ import (
 
 func installationWritable(path string) bool { return syscall.Access(path, 2) == nil }
 
+func processImagePath(_ int, path string) string { return path }
+
 func installationProcessIDs() ([]int, error) {
 	processes, err := unix.SysctlKinfoProcSlice("kern.proc.all")
 	if err != nil {
@@ -29,8 +31,11 @@ func installationProcessIDs() ([]int, error) {
 
 func installationProcessPath(pid int) (string, error) {
 	var path [C.PROC_PIDPATHINFO_MAXSIZE]byte
-	if C.proc_pidpath(C.int(pid), unsafe.Pointer(&path[0]), C.uint32_t(len(path))) <= 0 {
-		return "", errors.New("process executable unavailable")
+	if count, err := C.proc_pidpath(C.int(pid), unsafe.Pointer(&path[0]), C.uint32_t(len(path))); count <= 0 {
+		if err == nil {
+			err = errors.New("process executable unavailable")
+		}
+		return "", err
 	}
 	return C.GoString((*C.char)(unsafe.Pointer(&path[0]))), nil
 }

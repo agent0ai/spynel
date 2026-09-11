@@ -26,3 +26,7 @@ func installationWritable(path string) bool { return syscall.Access(path, 2) == 
 func installationProcessPath(pid int) (string, error) {
 	return os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
 }
+
+func processImagePath(pid int, _ string) string {
+	return filepath.Join("/proc", strconv.Itoa(pid), "exe")
+}

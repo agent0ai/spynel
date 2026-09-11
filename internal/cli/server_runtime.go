@@ -16,6 +16,7 @@ import (
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/localapi"
 	"github.com/agent0ai/spynel/internal/theme"
+	"github.com/agent0ai/spynel/internal/updater"
 )
 
 var errOwnershipLost = errors.New("workspace server ownership changed during startup")
@@ -39,7 +40,7 @@ type primaryTerm struct {
 	stopOnce         sync.Once
 }
 
-func runOwnerElection(ctx context.Context, cfg config.Config, version string, election *instance.Election, restart, update func(), options ...primaryOptions) error {
+func runOwnerElection(ctx context.Context, cfg config.Config, version string, election *instance.Election, restart func(), update func(updater.Result), options ...primaryOptions) error {
 	ticker := time.NewTicker(instance.RetryInterval)
 	defer ticker.Stop()
 	var term *primaryTerm
@@ -136,7 +137,7 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 	}
 }
 
-func startPrimaryTerm(parent context.Context, original config.Config, version string, election *instance.Election, listener net.Listener, token string, restart, update func(), options ...primaryOptions) (*primaryTerm, error) {
+func startPrimaryTerm(parent context.Context, original config.Config, version string, election *instance.Election, listener net.Listener, token string, restart func(), update func(updater.Result), options ...primaryOptions) (*primaryTerm, error) {
 	// A secondary may have waited for hours before taking over. Re-read YAML so
 	// it never resurrects the snapshot from its own startup.
 	cfg, err := config.Load(original.Path)
@@ -230,8 +231,8 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 		case <-ctx.Done():
 		case <-service.RestartRequests():
 			restart()
-		case <-service.UpdateRequests():
-			update()
+		case result := <-service.UpdateRequests():
+			update(result)
 		}
 	}()
 	started = true

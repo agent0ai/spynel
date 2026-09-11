@@ -19,6 +19,8 @@
 
 - `Enabled` inspects persistent native registration without changing it or trusting the saved preference. Linux queries the exact unit file; macOS checks the launchd override and validated LaunchAgent/LaunchDaemon file. Failed or unrecognized queries return an error, never an assumed disabled state.
 
+- `StopInstallation` shares exact registration ownership and native stop/unload with removal, but retains registration files and enabled links. `spynel killall` uses it before process termination to prevent service-manager respawn without changing future boot/login preferences.
+
 ## Child DOX Index
 
 No child DOX files.

@@ -35,6 +35,8 @@
 
 - Keep the README install and uninstall examples short. The plain install pipe must support an immediate `spynel` command for root and regular users; detailed permission and override behavior belongs in getting started. Public `uninstall.sh` automatically stops matching processes, removes startup registrations, and removes both standalone and npm installations while keeping workspace data.
 
+- Document update-by-default, explicit read-only `update check`, caller-installation versus channel-primary selection, cross-workspace instance restart, and shell `killall` with preserved future autostart registrations. State per-user process discovery and the one-time stop/relaunch requirement for older releases without coordinated restart.
+
 ## Child DOX Index
 
 No child DOX files.

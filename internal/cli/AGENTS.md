@@ -27,6 +27,8 @@
 
 - Internal `uninstall-bundles` is workspace-independent. Discover the current global npm root before elevation, retain the original HOME/PATH/user identity across one required native sudo authorization, and coordinate updater removal with startup cleanup for both standalone and npm installations. The public `uninstall.sh` uses the checksummed native bootstrap so cleanup runs outside either installation.
 
+- `spynel update` acts on the caller's managed installation without joining a workspace primary; bare update applies and restarts all its instances, `check` only checks. Channel updates select their primary's installation through the shared updater. Register each server/TUI for its entire election lifetime and translate the updater restart signal into ordinary graceful shutdown and exec. Internal launcher coordination commands are workspace-independent. `spynel killall` stops verified processes across installations and asks startup ownership to stop matching services without removing future registrations.
+
 ## Child DOX Index
 
 No child DOX files.

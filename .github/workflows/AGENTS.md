@@ -16,6 +16,8 @@
 
 - Before publishing, every native target tests startup/updater cleanup and the plain installer/uninstaller against a verified 0.12.1 baseline archive, including simultaneous running npm/GitHub installations and modeled authorization for a regular user with no writable PATH entry.
 
+- All four native targets also run the isolated npm multi-instance update test against the candidate archive, including real TUI terminals and a synthetic newer executable; this gate precedes asset/npm publication.
+
 ## Child DOX Index
 
 No child DOX files.

@@ -35,7 +35,7 @@ def main():
         env = {k: v for k, v in os.environ.items() if not k.startswith("SPYNEL_")}
         user_home = temp / "home"
         user_home.mkdir()
-        env.update(HOME=str(user_home), SHELL="/bin/bash", XDG_RUNTIME_DIR=str(temp / "isolated runtime"))
+        env.update(HOME=str(user_home), SHELL="/bin/bash", XDG_RUNTIME_DIR=str(temp / "isolated runtime"), XDG_CONFIG_HOME=str(user_home / ".config"))
         tools = temp / "system tools"
         tools.mkdir()
         for name in ("sh", "curl", "tar", "awk", "mktemp", "uname", "sha256sum", "shasum", "wc", "mkdir", "rm", "rmdir", "chmod", "readlink", "ln", "gzip", "id", "sed", "grep", "cat", "cmp"):
@@ -217,16 +217,16 @@ def main():
                 assert fixture["checks"] == checks
                 assert new_version in run("update")
                 assert "Updating Spynel" in run("update", "install")
-                wait_for(lambda: json.loads(primary.read_text()) != first and "current" in run("update"))
+                wait_for(lambda: json.loads(primary.read_text()) != first and new_version in run("update", "check"))
                 assert run("--version").strip() == "spynel " + new_version
-                assert "GitHub" in run("update")
+                assert "GitHub" in run("update", "check")
                 assert old_executable.exists(), "running process libraries were removed"
                 assert (vendor / "spynel").read_text() == "unrelated npm executable\n"
                 assert config.read_bytes() == original_config and sentinel.read_bytes() == original_task
                 # Ordinary /restart must also follow the stable launcher.
                 second = json.loads(primary.read_text())
                 run("restart")
-                wait_for(lambda: json.loads(primary.read_text()) != second and "GitHub" in run("update"))
+                wait_for(lambda: json.loads(primary.read_text()) != second and "GitHub" in run("update", "check"))
                 process.terminate()
                 process.wait(timeout=30)
                 assert not primary.exists(), "graceful shutdown did not release ownership"
@@ -258,7 +258,7 @@ def main():
                     assert "spynel " + new_version in output
                 assert run("--version", executable=offline_launcher).strip() == "spynel " + new_version
                 assert (install / "spynel").resolve() == previous_primary_bundle
-                assert "GitHub" in run("update", executable=offline_launcher)
+                assert "GitHub" in run("update", "check", executable=offline_launcher)
                 removed = subprocess.run(["sh"], input=uninstall_script, cwd=workspace, env={**env, "SPYNEL_INSTALL_DIR": str(offline_install), "SPYNEL_VERSION": new_version}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
                 assert removed.returncode == 0, removed.stderr.decode()
                 assert not offline_install.exists() and not offline_launcher.is_symlink()

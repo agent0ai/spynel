@@ -97,6 +97,18 @@ jobs:
           (cd .tmp-artifacts/standalone-prior && grep "  $archive$" checksums.txt | shasum -a 256 -c -)
           python3 scripts/test-standalone.py ".tmp-artifacts/standalone-prior/$archive" "release/spynel_${RELEASE_TAG#v}_${TARGET_OS}_${TARGET_ARCH}.tar.gz"
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Verify updates across live instances and terminals
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TARGET_OS: ${{ matrix.os }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: python3 scripts/test-instance-updates.py "release/spynel_${RELEASE_TAG#v}_${TARGET_OS}_${TARGET_ARCH}.tar.gz"
+
       - name: Run native harness contract and packaged-archive smoke
         shell: bash
         env:
