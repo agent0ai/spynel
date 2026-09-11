@@ -36,7 +36,7 @@ func TestOrphanedClaimedTaskReceivesRecoveryLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	working := filepath.Join(filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[0].Source)), "working", filepath.Base(task))
+	working := filepath.Join(filepath.Dir(cfg.Resolve(workflowRoutes()[0].Source)), "working", filepath.Base(task))
 	if _, err := ClaimDocument(task, working, "working", time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestOrphanedNotifiedTaskKeepsTransitionIdentityThroughReconciliation(t *tes
 	if err := WriteDocument(task, document); err != nil {
 		t.Fatal(err)
 	}
-	working := filepath.Join(filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[0].Source)), "working", filepath.Base(task))
+	working := filepath.Join(filepath.Dir(cfg.Resolve(workflowRoutes()[0].Source)), "working", filepath.Base(task))
 	if _, err := ClaimDocument(task, working, "working", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestJournaledClaimIsFinishedAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := documentID(document)
-	target := filepath.Join(filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[0].Source)), "working", filepath.Base(task))
+	target := filepath.Join(filepath.Dir(cfg.Resolve(workflowRoutes()[0].Source)), "working", filepath.Base(task))
 	now := time.Now().UTC()
 	claimKey := leaseID("tasks:"+phaseTaskImplementation, id)
 	lease := Lease{
@@ -199,7 +199,7 @@ func TestJournaledReviewClaimFinishesMetadataAfterRenameOnlyCrash(t *testing.T) 
 
 func TestPhaseClaimTargetCollisionDropsJournalWithoutDispatch(t *testing.T) {
 	cfg, fake, manager := workflowTestManager(t)
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	base := filepath.Dir(cfg.Resolve(route.Source))
 	source := filepath.Join(base, "review", "collision.md")
 	target := filepath.Join(base, "reviewing", "collision.md")
@@ -386,7 +386,7 @@ func TestGoalRoundSettlesIntoFreshGoalReviewAndContinuesToPlanning(t *testing.T)
 		t.Fatal(err)
 	}
 	manager.Wait()
-	goalBase := filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[1].Source))
+	goalBase := filepath.Dir(cfg.Resolve(workflowRoutes()[1].Source))
 	planning := filepath.Join(goalBase, "planning", filepath.Base(goal))
 	goalDocument, err := ReadDocument(planning)
 	if err != nil {
@@ -418,7 +418,7 @@ func TestGoalRoundSettlesIntoFreshGoalReviewAndContinuesToPlanning(t *testing.T)
 		t.Fatal(err)
 	}
 	manager.Wait()
-	taskBase := filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[0].Source))
+	taskBase := filepath.Dir(cfg.Resolve(workflowRoutes()[0].Source))
 	workingTask := filepath.Join(taskBase, "working", filepath.Base(task))
 	reviewTask := filepath.Join(taskBase, "review", filepath.Base(task))
 	if err := moveDocument(workingTask, reviewTask, "review", time.Now()); err != nil {
@@ -484,10 +484,10 @@ func TestGoalRoundSettlesIntoFreshGoalReviewAndContinuesToPlanning(t *testing.T)
 	}
 }
 
-func TestAdmittedGoalRoundKeepsTaskRouteAcrossLiveReplacement(t *testing.T) {
+func TestGoalRoundUsesCanonicalTaskFolders(t *testing.T) {
 	cfg, _, manager := workflowTestManager(t)
-	taskRoute := cfg.Orchestrator.Routes[0]
-	goalRoute := cfg.Orchestrator.Routes[1]
+	taskRoute := workflowRoutes()[0]
+	goalRoute := workflowRoutes()[1]
 	goal, err := Create(cfg, "goals", "preserve admitted task cohort", "")
 	if err != nil {
 		t.Fatal(err)
@@ -518,28 +518,23 @@ func TestAdmittedGoalRoundKeepsTaskRouteAcrossLiveReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	lease := Lease{
-		ID: "admitted-goal-route", Route: "goals", RouteSnapshot: cloneRoute(goalRoute), RoutesSnapshot: cloneRoutes(cfg.Orchestrator.Routes),
+		ID: "admitted-goal-route", Route: "goals",
 		File: planning, SessionKey: "orchestrator:goals:admitted-route", State: "awaiting_transition", Phase: phaseGoalPlanning,
 		ClaimAttempt: 1, StartedAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(),
 	}
 	if err := manager.saveLease(lease); err != nil {
 		t.Fatal(err)
 	}
-	next := cfg
-	next.Orchestrator.Routes = cloneRoutes(cfg.Orchestrator.Routes)
-	next.Orchestrator.Routes[0].Source = ".spynel/replaced-goal-tasks/todo"
-	next.Orchestrator.Routes[0].Working = ".spynel/replaced-goal-tasks/working"
-	manager.ApplyRuntimeConfig(next)
 	customPrompt := filepath.Join(cfg.Root, "goal-route-generation-prompt.md")
 	if err := os.WriteFile(customPrompt, []byte("Task source: {{TASK_SOURCE}}\n\nLinked tasks:\n{{RELATED_TASKS}}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	prompt, err := manager.renderPrompt(goalRoute, Lease{File: active, RoutesSnapshot: lease.RoutesSnapshot}, customPrompt)
+	prompt, err := manager.renderPrompt(goalRoute, Lease{File: active}, customPrompt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(prompt, cfg.Resolve(taskRoute.Source)) || strings.Contains(prompt, next.Resolve(next.Orchestrator.Routes[0].Source)) {
-		t.Fatalf("capacity-delayed goal prompt crossed route generations:\n%s", prompt)
+	if !strings.Contains(prompt, cfg.Resolve(taskRoute.Source)) {
+		t.Fatalf("goal prompt omitted canonical task folder:\n%s", prompt)
 	}
 	if !strings.Contains(prompt, task) || strings.Contains(prompt, "No tasks are linked to the current round") {
 		t.Fatalf("capacity-delayed goal prompt lost admitted linked-task evidence:\n%s", prompt)
@@ -551,9 +546,8 @@ func TestAdmittedGoalRoundKeepsTaskRouteAcrossLiveReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frozenRoute, ok := roundTaskRoute(activated)
-	if !ok || frozenRoute.Source != taskRoute.Source {
-		t.Fatalf("active goal task route = %#v, %t", frozenRoute, ok)
+	if _, exists := activated.FrontMatter["round_task_route"]; exists {
+		t.Fatal("goal persisted redundant workflow paths")
 	}
 	taskDocument.FrontMatter["status"] = "done"
 	done := filepath.Join(filepath.Dir(cfg.Resolve(taskRoute.Source)), "done", filepath.Base(task))
@@ -567,7 +561,7 @@ func TestAdmittedGoalRoundKeepsTaskRouteAcrossLiveReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(goalBase, "review", filepath.Base(goal))); err != nil {
-		t.Fatalf("goal did not observe its frozen task cohort: %v", err)
+		t.Fatalf("goal did not observe its task cohort: %v", err)
 	}
 }
 
@@ -576,7 +570,7 @@ func TestSettledGoalReviewIgnoresFutureCheckpointAcrossRestart(t *testing.T) {
 		t.Run(trigger, func(t *testing.T) {
 			cfg, fake, first := workflowTestManager(t)
 			goal := writeActiveGoalRound(t, cfg, trigger, time.Now().Add(7*24*time.Hour), "done", "done")
-			goalBase := filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[1].Source))
+			goalBase := filepath.Dir(cfg.Resolve(workflowRoutes()[1].Source))
 
 			// Model a restart after active-goal eligibility has been persisted but
 			// before the review queue's claim phase runs.
@@ -773,7 +767,7 @@ func TestGoalPlanningCheckpointRequiresReason(t *testing.T) {
 func TestReviewQueuesIgnoreEarlierPhaseDates(t *testing.T) {
 	cfg, fake, manager := workflowTestManager(t)
 	future := time.Now().Add(7 * 24 * time.Hour).UTC().Format(time.RFC3339)
-	for index, route := range cfg.Orchestrator.Routes[:2] {
+	for index, route := range workflowRoutes()[:2] {
 		base := filepath.Dir(cfg.Resolve(route.Source))
 		path := filepath.Join(base, "review", route.Name+"-dated.md")
 		document := Document{FrontMatter: map[string]any{
@@ -814,7 +808,7 @@ func writeActiveGoalRound(t *testing.T, cfg config.Config, trigger string, check
 	document.FrontMatter["review_trigger"] = trigger
 	document.FrontMatter["next_review_at"] = checkpoint.UTC().Format(time.RFC3339)
 	ids := make([]any, 0, len(taskStatuses))
-	taskBase := filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[0].Source))
+	taskBase := filepath.Dir(cfg.Resolve(workflowRoutes()[0].Source))
 	for index, status := range taskStatuses {
 		task, createErr := CreateWithOptions(cfg, "tasks", "round task", "", CreateOptions{GoalID: goalID, GoalRound: 1})
 		if createErr != nil {
@@ -834,7 +828,7 @@ func writeActiveGoalRound(t *testing.T, cfg config.Config, trigger string, check
 	if err := WriteDocument(goal, document); err != nil {
 		t.Fatal(err)
 	}
-	active := filepath.Join(filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[1].Source)), "active", filepath.Base(goal))
+	active := filepath.Join(filepath.Dir(cfg.Resolve(workflowRoutes()[1].Source)), "active", filepath.Base(goal))
 	if err := os.Rename(goal, active); err != nil {
 		t.Fatal(err)
 	}
@@ -843,7 +837,7 @@ func writeActiveGoalRound(t *testing.T, cfg config.Config, trigger string, check
 
 func TestGoalDoneRequiresReviewProof(t *testing.T) {
 	cfg, _, manager := workflowTestManager(t)
-	goalRoute := cfg.Orchestrator.Routes[1]
+	goalRoute := workflowRoutes()[1]
 	base := filepath.Dir(cfg.Resolve(goalRoute.Source))
 	path := filepath.Join(base, "reviewing", "proof.md")
 	now := time.Now().UTC()

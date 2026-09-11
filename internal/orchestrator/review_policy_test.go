@@ -106,7 +106,7 @@ func TestNeverReviewModeReturnsQueuedReviewToImplementation(t *testing.T) {
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
 	cfg.Harness.Reviews = config.TaskReviewsNever
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	base := filepath.Dir(cfg.Resolve(route.Source))
 	task, err := Create(cfg, "tasks", "queued before policy change", "")
 	if err != nil {
@@ -137,7 +137,7 @@ func TestAlwaysReviewModeRedirectsDocumentNoReviewCompletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	base := filepath.Dir(cfg.Resolve(route.Source))
 	task, err := CreateWithOptions(cfg, "tasks", "preexisting direct task", "", CreateOptions{NoReview: true})
 	if err != nil {
@@ -169,7 +169,7 @@ func TestNeverReviewModeAllowsExistingReviewRequiredTaskDirectCompletion(t *test
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	base := filepath.Dir(cfg.Resolve(route.Source))
 	task, err := Create(cfg, "tasks", "existing reviewed task", "")
 	if err != nil {
@@ -212,7 +212,7 @@ func TestDeveloperAndReviewerPromptsUseRolePrefixes(t *testing.T) {
 	if err := os.WriteFile(cfg.StatePath("instructions", "agent-reviewer.md"), []byte("reviewer-only-rule"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	base := filepath.Dir(cfg.Resolve(route.Source))
 	task, err := Create(cfg, "tasks", "prefix phases", "")
 	if err != nil {
@@ -268,7 +268,7 @@ func TestReviewedAndDirectTaskCompletion(t *testing.T) {
 				t.Fatal(err)
 			}
 			cfg, _ := config.Load(config.PathForRoot(root))
-			route := cfg.Orchestrator.Routes[0]
+			route := workflowRoutes()[0]
 			base := filepath.Dir(cfg.Resolve(route.Source))
 			options := CreateOptions{NoReview: test.noReview}
 			if test.noReview {
@@ -331,7 +331,7 @@ func TestDirectCompletionWithoutEvidenceReturnsToTodo(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	task, err := CreateWithOptions(cfg, "tasks", "collect incomplete inventory", "", CreateOptions{NoReview: true, Notify: true, Origin: "cli/local", Outcomes: []string{"done"}})
 	if err != nil {
 		t.Fatal(err)
@@ -366,7 +366,7 @@ func TestMalformedPolicyIsNormalizedAndDirectDoneIsReviewed(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	task, _ := Create(cfg, "tasks", "malformed", "")
 	document, _ := ReadDocument(task)
 	document.FrontMatter["review_required"] = "false"
@@ -400,7 +400,7 @@ func TestNoReviewTaskManuallyQueuedForReviewIsHonored(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	task, _ := CreateWithOptions(cfg, "tasks", "manual review", "", CreateOptions{NoReview: true})
 	name := filepath.Base(task)
 	fake := newFakeRecipient()
@@ -431,7 +431,7 @@ func TestReviewQueueWaitsForImplementationLeaseReconciliation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	base := filepath.Dir(cfg.Resolve(route.Source))
 	task, err := Create(cfg, "tasks", "review claim race", "")
 	if err != nil {
@@ -489,7 +489,7 @@ func TestImplementationReconciliationPreservesExistingReviewClaim(t *testing.T) 
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	base := filepath.Dir(cfg.Resolve(route.Source))
 	task, err := Create(cfg, "tasks", "already claimed review", "")
 	if err != nil {
@@ -573,7 +573,7 @@ func TestDirectCompletionHookFiresOnceAcrossRepeatReconciliation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	extension := filepath.Join(cfg.Resolve(cfg.Extensions.Directory), "counter")
 	if err := os.MkdirAll(extension, 0o700); err != nil {
 		t.Fatal(err)
@@ -627,7 +627,7 @@ func TestDirectCompletionRetriesFailedHookWithStableEventID(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	extension := filepath.Join(cfg.Resolve(cfg.Extensions.Directory), "retry")
 	if err := os.MkdirAll(extension, 0o700); err != nil {
 		t.Fatal(err)

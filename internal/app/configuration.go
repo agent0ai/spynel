@@ -22,7 +22,13 @@ import (
 func (s *Service) Screen(id string) (core.Screen, error) {
 	switch strings.ToLower(strings.TrimSpace(id)) {
 	case "config":
-		return settingsScreen(s.Settings.Snapshot(), "config"), nil
+		screen := settingsScreen(s.Settings.Snapshot(), "config")
+		for index := range screen.Controls {
+			if strings.HasPrefix(screen.Controls[index].Key, "autostart:") {
+				screen.Controls[index] = s.autostartControl()
+			}
+		}
+		return screen, nil
 	case "telegram", "whatsapp":
 		section := strings.ToLower(strings.TrimSpace(id))
 		if s.channelNeedsSetup(section) {
@@ -206,13 +212,21 @@ const (
 )
 
 func (s *Service) configurationScreenAction(ctx context.Context, screenID, action string, values map[string]string) (*core.Screen, bool, error) { //nolint:gocyclo
-	if screenID == "config" && (action == "autostart:enable" || action == "autostart:disable") {
-		enabled := action == "autostart:enable"
-		if _, err := s.ApplySettings(map[string]string{"startup.enabled": enabledText(enabled)}); err != nil {
-			return nil, true, err
+	if screenID == "config" && (action == "autostart:enable" || action == "autostart:disable" || action == "autostart:check") {
+		var err error
+		if action != "autostart:check" {
+			_, err = s.ApplySettings(map[string]string{"startup.enabled": enabledText(action == "autostart:enable")})
 		}
-		control := autostartControl(enabled)
-		return &core.Screen{SavedControl: &control, ActionMessage: autostartConfirmation(enabled)}, true, nil
+		control := s.autostartControl()
+		result := &core.Screen{SavedControl: &control}
+		if err != nil {
+			return result, true, err
+		}
+		if control.Key == "autostart:check" {
+			return result, true, errors.New(control.Description)
+		}
+		result.ActionMessage = control.Description
+		return result, true, nil
 	}
 	if screenID == "config" && action == "harness" {
 		screen := s.HarnessScreen(false)
@@ -1223,11 +1237,20 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	return changed, nil
 }
 
-func autostartControl(enabled bool) core.ScreenControl {
-	if enabled {
-		return core.ScreenControl{Key: "autostart:enable", Kind: "action", Value: "Enable autostart", Description: "Register this workspace for automatic startup and verify the registration now"}
+func (s *Service) autostartControl() core.ScreenControl {
+	var enabled bool
+	err := errors.New("autostart manager is unavailable")
+	if s.Startup != nil {
+		enabled, err = s.Startup.Enabled(s.Settings.Snapshot())
 	}
-	return core.ScreenControl{Key: "autostart:disable", Kind: "action", Value: "Disable autostart", Description: "Remove this workspace's automatic startup registration and verify removal now"}
+	if err != nil {
+		return core.ScreenControl{Key: "autostart:check", Kind: "action", Value: "Check autostart", Description: "Autostart state unknown: " + boundAndRedactLogText(err.Error())}
+	}
+	control := core.ScreenControl{Key: "autostart:enable", Kind: "action", Value: "Enable autostart", Description: "Autostart disabled. Registration checked."}
+	if enabled {
+		control.Key, control.Value, control.Description = "autostart:disable", "Disable autostart", "Autostart enabled. Registration verified."
+	}
+	return control
 }
 
 func autostartConfirmation(enabled bool) string {
@@ -1572,7 +1595,7 @@ func settingsScreen(cfg config.Config, section string) core.Screen {
 			continue
 		}
 		if setting.Key == "startup.enabled" {
-			screen.Controls = append(screen.Controls, autostartControl(true), autostartControl(false))
+			screen.Controls = append(screen.Controls, core.ScreenControl{Key: "autostart:check", Kind: "action", Value: "Check autostart", Description: "Autostart state unknown."})
 			continue
 		}
 		if setting.Advanced && !advanced {

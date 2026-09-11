@@ -2,7 +2,7 @@
 
 ## Purpose
 
-- Own the narrowly scoped MIT-licensed derivative of Bubbles v0.21 textarea used by the TUI composer.
+- Own the narrowly scoped MIT-licensed derivative of Bubbles v0.21 textarea used by the TUI composer and form fields.
 
 ## Local Contracts
 
@@ -16,6 +16,8 @@
 - Width and height changes also keep a previously visible caret in view without changing logical selection. When the caret was deliberately scrolled offscreen, clamp the existing viewport to the new layout instead of jumping to the caret. Callers must not synthesize key events to repair widget geometry.
 
 - Own bounded draft-local undo/redo (100 full-text snapshots, 4 MiB including state overhead) with immutable text/caret/selection snapshots. Group adjacent non-whitespace typing and repeated same-kind/direction character or word deletions within 500 ms, up to 64 changed runes per group; a larger single input event remains atomic. Unicode whitespace uses `unicode.IsSpace`; whitespace/newline insertion, navigation, selection, and action/direction changes separate groups. Paste, cut and selection/range replacements are isolated actions. Capture positions at action entry, but serialize text only before an accepted text mutation starts a new group; nested and joined mutations reuse that snapshot. No-op/rejected edits preserve history and redo. Undo/redo reveals the restored caret after reflow. `Reset` and accepted `SetValue` clear history; `ReplaceRange` remains an undoable edit preserving current caret/selection. A history generation changes on resets and undo/redo, including empty-stack presses, to fence delayed clipboard/attachment results. Callers may inspect retained text solely to keep draft metadata restorable without maintaining another history stack, and use the widget's key-boundary classification even for keys consumed by the surrounding UI.
+
+- Masked field presentation hides text cells while retaining the same source offsets, grapheme boundaries, selection, and hit testing. Rendering never exposes secret text, including selected and cursor cells.
 
 ## Child DOX Index
 

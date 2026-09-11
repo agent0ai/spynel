@@ -458,7 +458,7 @@ func TestInitLeavesHarnessSelectionOpenWhenNothingIsDetected(t *testing.T) {
 	}
 }
 
-func TestUpgradeRemovesRetiredTUILaunchPreference(t *testing.T) {
+func TestUpgradePreservesConfigIncludingUnusedKeys(t *testing.T) {
 	root := t.TempDir()
 	if err := Init(root, false); err != nil {
 		t.Fatal(err)
@@ -479,7 +479,7 @@ func TestUpgradeRemovesRetiredTUILaunchPreference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(after), "tui:\n        enabled:") || strings.Contains(string(after), "tui:\n    enabled:") {
-		t.Fatalf("upgrade retained retired TUI launch preference:\n%s", after)
+	if string(after) != string(data) {
+		t.Fatal("upgrade rewrote user configuration")
 	}
 }

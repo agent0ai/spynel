@@ -47,13 +47,13 @@ type WorkflowInventory struct {
 	Diagnostics []string
 }
 
-// WorkflowItems reads configured built-in task or goal route folders without
+// WorkflowItems reads canonical task or goal status folders without
 // following document symlinks. It returns at most maxStatusDocuments entries.
 func (m *Manager) WorkflowItems(kind string) WorkflowInventory {
 	result := WorkflowInventory{}
 	var routeFound bool
 	cfg := m.runtimeSnapshot()
-	for _, route := range cfg.Orchestrator.Routes {
+	for _, route := range workflowRoutes() {
 		if route.Name != kind || (kind != "tasks" && kind != "goals") {
 			continue
 		}
@@ -142,7 +142,7 @@ func (m *Manager) WorkflowItems(kind string) WorkflowInventory {
 		}
 	}
 	if !routeFound {
-		addStatusDiagnostic(&result.Diagnostics, fmt.Sprintf("built-in %s route is not configured", kind))
+		addStatusDiagnostic(&result.Diagnostics, fmt.Sprintf("unknown workflow %s", kind))
 	}
 	return result
 }

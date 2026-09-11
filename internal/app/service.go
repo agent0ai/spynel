@@ -51,6 +51,7 @@ type Service struct {
 	conversationActivity   map[string]int
 	Startup                interface {
 		Sync(config.Config, bool) error
+		Enabled(config.Config) (bool, error)
 	}
 	Updates                *updater.Manager
 	configurationMu        sync.Mutex
@@ -697,23 +698,13 @@ func (s *Service) creationCommandPrompt(message core.Message, kind, userMessage 
 	directive := string(data)
 	directive = strings.ReplaceAll(directive, "{{CHANNEL}}", message.Channel)
 	directive = strings.ReplaceAll(directive, "{{CONVERSATION}}", message.Conversation)
-	directive = strings.ReplaceAll(directive, "{{TASK_SOURCE}}", s.routeSource("tasks"))
-	directive = strings.ReplaceAll(directive, "{{GOAL_SOURCE}}", s.routeSource("goals"))
+	directive = strings.ReplaceAll(directive, "{{TASK_SOURCE}}", s.Config.StatePath("tasks", "todo"))
+	directive = strings.ReplaceAll(directive, "{{GOAL_SOURCE}}", s.Config.StatePath("goals", "proposed"))
 	// Replace user data last so template-looking text inside the request is
 	// never interpreted as another framework placeholder.
 	directive = strings.ReplaceAll(directive, "{{USER_MESSAGE}}", userMessage)
 	directive += "\n\nFramework source correlation: when creating the durable " + kind + ", include `source_message_ids: [\"" + message.SourceMessageID + "\"]` in YAML front matter. Preserve this exact private identifier; do not show it in the user-facing response."
 	return base + "\n\n---\n\n" + directive, nil
-}
-
-func (s *Service) routeSource(name string) string {
-	cfg := s.Settings.Snapshot()
-	for _, route := range cfg.Orchestrator.Routes {
-		if route.Name == name {
-			return cfg.Resolve(route.Source)
-		}
-	}
-	return "(route not configured)"
 }
 
 func (s *Service) chatPrompt(message core.Message) (string, error) {
@@ -730,8 +721,8 @@ func (s *Service) chatPrompt(message core.Message) (string, error) {
 	prompt = strings.ReplaceAll(prompt, "{{HISTORY_FILE}}", fullPath)
 	prompt = strings.ReplaceAll(prompt, "{{CHANNEL}}", message.Channel)
 	prompt = strings.ReplaceAll(prompt, "{{CONVERSATION}}", message.Conversation)
-	prompt = strings.ReplaceAll(prompt, "{{TASK_SOURCE}}", s.routeSource("tasks"))
-	prompt = strings.ReplaceAll(prompt, "{{GOAL_SOURCE}}", s.routeSource("goals"))
+	prompt = strings.ReplaceAll(prompt, "{{TASK_SOURCE}}", s.Config.StatePath("tasks", "todo"))
+	prompt = strings.ReplaceAll(prompt, "{{GOAL_SOURCE}}", s.Config.StatePath("goals", "proposed"))
 	prompt = agentdocs.InjectPromptGuidance(prompt)
 	prompt = instructions.EnsureChatGuidance(prompt)
 	// History is untrusted conversation data. Replace its placeholder only after

@@ -51,6 +51,7 @@ type screenActionRequest struct {
 }
 
 type screenResponse struct {
+	Error  string       `json:"error,omitempty"`
 	Screen *core.Screen `json:"screen,omitempty"`
 }
 
@@ -390,7 +391,7 @@ func (s *Server) screenAction(response http.ResponseWriter, request *http.Reques
 	}
 	screen, err := s.Service.ScreenActionForInstance(request.Context(), input.InstanceID, input.ScreenID, input.Action, input.Values)
 	if err != nil {
-		writeError(response, err)
+		writeJSON(response, http.StatusUnprocessableEntity, screenResponse{Screen: screen, Error: err.Error()})
 		return
 	}
 	writeJSON(response, http.StatusOK, screenResponse{Screen: screen})

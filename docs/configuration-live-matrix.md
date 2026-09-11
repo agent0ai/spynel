@@ -28,7 +28,6 @@ Every setting below is exposed by the shared typed catalog used by the TUI, slas
 | `orchestrator.retrigger_unresponded_messages` | Live | Primary recovery scheduler reads the committed snapshot before every startup/reconnect/periodic scan; enabling requests a coalesced pass | Disabling prevents later scans and does not cancel an admitted communication turn | forward-activation, disable, active-work, and ownership-fence tests |
 | `orchestrator.task_notifications` | Live | Every covered transition directly dispatches one ordinary agent; `off`, `decide`, and `always` supply policy context for that agent's own decision | No notification-specific persistence or recovery; the agent edits task progress itself | mandatory outcome/wait matrix, direct-dispatch, prompt-boundary, and no-output-parsing tests |
 | `orchestrator.max_parallel` | Restart-bound | Resizable gate raises promptly; lowering preserves active jobs and blocks new claims until below bound | Infallible generation publication follows durable commit | live capacity test and race suite |
-| `orchestrator.routes` | Restart-bound and absent from the catalog | Serialized manager snapshot supplies the next scan, claim, recovery, status, heartbeat inventory, and communication creation prompt; an admitted job retains the complete route generation and an active goal retains its admitted task route | Complete-array validation rejects before commit; acceptance waits for an active scan's admission boundary | structured-route next-scan, live creation-prompt, and in-flight goal-cohort tests |
 | `extensions.enabled` | Restart-bound | Process-start hook runner snapshot; takes effect after restart | Typed validation and atomic persistence only | catalog restart-bound test |
 | `extensions.directory` | Restart-bound | Process-start trusted extension root; takes effect after restart | Typed validation and atomic persistence only | extension discovery tests |
 | `extensions.hook_timeout` | Restart-bound | Process-start per-hook timeout; takes effect after restart | Duration validation and atomic persistence only | extension timeout tests |
@@ -62,3 +61,5 @@ Every setting below is exposed by the shared typed catalog used by the TUI, slas
 | `speech.chunk_seconds` | Live | Replacement chunks the next transcription at the new duration | Range validation rejects before commit | speech chunk tests |
 
 `channels.tui.enabled` is intentionally absent. Legacy YAML containing it is normalized during load and a canonical save removes it. Bare `spynel` launches the TUI; `spynel serve` remains headless unless invoked with `--tui`.
+
+Task and goal workflows use fixed `.spynel` folders and rules. Unused configuration keys are ignored on load and omitted by the next canonical save.

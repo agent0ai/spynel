@@ -71,6 +71,7 @@ const (
 )
 
 type screenSaveResult struct {
+	generation     uint64
 	screenID       string
 	closeOnSuccess bool
 	err            error
@@ -87,6 +88,7 @@ type themeLoadResult struct {
 type streamRefreshMsg struct{}
 type streamRenderCooldownMsg struct{}
 type screenActionResult struct {
+	generation    uint64
 	screenID      string
 	action        string
 	selectedIndex int
@@ -184,7 +186,7 @@ type composerToken struct {
 type screenFrame struct {
 	screen   *core.Screen
 	original map[string]string
-	cursors  map[int]int
+	editors  map[int]textarea.Model
 	index    int
 	advanced bool
 	scroll   int
@@ -273,7 +275,9 @@ type model struct {
 	streamTheme              theme.Theme
 	screen                   *core.Screen
 	screenOriginal           map[string]string
-	screenCursors            map[int]int
+	screenEditors            map[int]textarea.Model
+	screenDrag               *formDrag
+	screenGeneration         uint64
 	screenIndex              int
 	screenAdvanced           bool
 	screenScroll             int
@@ -828,6 +832,9 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.editorNotice = ""
 		m.input.BreakUndoGroupForKey(value)
 		updateViewport = false
+		if value.Type == tea.KeyCtrlC && m.screen != nil && m.dialog == nil && m.formHasSelection() {
+			return m, m.editScreenText(value)
+		}
 		if value.Type == tea.KeyCtrlC && (m.screen != nil || m.dialog != nil) {
 			updateInput = false
 			updateViewport = false
@@ -997,6 +1004,19 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		// Exec already restored and repainted the alternate screen. Another
 		// exit/enter lets the running renderer flush into the normal copy area.
 		commands = append(commands, tea.EnableMouseCellMotion)
+	case formPaste:
+		updateInput, updateViewport = false, false
+		if m.screen != nil && m.dialog == nil && value.screenGeneration == m.screenGeneration && value.index == m.screenIndex {
+			editor := m.formEditor(value.index, max(1, m.width-3))
+			if value.generation == editor.HistoryGeneration() {
+				if value.err != nil {
+					m.screen.Status = "Clipboard unavailable: " + value.err.Error()
+				} else {
+					editor.InsertString(value.text)
+					m.storeFormEditor(value.index, editor)
+				}
+			}
+		}
 	case clipboardPaste:
 		updateInput, updateViewport = false, false
 		if value.generation != m.input.HistoryGeneration() {
@@ -1291,7 +1311,7 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.durableWork = value.counts
 		commands = append(commands, m.waitEvent())
 	case screenSaveResult:
-		if m.screen == nil || m.screen.ID != value.screenID {
+		if m.screen == nil || m.screen.ID != value.screenID || value.generation != 0 && value.generation != m.screenGeneration {
 			break
 		}
 		m.screenSaving = false
@@ -1306,10 +1326,18 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "Configuration saved"
 		}
 	case screenActionResult:
-		if value.screenID != "" && (m.screen == nil || m.screen.ID != value.screenID) {
+		if value.screenID != "" && (m.screen == nil || m.screen.ID != value.screenID || value.generation != 0 && value.generation != m.screenGeneration) {
 			break
 		}
 		m.screenSaving = false
+		if value.screen != nil && value.screen.SavedControl != nil && m.screen != nil {
+			for index := range m.screen.Controls {
+				control := &m.screen.Controls[index]
+				if control.Kind == "action" && control.Key == value.action {
+					*control = *value.screen.SavedControl
+				}
+			}
+		}
 		if value.err != nil {
 			m.status = "Action failed: " + value.err.Error()
 			if m.screen != nil {
@@ -1344,7 +1372,10 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if updated {
 				m.screen.Status, m.status = actionMessage, actionMessage
-				m.screenManual, m.screenScroll = true, 0
+				if strings.HasPrefix(savedControl.Key, "autostart:") {
+					m.screen.Status = ""
+				}
+				m.screenManual = false
 				break
 			}
 		}
@@ -3206,15 +3237,8 @@ func (m model) viewWithoutDialog() string {
 	header := m.headerView(barWidth)
 	if m.screen != nil {
 		screenHeight := max(5, m.height-2)
-		fixedRows := 0
-		if strings.TrimSpace(m.screen.Title) != "" {
-			fixedRows += 2 // screen title plus one separating row
-		}
-		if len(m.screen.Tabs) > 0 {
-			fixedRows += 3 // labels, underline, and one separating row
-		}
-		contentHeight := max(1, screenHeight-2-fixedRows)
-		contentWidth := max(1, m.width-3)
+		bounds := m.formBounds()
+		contentHeight, contentWidth := bounds.height, bounds.width
 		content, offset, total := m.screenContent(contentHeight, contentWidth)
 		content = fitContent(content, contentHeight, contentWidth)
 		form := m.screenPanel(m.screen.Title, content, screenHeight, barWidth, offset, total)
@@ -3525,7 +3549,7 @@ func (m *model) openScreen(screen core.Screen) {
 		m.welcomeFocus = true
 		m.screen = nil
 		m.screenOriginal = nil
-		m.screenCursors = nil
+		m.screenEditors = nil
 		m.screenIndex = 0
 		m.screenAdvanced = false
 		m.screenScroll = 0
@@ -3552,7 +3576,7 @@ func (m *model) openScreen(screen core.Screen) {
 		m.invalidateHistoryRender()
 		m.screen = nil
 		m.screenOriginal = nil
-		m.screenCursors = nil
+		m.screenEditors = nil
 		m.screenIndex = 0
 		m.screenAdvanced = false
 		m.screenScroll = 0
@@ -3581,12 +3605,8 @@ func (m *model) openScreen(screen core.Screen) {
 	}
 	m.screen = &copyScreen
 	m.screenAdvanced = false
-	m.screenCursors = map[int]int{}
-	for index, control := range copyScreen.Controls {
-		if control.Kind == "text" || control.Kind == "password" {
-			m.screenCursors[index] = len([]rune(control.Value))
-		}
-	}
+	m.screenEditors = map[int]textarea.Model{}
+	m.screenGeneration++
 	m.screenIndex = 0
 	if visible := m.visibleScreenControlIndices(); len(visible) > 0 {
 		m.screenIndex = visible[0]
@@ -3620,6 +3640,7 @@ func (m *model) captureScreenOriginal() {
 }
 
 func (m *model) handleScreenKey(key tea.KeyMsg) tea.Cmd {
+	m.screenDrag = nil
 	if m.screen == nil {
 		return nil
 	}
@@ -3627,6 +3648,12 @@ func (m *model) handleScreenKey(key tea.KeyMsg) tea.Cmd {
 		return m.repaint()
 	}
 	if m.screenSaving {
+		return nil
+	}
+	if key.Type == tea.KeyEsc && m.formHasSelection() {
+		editor := m.screenEditors[m.screenIndex]
+		editor.ClearSelection()
+		m.storeFormEditor(m.screenIndex, editor)
 		return nil
 	}
 	if key.Type == tea.KeyEsc {
@@ -3695,7 +3722,7 @@ func (m *model) handleScreenKey(key tea.KeyMsg) tea.Cmd {
 			cycleControl(control, direction)
 		}
 	case "text", "password":
-		m.editScreenText(control, key)
+		return m.editScreenText(key)
 	}
 	return nil
 }
@@ -3704,7 +3731,7 @@ func (m *model) currentScreenFrame() screenFrame {
 	return screenFrame{
 		screen:   cloneScreen(m.screen),
 		original: cloneStringMap(m.screenOriginal),
-		cursors:  cloneIntMap(m.screenCursors),
+		editors:  m.screenEditors,
 		index:    m.screenIndex,
 		advanced: m.screenAdvanced,
 		scroll:   m.screenScroll,
@@ -3719,9 +3746,10 @@ func (m *model) restoreParentScreen() bool {
 	last := len(m.screenStack) - 1
 	frame := m.screenStack[last]
 	m.screenStack = m.screenStack[:last]
+	m.screenGeneration++
 	m.screen = cloneScreen(frame.screen)
 	m.screenOriginal = cloneStringMap(frame.original)
-	m.screenCursors = cloneIntMap(frame.cursors)
+	m.screenEditors = frame.editors
 	m.screenIndex = frame.index
 	m.screenAdvanced = frame.advanced
 	m.screenScroll = frame.scroll
@@ -3751,7 +3779,7 @@ func (m *model) refreshRestoredSelection(key, selection string) {
 func (m *model) clearScreen() {
 	m.screen = nil
 	m.screenOriginal = nil
-	m.screenCursors = nil
+	m.screenEditors = nil
 	m.screenIndex = 0
 	m.screenAdvanced = false
 	m.screenScroll = 0
@@ -3785,68 +3813,6 @@ func cloneStringMap(values map[string]string) map[string]string {
 		result[key] = value
 	}
 	return result
-}
-
-func cloneIntMap(values map[int]int) map[int]int {
-	if values == nil {
-		return nil
-	}
-	result := make(map[int]int, len(values))
-	for key, value := range values {
-		result[key] = value
-	}
-	return result
-}
-
-func (m *model) editScreenText(control *core.ScreenControl, key tea.KeyMsg) {
-	runes := []rune(control.Value)
-	if m.screenCursors == nil {
-		m.screenCursors = map[int]int{}
-	}
-	cursor, ok := m.screenCursors[m.screenIndex]
-	if !ok {
-		cursor = len(runes)
-	}
-	cursor = bounded(cursor, 0, len(runes))
-	insert := func(characters []rune) {
-		if len(characters) == 0 {
-			return
-		}
-		updated := make([]rune, 0, len(runes)+len(characters))
-		updated = append(updated, runes[:cursor]...)
-		updated = append(updated, characters...)
-		updated = append(updated, runes[cursor:]...)
-		runes = updated
-		cursor += len(characters)
-	}
-	switch key.Type {
-	case tea.KeyLeft:
-		cursor = max(0, cursor-1)
-	case tea.KeyRight:
-		cursor = min(len(runes), cursor+1)
-	case tea.KeyHome, tea.KeyCtrlA:
-		cursor = 0
-	case tea.KeyEnd, tea.KeyCtrlE:
-		cursor = len(runes)
-	case tea.KeyBackspace, tea.KeyCtrlH:
-		if cursor > 0 {
-			runes = append(runes[:cursor-1], runes[cursor:]...)
-			cursor--
-		}
-	case tea.KeyDelete:
-		if cursor < len(runes) {
-			runes = append(runes[:cursor], runes[cursor+1:]...)
-		}
-	case tea.KeyCtrlU:
-		runes = nil
-		cursor = 0
-	case tea.KeySpace:
-		insert([]rune{' '})
-	case tea.KeyRunes:
-		insert(key.Runes)
-	}
-	control.Value = string(runes)
-	m.screenCursors[m.screenIndex] = cursor
 }
 
 func (m model) visibleScreenControlIndices() []int {
@@ -3893,13 +3859,14 @@ func (m *model) runScreenAction(action string) tea.Cmd {
 		return nil
 	}
 	screenID := m.screen.ID
+	generation := m.screenGeneration
 	selectedIndex := m.screenIndex
 	values := m.screenValues()
 	m.screenSaving = true
 	ctx := m.ctx
 	return func() tea.Msg {
 		next, err := callback(ctx, screenID, action, values)
-		return screenActionResult{screenID: screenID, action: action, selectedIndex: selectedIndex, screen: next, err: err}
+		return screenActionResult{generation: generation, screenID: screenID, action: action, selectedIndex: selectedIndex, screen: next, err: err}
 	}
 }
 
@@ -3947,10 +3914,11 @@ func (m *model) saveScreen() tea.Cmd {
 	}
 	m.screenSaving = true
 	screenID := m.screen.ID
+	generation := m.screenGeneration
 	closeOnSuccess := m.isSettingsScreen()
 	save := m.saveSettings
 	return func() tea.Msg {
-		return screenSaveResult{screenID: screenID, closeOnSuccess: closeOnSuccess, err: save(changes)}
+		return screenSaveResult{generation: generation, screenID: screenID, closeOnSuccess: closeOnSuccess, err: save(changes)}
 	}
 }
 
@@ -4007,10 +3975,16 @@ func (m *model) confirmDiscardScreenChanges() {
 }
 
 func (m model) screenContent(height, width int) (string, int, int) {
+	layout := m.layoutScreen(height, width)
+	return layout.content, layout.offset, layout.total
+}
+
+func (m model) layoutScreen(height, width int) formLayout {
 	if m.screen == nil {
-		return "", 0, 0
+		return formLayout{}
 	}
-	innerWidth := max(12, width)
+	var hits []formHit
+	innerWidth := max(1, width)
 	// Prose renderers treat their wrap width as an exclusive boundary in a few
 	// styled/Unicode cases. Reserve one cell so a complete boundary word wraps
 	// before screenCanvas applies its final hard safety truncation.
@@ -4075,15 +4049,9 @@ func (m model) screenContent(height, width int) (string, int, int) {
 				value = "Hide Advanced Settings"
 			}
 		}
-		if control.Secret {
-			if value != "" {
-				value = strings.Repeat("*", len([]rune(value)))
-			} else if control.Configured {
-				value = "(configured; type to replace)"
-			}
-		}
-		if index == m.screenIndex && (control.Kind == "text" || control.Kind == "password") {
-			value = m.renderScreenTextCursor(index, control, value)
+		if control.Kind == "text" || control.Kind == "password" {
+			editor := m.formEditor(index, innerWidth)
+			value = editor.View()
 		}
 		selected := index == m.screenIndex
 		label := strings.Title(control.Label) //nolint:staticcheck
@@ -4098,13 +4066,19 @@ func (m model) screenContent(height, width int) (string, int, int) {
 				line = m.screenButton(value, selected)
 			}
 		case "toggle", "select":
-			line = m.screenFieldLine(label, "‹ "+value+" ›", selected, innerWidth)
+			value = "‹ " + value + " ›"
+			line = m.screenFieldLine(label, value, selected, innerWidth)
 		default:
 			line = m.screenFieldLine(label, value, selected, innerWidth)
 		}
 		if index == m.screenIndex {
 			selectedLine = len(lines)
 		}
+		hitWidth := innerWidth
+		if control.Kind == "action" || control.Kind == "disclosure" {
+			hitWidth = min(innerWidth, lipgloss.Width(m.screenButton(value, selected)))
+		}
+		hits = append(hits, formHit{index: index, row: len(lines), width: hitWidth, valueX: innerWidth - min(max(1, innerWidth/2), lipgloss.Width(value))})
 		lines = append(lines, ansi.Truncate(line, innerWidth, "…"))
 		descriptionWidth := textWidth
 		if control.DescriptionMarkdown {
@@ -4142,7 +4116,7 @@ func (m model) screenContent(height, width int) (string, int, int) {
 		offset = bounded(m.screenScroll, 0, max(0, len(lines)-visible))
 	}
 	end := min(len(lines), offset+visible)
-	return strings.Join(lines[offset:end], "\n"), offset, len(lines)
+	return formLayout{content: strings.Join(lines[offset:end], "\n"), offset: offset, total: len(lines), hits: hits}
 }
 
 func appendBlankScreenRow(lines []string) []string {
@@ -4291,22 +4265,6 @@ func (m model) screenConnectionSection(innerWidth int) []string {
 		}
 	}
 	return append(lines, "")
-}
-
-func (m model) renderScreenTextCursor(index int, control core.ScreenControl, display string) string {
-	valueRunes := []rune(control.Value)
-	if len(valueRunes) == 0 && control.Secret && control.Configured {
-		return display + "█"
-	}
-	cursor := len(valueRunes)
-	if position, ok := m.screenCursors[index]; ok {
-		cursor = bounded(position, 0, len(valueRunes))
-	}
-	displayRunes := []rune(display)
-	if cursor > len(displayRunes) {
-		cursor = len(displayRunes)
-	}
-	return string(displayRunes[:cursor]) + "█" + string(displayRunes[cursor:])
 }
 
 func (m model) screenFooterHint() string {

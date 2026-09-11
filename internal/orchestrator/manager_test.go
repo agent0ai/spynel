@@ -167,87 +167,6 @@ func TestLiveScanIntervalResetsRunningSchedulerFromAcceptedChange(t *testing.T) 
 	}
 }
 
-func TestStructuredRoutesApplyToNextScanWithoutRestart(t *testing.T) {
-	root := t.TempDir()
-	if err := workspace.Init(root, false); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(config.PathForRoot(root))
-	if err != nil {
-		t.Fatal(err)
-	}
-	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
-	next := cfg
-	next.Orchestrator.Routes = append([]config.Route(nil), cfg.Orchestrator.Routes...)
-	next.Orchestrator.Routes[0].Source = ".spynel/live-routes/todo"
-	next.Orchestrator.Routes[0].Working = ".spynel/live-routes/working"
-	manager.ApplyRuntimeConfig(next)
-	if err := manager.ScanOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{next.Orchestrator.Routes[0].Source, next.Orchestrator.Routes[0].Working} {
-		if info, err := os.Stat(next.Resolve(path)); err != nil || !info.IsDir() {
-			t.Fatalf("live route directory %q: %v", path, err)
-		}
-	}
-}
-
-func TestInFlightRouteSnapshotReconcilesAfterLiveRouteReplacement(t *testing.T) {
-	root := t.TempDir()
-	if err := workspace.Init(root, false); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := config.Load(config.PathForRoot(root))
-	if err != nil {
-		t.Fatal(err)
-	}
-	route := cfg.Orchestrator.Routes[0]
-	task, err := Create(cfg, route.Name, "preserve admitted route", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	working := filepath.Join(cfg.Resolve(route.Working), filepath.Base(task))
-	document, err := ClaimDocument(task, working, "working", time.Now().UTC())
-	if err != nil {
-		t.Fatal(err)
-	}
-	document.FrontMatter["attempt"] = 1
-	if err := WriteDocument(working, document); err != nil {
-		t.Fatal(err)
-	}
-	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
-	lease := Lease{
-		ID: "admitted-route", ClaimID: "admitted-route", DocumentType: "task", OwnerID: manager.ownerID,
-		Route: route.Name, RouteSnapshot: cloneRoute(route), File: working, SessionKey: "orchestrator:tasks:admitted-route",
-		State: "processing", Phase: phaseTaskImplementation, ClaimAttempt: 1, StartedAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(),
-	}
-	if err := manager.saveLease(lease); err != nil {
-		t.Fatal(err)
-	}
-	oldBase := filepath.Dir(cfg.Resolve(route.Source))
-	done := filepath.Join(oldBase, "done", filepath.Base(task))
-	if err := os.Rename(working, done); err != nil {
-		t.Fatal(err)
-	}
-	next := cfg
-	next.Orchestrator.Routes = append([]config.Route(nil), cfg.Orchestrator.Routes...)
-	next.Orchestrator.Routes[0] = route
-	next.Orchestrator.Routes[0].Source = ".spynel/replaced-routes/todo"
-	next.Orchestrator.Routes[0].Working = ".spynel/replaced-routes/working"
-	next.Orchestrator.Routes[0].AllowedNext = []string{"waiting"}
-	manager.ApplyRuntimeConfig(next)
-	if err := manager.reconcileTransitions(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	review := filepath.Join(oldBase, "review", filepath.Base(task))
-	if _, err := os.Stat(review); err != nil {
-		t.Fatalf("admitted route completion was not reconciled through its immutable snapshot: %v", err)
-	}
-	if manager.leaseExists(lease.ID) {
-		t.Fatal("reconciled admitted-route lease was retained")
-	}
-}
-
 func TestImplementationDoneMoveIsReconciledIntoIndependentReview(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
@@ -258,8 +177,8 @@ func TestImplementationDoneMoveIsReconciledIntoIndependentReview(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	working := filepath.Join(cfg.Resolve(cfg.Orchestrator.Routes[0].Working), filepath.Base(task))
-	done := filepath.Join(filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[0].Source)), "done", filepath.Base(task))
+	working := filepath.Join(cfg.Resolve(workflowRoutes()[0].Working), filepath.Base(task))
+	done := filepath.Join(filepath.Dir(cfg.Resolve(workflowRoutes()[0].Source)), "done", filepath.Base(task))
 	fake := newFakeRecipient()
 	var manager *Manager
 	var moved sync.Once
@@ -303,7 +222,7 @@ func TestImplementationDoneMoveIsReconciledIntoIndependentReview(t *testing.T) {
 	if err != nil || len(leases) != 1 || leases[0].Phase != phaseTaskReview {
 		t.Fatalf("task did not enter review phase: %#v, %v", leases, err)
 	}
-	reviewing := filepath.Join(filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[0].Source)), "reviewing", filepath.Base(task))
+	reviewing := filepath.Join(filepath.Dir(cfg.Resolve(workflowRoutes()[0].Source)), "reviewing", filepath.Base(task))
 	if _, err := os.Stat(reviewing); err != nil {
 		t.Fatal(err)
 	}
@@ -367,11 +286,11 @@ func TestProviderCompletionRemainsAwaitingTransitionUntilDurableMove(t *testing.
 		t.Fatal(err)
 	}
 	manager.Wait()
-	working := filepath.Join(cfg.Resolve(cfg.Orchestrator.Routes[0].Working), filepath.Base(task))
+	working := filepath.Join(cfg.Resolve(workflowRoutes()[0].Working), filepath.Base(task))
 	if started != 1 || finished != 0 || len(states) == 0 || states[len(states)-1] != "awaiting_transition" || !reflect.DeepEqual(providerStates, []string{"reconnecting", "running"}) {
 		t.Fatalf("before transition: started=%d finished=%d lease=%v provider=%v", started, finished, states, providerStates)
 	}
-	waiting := filepath.Join(filepath.Dir(cfg.Resolve(cfg.Orchestrator.Routes[0].Source)), "waiting", filepath.Base(task))
+	waiting := filepath.Join(filepath.Dir(cfg.Resolve(workflowRoutes()[0].Source)), "waiting", filepath.Base(task))
 	if err := moveDocument(working, waiting, "waiting", time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +322,7 @@ func TestClaimLeasePreventsDuplicatesAndStaleLeaseRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager.Wait()
-	working := filepath.Join(cfg.Resolve(cfg.Orchestrator.Routes[0].Working), filepath.Base(task))
+	working := filepath.Join(cfg.Resolve(workflowRoutes()[0].Working), filepath.Base(task))
 	if _, err := os.Stat(working); err != nil {
 		t.Fatalf("task was not claimed into working: %v", err)
 	}
@@ -518,7 +437,7 @@ func TestRecoveryDispatchStateTracksProviderLifecycle(t *testing.T) {
 			}
 			var updates []Lease
 			manager.JobUpdated = func(_ int, current Lease) { updates = append(updates, current) }
-			manager.dispatch(context.Background(), cfg.Orchestrator.Routes[0], lease, true)
+			manager.dispatch(context.Background(), workflowRoutes()[0], lease, true)
 			manager.Wait()
 			current, err := manager.loadLease(lease.ID)
 			if err != nil || current.State != test.wantState || current.LastError != test.wantError || current.RecoveryCount != 1 {
@@ -614,7 +533,7 @@ func TestReviewTransitionAcceptRejectAndSelfReviewGuard(t *testing.T) {
 				t.Fatal(err)
 			}
 			cfg, _ := config.Load(config.PathForRoot(root))
-			route := cfg.Orchestrator.Routes[0]
+			route := workflowRoutes()[0]
 			reviewDir := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "review")
 			path := filepath.Join(filepath.Dir(reviewDir), "reviewing", "review.md")
 			doc := Document{FrontMatter: map[string]any{"id": "review-id", "title": "review", "status": "reviewing", "created_at": time.Now().UTC().Format(time.RFC3339), "updated_at": time.Now().UTC().Format(time.RFC3339), "review_attempt": 1, "notify": map[string]any{"enabled": false}}, Body: "# review\n"}
@@ -655,7 +574,7 @@ func TestReviewDispatchUsesFreshAttemptSessionAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	route := cfg.Orchestrator.Routes[0]
+	route := workflowRoutes()[0]
 	path := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), "review", "retry.md")
 	if err := WriteDocument(path, Document{FrontMatter: map[string]any{"id": "retry", "title": "retry", "status": "review", "created_at": time.Now().UTC().Format(time.RFC3339), "updated_at": time.Now().UTC().Format(time.RFC3339)}, Body: "# retry\n"}); err != nil {
 		t.Fatal(err)

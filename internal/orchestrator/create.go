@@ -31,15 +31,9 @@ type CreateOptions struct {
 }
 
 func CreateWithOptions(cfg config.Config, routeName, title, body string, options CreateOptions) (string, error) {
-	var route *config.Route
-	for i := range cfg.Orchestrator.Routes {
-		if cfg.Orchestrator.Routes[i].Name == routeName {
-			route = &cfg.Orchestrator.Routes[i]
-			break
-		}
-	}
-	if route == nil {
-		return "", fmt.Errorf("orchestrator route %q is not configured", routeName)
+	route, ok := routeByName(routeName)
+	if !ok {
+		return "", fmt.Errorf("unknown workflow %q: expected tasks or goals", routeName)
 	}
 	title = strings.TrimSpace(title)
 	if title == "" {

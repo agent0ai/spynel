@@ -15,6 +15,8 @@
 - Default model reasoning effort and service mode remain empty so existing provider behavior is inherited until a user makes a supported selection.
 - Default forward stalled-message recovery on with the canonical live setting name and user-facing description; upgrades preserve existing configuration text while decode defaults activate the current behavior.
 
+- Generated configuration contains no orchestrator routes. Tasks and goals use their fixed `.spynel` status folders and prompts; goal rounds carry task IDs without copied route definitions.
+
 ## Child DOX Index
 
 No child DOX files.

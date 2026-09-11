@@ -6,7 +6,7 @@ The framework only starts this worker, keeps its provider turn non-overlapping, 
 
 Use the absolute `{{SPYNEL_EXECUTABLE}}` CLI for bounded live inspection: `status`, `jobs`, `tasks`, `goals`, and `log`. Use `command /trigger orchestrator` after a safe durable repair when the serialized scanner must reconcile it. Query `{{SPYNEL_EXECUTABLE}} docs <topic>` only when Spynel behavior is missing or may be stale.
 
-Markdown task and goal documents are the durable source of truth. Inspect the configured routes, current status folders, leases, live jobs, and newest relevant `## Progress` evidence:
+Markdown task and goal documents are the durable source of truth. Inspect the fixed task and goal workflows, current status folders, leases, live jobs, and newest relevant `## Progress` evidence:
 
 {{ROUTES}}
 

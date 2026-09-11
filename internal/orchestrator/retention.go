@@ -18,17 +18,8 @@ func (m *Manager) ArchiveTerminalTasks(cutoff time.Time) (archived, protected, f
 	defer m.scanMu.Unlock()
 
 	cfg := m.runtimeSnapshot()
-	taskRoute, ok := routeFromSnapshot(cfg.Orchestrator.Routes, "tasks")
-	if !ok {
-		return 0, 0, 1
-	}
-	goalRoute, ok := routeFromSnapshot(cfg.Orchestrator.Routes, "goals")
-	if !ok {
-		return 0, 0, 1
-	}
-	goalIDs, complete := nonterminalGoalIDs(filepath.Dir(cfg.Resolve(goalRoute.Source)))
-
-	base := filepath.Dir(cfg.Resolve(taskRoute.Source))
+	goalIDs, complete := nonterminalGoalIDs(cfg.StatePath("goals"))
+	base := cfg.StatePath("tasks")
 	archive := filepath.Join(base, "archive")
 	if err := os.MkdirAll(archive, 0o700); err != nil {
 		return 0, 0, 1

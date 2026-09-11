@@ -306,7 +306,7 @@ func TestOversizedTaskTransitionAdmitsOneNotificationJobAndAgentJournals(t *test
 		return updateDocumentProgress(path, time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC), "Notification agent sent the controlled test notification through the authorized origin.")
 	}
 	lease := Lease{ID: "oversized-canary", Route: "tasks", Phase: phaseTaskImplementation, ClaimAttempt: 1}
-	if err := manager.completeTransition(context.Background(), manager.Config.Orchestrator.Routes[0], lease, "done", path); err != nil {
+	if err := manager.completeTransition(context.Background(), workflowRoutes()[0], lease, "done", path); err != nil {
 		t.Fatal(err)
 	}
 	manager.Wait()
@@ -402,7 +402,7 @@ func TestQualifyingTransitionDirectlyStartsOneOrdinaryJobWithoutRuntimeEvent(t *
 	}
 	before := document.Body
 	lease := Lease{ID: "lease-1", Route: "tasks", Phase: phaseTaskImplementation, ClaimAttempt: 1}
-	if err := manager.completeTransition(context.Background(), manager.Config.Orchestrator.Routes[0], lease, "done", path); err != nil {
+	if err := manager.completeTransition(context.Background(), workflowRoutes()[0], lease, "done", path); err != nil {
 		t.Fatal(err)
 	}
 	manager.Wait()

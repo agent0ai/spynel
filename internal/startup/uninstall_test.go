@@ -38,6 +38,9 @@ func TestRemoveInstallation(t *testing.T) {
 					manager.NodeExecutable = "/node"
 				}
 				manager.RunCommand = func(_ context.Context, name string, args ...string) (string, error) {
+					if name == "launchctl" && args[0] == "print-disabled" {
+						return "disabled services = {\n}\n", nil
+					}
 					if name == "systemctl" && strings.Contains(strings.Join(args, " "), "list-unit-files") {
 						return args[len(args)-1] + " enabled enabled\n", nil
 					}

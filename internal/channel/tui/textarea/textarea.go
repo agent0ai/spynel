@@ -214,6 +214,9 @@ type Model struct {
 	// hasn't entered anything yet.
 	Placeholder string
 
+	// Mask hides each occupied text cell while retaining source-based editing and hit testing.
+	Mask bool
+
 	// ShowLineNumbers, if enabled, causes line numbers to be printed
 	// after the prompt.
 	ShowLineNumbers bool

@@ -35,6 +35,7 @@ const (
 	noPane pane = iota
 	outputPane
 	inputPane
+	formPane
 )
 
 type dragSelection struct {
@@ -301,6 +302,7 @@ func (m model) outputPosition(x, y int, character bool) (textPoint, bool) {
 
 func (m *model) cancelDrag() {
 	m.drag = dragSelection{}
+	m.screenDrag = nil
 	m.dragGeneration++
 	m.clicks = clickSequence{}
 }
@@ -314,9 +316,12 @@ func (m *model) clearSelections() {
 
 func (m *model) handleMouse(event tea.MouseMsg) tea.Cmd {
 	m.editorNotice = ""
-	if m.screen != nil || m.dialog != nil {
+	if m.dialog != nil {
 		m.cancelDrag()
-		return nil
+		return m.handleDialogMouse(event)
+	}
+	if m.screen != nil {
+		return m.handleFormMouse(event)
 	}
 	if event.Action == tea.MouseActionRelease {
 		clicks := m.clicks

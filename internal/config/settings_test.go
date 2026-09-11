@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -22,26 +21,6 @@ func TestOnlyExtensionSettingsRequireRestart(t *testing.T) {
 	}
 	if _, ok := SettingByKey(cfg, "channels.tui.enabled"); ok {
 		t.Fatal("retired TUI launch preference remains exposed")
-	}
-}
-
-func TestStructuredRoutesRoundTripThroughSharedSetting(t *testing.T) {
-	cfg := Default()
-	routes := append([]Route(nil), cfg.Orchestrator.Routes...)
-	routes[0].Source = ".spynel/custom-tasks/todo"
-	data, err := json.Marshal(routes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := SetSetting(&cfg, "orchestrator.routes", string(data)); err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Orchestrator.Routes[0].Source != routes[0].Source {
-		t.Fatalf("live routes = %#v", cfg.Orchestrator.Routes)
-	}
-	setting, ok := SettingByKey(cfg, "orchestrator.routes")
-	if !ok || setting.Restart || !strings.Contains(setting.Value, "custom-tasks") {
-		t.Fatalf("route setting = %#v, present %t", setting, ok)
 	}
 }
 
@@ -412,5 +391,15 @@ func TestWhatsAppWhitelistAndEnabledStateValidateAtomically(t *testing.T) {
 	}
 	if len(cfg.Channels.WhatsApp.AllowedNumbers) != 1 || cfg.Channels.WhatsApp.AllowedNumbers[0] != "+1 (555) 123-4567" {
 		t.Fatalf("failed allow-list clear changed the configuration: %#v", cfg.Channels.WhatsApp.AllowedNumbers)
+	}
+}
+
+func TestRoutesAreNotASetting(t *testing.T) {
+	cfg := Default()
+	if _, ok := SettingByKey(cfg, "orchestrator.routes"); ok {
+		t.Fatal("routes remain exposed")
+	}
+	if _, err := SetSetting(&cfg, "orchestrator.routes", "[]"); err == nil {
+		t.Fatal("retired setting accepted")
 	}
 }

@@ -1,7 +1,6 @@
 package config
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -180,32 +179,12 @@ type Startup struct {
 }
 
 type Orchestrator struct {
-	Enabled                      bool    `yaml:"enabled"`
-	IntervalSec                  int     `yaml:"interval_seconds"`
-	RetriggerUnrespondedMessages bool    `yaml:"retrigger_unresponded_messages"`
-	SemanticHeartbeatMinutes     int     `yaml:"semantic_heartbeat_minutes"`
-	TaskNotifications            string  `yaml:"task_notifications"`
-	MaxParallel                  int     `yaml:"max_parallel"`
-	Routes                       []Route `yaml:"routes"`
-}
-
-type Route struct {
-	Name           string   `yaml:"name" json:"name"`
-	Source         string   `yaml:"source" json:"source"`
-	Working        string   `yaml:"working" json:"working"`
-	Prompt         string   `yaml:"prompt" json:"prompt"`
-	RecoveryPrompt string   `yaml:"recovery_prompt" json:"recovery_prompt"`
-	ReviewPrompt   string   `yaml:"review_prompt,omitempty" json:"review_prompt,omitempty"`
-	StaleAfter     string   `yaml:"stale_after" json:"stale_after"`
-	AllowedNext    []string `yaml:"allowed_next" json:"allowed_next"`
-}
-
-func (r Route) StaleDuration() time.Duration {
-	d, err := time.ParseDuration(r.StaleAfter)
-	if err != nil || d <= 0 {
-		return 30 * time.Minute
-	}
-	return d
+	Enabled                      bool   `yaml:"enabled"`
+	IntervalSec                  int    `yaml:"interval_seconds"`
+	RetriggerUnrespondedMessages bool   `yaml:"retrigger_unresponded_messages"`
+	SemanticHeartbeatMinutes     int    `yaml:"semantic_heartbeat_minutes"`
+	TaskNotifications            string `yaml:"task_notifications"`
+	MaxParallel                  int    `yaml:"max_parallel"`
 }
 
 type Extensions struct {
@@ -242,10 +221,6 @@ func Default() Config {
 		Startup: Startup{},
 		Orchestrator: Orchestrator{
 			Enabled: true, IntervalSec: 10, RetriggerUnrespondedMessages: true, SemanticHeartbeatMinutes: 15, TaskNotifications: TaskNotificationsDecide, MaxParallel: 4,
-			Routes: []Route{
-				{Name: "tasks", Source: ".spynel/tasks/todo", Working: ".spynel/tasks/working", Prompt: ".spynel/prompts/task.md", RecoveryPrompt: ".spynel/prompts/recovery.md", ReviewPrompt: ".spynel/prompts/review.md", StaleAfter: "30m", AllowedNext: []string{"todo", "working", "review", "reviewing", "waiting", "done", "failed", "cancelled"}},
-				{Name: "goals", Source: ".spynel/goals/proposed", Working: ".spynel/goals/planning", Prompt: ".spynel/prompts/goal.md", RecoveryPrompt: ".spynel/prompts/recovery.md", ReviewPrompt: ".spynel/prompts/goal-review.md", StaleAfter: "2h", AllowedNext: []string{"proposed", "planning", "active", "review", "reviewing", "waiting", "done", "abandoned"}},
-			},
 		},
 		Extensions: Extensions{Enabled: true, Directory: ".spynel/extensions", HookTimeout: "30s"},
 	}
@@ -296,10 +271,6 @@ func loadAt(abs string) (Config, error) {
 }
 
 func decode(data []byte, abs string) (Config, error) {
-	data, _, err := normalizeLegacyConfig(data)
-	if err != nil {
-		return Config{}, fmt.Errorf("parse %s: %w", abs, err)
-	}
 	cfg := Default()
 	var document yaml.Node
 	if err := yaml.Unmarshal(data, &document); err != nil {
@@ -308,9 +279,8 @@ func decode(data []byte, abs string) (Config, error) {
 	if len(document.Content) > 0 {
 		cfg.Harness.reasoningEffortOmitted = mappingValue(mappingValue(document.Content[0], "harness"), "reasoning_effort") == nil
 	}
-	decoder := yaml.NewDecoder(bytes.NewReader(data))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&cfg); err != nil {
+	// Unknown keys have no runtime effect and disappear on the next canonical save.
+	if err := document.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("parse %s: %w", abs, err)
 	}
 	cfg.Harness.Name = harness.NormalizeName(cfg.Harness.Name)
@@ -329,28 +299,6 @@ func decode(data []byte, abs string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
-}
-
-// normalizeLegacyConfig accepts the one retired launch preference long enough
-// to remove it from the decoded representation. A subsequent ordinary save
-// writes only the canonical schema; all other unknown fields still fail closed.
-func normalizeLegacyConfig(data []byte) ([]byte, bool, error) {
-	var document yaml.Node
-	if err := yaml.Unmarshal(data, &document); err != nil {
-		return nil, false, err
-	}
-	if len(document.Content) == 0 {
-		return data, false, nil
-	}
-	root := document.Content[0]
-	channels := mappingValue(root, "channels")
-	tui := mappingValue(channels, "tui")
-	changed := removeMappingKey(tui, "enabled")
-	if !changed {
-		return data, false, nil
-	}
-	normalized, err := yaml.Marshal(&document)
-	return normalized, true, err
 }
 
 func mappingValue(node *yaml.Node, key string) *yaml.Node {
@@ -376,26 +324,6 @@ func removeMappingKey(node *yaml.Node, key string) bool {
 		}
 	}
 	return false
-}
-
-// NormalizeLegacyFile performs the one supported one-time schema cleanup.
-// Current-schema files are not rewritten.
-func NormalizeLegacyFile(path string) (bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false, err
-	}
-	normalized, changed, err := normalizeLegacyConfig(data)
-	if err != nil || !changed {
-		return false, err
-	}
-	if _, err := decode(normalized, path); err != nil {
-		return false, err
-	}
-	if err := fsx.AtomicWriteFile(path, normalized, 0o600); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 // PathForRoot returns the fixed configuration path for a workspace root.
@@ -502,25 +430,6 @@ func (c Config) Validate() error {
 	case TaskNotificationsOff, TaskNotificationsDecide, TaskNotificationsAlways:
 	default:
 		problems = append(problems, "orchestrator.task_notifications must be off, decide, or always")
-	}
-	seen := map[string]bool{}
-	for i, route := range c.Orchestrator.Routes {
-		prefix := fmt.Sprintf("orchestrator.routes[%d]", i)
-		if route.Name == "" || route.Source == "" || route.Working == "" || route.Prompt == "" || route.RecoveryPrompt == "" {
-			problems = append(problems, prefix+" requires name, source, working, prompt, and recovery_prompt")
-		}
-		if (route.Name == "tasks" || route.Name == "goals") && strings.TrimSpace(route.ReviewPrompt) == "" {
-			problems = append(problems, prefix+".review_prompt is required for built-in task and goal routes")
-		}
-		if seen[route.Name] {
-			problems = append(problems, "duplicate route name "+route.Name)
-		}
-		seen[route.Name] = true
-		if route.StaleAfter != "" {
-			if _, err := time.ParseDuration(route.StaleAfter); err != nil {
-				problems = append(problems, prefix+".stale_after is invalid")
-			}
-		}
 	}
 	if c.Channels.WhatsApp.Mode != "" && c.Channels.WhatsApp.Mode != "self-chat" && c.Channels.WhatsApp.Mode != "dedicated" {
 		problems = append(problems, "channels.whatsapp.mode must be self-chat or dedicated")

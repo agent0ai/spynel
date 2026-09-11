@@ -516,7 +516,7 @@ func TestJobPingAndGuardedContinuationPersistProviderIterations(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.Orchestrator.Wait()
-	working := filepath.Join(cfg.Resolve(cfg.Orchestrator.Routes[0].Working), filepath.Base(task))
+	working := filepath.Join(cfg.StatePath("tasks", "working"), filepath.Base(task))
 	document, err := orchestrator.ReadDocument(working)
 	if err != nil {
 		t.Fatal(err)

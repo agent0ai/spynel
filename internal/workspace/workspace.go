@@ -165,8 +165,7 @@ func Init(root string, force bool) error {
 
 // Upgrade restores missing runtime directories and embedded support files. It
 // preserves current configuration and user-owned prompts, instructions,
-// themes, and extensions. The retired TUI launch preference is the sole
-// one-time configuration normalization.
+// themes, and extensions. Unused configuration keys disappear on the next save.
 func Upgrade(root string) error {
 	abs, err := filepath.Abs(root)
 	if err != nil {
@@ -176,10 +175,6 @@ func Upgrade(root string) error {
 		return err
 	}
 	if err := ensureInstructionBoundary(abs); err != nil {
-		return err
-	}
-	configPath := config.PathForRoot(abs)
-	if _, err := config.NormalizeLegacyFile(configPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	for _, dir := range directories {

@@ -17,6 +17,8 @@
 
 - Explicit installation removal scans bounded generated registrations for the exact stable executable or npm launcher, including quoted special paths. Stop/unload matching services and remove their future startup registrations before deleting binaries; ordinary preference changes retain their existing lifecycle. An absent Linux user manager allows offline removal, but an active service that cannot be stopped fails closed. Elevated removal retains the original user scope alongside system registrations.
 
+- `Enabled` inspects persistent native registration without changing it or trusting the saved preference. Linux queries the exact unit file; macOS checks the launchd override and validated LaunchAgent/LaunchDaemon file. Failed or unrecognized queries return an error, never an assumed disabled state.
+
 ## Child DOX Index
 
 No child DOX files.

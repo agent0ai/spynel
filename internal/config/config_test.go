@@ -43,13 +43,10 @@ func writeTestConfig(t *testing.T, root string, data []byte) string {
 	return path
 }
 
-func TestDefaultIsValidAndRoutesAreExtensible(t *testing.T) {
+func TestDefaultIsValid(t *testing.T) {
 	cfg := Default()
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
-	}
-	if len(cfg.Orchestrator.Routes) != 2 {
-		t.Fatalf("expected task and goal routes, got %d", len(cfg.Orchestrator.Routes))
 	}
 	if cfg.Harness.Name != "" {
 		t.Fatalf("default coding harness should await detection, got %q", cfg.Harness.Name)
@@ -74,13 +71,6 @@ func TestDefaultIsValidAndRoutesAreExtensible(t *testing.T) {
 	}
 	if cfg.Workspace.CleanupRetentionDays != 30 {
 		t.Fatalf("cleanup retention default = %d, want 30", cfg.Workspace.CleanupRetentionDays)
-	}
-	if got := strings.Join(cfg.Orchestrator.Routes[0].AllowedNext, ","); got != "todo,working,review,reviewing,waiting,done,failed,cancelled" {
-		t.Fatalf("task workflow statuses = %q", got)
-	}
-	goals := cfg.Orchestrator.Routes[1]
-	if filepath.Base(goals.Source) != "proposed" || filepath.Base(goals.Working) != "planning" || filepath.Base(goals.ReviewPrompt) != "goal-review.md" || strings.Join(goals.AllowedNext, ",") != "proposed,planning,active,review,reviewing,waiting,done,abandoned" {
-		t.Fatalf("goal workflow defaults = %#v", goals)
 	}
 }
 
@@ -325,51 +315,41 @@ func TestDirectConfigRejectsUnsupportedACPInferenceProperties(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsUnknownConfigurationFields(t *testing.T) {
+func TestLoadIgnoresUnusedKeysAndSaveRemovesThem(t *testing.T) {
 	root := t.TempDir()
-	path := writeTestConfig(t, root, []byte("version: 1\nspeech:\n  command: retired-speech-command\n"))
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "field command not found") {
-		t.Fatalf("unknown configuration field error = %v", err)
-	}
-}
-
-func TestLoadSafelyNormalizesRetiredTUILaunchPreference(t *testing.T) {
-	root := t.TempDir()
-	path := writeTestConfig(t, root, []byte("version: 1\nchannels:\n  tui:\n    enabled: false\n    title: Legacy\n"))
+	data := []byte("version: 1\nunused: {anything: true}\nspeech:\n  command: obsolete\nchannels:\n  tui:\n    enabled: false\n    title: Preserved\norchestrator:\n  routes: [{source: old-folder}]\n")
+	path := writeTestConfig(t, root, data)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Channels.TUI.Title != "Legacy" {
-		t.Fatalf("TUI title = %q", cfg.Channels.TUI.Title)
+	if cfg.Channels.TUI.Title != "Preserved" {
+		t.Fatal("known setting lost")
 	}
-	changed, err := NormalizeLegacyFile(path)
-	if err != nil || !changed {
-		t.Fatalf("NormalizeLegacyFile() = %t, %v", changed, err)
+	before, err := os.ReadFile(path)
+	if err != nil || string(before) != string(data) {
+		t.Fatal("load rewrote config")
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
+	if err := Save(cfg); err != nil {
 		t.Fatal(err)
-	}
-	if strings.Contains(string(data), "tui:\n    enabled:") {
-		t.Fatalf("retired TUI launch preference survived canonical save:\n%s", data)
-	}
-}
-
-func TestNormalizeLegacyFileLeavesCurrentSchemaByteExact(t *testing.T) {
-	root := t.TempDir()
-	data := []byte("# keep this comment\nversion: 1\n")
-	path := writeTestConfig(t, root, data)
-	changed, err := NormalizeLegacyFile(path)
-	if err != nil || changed {
-		t.Fatalf("NormalizeLegacyFile() = %t, %v", changed, err)
 	}
 	after, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(after) != string(data) {
-		t.Fatalf("current schema was rewritten:\n%s", after)
+	for _, key := range []string{"unused:", "command:", "routes:", "old-folder", "obsolete"} {
+		if strings.Contains(string(after), key) {
+			t.Fatalf("unused key survived save: %s", key)
+		}
+	}
+	reloaded, err := Load(path)
+	if err != nil || reloaded.Channels.TUI.Title != "Preserved" {
+		t.Fatalf("saved settings: %#v, %v", reloaded, err)
+	}
+	for _, invalid := range []string{"speech: {enabled: invalid}", "orchestrator: {max_parallel: 0}", "version: 1\nversion: 2"} {
+		if _, err := decode([]byte(invalid), path); err == nil {
+			t.Fatalf("invalid current setting accepted: %s", invalid)
+		}
 	}
 }
 

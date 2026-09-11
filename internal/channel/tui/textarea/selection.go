@@ -308,7 +308,7 @@ func textWidth(text string) int      { return uniseg.StringWidth(displayText(tex
 func (m Model) renderSelected(text []rune, offset int, style lipgloss.Style, cursorAt int) string {
 	start, end := m.SelectionRange()
 	selected := m.HasSelection() && start < offset+len(text) && end > offset
-	if !selected && cursorAt < 0 {
+	if !m.Mask && !selected && cursorAt < 0 {
 		return style.Render(displayText(string(text)))
 	}
 	var out, run strings.Builder
@@ -328,6 +328,9 @@ func (m Model) renderSelected(text []rune, offset int, style lipgloss.Style, cur
 	col := 0
 	for clusters.Next() {
 		value := displayText(clusters.Str())
+		if m.Mask {
+			value = strings.Repeat("*", textWidth(clusters.Str()))
+		}
 		count := len(clusters.Runes())
 		inSelection := selected && offset+col >= start && offset+col < end
 		if col == cursorAt && !inSelection {

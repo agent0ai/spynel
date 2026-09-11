@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -362,8 +361,10 @@ func (r *reconfigurableServiceHarness) Reconfigure(next harness.HarnessConfig) e
 }
 
 type fakeStartupManager struct {
-	calls []bool
-	err   error
+	calls      []bool
+	err        error
+	enabled    bool
+	inspectErr error
 }
 
 type fakePairingManager struct {
@@ -385,8 +386,13 @@ func (m *fakePairingManager) PairPhone(_ context.Context, name, phone string) (s
 
 func (m *fakeStartupManager) Sync(_ config.Config, enabled bool) error {
 	m.calls = append(m.calls, enabled)
+	if m.err == nil {
+		m.enabled = enabled
+	}
 	return m.err
 }
+
+func (m *fakeStartupManager) Enabled(config.Config) (bool, error) { return m.enabled, m.inspectErr }
 
 func newHeldServiceHarness() *heldServiceHarness {
 	return &heldServiceHarness{serviceHarness: newServiceHarness(), emits: map[string]core.Emit{}, models: map[string][]string{}}
@@ -1136,15 +1142,15 @@ func TestSlashCommandsSendCreationPromptsToCommunicationAgent(t *testing.T) {
 	if len(prompts) != 2 || !strings.Contains(prompts[0], "<user_task_request>\ninspect the queue") || !strings.Contains(prompts[1], "<user_goal_request>\nkeep the queue healthy") || !strings.Contains(prompts[1], "success_criteria") {
 		t.Fatalf("creation prompts = %#v", prompts)
 	}
-	for _, route := range cfg.Orchestrator.Routes {
-		entries, err := filepath.Glob(filepath.Join(cfg.Resolve(route.Source), "*.md"))
+	for _, source := range []string{cfg.StatePath("tasks", "todo"), cfg.StatePath("goals", "proposed")} {
+		entries, err := filepath.Glob(filepath.Join(source, "*.md"))
 		if err != nil || len(entries) != 0 {
-			t.Fatalf("framework command bypassed communication agent for %s: %#v, %v", route.Name, entries, err)
+			t.Fatalf("framework command bypassed communication agent for %s: %#v, %v", source, entries, err)
 		}
 	}
 }
 
-func TestCreationPromptsUseLiveRouteSettings(t *testing.T) {
+func TestCreationPromptsUseCanonicalWorkflowFolders(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
@@ -1154,35 +1160,16 @@ func TestCreationPromptsUseLiveRouteSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	service := New(cfg, newServiceHarness())
-	routes := append([]config.Route(nil), cfg.Orchestrator.Routes...)
-	routes[0].Source = ".spynel/live-task-prompts/todo"
-	routes[1].Source = ".spynel/live-goal-prompts/proposed"
-	routeValue, err := json.Marshal(routes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := service.ApplySettings(map[string]string{"orchestrator.routes": string(routeValue)}); err != nil {
-		t.Fatal(err)
-	}
-	next := service.Settings.Snapshot()
-	reloaded, err := config.Load(cfg.Path)
-	if err != nil || !reflect.DeepEqual(reloaded.Orchestrator.Routes, next.Orchestrator.Routes) {
-		t.Fatalf("saved routes were not reloaded into shared memory: disk=%#v snapshot=%#v err=%v", reloaded.Orchestrator.Routes, next.Orchestrator.Routes, err)
-	}
 	prompt, err := service.creationCommandPrompt(core.Message{Channel: "cli", Conversation: "live-routes"}, "task", "inspect live routes")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, source := range []string{next.Resolve(next.Orchestrator.Routes[0].Source), next.Resolve(next.Orchestrator.Routes[1].Source)} {
+	for _, source := range []string{cfg.StatePath("tasks", "todo"), cfg.StatePath("goals", "proposed")} {
 		if !strings.Contains(prompt, source) {
 			t.Fatalf("creation prompt does not contain live route %q:\n%s", source, prompt)
 		}
 	}
-	for _, route := range cfg.Orchestrator.Routes[:2] {
-		if strings.Contains(prompt, cfg.Resolve(route.Source)) {
-			t.Fatalf("creation prompt retained process-start route %q", cfg.Resolve(route.Source))
-		}
-	}
+
 }
 
 func TestSlashCommandCatalogBuildsHelpAndReturnsACopy(t *testing.T) {
@@ -1679,10 +1666,11 @@ func TestStatusBoundsGoalCheckpointFilesystemDiagnostic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index := range cfg.Orchestrator.Routes {
-		if cfg.Orchestrator.Routes[index].Name == "goals" {
-			cfg.Orchestrator.Routes[index].Source = filepath.Join(".spynel", strings.Repeat("x", 300)+"\u0085\nraw-path", "todo")
-		}
+	if err := os.RemoveAll(cfg.StatePath("goals", "active")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfg.StatePath("goals", "active"), []byte("unreadable folder"), 0600); err != nil {
+		t.Fatal(err)
 	}
 	status, err := New(cfg, newServiceHarness()).Status(core.Message{Channel: "cli", Conversation: "local"})
 	if err != nil {
@@ -3115,7 +3103,7 @@ func TestAutostartButtonsReportValidationAndDoNotSaveOtherFormEdits(t *testing.T
 	service.Startup = manager
 	for _, action := range []string{"autostart:enable", "autostart:enable", "autostart:disable", "autostart:disable"} {
 		screen, err := service.ScreenAction(context.Background(), "config", action, map[string]string{"workspace.history_char_limit": "invalid unsaved edit"})
-		if err != nil || screen == nil || screen.SavedControl == nil || screen.SavedControl.Key != action || !strings.Contains(screen.ActionMessage, "verified") {
+		if err != nil || screen == nil || screen.SavedControl == nil || screen.SavedControl.Key == action || !strings.Contains(screen.ActionMessage, "Registration") {
 			t.Fatalf("%s = %#v, %v", action, screen, err)
 		}
 		if service.Settings.Snapshot().Workspace.HistoryCharLimit != cfg.Workspace.HistoryCharLimit {
@@ -3128,7 +3116,7 @@ func TestAutostartButtonsReportValidationAndDoNotSaveOtherFormEdits(t *testing.T
 	manager.err = errors.New("systemctl: permission denied; authorization: Bearer private-startup-token")
 	for _, action := range []string{"autostart:enable", "autostart:disable"} {
 		screen, err := service.ScreenAction(context.Background(), "config", action, nil)
-		if screen != nil || err == nil || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "private-startup-token") {
+		if screen == nil || screen.SavedControl == nil || err == nil || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "private-startup-token") {
 			t.Fatalf("failed %s returned success or lost/redacted the wrong evidence: %#v, %v", action, screen, err)
 		}
 	}
@@ -3328,7 +3316,7 @@ func TestMainConfigurationStartsWithHarnessModelAndEssentials(t *testing.T) {
 	if screen.Title != "" || screen.Subtitle != "" {
 		t.Fatalf("main configuration has redundant heading copy: title %q subtitle %q", screen.Title, screen.Subtitle)
 	}
-	want := []string{"harness", "model", "harness.sandbox", "harness.reviews", "workspace.history_max_messages", "workspace.history_char_limit", "autostart:enable", "autostart:disable", "advanced"}
+	want := []string{"harness", "model", "harness.sandbox", "harness.reviews", "workspace.history_max_messages", "workspace.history_char_limit", "autostart:check", "advanced"}
 	if len(screen.Controls) < len(want)+1 {
 		t.Fatalf("main configuration controls = %#v", screen.Controls)
 	}
@@ -3337,10 +3325,10 @@ func TestMainConfigurationStartsWithHarnessModelAndEssentials(t *testing.T) {
 			t.Fatalf("main control %d = %q, want %q", index, screen.Controls[index].Key, key)
 		}
 	}
-	if screen.Controls[0].Kind != "action" || screen.Controls[1].Kind != "action" || screen.Controls[2].Kind != "select" || screen.Controls[3].Kind != "select" || screen.Controls[6].Kind != "action" || screen.Controls[7].Kind != "action" || screen.Controls[8].Kind != "disclosure" || !screen.Controls[9].Advanced {
+	if screen.Controls[0].Kind != "action" || screen.Controls[1].Kind != "action" || screen.Controls[2].Kind != "select" || screen.Controls[3].Kind != "select" || screen.Controls[6].Kind != "action" || screen.Controls[7].Kind != "disclosure" || !screen.Controls[8].Advanced {
 		t.Fatalf("main control kinds/order = %#v", screen.Controls)
 	}
-	if screen.Controls[0].Section != "Core settings" || screen.Controls[8].Section != "Advanced settings" {
+	if screen.Controls[0].Section != "Core settings" || screen.Controls[7].Section != "Advanced settings" {
 		t.Fatalf("main control sections = %#v", screen.Controls[:8])
 	}
 	harnessScreen, err := service.ScreenAction(context.Background(), "config", "harness", nil)
@@ -3841,5 +3829,48 @@ func TestClearCommandPreservesHistoryWhenRecipientResetFails(t *testing.T) {
 	entries, _, err := service.History.Entries("telegram", "42")
 	if err != nil || len(entries) < 1 || entries[0].Content != "keep me" {
 		t.Fatalf("history changed after failed harness reset: %#v, %v", entries, err)
+	}
+}
+
+func TestAutostartScreenReadsRegistrationInsteadOfPreference(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	service := New(cfg, newServiceHarness())
+	manager := &fakeStartupManager{enabled: true}
+	service.Startup = manager
+	check := func(key, label string) {
+		t.Helper()
+		screen, err := service.Screen("config")
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := 0
+		for _, control := range screen.Controls {
+			if strings.HasPrefix(control.Key, "autostart:") {
+				count++
+				if control.Key != key || control.Value != label {
+					t.Fatalf("autostart control = %#v", control)
+				}
+			}
+		}
+		if count != 1 {
+			t.Fatalf("autostart actions = %d", count)
+		}
+	}
+	check("autostart:disable", "Disable autostart")
+	manager.enabled = false
+	check("autostart:enable", "Enable autostart")
+	manager.inspectErr = errors.New("cannot reach systemd")
+	check("autostart:check", "Check autostart")
+	if _, err := service.ScreenAction(context.Background(), "config", "autostart:check", nil); err == nil {
+		t.Fatal("unknown state reported success")
+	}
+	manager.inspectErr = nil
+	result, err := service.ScreenAction(context.Background(), "config", "autostart:check", nil)
+	if err != nil || result.SavedControl.Key != "autostart:enable" || len(manager.calls) != 0 {
+		t.Fatalf("recheck mutated registration: %#v, %v", result, err)
 	}
 }

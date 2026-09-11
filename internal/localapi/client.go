@@ -293,12 +293,18 @@ func (c *Client) ScreenAction(ctx context.Context, screenID, action string, valu
 		return nil, err
 	}
 	defer response.Body.Close()
-	if err := responseError(response); err != nil {
-		return nil, err
+	if response.StatusCode >= 300 && !strings.HasPrefix(response.Header.Get("Content-Type"), "application/json") {
+		return nil, responseError(response)
 	}
 	var result screenResponse
-	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result); err != nil {
 		return nil, err
+	}
+	if result.Error != "" {
+		return result.Screen, errors.New(result.Error)
+	}
+	if response.StatusCode >= 300 {
+		return result.Screen, fmt.Errorf("screen action failed: %s", response.Status)
 	}
 	return result.Screen, nil
 }

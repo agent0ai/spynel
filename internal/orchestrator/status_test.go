@@ -21,11 +21,6 @@ func TestWorkStatusCountsDurableActiveFoldersConservatively(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index := range cfg.Orchestrator.Routes {
-		if cfg.Orchestrator.Routes[index].Name == "tasks" {
-			cfg.Orchestrator.Routes[index].AllowedNext = append(cfg.Orchestrator.Routes[index].AllowedNext, "triage")
-		}
-	}
 	write := func(relative, body string) {
 		t.Helper()
 		path := filepath.Join(root, filepath.FromSlash(relative))
@@ -52,7 +47,7 @@ func TestWorkStatusCountsDurableActiveFoldersConservatively(t *testing.T) {
 
 	manager := New(cfg, &heartbeatHarness{}, extensions.Runner{})
 	status := manager.WorkStatus()
-	if status.TasksActive != 6 || status.TasksWaiting != 2 || status.GoalsActive != 1 {
+	if status.TasksActive != 5 || status.TasksWaiting != 2 || status.GoalsActive != 1 {
 		t.Fatalf("durable counts = tasks %d waiting %d goals %d", status.TasksActive, status.TasksWaiting, status.GoalsActive)
 	}
 	if len(status.CountDiagnostics) != 3 || !strings.Contains(strings.Join(status.CountDiagnostics, "\n"), "corrupt-waiting.md counts active") {

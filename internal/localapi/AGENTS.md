@@ -20,6 +20,8 @@
 - Support versioned local integration through message, committed conversation events, atomic bounded conversation snapshots, status and ordinary notification routes. Event subscriptions share a 32-client cap across listeners, use history-owned cursors and bounded replay, set finite write deadlines, expose gap errors, and never acknowledge notifications or own workflow policy. Request response queues drain concurrently with synchronous application admission; continuing finals/errors cannot truncate a response stream.
 - The optional Unix listener reuses the exact authenticated HTTP service alongside loopback. Require an existing canonical user-owned 0700 parent, 0600 socket and descriptor, refuse all existing paths (including stale sockets), pin explicit clients to the descriptor workspace, and remove only owned files on close. Explicit socket selection does not participate in or weaken foreign-loopback election fences.
 
+- Screen-action failures retain an error HTTP status and may return a refreshed `SavedControl` beside the error. The client preserves both so forms can show native errors and update observed registration state together.
+
 ## Child DOX Index
 
 No child DOX files.

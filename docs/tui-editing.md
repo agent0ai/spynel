@@ -69,6 +69,10 @@ cancels pending paste preparation and ignores late native-clipboard and attachme
 results, even if redo restores identical text. Cancelled paths remain literal;
 paste again to request preparation.
 
+## Forms and configuration
+
+Configuration, Telegram, WhatsApp, wizards, and selectors support mouse-wheel scrolling and clicks on buttons, disclosures, and choices. Text fields use the composer editor: click to position the caret, drag or Shift-click to select, double/triple-click for words/lines, and use the same replacement, clipboard, and undo/redo keys. Password values remain masked. Modal buttons receive clicks without changing the covered form. No mouse usage hints are added to the interface.
+
 ## Clipboard and terminal compatibility
 
 Copy retains an internal copy, offers base64-encoded OSC 52 to the terminal, and

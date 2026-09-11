@@ -1,7 +1,6 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -46,13 +45,12 @@ func Settings(cfg Config) []Setting {
 		{Key: "workspace.cleanup_retention_days", Section: "config", Description: "Age in whole days before automatic conversation/job cleanup and terminal-task archiving", Value: strconv.Itoa(cfg.Workspace.CleanupRetentionDays), Advanced: true},
 		{Key: "channels.tui.title", Section: "config", Description: "Default TUI title", Value: cfg.Channels.TUI.Title, Advanced: true},
 		{Key: "channels.tui.theme", Section: "config", Description: "Active color theme from .spynel/themes", Value: cfg.Channels.TUI.Theme, Advanced: true},
-		{Key: "orchestrator.enabled", Section: "config", Description: "Run Markdown task and goal routes", Value: formatBool(cfg.Orchestrator.Enabled), Choices: []string{"on", "off"}, Advanced: true},
+		{Key: "orchestrator.enabled", Section: "config", Description: "Run Markdown tasks and goals", Value: formatBool(cfg.Orchestrator.Enabled), Choices: []string{"on", "off"}, Advanced: true},
 		{Key: "orchestrator.interval_seconds", Section: "config", Description: "Live route scan interval; saving resets the next scan deadline", Value: strconv.Itoa(cfg.Orchestrator.IntervalSec), Advanced: true},
 		{Key: "orchestrator.retrigger_unresponded_messages", Section: "config", Description: "Automatically processes stalled messages after restarts and disconnects.", Value: formatBool(cfg.Orchestrator.RetriggerUnrespondedMessages), Choices: []string{"on", "off"}, Advanced: true},
 		{Key: "orchestrator.semantic_heartbeat_minutes", Section: "config", Description: "Fixed delay after each agent workflow audit completes; 0 disables it", Value: strconv.Itoa(cfg.Orchestrator.SemanticHeartbeatMinutes), Advanced: true},
 		{Key: "orchestrator.task_notifications", Section: "config", Description: "Live policy context for direct task notification agents", Value: cfg.Orchestrator.TaskNotifications, Choices: []string{TaskNotificationsOff, TaskNotificationsDecide, TaskNotificationsAlways}, Advanced: true},
 		{Key: "orchestrator.max_parallel", Section: "config", Description: "Live maximum concurrent Markdown jobs; lowering never cancels active work", Value: strconv.Itoa(cfg.Orchestrator.MaxParallel), Advanced: true},
-		{Key: "orchestrator.routes", Section: "config", Description: "JSON array of live Markdown route definitions", Value: routesJSON(cfg.Orchestrator.Routes), Advanced: true},
 		{Key: "extensions.enabled", Section: "config", Description: "Run trusted extension hooks after restart", Value: formatBool(cfg.Extensions.Enabled), Choices: []string{"on", "off"}, Restart: true, Advanced: true},
 		{Key: "extensions.directory", Section: "config", Description: "Installed extension directory after restart", Value: cfg.Extensions.Directory, Restart: true, Advanced: true},
 		{Key: "extensions.hook_timeout", Section: "config", Description: "Per-hook timeout after restart", Value: cfg.Extensions.HookTimeout, Restart: true, Advanced: true},
@@ -236,13 +234,6 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Orchestrator.TaskNotifications = strings.ToLower(value)
 	case "orchestrator.max_parallel":
 		cfg.Orchestrator.MaxParallel, err = parseInteger(1)
-	case "orchestrator.routes":
-		var routes []Route
-		if err = json.Unmarshal([]byte(value), &routes); err == nil {
-			cfg.Orchestrator.Routes = routes
-		} else {
-			err = fmt.Errorf("orchestrator.routes must be a JSON route array: %w", err)
-		}
 	case "extensions.enabled":
 		cfg.Extensions.Enabled, err = parseBoolean()
 	case "extensions.directory":
@@ -379,11 +370,6 @@ func formatBool(value bool) string {
 		return "on"
 	}
 	return "off"
-}
-
-func routesJSON(routes []Route) string {
-	data, _ := json.Marshal(routes)
-	return string(data)
 }
 
 func secretState(value string) string {

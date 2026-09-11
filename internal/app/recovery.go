@@ -353,50 +353,38 @@ func (s *Service) scanRecovery(ctx context.Context, trigger string) RecoveryStat
 func (s *Service) durableRecoverySources() (map[string]bool, error) {
 	const documentMax = 2000
 	result := map[string]bool{}
-	seenDirectory := map[string]bool{}
 	documents := 0
-	cfg := s.Settings.Snapshot()
-	for _, route := range cfg.Orchestrator.Routes {
-		parents := []string{filepath.Dir(cfg.Resolve(route.Source)), filepath.Dir(cfg.Resolve(route.Working))}
-		for _, parent := range parents {
-			for _, status := range route.AllowedNext {
-				directory := filepath.Join(parent, status)
-				if seenDirectory[directory] {
-					continue
-				}
-				seenDirectory[directory] = true
-				entries, err := os.ReadDir(directory)
-				if os.IsNotExist(err) {
-					continue
-				}
-				if err != nil {
-					return nil, err
-				}
-				for _, entry := range entries {
-					if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" || entry.Type()&os.ModeSymlink != 0 {
-						continue
+	for _, directory := range s.Orchestrator.WorkflowDirectories() {
+		entries, err := os.ReadDir(directory)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" || entry.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			documents++
+			if documents > documentMax {
+				return nil, errors.New("durable source-link index exceeds recovery bound")
+			}
+			document, err := orchestrator.ReadDocument(filepath.Join(directory, entry.Name()))
+			if err != nil {
+				return nil, err
+			}
+			switch values := document.FrontMatter["source_message_ids"].(type) {
+			case []string:
+				for _, value := range values {
+					if value != "" {
+						result[value] = true
 					}
-					documents++
-					if documents > documentMax {
-						return nil, errors.New("durable source-link index exceeds recovery bound")
-					}
-					document, err := orchestrator.ReadDocument(filepath.Join(directory, entry.Name()))
-					if err != nil {
-						return nil, err
-					}
-					switch values := document.FrontMatter["source_message_ids"].(type) {
-					case []string:
-						for _, value := range values {
-							if value != "" {
-								result[value] = true
-							}
-						}
-					case []any:
-						for _, raw := range values {
-							if value, ok := raw.(string); ok && value != "" {
-								result[value] = true
-							}
-						}
+				}
+			case []any:
+				for _, raw := range values {
+					if value, ok := raw.(string); ok && value != "" {
+						result[value] = true
 					}
 				}
 			}

@@ -9,8 +9,6 @@ import (
 	"strings"
 	"time"
 	"unicode"
-
-	"github.com/agent0ai/spynel/internal/config"
 )
 
 const (
@@ -39,15 +37,14 @@ func (s *WorkStatus) AddCountDiagnostic(value string) {
 	addStatusDiagnostic(&s.CountDiagnostics, value)
 }
 
-// WorkStatus counts files in configured built-in active route folders. A
+// WorkStatus counts files in canonical active task and goal folders. A
 // corrupt document in an active folder still counts so broken work cannot
 // disappear. Unreadable folders and enumeration caps produce a bounded
 // diagnostic and make the reported value an explicit lower bound.
 func (m *Manager) WorkStatus() WorkStatus {
 	status := WorkStatus{}
 	diagnostics := make([]string, 0, maxStatusDiagnostics)
-	cfg := m.runtimeSnapshot()
-	for _, route := range cfg.Orchestrator.Routes {
+	for _, route := range workflowRoutes() {
 		switch route.Name {
 		case "tasks":
 			status.TasksActive, status.TasksWaiting = m.countActiveRoute(route, map[string]bool{"done": true, "failed": true, "cancelled": true}, &diagnostics)
@@ -82,7 +79,7 @@ func (m *Manager) semanticHeartbeatSchedule() (string, time.Time) {
 	return "scheduled", next
 }
 
-func (m *Manager) countActiveRoute(route config.Route, terminal map[string]bool, diagnostics *[]string) (int, int) {
+func (m *Manager) countActiveRoute(route workflowRoute, terminal map[string]bool, diagnostics *[]string) (int, int) {
 	base := filepath.Dir(m.runtimeSnapshot().Resolve(route.Source))
 	statuses := make(map[string]bool)
 	for _, value := range append([]string{filepath.Base(route.Source), filepath.Base(route.Working)}, route.AllowedNext...) {

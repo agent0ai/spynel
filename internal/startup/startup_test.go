@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/instance"
@@ -91,6 +92,9 @@ func startupTestManager(t *testing.T, goos string) *Manager {
 				return "", nil
 			}
 			return args[len(args)-1] + " enabled enabled\n", nil
+		}
+		if name == "launchctl" && args[0] == "print-disabled" {
+			return "disabled services = {\n}\n", nil
 		}
 		return "", nil
 	}
@@ -456,6 +460,11 @@ func TestLinuxNativeRegistrationQueries(t *testing.T) {
 		if err := manager.Sync(cfg, enabled); err != nil {
 			t.Fatalf("native registration enabled=%t: %v", enabled, err)
 		}
+		cfg.Startup.Enabled = !enabled
+		actual, err := manager.Enabled(cfg)
+		if err != nil || actual != enabled {
+			t.Fatalf("native state = %t, %v; expected %t", actual, err, enabled)
+		}
 	}
 }
 
@@ -468,5 +477,62 @@ func TestInvalidStartupPathsDoNotRegister(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(manager.Home, ".config")); !os.IsNotExist(err) {
 		t.Fatalf("invalid startup command created registration artifacts: %v", err)
+	}
+}
+
+func TestNativeStartupStateReadDoesNotMutateRegistration(t *testing.T) {
+	cfg := startupTestConfig(t, t.TempDir())
+	m := startupTestManager(t, "linux")
+	unit := "spynel-" + workspaceID(cfg) + ".service"
+	for _, test := range []struct {
+		output        string
+		enabled, fail bool
+	}{
+		{unit + " enabled enabled\n", true, false}, {unit + " disabled enabled\n", false, false}, {"", false, false},
+		{unit + " enabled-runtime enabled\n", false, true}, {"unrelated.service enabled enabled\n", false, true},
+	} {
+		m.RunCommand = func(_ context.Context, name string, args ...string) (string, error) {
+			if name != "systemctl" || !strings.Contains(strings.Join(args, " "), "list-unit-files") || strings.Contains(strings.Join(args, " "), "daemon-reload") {
+				t.Fatalf("state inspection mutated OS: %s %v", name, args)
+			}
+			return test.output, nil
+		}
+		got, err := m.Enabled(cfg)
+		if got != test.enabled || (err != nil) != test.fail {
+			t.Fatalf("state %q = %t, %v", test.output, got, err)
+		}
+	}
+}
+
+func TestLaunchdStateUsesExactNativeOverride(t *testing.T) {
+	label := "dev.spynel.workspace.example"
+	for _, test := range []struct {
+		output         string
+		disabled, fail bool
+	}{
+		{"disabled services = {\n}", false, false},
+		{"disabled services = {\n\"" + label + "\" => true\n}", true, false},
+		{"disabled services = {\n\"" + label + "\" => false\n}", false, false},
+		{"disabled services = {\n\"" + label + "\" => disabled\n}", true, false},
+		{"disabled services = {\n\"" + label + "\" => enabled\n}", false, false},
+		{"disabled services = {\n\"" + label + "\" => unknown\n}", false, true},
+		{"disabled services = {\n\"" + label + "-other\" => true\n}", false, false},
+		{"permission denied", false, true},
+	} {
+		got, err := launchdDisabled(test.output, label)
+		if got != test.disabled || (err != nil) != test.fail {
+			t.Fatalf("state %q = %t, %v", test.output, got, err)
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		output, err := runCommand(ctx, nil, "launchctl", "print-disabled", "system")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := launchdDisabled(output, label); err != nil {
+			t.Fatalf("native launchctl response: %v", err)
+		}
 	}
 }

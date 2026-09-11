@@ -487,3 +487,21 @@ func startTestServer(t *testing.T, state string) (*instance.Election, *Server, *
 	}
 	return election, server, target, cancel, done
 }
+
+type unavailableStartup struct{}
+
+func (unavailableStartup) Sync(config.Config, bool) error { return errors.New("registration denied") }
+func (unavailableStartup) Enabled(config.Config) (bool, error) {
+	return false, errors.New("state unavailable")
+}
+
+func TestScreenActionReturnsRefreshedStateWithFailure(t *testing.T) {
+	election, server, _, cancel, done := startTestServer(t, t.TempDir())
+	defer func() { cancel(); <-done; lease, _ := election.Current(); _ = election.Release(lease.Token) }()
+	server.Service.Startup = unavailableStartup{}
+	client := NewClient(election)
+	screen, err := client.ScreenAction(context.Background(), "config", "autostart:enable", nil)
+	if err == nil || screen == nil || screen.SavedControl == nil || screen.SavedControl.Key != "autostart:check" || !strings.Contains(screen.SavedControl.Description, "state unavailable") {
+		t.Fatalf("error state crossed API incorrectly: %#v, %v", screen, err)
+	}
+}

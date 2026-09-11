@@ -137,6 +137,13 @@ func (m *Manager) Sync(cfg config.Config, enabled bool) error {
 		if err != nil {
 			return fmt.Errorf("%s autostart registration: %w", action, err)
 		}
+		actual, err := m.enabled(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		if actual != enabled {
+			return fmt.Errorf("verify autostart registration: enabled=%t, expected %t", actual, enabled)
+		}
 		return nil
 	case "windows":
 		return m.syncWindows(ctx, cfg, enabled)
@@ -330,26 +337,112 @@ func (m *Manager) verifyLinux(ctx context.Context, unitName string, enabled bool
 	if _, err := m.run(ctx, "systemctl", append(arguments, "daemon-reload")...); err != nil {
 		return fmt.Errorf("reload autostart registration: %w", err)
 	}
+	actual, err := m.linuxEnabled(ctx, unitName)
+	if err != nil {
+		return err
+	}
+	if actual != enabled {
+		return fmt.Errorf("verify autostart registration: enabled=%t, expected %t", actual, enabled)
+	}
+	return nil
+}
+
+func (m *Manager) linuxEnabled(ctx context.Context, unitName string) (bool, error) {
+	arguments := []string{"--no-ask-password"}
+	if !m.SystemWide {
+		arguments = append(arguments, "--user")
+	}
 	output, err := m.run(ctx, "systemctl", append(arguments, "list-unit-files", "--no-legend", "--no-pager", unitName)...)
-	// list-unit-files returns exit 1 without output when the exact pattern has
-	// no matches. Any diagnostic, timeout, or other failure remains an error.
 	var exit *exec.ExitError
-	if !enabled && ctx.Err() == nil && output == "" && errors.As(err, &exit) && exit.ExitCode() == 1 && len(exit.Stderr) == 0 {
-		return nil
+	if ctx.Err() == nil && output == "" && errors.As(err, &exit) && exit.ExitCode() == 1 && len(exit.Stderr) == 0 {
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("verify autostart registration: %w", err)
+		return false, fmt.Errorf("check autostart registration: %w", err)
 	}
 	fields := strings.Fields(output)
-	if !enabled && len(fields) == 0 {
-		return nil
+	if len(fields) == 0 {
+		return false, nil
 	}
 	if (len(fields) == 2 || len(fields) == 3) && fields[0] == unitName {
-		if enabled && fields[1] == "enabled" || !enabled && fields[1] == "disabled" {
-			return nil
+		switch fields[1] {
+		case "enabled":
+			return true, nil
+		case "disabled":
+			return false, nil
 		}
 	}
-	return fmt.Errorf("verify autostart registration: unexpected systemd registration %q", strings.TrimSpace(output))
+	return false, fmt.Errorf("check autostart registration: unexpected systemd registration %q", strings.TrimSpace(output))
+}
+
+// Enabled reads native persistent registration, independently of the saved preference
+// and of whether the currently running Spynel process belongs to a service.
+func (m *Manager) Enabled(cfg config.Config) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return m.enabled(ctx, cfg)
+}
+
+func (m *Manager) enabled(ctx context.Context, cfg config.Config) (bool, error) {
+	if cfg.Path == "" {
+		return false, errors.New("cannot check startup without a loaded .spynel/config.yaml")
+	}
+	switch m.GOOS {
+	case "linux":
+		return m.linuxEnabled(ctx, "spynel-"+workspaceID(cfg)+".service")
+	case "darwin":
+		label := "dev.spynel.workspace." + workspaceID(cfg)
+		domain := "gui/" + strconv.Itoa(os.Getuid())
+		directory := filepath.Join(m.Home, "Library", "LaunchAgents")
+		if m.SystemWide {
+			domain, directory = "system", m.SystemLaunchDirectory
+		}
+		output, err := m.run(ctx, "launchctl", "print-disabled", domain)
+		if err != nil {
+			return false, fmt.Errorf("check autostart registration: %w", err)
+		}
+		disabled, err := launchdDisabled(output, label)
+		if err != nil {
+			return false, err
+		}
+		path := filepath.Join(directory, label+".plist")
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return false, nil
+		} else if err != nil {
+			return false, err
+		}
+		if disabled {
+			return false, nil
+		}
+		if _, err := m.run(ctx, "plutil", "-lint", path); err != nil {
+			return false, err
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("autostart state inspection is not supported on %s", m.GOOS)
+	}
+}
+
+func launchdDisabled(output, label string) (bool, error) {
+	output = strings.TrimSpace(output)
+	if !strings.HasPrefix(output, "disabled services = {") || !strings.HasSuffix(output, "}") {
+		return false, errors.New("check autostart registration: unexpected launchctl response")
+	}
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), " => ")
+		if !ok || key != strconv.Quote(label) {
+			continue
+		}
+		switch strings.TrimSpace(value) {
+		case "true", "disabled":
+			return true, nil
+		case "false", "enabled":
+			return false, nil
+		default:
+			return false, errors.New("check autostart registration: invalid launchctl enabled state")
+		}
+	}
+	return false, nil
 }
 
 func (m *Manager) enableDarwin(ctx context.Context, cfg config.Config) error {

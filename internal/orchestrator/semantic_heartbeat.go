@@ -17,7 +17,6 @@ import (
 const (
 	semanticHeartbeatSession = "orchestrator:semantic-heartbeat"
 	maxHeartbeatPromptBytes  = 128 << 10
-	maxHeartbeatRouteBytes   = 64 << 10
 )
 
 type heartbeatManualRequest struct {
@@ -362,28 +361,9 @@ func (m *Manager) semanticHeartbeatPrompt(executionID string, now time.Time) (st
 	if err != nil {
 		return "", err
 	}
-	cfg := m.runtimeSnapshot()
-	if len(cfg.Orchestrator.Routes) > 128 {
-		return "", errors.New("heartbeat route summary exceeds 128 routes")
-	}
-	routes := make([]string, 0, len(cfg.Orchestrator.Routes))
-	routeBytes := 0
-	for _, route := range cfg.Orchestrator.Routes {
-		fieldBytes := len(route.Name) + len(route.Source) + len(route.Working) + len(route.StaleAfter)
-		if fieldBytes > 8<<10 || routeBytes+fieldBytes > maxHeartbeatRouteBytes {
-			return "", errors.New("heartbeat route summary exceeds bounded input limit")
-		}
-		allowed, err := joinBounded(route.AllowedNext, ",", (8<<10)-fieldBytes)
-		if err != nil {
-			return "", errors.New("heartbeat route summary exceeds bounded input limit")
-		}
-		fieldBytes += len(allowed)
-		if fieldBytes > 8<<10 || routeBytes+fieldBytes > maxHeartbeatRouteBytes {
-			return "", errors.New("heartbeat route summary exceeds bounded input limit")
-		}
-		line := fmt.Sprintf("- %s: source=%s, working=%s, allowed=%s, stale_after=%s", route.Name, route.Source, route.Working, allowed, route.StaleAfter)
-		routeBytes += len(line) + 1
-		routes = append(routes, line)
+	var routes []string
+	for _, route := range workflowRoutes() {
+		routes = append(routes, fmt.Sprintf("- %s: source=%s, working=%s, allowed=%s, stale_after=%s", route.Name, route.Source, route.Working, strings.Join(route.AllowedNext, ","), route.StaleAfter))
 	}
 	prompt := sanitizeHeartbeatTemplate(string(data))
 	prompt = strings.ReplaceAll(prompt, "{{EXECUTION_ID}}", executionID)
@@ -469,27 +449,6 @@ func readFileLimit(path string, limit int64, description string) ([]byte, error)
 		return nil, fmt.Errorf("%s exceeds read limit", description)
 	}
 	return data, nil
-}
-
-func joinBounded(values []string, separator string, limit int) (string, error) {
-	if limit < 0 {
-		return "", errors.New("negative join limit")
-	}
-	var result strings.Builder
-	for index, value := range values {
-		required := len(value)
-		if index > 0 {
-			required += len(separator)
-		}
-		if required > limit-result.Len() {
-			return "", errors.New("joined value exceeds limit")
-		}
-		if index > 0 {
-			result.WriteString(separator)
-		}
-		result.WriteString(value)
-	}
-	return result.String(), nil
 }
 
 func readSemanticDocument(path string) (Document, error) {
