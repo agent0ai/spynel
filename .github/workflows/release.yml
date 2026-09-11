@@ -3,6 +3,12 @@ name: Release Spynel
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version tag to validate without publishing (for example v0.12.9)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,7 +20,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
 
       - uses: actions/setup-go@v6
         with:
@@ -28,8 +34,8 @@ jobs:
 
       - name: Prepare npm metadata from the GitHub release
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease || false }}
         run: node npm/prepare-release.js "$RELEASE_TAG" "$RELEASE_PRERELEASE"
 
       - name: Verify implementation and release package
@@ -65,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
 
       - uses: actions/setup-go@v6
         with:
@@ -80,13 +86,13 @@ jobs:
       - name: Build native release archive
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
         run: ./scripts/package-native.sh "$RELEASE_TAG" "${{ matrix.os }}" "${{ matrix.arch }}" release
 
       - name: Verify native install and uninstall commands
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
           TARGET_OS: ${{ matrix.os }}
           TARGET_ARCH: ${{ matrix.arch }}
         run: |
@@ -104,7 +110,7 @@ jobs:
 
       - name: Verify updates across live instances and terminals
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
           TARGET_OS: ${{ matrix.os }}
           TARGET_ARCH: ${{ matrix.arch }}
         run: python3 scripts/test-instance-updates.py "release/spynel_${RELEASE_TAG#v}_${TARGET_OS}_${TARGET_ARCH}.tar.gz"
@@ -112,8 +118,9 @@ jobs:
       - name: Run native harness contract and packaged-archive smoke
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: go run ./scripts/native-evidence --archive-dir release --output "evidence/native-${{ matrix.os }}-${{ matrix.arch }}.json" --ref "$RELEASE_TAG"
+          EVIDENCE_REF: ${{ github.event.release.tag_name || github.sha }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
+        run: go run ./scripts/native-evidence --archive-dir release --output "evidence/native-${{ matrix.os }}-${{ matrix.arch }}.json" --ref "$EVIDENCE_REF"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -129,6 +136,7 @@ jobs:
           if-no-files-found: error
 
   publish:
+    if: github.event_name == 'release'
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -137,7 +145,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -151,7 +159,7 @@ jobs:
       - name: Attach native archives and checksums to the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
         run: gh release upload "$RELEASE_TAG" release/* --clobber
 
       - uses: actions/setup-node@v6
@@ -162,8 +170,8 @@ jobs:
 
       - name: Prepare npm metadata from the GitHub release
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease || false }}
         run: node npm/prepare-release.js "$RELEASE_TAG" "$RELEASE_PRERELEASE"
 
       - name: Publish npm launcher

@@ -21,6 +21,8 @@
 
 - Native release runners verify npm updates across two workspaces with a headless primary and two real TUI terminals before publishing.
 
+- Manual release-workflow dispatch validates the selected commit with an explicit version through the same verification/native matrix, records the actual commit as evidence, and cannot enter the publication job. Use this gate before publishing a release that changes cross-platform lifecycle behavior.
+
 ## Child DOX Index
 
 Direct child DOX files:

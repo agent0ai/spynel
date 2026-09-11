@@ -105,8 +105,25 @@ func TestRestartAllWorkspacesAndStopAllInstallations(t *testing.T) {
 			t.Fatalf("process %d version: %s", record.PID, record.Version)
 		}
 	}
-	if count, err := KillAll(ctx, nil); err != nil || count != 3 {
-		t.Fatalf("kill all installations: %d %v", count, err)
+	preflightOnly := errors.New("verified discovery without stopping unrelated test runs")
+	if _, err := KillAll(ctx, func(records []ProcessRegistration) error {
+		found := make(map[int]bool)
+		for _, record := range records {
+			found[record.PID] = true
+		}
+		for _, pid := range ids {
+			if !found[pid] {
+				t.Fatalf("killall omitted fixture %d", pid)
+			}
+		}
+		return preflightOnly
+	}); err != preflightOnly {
+		t.Fatalf("killall preflight: %v", err)
+	}
+	// Other updater test invocations share the same executable identity.
+	// Exercise termination only against this test's fixture processes.
+	if err := stopProcessRecords(ctx, after); err != nil {
+		t.Fatalf("stop all fixture installations: %v", err)
 	}
 	if remaining, err := processRecords(ids); err != nil || len(remaining) != 0 {
 		t.Fatalf("remaining processes: %d %v", len(remaining), err)
@@ -194,5 +211,31 @@ func TestRestartRequiresApplicationReadiness(t *testing.T) {
 	records, err := processRecords([]int{process.Process.Pid})
 	if err != nil || len(records) != 1 || records[0].Version != "2.0.0" || records[0].Ready {
 		t.Fatalf("expected started but unready updated process: %v %v", records, err)
+	}
+}
+
+func TestRestartAfterRunningExecutableIsUnlinked(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := lifecycleFixture(t, root)
+	path, err := installationProcessPath(process.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	uninstallFixtureBinary(t, path)
+	if records, err := processRecords([]int{process.Process.Pid}); err != nil || len(records) != 1 {
+		t.Fatalf("lost running instance after executable replacement: %v %v", records, err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if count, err := (&Manager{InstallRoot: root}).RestartInstances(ctx, "2.0.0"); err != nil || count != 1 {
+		t.Fatalf("restart after executable replacement: %d %v", count, err)
 	}
 }

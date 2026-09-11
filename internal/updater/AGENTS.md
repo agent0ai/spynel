@@ -22,6 +22,8 @@
 
 - The current npm wrapper explicitly advertises coordinated-update support. Bind that capability to validated launcher ownership and include it in process registration; an older wrapper supervising a newer native executable must fail preflight with one-time stop/relaunch guidance instead of silently using the old single-process update protocol.
 
+- Native process discovery must retain visibility after npm unlinks a running image. On macOS, use the retained executable-path field from `kern.procargs2` when `proc_pidpath` loses the vnode path; never expose its arguments or environment. An unreadable live registered process is an explicit error, never an omitted restart target.
+
 ## Child DOX Index
 
 No child DOX files.

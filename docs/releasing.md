@@ -35,6 +35,8 @@ See npm's official [Trusted Publishing](https://docs.npmjs.com/trusted-publisher
 
 ## Release procedure
 
+For changes to cross-platform process lifecycle, first run the release workflow manually on the intended commit with the proposed version tag. This runs the same verification and four native jobs, including live npm replacement across workspaces and TUI terminals, but cannot publish a GitHub Release or npm package. Confirm that every native job passed for that exact commit before creating its release tag.
+
 Create a GitHub Release with a `v`-prefixed semantic version tag, for example `v0.2.1`. Mark a version such as `v0.3.0-beta.1` as a GitHub prerelease. Publishing the release starts the workflow; creating or editing a draft does not. The committed `package.json` uses `0.0.0-development` because npm requires a version field; both verification and publication replace it with the tag-derived version in their isolated checkouts.
 
 The npm package uses the root repository `README.md` from the released commit. Before publication, relative Markdown document links are pinned to that GitHub tag and relative Markdown or HTML image sources are pinned to `raw.githubusercontent.com` at the same tag. Consequently, an npm version keeps a stable README snapshot even when the default branch changes later.

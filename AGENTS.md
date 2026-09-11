@@ -101,6 +101,8 @@ Update parent docs when parent-level structure, ownership, workflow, or child in
 
 - Updates apply by default: shell `spynel update` selects its installation independently of workspace ownership; shared `/update` selects the primary's installation. Both restart all registered servers and TUIs of that installation across workspaces, even when already current. `update check` is read-only. The updater owns private per-user process-control records outside workspaces, verifies native executable identity, and requires a new process generation at the target version with application readiness before reporting restart success. Older unregistered instances require an explicit one-time stop/relaunch. `spynel killall` stops all verified Spynel processes the caller can control and matching autostart services, preserving workspace data and future startup registrations.
 
+- Native process discovery must retain visibility after npm unlinks a running image. On macOS, use the retained executable-path field from `kern.procargs2` when `proc_pidpath` loses the vnode path; never expose its arguments or environment. An unreadable live registered process is an explicit error, never an omitted restart target.
+
 ## Child DOX Index
 
 Direct child DOX files:

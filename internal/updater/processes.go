@@ -162,6 +162,9 @@ func processRecords(ids []int) ([]ProcessRegistration, error) {
 		}
 		path, err := installationProcessPath(pid)
 		if err != nil {
+			if _, recordErr := readProcess(filepath.Join(directory, strconv.Itoa(pid)+".json")); recordErr == nil && processAlive(pid) {
+				return nil, fmt.Errorf("cannot verify executable of registered Spynel process %d: %w", pid, err)
+			}
 			continue
 		}
 		record, err := readProcess(filepath.Join(directory, strconv.Itoa(pid)+".json"))
