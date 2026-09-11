@@ -2027,7 +2027,7 @@ func TestUpdateCommandChecksNPMAndRequestsLauncherManagedInstall(t *testing.T) {
 	defer registry.Close()
 	service := New(cfg, newServiceHarness())
 	service.Updates = &updater.Manager{
-		CurrentVersion: "1.2.0", PackageRoot: root, LauncherManaged: true,
+		CurrentVersion: "1.2.0", PackageRoot: root, LauncherManaged: true, CoordinatedUpdates: true,
 		RegistryURL: registry.URL,
 	}
 	run := func(command string) core.Event {

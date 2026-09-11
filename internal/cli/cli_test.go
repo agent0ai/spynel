@@ -782,7 +782,13 @@ func TestOfflineUpdateInstallReturnsControlToNPMLauncher(t *testing.T) {
 	t.Setenv("SPYNEL_NPM_PACKAGE_ROOT", packageRoot)
 	t.Setenv("SPYNEL_NPM_LAUNCHER_MANAGED", "1")
 	t.Setenv("SPYNEL_NPM_REGISTRY_URL", registry.URL)
+	t.Setenv("SPYNEL_NPM_COORDINATED_UPDATES", "")
 	var output bytes.Buffer
+	err = runFrameworkMessageMode(config.PathForRoot(root), "updates", "/update install", "1.2.0", messageRunOptions{Output: &output})
+	if err == nil || !strings.Contains(err.Error(), "launcher does not support coordinated updates") {
+		t.Fatalf("older launcher accepted an update: %v", err)
+	}
+	t.Setenv("SPYNEL_NPM_COORDINATED_UPDATES", "1")
 	err = runFrameworkMessageMode(config.PathForRoot(root), "updates", "/update install", "1.2.0", messageRunOptions{Output: &output})
 	exit, ok := err.(interface{ ExitCode() int })
 	if !ok || exit.ExitCode() != npmUpdateExitCode || !strings.Contains(output.String(), "Updating Spynel") {

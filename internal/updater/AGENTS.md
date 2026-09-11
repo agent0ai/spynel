@@ -20,6 +20,8 @@
 
 - Own the per-user OS-config `spynel/processes` registry of private PID/generation/executable/installation/version records for live servers and TUIs. Verify native executable identity before signals; use a new registration generation at the target version with application readiness as restart evidence. Coordinate every registered instance of the selected installation across workspaces, preserving terminal descriptors through exec. Reject pre-coordination processes explicitly. `KillAll` uses the same verified discovery across installations and shares bounded TERM/KILL termination with uninstall; startup service shutdown is a supplied owning-layer callback.
 
+- The current npm wrapper explicitly advertises coordinated-update support. Bind that capability to validated launcher ownership and include it in process registration; an older wrapper supervising a newer native executable must fail preflight with one-time stop/relaunch guidance instead of silently using the old single-process update protocol.
+
 ## Child DOX Index
 
 No child DOX files.

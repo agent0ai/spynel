@@ -23,12 +23,13 @@ import (
 // ProcessRegistration identifies a live server/TUI, including secondary TUIs
 // and servers in other workspaces. It contains no workspace credentials.
 type ProcessRegistration struct {
-	PID          int    `json:"pid"`
-	Generation   string `json:"generation"`
-	Executable   string `json:"executable"`
-	Installation string `json:"installation,omitempty"`
-	Version      string `json:"version"`
-	Ready        bool   `json:"ready"`
+	PID                int    `json:"pid"`
+	Generation         string `json:"generation"`
+	Executable         string `json:"executable"`
+	Installation       string `json:"installation,omitempty"`
+	Version            string `json:"version"`
+	Ready              bool   `json:"ready"`
+	CoordinatedUpdates bool   `json:"coordinated_updates"`
 }
 
 func processDirectory() (string, error) {
@@ -69,6 +70,7 @@ func (m *Manager) RegisterProcess() (func(), error) {
 		return nil, err
 	}
 	record := ProcessRegistration{PID: os.Getpid(), Generation: hex.EncodeToString(nonce[:]), Executable: executable, Installation: m.InstallationRoot(), Version: m.CurrentVersion}
+	record.CoordinatedUpdates = m.PackageRoot == "" || m.CoordinatedUpdates
 	path := filepath.Join(directory, strconv.Itoa(record.PID)+".json")
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -198,12 +200,15 @@ func (m *Manager) CheckRestartable() error {
 	if root == "" {
 		return errors.New("updates require a managed Spynel installation")
 	}
+	if m.PackageRoot != "" && !m.CoordinatedUpdates {
+		return errors.New("this npm launcher does not support coordinated updates; run the installed spynel killall command once, then relaunch Spynel")
+	}
 	records, err := liveProcesses()
 	if err != nil {
 		return err
 	}
 	for _, record := range records {
-		if (record.Installation == root || m.ownsProcessPath(root, record.Executable)) && (record.Generation == "" || record.Installation != root) {
+		if (record.Installation == root || m.ownsProcessPath(root, record.Executable)) && (record.Generation == "" || record.Installation != root || m.PackageRoot != "" && !record.CoordinatedUpdates) {
 			return fmt.Errorf("Spynel process %d has no valid coordinated-restart registration; run spynel killall once, then launch the current version", record.PID)
 		}
 	}

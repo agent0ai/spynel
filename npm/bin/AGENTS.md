@@ -14,6 +14,8 @@
 
 - Use native check/restart coordination for both startup-offer and explicit-update paths, with bounded subprocess execution. Preserve normalized requester arguments and propagate coordination failures; never report success merely because npm exited successfully.
 
+- The current npm wrapper explicitly advertises coordinated-update support. Bind that capability to validated launcher ownership and include it in process registration; an older wrapper supervising a newer native executable must fail preflight with one-time stop/relaunch guidance instead of silently using the old single-process update protocol.
+
 ## Child DOX Index
 
 No child DOX files.

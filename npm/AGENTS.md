@@ -20,6 +20,8 @@
 
 - Both accepted startup offers and explicit update requests use the native updater's preflight and post-publication restart coordination. Updates restart all registered instances of this package across workspaces, then relaunch the requester. The native coordinator verifies new generations and versions; failures stay explicit. A request already at the latest version skips npm replacement but still restarts instances.
 
+- The current npm wrapper explicitly advertises coordinated-update support. Bind that capability to validated launcher ownership and include it in process registration; an older wrapper supervising a newer native executable must fail preflight with one-time stop/relaunch guidance instead of silently using the old single-process update protocol.
+
 ## Child DOX Index
 
 Direct child DOX files:

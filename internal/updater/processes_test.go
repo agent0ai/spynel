@@ -146,7 +146,10 @@ func TestProcessRecordCannotTargetAnUnrelatedExecutable(t *testing.T) {
 func TestRestartRejectsLegacyProcessBeforeSignaling(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	process := lifecycleFixture(t, root)
 	directory, err := processDirectory()
 	if err != nil {

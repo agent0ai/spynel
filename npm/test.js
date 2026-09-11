@@ -28,6 +28,7 @@ assert.strictEqual(failedSnapshot.SPYNEL_NPM_PERIODIC_UPDATE_CHECKS, "1");
 assert.strictEqual(failedSnapshot.SPYNEL_NPM_UPDATE_CHECKED_AT, "2026-08-16T07:00:00Z");
 assert.strictEqual(failedSnapshot.SPYNEL_NPM_UPDATE_LATEST, undefined);
 const skippedSnapshot = createLaunchEnvironment(staleSnapshot, false);
+assert.strictEqual(skippedSnapshot.SPYNEL_NPM_COORDINATED_UPDATES, "1");
 assert.strictEqual(skippedSnapshot.SPYNEL_NPM_PERIODIC_UPDATE_CHECKS, undefined);
 assert.strictEqual(skippedSnapshot.SPYNEL_NPM_UPDATE_CHECKED_AT, undefined);
 assert.strictEqual(skippedSnapshot.SPYNEL_NPM_UPDATE_LATEST, undefined);

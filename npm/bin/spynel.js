@@ -25,6 +25,7 @@ function createLaunchEnvironment(parentEnvironment = process.env, periodicChecks
     ...parentEnvironment,
     SPYNEL_NPM_PACKAGE_ROOT: packageRoot,
     SPYNEL_NPM_LAUNCHER_MANAGED: "1",
+    SPYNEL_NPM_COORDINATED_UPDATES: "1",
     SPYNEL_NPM_LAUNCHER: __filename,
     SPYNEL_NPM_NODE: process.execPath,
     SPYNEL_NPM_UPDATE_STATE: path.join(os.tmpdir(), `spynel-update-${process.pid}-${crypto.randomBytes(8).toString("hex")}.json`)

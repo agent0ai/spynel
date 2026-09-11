@@ -79,15 +79,16 @@ func (m *Manager) InitialAvailability() (available bool, checkedAt time.Time, ok
 
 // Manager owns source-specific release discovery and installation.
 type Manager struct {
-	CurrentVersion  string
-	InstallRoot     string
-	GitHubURL       string
-	PackageRoot     string
-	LauncherManaged bool
-	PeriodicChecks  bool
-	RegistryURL     string
-	CheckTimeout    time.Duration
-	Client          *http.Client
+	CurrentVersion     string
+	InstallRoot        string
+	GitHubURL          string
+	PackageRoot        string
+	LauncherManaged    bool
+	CoordinatedUpdates bool
+	PeriodicChecks     bool
+	RegistryURL        string
+	CheckTimeout       time.Duration
+	Client             *http.Client
 }
 
 type packageMetadata struct {
@@ -140,6 +141,7 @@ func Detect(currentVersion string) *Manager {
 	if validNPMRoot(root, currentVersion) && sameFile(executable, filepath.Join(root, "npm", "vendor", "spynel")) {
 		manager.PackageRoot = root
 		manager.LauncherManaged = os.Getenv("SPYNEL_NPM_LAUNCHER_MANAGED") == "1" && sameFile(root, launcherRoot)
+		manager.CoordinatedUpdates = manager.LauncherManaged && os.Getenv("SPYNEL_NPM_COORDINATED_UPDATES") == "1"
 		manager.PeriodicChecks = os.Getenv(periodicChecksEnv) == "1"
 	}
 	return manager

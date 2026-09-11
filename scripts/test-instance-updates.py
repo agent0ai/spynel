@@ -126,7 +126,7 @@ for line in sys.stdin:
                 pass
 
         try:
-            workspaces = [temp / "workspace one", temp / "workspace two"]
+            workspaces = [temp / "workspace one", temp / "workspace two", temp / "older launcher workspace"]
             for workspace in workspaces:
                 workspace.mkdir()
                 subprocess.run([*launcher, "init", "--no-start"], cwd=workspace, env=env, check=True, stdout=subprocess.DEVNULL)
@@ -174,7 +174,17 @@ for line in sys.stdin:
             finally:
                 path.write_bytes(saved)
                 path.chmod(0o600)
-            print("Verified npm replacement, all-instance restart across two workspaces, preserved PTYs, channel update and legacy rejection.")
+            # A new native binary can still have an older supervising Node launcher.
+            old_environment = {**env, "SPYNEL_NPM_PACKAGE_ROOT": str(package), "SPYNEL_NPM_LAUNCHER_MANAGED": "1"}
+            log = (temp / "older-launcher.log").open("w")
+            logs.append(log)
+            older = subprocess.Popen([str(vendor / "spynel"), "serve"], cwd=workspaces[2], env=old_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            processes.append(older)
+            wait_for(lambda: len(records()) == 4)
+            failed = subprocess.run([*launcher, "update"], cwd=temp, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            assert failed.returncode != 0 and "spynel killall" in failed.stderr, failed.stderr
+            assert all(p.poll() is None for p in processes), "preflight stopped an instance"
+            print("Verified npm replacement, all-instance restart across two workspaces, preserved PTYs, channel update, and rejection of older processes/launchers.")
         finally:
             for process in processes:
                 if process.poll() is None:
