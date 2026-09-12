@@ -2026,6 +2026,14 @@ func TestUpdateCommandChecksNPMAndRequestsLauncherManagedInstall(t *testing.T) {
 	}))
 	defer registry.Close()
 	service := New(cfg, newServiceHarness())
+	t.Cleanup(func() { _ = service.Close() })
+	historyPath, err := service.History.Ensure("tui", "updates")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(historyPath, []byte(strings.Repeat("{\"role\":\"assistant\",\"content\":\"old reply\"}\n", 2001)), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	service.Updates = &updater.Manager{
 		CurrentVersion: "1.2.0", PackageRoot: root, LauncherManaged: true, CoordinatedUpdates: true,
 		RegistryURL: registry.URL,

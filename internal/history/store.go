@@ -634,23 +634,42 @@ func (s *Store) HasEntries(channel, conversation string) (bool, error) {
 	return info.Size() > 0, nil
 }
 
-// HasUserSourceID performs a bounded strict duplicate-admission check. A
-// bound or corruption error fails closed instead of accepting the message a
-// second time.
+// HasUserSourceID strictly checks retained history with bounded memory.
+// Recovery's entry limit must not prevent new messages in long conversations.
 func (s *Store) HasUserSourceID(channel, conversation, sourceID string) (bool, error) {
 	if sourceID == "" {
 		return false, nil
 	}
-	entries, _, err := s.RecoveryEntries(channel, conversation, 2000)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	file, err := os.Open(s.Path(channel, conversation))
+	if os.IsNotExist(err) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
-	for _, entry := range entries {
+	defer file.Close()
+	// ponytail: linear scan; add a durable source-ID index if admission gets slow.
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, historyReadChunk), maxHistoryEntryBytes)
+	found := false
+	for scanner.Scan() {
+		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
+			continue
+		}
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return false, errors.New("conversation history contains corrupt correlation data")
+		}
 		if entry.Role == "user" && entry.SourceMessageID == sourceID {
-			return true, nil
+			found = true
 		}
 	}
-	return false, nil
+	if err := scanner.Err(); err != nil {
+		return false, err
+	}
+	return found, nil
 }
 
 // RecoveryEntries strictly reads at most max append-only entries. Recovery

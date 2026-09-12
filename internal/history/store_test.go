@@ -94,7 +94,7 @@ func TestSourceIdentityDeduplicationStrictlyScansLongHistory(t *testing.T) {
 	if _, err := store.Append("telegram", "person", Entry{Role: "user", SourceMessageID: "telegram:old", Content: "original"}); err != nil {
 		t.Fatal(err)
 	}
-	for index := 0; index < 600; index++ {
+	for index := 0; index < 2001; index++ {
 		if _, err := store.Append("telegram", "person", Entry{Role: "assistant", Content: fmt.Sprintf("reply-%03d", index)}); err != nil {
 			t.Fatal(err)
 		}
@@ -102,6 +102,15 @@ func TestSourceIdentityDeduplicationStrictlyScansLongHistory(t *testing.T) {
 	found, err := store.HasUserSourceID("telegram", "person", "telegram:old")
 	if err != nil || !found {
 		t.Fatalf("older source identity = %t, %v", found, err)
+	}
+	if found, err := store.HasUserSourceID("telegram", "person", "telegram:new"); err != nil || found {
+		t.Fatalf("new source identity = %t, %v", found, err)
+	}
+	if _, err := store.Append("telegram", "person", Entry{Role: "user", SourceMessageID: "telegram:new", Content: "new request"}); err != nil {
+		t.Fatal(err)
+	}
+	if found, err := New(store.root).HasUserSourceID("telegram", "person", "telegram:new"); err != nil || !found {
+		t.Fatalf("new source identity after restart = %t, %v", found, err)
 	}
 }
 
@@ -121,8 +130,10 @@ func TestSourceIdentityDeduplicationFailsClosedOnCorruptHistory(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if found, err := store.HasUserSourceID("whatsapp", "person", "whatsapp:new"); err == nil || found {
-		t.Fatalf("corrupt duplicate check did not fail closed: found=%t err=%v", found, err)
+	for _, sourceID := range []string{"whatsapp:old", "whatsapp:new"} {
+		if found, err := store.HasUserSourceID("whatsapp", "person", sourceID); err == nil || found {
+			t.Fatalf("corrupt duplicate check did not fail closed: source=%s found=%t err=%v", sourceID, found, err)
+		}
 	}
 }
 
