@@ -22,11 +22,18 @@ const (
 	notificationOmissionMarker    = "UNTRUSTED TASK DOCUMENT MIDDLE OMITTED"
 )
 
+// defaultNotificationTimeout bounds one notification-agent job when the workspace
+// leaves orchestrator.notification_timeout_seconds at its default.
+const defaultNotificationTimeout = 2 * time.Minute
+
 func (m *Manager) notificationTimeout() time.Duration {
 	if m.notificationAgentTimeout > 0 {
 		return m.notificationAgentTimeout
 	}
-	return 2 * time.Minute
+	if seconds := m.notificationTimeoutSeconds.Load(); seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultNotificationTimeout
 }
 
 // startTaskNotificationAgent admits one ordinary asynchronous harness job for

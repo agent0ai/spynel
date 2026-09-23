@@ -101,6 +101,7 @@ type Manager struct {
 	primaryOwned                atomic.Bool
 	orchestratorEnabled         atomic.Bool
 	heartbeatMinutes            atomic.Int64
+	notificationTimeoutSeconds  atomic.Int64
 	heartbeatConfigChanged      chan struct{}
 	heartbeatManual             chan heartbeatManualRequest
 	heartbeatConfigAcceptedAt   atomic.Int64
@@ -141,6 +142,7 @@ func (m *Manager) ApplyRuntimeConfig(cfg config.Config) {
 	m.runtimeConfigMu.Unlock()
 	m.harnessPolicy.Store(cfg.Harness)
 	m.cleanupDays.Store(int64(cfg.Workspace.CleanupRetentionDays))
+	m.notificationTimeoutSeconds.Store(int64(cfg.Orchestrator.NotificationTimeoutSeconds))
 	wasEnabled := m.orchestratorEnabled.Load()
 	heartbeatChanged := previous.Orchestrator.Enabled != cfg.Orchestrator.Enabled || previous.Orchestrator.SemanticHeartbeatMinutes != cfg.Orchestrator.SemanticHeartbeatMinutes
 	if heartbeatChanged {
@@ -227,6 +229,7 @@ func New(cfg config.Config, target harness.Harness, hooks extensions.Runner) *Ma
 	}
 	manager.orchestratorEnabled.Store(cfg.Orchestrator.Enabled)
 	manager.heartbeatMinutes.Store(int64(cfg.Orchestrator.SemanticHeartbeatMinutes))
+	manager.notificationTimeoutSeconds.Store(int64(cfg.Orchestrator.NotificationTimeoutSeconds))
 	manager.cleanupDays.Store(int64(cfg.Workspace.CleanupRetentionDays))
 	manager.harnessPolicy.Store(cfg.Harness)
 	return manager

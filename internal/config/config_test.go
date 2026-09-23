@@ -63,6 +63,9 @@ func TestDefaultIsValid(t *testing.T) {
 	if cfg.Channels.TUI.Theme != "spynel" {
 		t.Fatalf("unexpected default TUI theme: %#v", cfg.Channels.TUI)
 	}
+	if cfg.Orchestrator.NotificationTimeoutSeconds != 120 {
+		t.Fatalf("notification timeout default = %d, want 120", cfg.Orchestrator.NotificationTimeoutSeconds)
+	}
 	if cfg.Orchestrator.SemanticHeartbeatMinutes != 15 {
 		t.Fatalf("semantic heartbeat default = %d, want 15", cfg.Orchestrator.SemanticHeartbeatMinutes)
 	}
@@ -471,5 +474,22 @@ func TestStoreUpdateSavesAndReloadsSharedSnapshot(t *testing.T) {
 	}
 	if updated.Channels.Telegram.Name != "reloaded" || store.Snapshot().Channels.Telegram.Name != "reloaded" {
 		t.Fatalf("shared snapshot was not refreshed: update=%q snapshot=%q", updated.Channels.Telegram.Name, store.Snapshot().Channels.Telegram.Name)
+	}
+}
+
+func TestNotificationTimeoutSecondsValidation(t *testing.T) {
+	for _, seconds := range []int{0, 29, 1801} {
+		cfg := Default()
+		cfg.Orchestrator.NotificationTimeoutSeconds = seconds
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("notification_timeout_seconds = %d accepted, want rejection", seconds)
+		}
+	}
+	for _, seconds := range []int{30, 120, 1800} {
+		cfg := Default()
+		cfg.Orchestrator.NotificationTimeoutSeconds = seconds
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("notification_timeout_seconds = %d rejected: %v", seconds, err)
+		}
 	}
 }
