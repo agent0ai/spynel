@@ -7,7 +7,7 @@ import (
 
 func TestOnlyExtensionSettingsRequireRestart(t *testing.T) {
 	cfg := Default()
-	for _, key := range []string{"orchestrator.enabled", "orchestrator.interval_seconds", "orchestrator.retrigger_unresponded_messages", "orchestrator.semantic_heartbeat_minutes", "orchestrator.task_notifications", "orchestrator.max_parallel"} {
+	for _, key := range []string{"orchestrator.enabled", "orchestrator.interval_seconds", "orchestrator.retrigger_unresponded_messages", "orchestrator.semantic_heartbeat_minutes", "orchestrator.task_notifications", "orchestrator.notification_timeout_seconds", "orchestrator.max_parallel"} {
 		setting, ok := SettingByKey(cfg, key)
 		if !ok || setting.Restart {
 			t.Fatalf("live setting %q = %#v, present %t", key, setting, ok)

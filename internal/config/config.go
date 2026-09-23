@@ -184,6 +184,7 @@ type Orchestrator struct {
 	RetriggerUnrespondedMessages bool   `yaml:"retrigger_unresponded_messages"`
 	SemanticHeartbeatMinutes     int    `yaml:"semantic_heartbeat_minutes"`
 	TaskNotifications            string `yaml:"task_notifications"`
+	NotificationTimeoutSeconds   int    `yaml:"notification_timeout_seconds"`
 	MaxParallel                  int    `yaml:"max_parallel"`
 }
 
@@ -220,7 +221,7 @@ func Default() Config {
 		Speech:  Speech{Enabled: true, Language: "en", NumThreads: 2, MaxFileMB: 100, MaxDurationSec: 1800, ChunkSeconds: 600},
 		Startup: Startup{},
 		Orchestrator: Orchestrator{
-			Enabled: true, IntervalSec: 10, RetriggerUnrespondedMessages: true, SemanticHeartbeatMinutes: 15, TaskNotifications: TaskNotificationsDecide, MaxParallel: 4,
+			Enabled: true, IntervalSec: 10, RetriggerUnrespondedMessages: true, SemanticHeartbeatMinutes: 15, TaskNotifications: TaskNotificationsDecide, NotificationTimeoutSeconds: 120, MaxParallel: 4,
 		},
 		Extensions: Extensions{Enabled: true, Directory: ".spynel/extensions", HookTimeout: "30s"},
 	}
@@ -428,6 +429,9 @@ func (c Config) Validate() error {
 	}
 	if minutes := c.Orchestrator.SemanticHeartbeatMinutes; minutes != 0 && (minutes < 5 || minutes > 1440) {
 		problems = append(problems, "orchestrator.semantic_heartbeat_minutes must be 0 (disabled) or between 5 and 1440")
+	}
+	if seconds := c.Orchestrator.NotificationTimeoutSeconds; seconds < 30 || seconds > 1800 {
+		problems = append(problems, "orchestrator.notification_timeout_seconds must be between 30 and 1800")
 	}
 	switch c.Orchestrator.TaskNotifications {
 	case TaskNotificationsOff, TaskNotificationsDecide, TaskNotificationsAlways:

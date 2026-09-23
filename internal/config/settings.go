@@ -50,6 +50,7 @@ func Settings(cfg Config) []Setting {
 		{Key: "orchestrator.retrigger_unresponded_messages", Section: "config", Description: "Automatically processes stalled messages after restarts and disconnects.", Value: formatBool(cfg.Orchestrator.RetriggerUnrespondedMessages), Choices: []string{"on", "off"}, Advanced: true},
 		{Key: "orchestrator.semantic_heartbeat_minutes", Section: "config", Description: "Fixed delay after each agent workflow audit completes; 0 disables it", Value: strconv.Itoa(cfg.Orchestrator.SemanticHeartbeatMinutes), Advanced: true},
 		{Key: "orchestrator.task_notifications", Section: "config", Description: "Live policy context for direct task notification agents", Value: cfg.Orchestrator.TaskNotifications, Choices: []string{TaskNotificationsOff, TaskNotificationsDecide, TaskNotificationsAlways}, Advanced: true},
+		{Key: "orchestrator.notification_timeout_seconds", Section: "config", Description: "Live deadline for one notification-agent job; raise it for slower harnesses", Value: strconv.Itoa(cfg.Orchestrator.NotificationTimeoutSeconds), Advanced: true},
 		{Key: "orchestrator.max_parallel", Section: "config", Description: "Live maximum concurrent Markdown jobs; lowering never cancels active work", Value: strconv.Itoa(cfg.Orchestrator.MaxParallel), Advanced: true},
 		{Key: "extensions.enabled", Section: "config", Description: "Run trusted extension hooks after restart", Value: formatBool(cfg.Extensions.Enabled), Choices: []string{"on", "off"}, Restart: true, Advanced: true},
 		{Key: "extensions.directory", Section: "config", Description: "Installed extension directory after restart", Value: cfg.Extensions.Directory, Restart: true, Advanced: true},
@@ -235,6 +236,8 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Orchestrator.SemanticHeartbeatMinutes, err = parseInteger(0)
 	case "orchestrator.task_notifications":
 		cfg.Orchestrator.TaskNotifications = strings.ToLower(value)
+	case "orchestrator.notification_timeout_seconds":
+		cfg.Orchestrator.NotificationTimeoutSeconds, err = parseInteger(30)
 	case "orchestrator.max_parallel":
 		cfg.Orchestrator.MaxParallel, err = parseInteger(1)
 	case "extensions.enabled":

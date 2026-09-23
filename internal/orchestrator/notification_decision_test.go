@@ -657,3 +657,20 @@ func TestNotificationPromptRejectsUnauthorizedMetadataBeforeCommandConstruction(
 		})
 	}
 }
+
+func TestNotificationTimeoutUsesConfiguredSeconds(t *testing.T) {
+	manager := &Manager{}
+	if got := manager.notificationTimeout(); got != defaultNotificationTimeout {
+		t.Fatalf("unset timeout = %s, want %s", got, defaultNotificationTimeout)
+	}
+
+	manager.notificationTimeoutSeconds.Store(600)
+	if got := manager.notificationTimeout(); got != 10*time.Minute {
+		t.Fatalf("configured timeout = %s, want 10m", got)
+	}
+
+	manager.notificationAgentTimeout = time.Second
+	if got := manager.notificationTimeout(); got != time.Second {
+		t.Fatalf("explicit override = %s, want 1s", got)
+	}
+}
