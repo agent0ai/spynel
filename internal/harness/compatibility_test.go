@@ -214,6 +214,44 @@ func TestClaudeRejectsChangedInitEventWithoutPersistence(t *testing.T) {
 	}
 }
 
+func TestClaudeToleratesHookLifecycleEventsBeforeInit(t *testing.T) {
+	command, root, _ := portableHarnessFixture(t, "claude-hook-events-before-init")
+	sessions := filepath.Join(root, "sessions.json")
+	claude, err := NewClaude(HarnessConfig{Command: command, Cwd: root, ApprovalPolicy: "plan", SessionsFile: sessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := claude.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer claude.Close()
+	done := make(chan core.Event, 1)
+	threadID, _, err := claude.Send(ctx, "chat", "test", func(event core.Event) {
+		if event.Done {
+			done <- event
+		}
+	})
+	if err != nil {
+		t.Fatalf("Claude turn rejected hook lifecycle events before init: %v", err)
+	}
+	if threadID != "claude-session" {
+		t.Fatalf("Claude session ID = %q, want claude-session", threadID)
+	}
+	select {
+	case event := <-done:
+		if event.Kind != core.EventFinal {
+			t.Fatalf("Claude terminal event = %#v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for Claude turn to finish")
+	}
+	if claude.ThreadID("chat") != "claude-session" {
+		t.Fatalf("persisted Claude session = %q, want claude-session", claude.ThreadID("chat"))
+	}
+}
+
 func TestClaudeSurfacesDocumentedTerminalError(t *testing.T) {
 	command, root, _ := portableHarnessFixture(t, "claude-terminal-error")
 	claude, err := NewClaude(HarnessConfig{Command: command, Cwd: root, ApprovalPolicy: "plan"})

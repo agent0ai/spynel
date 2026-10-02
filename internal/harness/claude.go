@@ -622,12 +622,6 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 			turn.emitEvent(core.Event{Kind: core.EventStatus, Text: "Claude Code turn started", ThreadID: event.SessionID,
 				Execution: &core.ExecutionStatus{State: "running"}})
 		}
-		if turn.sessionID == "" && event.Type != "system" {
-			terminal = core.Event{Kind: core.EventError, Text: fmt.Sprintf("Claude Code executable %q returned an incompatible stream: expected system/init with required session_id before output; update Claude Code or select another harness", turn.executable), Done: true}
-			completed = true
-			turn.cancel()
-			break
-		}
 		if event.Type == "stream_event" {
 			switch event.Event.Type {
 			case "message_start":
@@ -649,6 +643,18 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 			continue
 		}
 		if event.Type == "result" {
+			if turn.sessionID == "" {
+				// Claude Code never confirmed a session (for example, its
+				// SessionStart hook lifecycle events preceded system/init
+				// throughout the whole turn). Reject now instead of on the
+				// first non-system byte, so ordinary hook/announcement
+				// interleaving does not abort a turn that later establishes
+				// its session correctly.
+				terminal = core.Event{Kind: core.EventError, Text: fmt.Sprintf("Claude Code executable %q returned an incompatible stream: expected system/init with required session_id before output; update Claude Code or select another harness", turn.executable), Done: true}
+				completed = true
+				turn.cancel()
+				break
+			}
 			text := turn.text.String()
 			if text == "" || event.IsError {
 				text = event.Result

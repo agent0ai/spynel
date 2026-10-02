@@ -167,7 +167,7 @@ func runHarnessFixture(mode string) int {
 	switch mode {
 	case "codex-lifecycle", "codex-interrupt", "codex-models", "codex-init-missing-method", "codex-resume-missing-method", "codex-resume-error", "codex-stream-overflow", "codex-thread-changed-field", "codex-terminal-changed-status":
 		return runCodexFixture(mode)
-	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero":
+	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero", "claude-hook-events-before-init":
 		return runClaudeFixture(mode)
 	case "pi-lifecycle", "pi-steer", "pi-interrupt", "pi-state-missing-session", "pi-model-capabilities", "pi-off-default":
 		return runPiFixture(mode)
@@ -540,6 +540,13 @@ func runClaudeFixture(mode string) int {
 	}
 	if mode == "claude-init-changed-event" {
 		write(map[string]any{"type": "system", "subtype": "startup", "session_id": session})
+	} else if mode == "claude-hook-events-before-init" {
+		// Mirrors Claude Code 2.1.273 with SessionStart hooks configured:
+		// several non-init system events carrying the eventual session_id
+		// arrive before the literal system/init event.
+		write(map[string]any{"type": "system", "subtype": "hook_started", "hook_name": "SessionStart:startup", "session_id": session})
+		write(map[string]any{"type": "system", "subtype": "hook_response", "hook_name": "SessionStart:startup", "session_id": session})
+		write(map[string]any{"type": "system", "subtype": "init", "session_id": session})
 	} else {
 		write(map[string]any{"type": "system", "subtype": "init", "session_id": session})
 	}
