@@ -21,11 +21,14 @@ import (
 
 const piRPCMaxRecord = 16 * 1024 * 1024
 
-// Pi is a native adapter for Pi's documented JSONL RPC mode. Pi owns one
-// current session per process, so Spynel keeps one idle-capable process per
-// active conversation and persists its session file for restart/resume.
+// Pi is a native adapter for Pi's documented JSONL RPC mode. The Oh My Pi
+// fork speaks the same protocol with the small dialect differences recorded
+// in piUpstreamDialect and ohMyPiDialect. Pi owns one current session per
+// process, so Spynel keeps one idle-capable process per active conversation
+// and persists its session file for restart/resume.
 type Pi struct {
-	config HarnessConfig
+	config  HarnessConfig
+	dialect piDialect
 
 	mu           sync.Mutex
 	ctx          context.Context
@@ -100,9 +103,57 @@ type piState struct {
 	} `json:"model"`
 }
 
-func NewPi(cfg HarnessConfig) (*Pi, error) {
+// piDialect records the differences between Pi and its Oh My Pi fork while
+// both run through the shared JSONL RPC adapter below.
+type piDialect struct {
+	label          string   // diagnostics label
+	defaultCommand string   // executable used when configuration omits one
+	quietArgs      []string // discovery-off launch flags that follow --mode rpc
+	resumeFlag     string   // launch flag that reopens a stored session file
+	readOnlyTools  string   // --tools value applied for the read-only sandbox
+	settleEvent    string   // RPC event that completes a turn
+	// settleWhenTerminal marks a dialect whose settle event also covers
+	// intermediate stops: only frames whose isTerminal and yielded flags are
+	// not false complete a prompt.
+	settleWhenTerminal bool
+	// catalogThinkingEfforts marks a dialect without the
+	// get_available_thinking_levels command; every catalog model then embeds
+	// its own thinking efforts list instead.
+	catalogThinkingEfforts bool
+}
+
+var piUpstreamDialect = piDialect{
+	label:          "Pi",
+	defaultCommand: "pi",
+	quietArgs:      []string{"--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes"},
+	resumeFlag:     "--session",
+	readOnlyTools:  "read,grep,find,ls",
+	settleEvent:    "agent_settled",
+}
+
+var ohMyPiDialect = piDialect{
+	label:          "Oh My Pi",
+	defaultCommand: "omp",
+	quietArgs:      []string{"--no-extensions", "--no-skills"},
+	resumeFlag:     "--resume",
+	readOnlyTools:  "read,grep,glob",
+	settleEvent:    "agent_end",
+	// Oh My Pi reuses agent_end for intermediate stops such as auto retries,
+	// auto compaction, and stop-time reminders, and it emits no
+	// agent_settled event at all.
+	settleWhenTerminal:     true,
+	catalogThinkingEfforts: true,
+}
+
+func NewPi(cfg HarnessConfig) (*Pi, error) { return newPi(cfg, piUpstreamDialect) }
+
+// NewOhMyPi drives the Oh My Pi fork of Pi through the shared JSONL RPC
+// adapter; only the piDialect values above differ.
+func NewOhMyPi(cfg HarnessConfig) (*Pi, error) { return newPi(cfg, ohMyPiDialect) }
+
+func newPi(cfg HarnessConfig, dialect piDialect) (*Pi, error) {
 	if strings.TrimSpace(cfg.Command) == "" {
-		cfg.Command = "pi"
+		cfg.Command = dialect.defaultCommand
 	}
 	if strings.TrimSpace(cfg.Cwd) == "" {
 		cfg.Cwd = "."
@@ -111,7 +162,7 @@ func NewPi(cfg HarnessConfig) (*Pi, error) {
 		cfg.Sandbox = "danger-full-access"
 	}
 	adapter := &Pi{
-		config: cfg, processes: map[string]*piProcess{}, sessions: map[string]piSession{}, keyLocks: map[string]*sync.Mutex{},
+		config: cfg, dialect: dialect, processes: map[string]*piProcess{}, sessions: map[string]piSession{}, keyLocks: map[string]*sync.Mutex{},
 	}
 	if err := adapter.loadSessions(); err != nil {
 		return nil, err
@@ -129,12 +180,12 @@ func (p *Pi) Start(parent context.Context) error {
 	}
 	if p.closed {
 		p.mu.Unlock()
-		return errors.New("Pi harness is closed")
+		return errors.New(p.dialect.label + " harness is closed")
 	}
 	info, err := os.Stat(p.config.Cwd)
 	if err != nil || !info.IsDir() {
 		p.mu.Unlock()
-		return fmt.Errorf("Pi working directory %q is unavailable", p.config.Cwd)
+		return fmt.Errorf("%s working directory %q is unavailable", p.dialect.label, p.config.Cwd)
 	}
 	p.ctx, p.cancel = context.WithCancel(parent)
 	checkContext, cancelCheck := context.WithTimeout(p.ctx, 5*time.Second)
@@ -148,11 +199,11 @@ func (p *Pi) Start(parent context.Context) error {
 	command.Stderr = output
 	if err := command.Run(); err != nil {
 		_ = p.Close()
-		return fmt.Errorf("Pi executable %q failed --version capability check: %w (%s)", p.config.Command, err, strings.TrimSpace(output.String()))
+		return fmt.Errorf("%s executable %q failed --version capability check: %w (%s)", p.dialect.label, p.config.Command, err, strings.TrimSpace(output.String()))
 	}
 	if strings.TrimSpace(output.String()) == "" {
 		_ = p.Close()
-		return fmt.Errorf("Pi executable %q returned an incompatible empty --version result", p.config.Command)
+		return fmt.Errorf("%s executable %q returned an incompatible empty --version result", p.dialect.label, p.config.Command)
 	}
 	return nil
 }
@@ -188,7 +239,7 @@ func (p *Pi) SendWithInference(ctx context.Context, key, prompt string, selectio
 		return "", false, errors.New("harness prompt is empty")
 	}
 	if selection.ServiceMode != "" {
-		return "", false, errors.New("Pi does not support a Spynel service mode; reset harness.service_mode to inherit")
+		return "", false, errors.New(p.dialect.label + " does not support a Spynel service mode; reset harness.service_mode to inherit")
 	}
 	if err := ValidateInferenceSelection(nil, selection); err != nil {
 		return "", false, err
@@ -211,7 +262,7 @@ func (p *Pi) SendWithInference(ctx context.Context, key, prompt string, selectio
 	process.mu.Lock()
 	if process.closed {
 		process.mu.Unlock()
-		return process.session.ID, false, errors.New("Pi RPC process is closed")
+		return process.session.ID, false, errors.New(p.dialect.label + " RPC process is closed")
 	}
 	process.active = turn
 	process.mu.Unlock()
@@ -222,10 +273,10 @@ func (p *Pi) SendWithInference(ctx context.Context, key, prompt string, selectio
 			process.active = nil
 		}
 		process.mu.Unlock()
-		return process.session.ID, false, fmt.Errorf("Pi rejected prompt: %w", err)
+		return process.session.ID, false, fmt.Errorf("%s rejected prompt: %w", p.dialect.label, err)
 	}
 	if emit != nil {
-		emit(core.Event{Kind: core.EventStatus, Text: "Pi turn started", ThreadID: process.session.ID,
+		emit(core.Event{Kind: core.EventStatus, Text: p.dialect.label + " turn started", ThreadID: process.session.ID,
 			Execution: &core.ExecutionStatus{State: "running"}})
 	}
 	return process.session.ID, false, nil
@@ -242,7 +293,7 @@ func (p *Pi) Steer(ctx context.Context, key, prompt string, emit core.Emit, befo
 	process := p.processes[key]
 	p.mu.Unlock()
 	if process == nil {
-		return p.ThreadID(key), fmt.Errorf("Pi turn is no longer active: %w", errNativeTurnInactive)
+		return p.ThreadID(key), fmt.Errorf("%s turn is no longer active: %w", p.dialect.label, errNativeTurnInactive)
 	}
 	return p.steerLocked(ctx, process, prompt, emit, beforeDelivery)
 }
@@ -252,7 +303,7 @@ func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string,
 	turn := process.active
 	process.mu.Unlock()
 	if turn == nil {
-		return process.session.ID, fmt.Errorf("Pi turn is no longer active: %w", errNativeTurnInactive)
+		return process.session.ID, fmt.Errorf("%s turn is no longer active: %w", p.dialect.label, errNativeTurnInactive)
 	}
 	turn.deliveryMu.Lock()
 	defer turn.deliveryMu.Unlock()
@@ -260,7 +311,7 @@ func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string,
 	completed := turn.completed
 	turn.mu.Unlock()
 	if completed {
-		return process.session.ID, fmt.Errorf("Pi turn is no longer active: %w", errNativeTurnInactive)
+		return process.session.ID, fmt.Errorf("%s turn is no longer active: %w", p.dialect.label, errNativeTurnInactive)
 	}
 	var previous core.Emit
 	reserved := false
@@ -312,7 +363,7 @@ func (p *Pi) Interrupt(ctx context.Context, key string) (bool, error) {
 		return false, nil
 	}
 	if _, err := process.call(ctx, map[string]any{"type": "abort"}, nil); err != nil {
-		return false, fmt.Errorf("abort Pi turn: %w", err)
+		return false, fmt.Errorf("abort %s turn: %w", p.dialect.label, err)
 	}
 	return true, nil
 }
@@ -329,7 +380,7 @@ func (p *Pi) ResetSession(key string) error {
 		process.mu.Unlock()
 		if active {
 			p.mu.Unlock()
-			return errors.New("cannot reset a Pi session while its turn is active")
+			return errors.New("cannot reset a " + p.dialect.label + " session while its turn is active")
 		}
 		delete(p.processes, key)
 	}
@@ -398,7 +449,7 @@ func (p *Pi) Models(ctx context.Context) ([]Model, error) {
 	defer process.close()
 	data, err := process.call(ctx, map[string]any{"type": "get_available_models"}, nil)
 	if err != nil {
-		return nil, fmt.Errorf("list Pi models: %w", err)
+		return nil, fmt.Errorf("list %s models: %w", p.dialect.label, err)
 	}
 	var response struct {
 		Models []struct {
@@ -406,10 +457,13 @@ func (p *Pi) Models(ctx context.Context) ([]Model, error) {
 			Name      string `json:"name"`
 			Provider  string `json:"provider"`
 			Reasoning bool   `json:"reasoning"`
+			Thinking  struct {
+				Efforts []string `json:"efforts"`
+			} `json:"thinking"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(data, &response); err != nil {
-		return nil, fmt.Errorf("decode Pi model catalog: %w", err)
+		return nil, fmt.Errorf("decode %s model catalog: %w", p.dialect.label, err)
 	}
 	models := make([]Model, 0, len(response.Models))
 	for _, item := range response.Models {
@@ -424,31 +478,33 @@ func (p *Pi) Models(ctx context.Context) ([]Model, error) {
 		if model.DisplayName == "" {
 			model.DisplayName = id
 		}
-		// Pi's set_model RPC persists the selected model as Pi's global default.
-		// Probe each model in its own no-session process instead: the --model CLI
-		// option is a runtime override and does not mutate Pi's settings.
-		modelProcess, err := p.startProcess(ctx, "", piSession{}, true, id, "")
-		if err != nil {
-			return nil, fmt.Errorf("start Pi capability discovery for model %q: %w", id, err)
-		}
-		levelsData, err := modelProcess.call(ctx, map[string]any{"type": "get_available_thinking_levels"}, nil)
-		modelProcess.close()
-		if err != nil {
-			return nil, fmt.Errorf("list Pi thinking levels for model %q: %w", id, err)
-		}
-		var levelsResponse struct {
-			Levels []string `json:"levels"`
-		}
-		if err := json.Unmarshal(levelsData, &levelsResponse); err != nil {
-			return nil, fmt.Errorf("decode Pi thinking levels for model %q: %w", id, err)
-		}
-		// Pi documents ["off"] as the sentinel for a model without reasoning.
-		// Such a model should keep the dependent selection flow short.
-		if !(len(levelsResponse.Levels) == 1 && levelsResponse.Levels[0] == "off") {
-			model.Efforts = append([]string(nil), levelsResponse.Levels...)
-			if model.Default && containsString(model.Efforts, process.thinkingLevel) {
-				model.DefaultEffort = process.thinkingLevel
+		if p.dialect.catalogThinkingEfforts {
+			// Oh My Pi does not implement get_available_thinking_levels;
+			// every catalog model embeds its own thinking efforts instead.
+			model.Efforts = piCatalogEfforts(item.Thinking.Efforts)
+		} else {
+			// Pi's set_model RPC persists the selected model as Pi's global default.
+			// Probe each model in its own no-session process instead: the --model CLI
+			// option is a runtime override and does not mutate Pi's settings.
+			modelProcess, err := p.startProcess(ctx, "", piSession{}, true, id, "")
+			if err != nil {
+				return nil, fmt.Errorf("start %s capability discovery for model %q: %w", p.dialect.label, id, err)
 			}
+			levelsData, err := modelProcess.call(ctx, map[string]any{"type": "get_available_thinking_levels"}, nil)
+			modelProcess.close()
+			if err != nil {
+				return nil, fmt.Errorf("list %s thinking levels for model %q: %w", p.dialect.label, id, err)
+			}
+			var levelsResponse struct {
+				Levels []string `json:"levels"`
+			}
+			if err := json.Unmarshal(levelsData, &levelsResponse); err != nil {
+				return nil, fmt.Errorf("decode %s thinking levels for model %q: %w", p.dialect.label, id, err)
+			}
+			model.Efforts = piCatalogEfforts(levelsResponse.Levels)
+		}
+		if model.Default && containsString(model.Efforts, process.thinkingLevel) {
+			model.DefaultEffort = process.thinkingLevel
 		}
 		models = append(models, model)
 	}
@@ -456,6 +512,16 @@ func (p *Pi) Models(ctx context.Context) ([]Model, error) {
 	p.modelCatalog = append([]Model(nil), models...)
 	p.mu.Unlock()
 	return models, nil
+}
+
+// piCatalogEfforts copies a provider thinking-efforts list, dropping Pi's
+// ["off"] sentinel that marks a model without reasoning choices so the
+// dependent selection flow stays short.
+func piCatalogEfforts(efforts []string) []string {
+	if len(efforts) == 1 && efforts[0] == "off" {
+		return nil
+	}
+	return append([]string(nil), efforts...)
 }
 
 func containsString(values []string, wanted string) bool {
@@ -471,7 +537,7 @@ func (p *Pi) ensureProcess(ctx context.Context, key, model, effort string) (*piP
 	p.mu.Lock()
 	if p.closed || p.ctx == nil {
 		p.mu.Unlock()
-		return nil, errors.New("Pi harness is not running")
+		return nil, errors.New(p.dialect.label + " harness is not running")
 	}
 	if process := p.processes[key]; process != nil {
 		process.mu.Lock()
@@ -501,7 +567,7 @@ func (p *Pi) ensureProcess(ctx context.Context, key, model, effort string) (*piP
 	if p.closed {
 		p.mu.Unlock()
 		process.close()
-		return nil, errors.New("Pi harness closed while starting a session")
+		return nil, errors.New(p.dialect.label + " harness closed while starting a session")
 	}
 	if existing := p.processes[key]; existing != nil {
 		p.mu.Unlock()
@@ -525,10 +591,10 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 		baseContext = ctx
 	}
 	if closed || baseContext == nil {
-		return nil, errors.New("Pi harness is not running")
+		return nil, errors.New(p.dialect.label + " harness is not running")
 	}
 	processContext, cancel := context.WithCancel(baseContext)
-	args := []string{"--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes"}
+	args := append([]string{"--mode", "rpc"}, p.dialect.quietArgs...)
 	if ephemeral {
 		args = append(args, "--no-session")
 	} else {
@@ -543,7 +609,7 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 		args = append(args, "--session-dir", sessionDir)
 		if session.Path != "" {
 			if _, err := os.Stat(session.Path); err == nil {
-				args = append(args, "--session", session.Path)
+				args = append(args, p.dialect.resumeFlag, session.Path)
 			}
 		}
 	}
@@ -554,7 +620,7 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 		args = append(args, "--thinking", cfg.Effort)
 	}
 	if cfg.Sandbox == "read-only" {
-		args = append(args, "--tools", "read,grep,find,ls")
+		args = append(args, "--tools", p.dialect.readOnlyTools)
 	}
 	command := exec.CommandContext(processContext, cfg.Command, args...)
 	command.Dir = cfg.Cwd
@@ -573,7 +639,7 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 	}
 	if err := command.Start(); err != nil {
 		cancel()
-		return nil, fmt.Errorf("start Pi RPC process: %w", err)
+		return nil, fmt.Errorf("start %s RPC process: %w", p.dialect.label, err)
 	}
 	process := &piProcess{owner: p, key: key, cmd: command, cancel: cancel, stdin: stdin, nextID: 1, pending: map[string]chan piResponse{}}
 	go process.readLoop(stdout)
@@ -581,23 +647,23 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 	data, err := process.call(ctx, map[string]any{"type": "get_state"}, nil)
 	if err != nil {
 		process.close()
-		return nil, fmt.Errorf("Pi executable %q failed RPC get_state negotiation: %w", cfg.Command, err)
+		return nil, fmt.Errorf("%s executable %q failed RPC get_state negotiation: %w", p.dialect.label, cfg.Command, err)
 	}
 	var state piState
 	if err := json.Unmarshal(data, &state); err != nil || (!ephemeral && (state.SessionID == "" || state.SessionFile == "")) {
 		process.close()
-		return nil, fmt.Errorf("Pi executable %q returned an incompatible get_state result with missing sessionId or sessionFile", cfg.Command)
+		return nil, fmt.Errorf("%s executable %q returned an incompatible get_state result with missing sessionId or sessionFile", p.dialect.label, cfg.Command)
 	}
 	process.session = piSession{ID: state.SessionID, Path: state.SessionFile, Policy: piSessionPolicy(cfg)}
 	process.modelID = piCatalogModelID(state.Model.Provider, state.Model.ID)
 	process.thinkingLevel = state.ThinkingLevel
 	if _, err := process.call(ctx, map[string]any{"type": "set_steering_mode", "mode": "all"}, nil); err != nil {
 		process.close()
-		return nil, fmt.Errorf("configure Pi steering queue: %w", err)
+		return nil, fmt.Errorf("configure %s steering queue: %w", p.dialect.label, err)
 	}
 	if _, err := process.call(ctx, map[string]any{"type": "set_follow_up_mode", "mode": "all"}, nil); err != nil {
 		process.close()
-		return nil, fmt.Errorf("configure Pi follow-up queue: %w", err)
+		return nil, fmt.Errorf("configure %s follow-up queue: %w", p.dialect.label, err)
 	}
 	if !ephemeral {
 		p.mu.Lock()
@@ -619,13 +685,16 @@ func piCatalogModelID(provider, id string) string {
 	return id
 }
 
+// label names the dialect a process speaks for diagnostics.
+func (process *piProcess) label() string { return process.owner.dialect.label }
+
 func (process *piProcess) call(ctx context.Context, message map[string]any, beforeWrite func() bool) (json.RawMessage, error) {
 	process.writeMu.Lock()
 	process.mu.Lock()
 	if process.closed || process.stdin == nil {
 		process.mu.Unlock()
 		process.writeMu.Unlock()
-		return nil, errors.New("Pi RPC stdin is closed")
+		return nil, errors.New(process.label() + " RPC stdin is closed")
 	}
 	id := "spynel-" + strconv.FormatUint(process.nextID, 10)
 	process.nextID++
@@ -671,7 +740,7 @@ func (process *piProcess) readLoop(reader io.Reader) {
 	for scanner.Scan() {
 		var envelope piWireMessage
 		if err := json.Unmarshal(scanner.Bytes(), &envelope); err != nil {
-			process.fail(fmt.Errorf("Pi RPC emitted incompatible non-JSON output: %w", err))
+			process.fail(fmt.Errorf("%s RPC emitted incompatible non-JSON output: %w", process.label(), err))
 			return
 		}
 		if envelope.Type == "response" {
@@ -682,7 +751,7 @@ func (process *piProcess) readLoop(reader io.Reader) {
 			if waiter != nil {
 				response := piResponse{Data: envelope.Data}
 				if !envelope.Success {
-					response.Error = errors.New(emptyPiError(envelope.Error))
+					response.Error = errors.New(emptyPiError(process.label(), envelope.Error))
 				}
 				waiter <- response
 			}
@@ -693,12 +762,12 @@ func (process *piProcess) readLoop(reader io.Reader) {
 			process.handleEvent(envelope.Type, event)
 		}
 	}
-	process.fail(fmt.Errorf("Pi RPC stream closed: %v", scanner.Err()))
+	process.fail(fmt.Errorf("%s RPC stream closed: %v", process.label(), scanner.Err()))
 }
 
-func emptyPiError(value string) string {
+func emptyPiError(label, value string) string {
 	if strings.TrimSpace(value) == "" {
-		return "Pi RPC command failed"
+		return label + " RPC command failed"
 	}
 	return value
 }
@@ -750,14 +819,43 @@ func (process *piProcess) handleEvent(kind string, event map[string]json.RawMess
 	case "tool_execution_start":
 		var toolName string
 		_ = json.Unmarshal(event["toolName"], &toolName)
-		turn.emitEvent(core.Event{Kind: core.EventStatus, Text: "Pi tool: " + emptyAsHarness(toolName, "running"), ThreadID: process.session.ID,
+		turn.emitEvent(core.Event{Kind: core.EventStatus, Text: process.label() + " tool: " + emptyAsHarness(toolName, "running"), ThreadID: process.session.ID,
 			Execution: &core.ExecutionStatus{State: "running", Detail: toolName}})
 	case "auto_retry_start", "summarization_retry_scheduled":
-		turn.emitEvent(core.Event{Kind: core.EventStatus, Text: "Pi is retrying", ThreadID: process.session.ID,
+		turn.emitEvent(core.Event{Kind: core.EventStatus, Text: process.label() + " is retrying", ThreadID: process.session.ID,
 			Execution: &core.ExecutionStatus{State: "reconnecting"}})
-	case "agent_settled":
-		process.finishTurn(turn)
+	case process.owner.dialect.settleEvent:
+		if process.settleEndsTurn(event) {
+			process.finishTurn(turn)
+		}
 	}
+}
+
+// settleEndsTurn reports whether a settle event completes the active turn.
+// Oh My Pi reuses agent_end for intermediate stops — auto retries, auto
+// compaction, stop-time reminders, and queued follow-ups all emit their own
+// earlier agent_end frames — so only frames whose isTerminal and yielded
+// flags are not false complete a prompt.
+func (process *piProcess) settleEndsTurn(event map[string]json.RawMessage) bool {
+	if !process.owner.dialect.settleWhenTerminal {
+		return true
+	}
+	return piEventFlagNotFalse(event, "isTerminal") && piEventFlagNotFalse(event, "yielded")
+}
+
+// piEventFlagNotFalse reads an optional boolean event flag; a missing, null,
+// or non-boolean value counts as true so protocol additions cannot stall a
+// turn.
+func piEventFlagNotFalse(event map[string]json.RawMessage, key string) bool {
+	raw, ok := event[key]
+	if !ok {
+		return true
+	}
+	var value *bool
+	if json.Unmarshal(raw, &value) != nil || value == nil {
+		return true
+	}
+	return *value
 }
 
 func piMessageText(content json.RawMessage) string {
@@ -894,7 +992,7 @@ func (process *piProcess) finishTurn(turn *piTurn) {
 func (process *piProcess) waitLoop() {
 	err := process.cmd.Wait()
 	if err == nil {
-		err = errors.New("Pi RPC process exited")
+		err = errors.New(process.label() + " RPC process exited")
 	}
 	process.fail(err)
 }
@@ -985,7 +1083,7 @@ func (p *Pi) loadSessions() error {
 		return err
 	}
 	if err := json.Unmarshal(data, &p.sessions); err != nil {
-		return fmt.Errorf("decode Pi session map: %w", err)
+		return fmt.Errorf("decode %s session map: %w", p.dialect.label, err)
 	}
 	return nil
 }

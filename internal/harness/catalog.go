@@ -49,6 +49,11 @@ var catalog = []Definition{
 		Description: "Pi coding agent via native RPC", InstallURL: "https://github.com/earendil-works/pi",
 		factory: func(cfg HarnessConfig) (Harness, error) { return NewPi(cfg) },
 	},
+	{
+		Name: "oh-my-pi", DisplayName: "Oh My Pi", Command: "omp", SupportsEffort: true,
+		Description: "Oh My Pi coding agent via native RPC", InstallURL: "https://github.com/can1357/oh-my-pi",
+		factory: func(cfg HarnessConfig) (Harness, error) { return NewOhMyPi(cfg) },
+	},
 	acpDefinition("opencode", "OpenCode", "opencode", []string{"acp"}, "OpenCode via ACP", "https://opencode.ai/docs/acp/"),
 	acpDefinition("qwen-code", "Qwen Code", "qwen", []string{"--acp", "--experimental-skills"}, "Qwen Code via ACP", "https://qwenlm.github.io/qwen-code-docs/"),
 	acpDefinition("kimi", "Kimi CLI", "kimi", []string{"acp"}, "Kimi CLI via ACP", "https://www.kimi.com/code/docs/en/kimi-code-cli.html"),
@@ -100,14 +105,14 @@ func newCodexFromHarnessConfig(cfg HarnessConfig) (Harness, error) {
 
 // StaticCapabilities documents model-associated controls that are known
 // before a provider process is started. Dynamic model catalogs remain the
-// authority for the exact choices of Codex and Pi.
+// authority for the exact choices of Codex, Pi, and Oh My Pi.
 func StaticCapabilities(name string) (reasoning, service string) {
 	switch NormalizeName(name) {
 	case "codex":
 		return "per-model catalog", "per-model service tiers"
 	case "claude-code":
 		return "low, medium, high, xhigh, max", "unsupported"
-	case "pi":
+	case "pi", "oh-my-pi":
 		return "per-model catalog", "unsupported"
 	case "agent-zero", "opencode", "qwen-code", "kimi", "goose", "cursor", "gemini-cli", "github-copilot", "factory-droid", "acp":
 		return "unsupported (choices are unavailable before ACP session creation)", "unsupported (no standard ACP speed category)"

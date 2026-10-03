@@ -66,7 +66,7 @@ spynel send --conversation bot --json "Report current work" | jq -c .
 spynel followup [send flags] TEXT
 ```
 
-`followup` targets the same `cli/<conversation>` key as `send`, but it is strict: the elected service rejects it before writing history unless that conversation currently has an active harness execution. Codex and Pi use native turn steering. Harnesses that declare queue semantics retain follow-ups in the same session; adjacent ordinary messages that accumulate before the next turn are combined in arrival order into one provider prompt. This makes a failed shell race visible instead of silently starting unrelated work.
+`followup` targets the same `cli/<conversation>` key as `send`, but it is strict: the elected service rejects it before writing history unless that conversation currently has an active harness execution. Codex, Pi, and Oh My Pi use native turn steering. Harnesses that declare queue semantics retain follow-ups in the same session; adjacent ordinary messages that accumulate before the next turn are combined in arrival order into one provider prompt. This makes a failed shell race visible instead of silently starting unrelated work.
 
 When native steering transfers output ownership, the earlier waiting CLI process receives a terminal transport status and exits successfully; the follow-up process receives subsequent deltas and the final response. This is the same emitter handoff used to keep overlapping remote-channel typing state correct.
 
