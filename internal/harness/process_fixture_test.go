@@ -501,7 +501,7 @@ func runCodexFixture(mode string) int {
 				write(map[string]any{"method": "item/completed", "params": map[string]any{"threadId": "fixture-thread", "turnId": "fixture-turn", "item": map[string]any{"type": "commandExecution", "aggregatedOutput": strings.Repeat("x", 17*1024*1024)}}})
 				continue
 			}
-			write(map[string]any{"id": message.ID, "result": map[string]any{"data": []any{map[string]any{"id": "model-a", "model": "model-a", "displayName": "Model A", "defaultReasoningEffort": "medium", "supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}, map[string]any{"reasoningEffort": "medium"}, map[string]any{"reasoningEffort": "ultra"}}, "serviceTiers": []any{map[string]any{"id": "fast", "name": "Fast", "description": "Priority processing"}}, "defaultServiceTier": nil, "isDefault": true}}, "nextCursor": nil}})
+			write(map[string]any{"id": message.ID, "result": map[string]any{"data": []any{map[string]any{"id": "model-a", "model": "model-a", "displayName": "Model A", "defaultReasoningEffort": "medium", "supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "low"}, map[string]any{"reasoningEffort": "medium"}, map[string]any{"reasoningEffort": "ultra"}}, "serviceTiers": []any{map[string]any{"id": "priority", "name": "Fast", "description": "Priority processing"}}, "defaultServiceTier": nil, "isDefault": true}}, "nextCursor": nil}})
 		}
 	}
 	return 0

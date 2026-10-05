@@ -65,7 +65,10 @@ func TestInferenceSettingsResetToInheritedDefaults(t *testing.T) {
 	if setting, err := SetSetting(&cfg, "harness.reasoning_effort", "inherit"); err != nil || setting.Value != "inherit" || cfg.Harness.ReasoningEffort != "" {
 		t.Fatalf("effort reset = %#v, %v", setting, err)
 	}
-	if setting, err := SetSetting(&cfg, "harness.service_mode", "default"); err != nil || setting.Value != "inherit" || cfg.Harness.ServiceMode != "" {
+	if setting, err := SetSetting(&cfg, "harness.service_mode", "DEFAULT"); err != nil || setting.Value != "default" || cfg.Harness.ServiceMode != "default" {
+		t.Fatalf("normal service = %#v, %v", setting, err)
+	}
+	if setting, err := SetSetting(&cfg, "harness.service_mode", "inherit"); err != nil || setting.Value != "inherit" || cfg.Harness.ServiceMode != "" {
 		t.Fatalf("service reset = %#v, %v", setting, err)
 	}
 	if _, err := SetSetting(&cfg, "effort", "ULTRA"); err != nil || cfg.Harness.ReasoningEffort != "ultra" {

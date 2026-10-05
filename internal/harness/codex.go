@@ -221,7 +221,12 @@ func (c *Codex) Models(ctx context.Context) ([]Model, error) {
 			for _, effort := range item.SupportedEfforts {
 				model.Efforts = append(model.Efforts, effort.Effort)
 			}
+			// Ordinary service is supported independently of the optional faster tiers.
+			model.ServiceModes = append(model.ServiceModes, ModelPropertyOption{ID: "default", DisplayName: "Normal", Description: "Standard speed and usage"})
 			for _, tier := range item.ServiceTiers {
+				if tier.ID == "default" {
+					continue
+				}
 				model.ServiceModes = append(model.ServiceModes, ModelPropertyOption{ID: tier.ID, DisplayName: tier.Name, Description: tier.Description})
 			}
 			if item.DefaultServiceTier != nil {
@@ -379,7 +384,9 @@ func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selec
 		params["effort"] = selection.Effort
 	}
 	if selection.ServiceMode != "" {
-		params["serviceTier"] = selection.ServiceMode
+		// Keep overrides local to this admitted turn so a later Inherit choice
+		// uses the thread's provider default, rather than a previous Fast choice.
+		params["serviceTierForTurn"] = selection.ServiceMode
 	}
 	result, err := c.call(ctx, "turn/start", params)
 	if err != nil {

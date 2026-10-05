@@ -1330,7 +1330,9 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		m.screenSaving = false
-		if value.screen != nil && value.screen.SavedControl != nil && m.screen != nil {
+		// SavedControl replaces the source action only on an editable form.
+		// Selector options must retain their identity until parent restoration.
+		if value.screen != nil && value.screen.SavedControl != nil && m.screen != nil && !m.screen.SaveDisabled {
 			for index := range m.screen.Controls {
 				control := &m.screen.Controls[index]
 				if control.Kind == "action" && control.Key == value.action {

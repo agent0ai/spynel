@@ -494,8 +494,11 @@ func normalizeInheritedValue(value string) string {
 
 func normalizeServiceMode(value string) string {
 	value = strings.TrimSpace(value)
-	if strings.EqualFold(value, "default") || strings.EqualFold(value, "inherit") || strings.EqualFold(value, "auto") {
+	if strings.EqualFold(value, "inherit") || strings.EqualFold(value, "auto") {
 		return ""
+	}
+	if strings.EqualFold(value, "default") {
+		return "default"
 	}
 	return value
 }

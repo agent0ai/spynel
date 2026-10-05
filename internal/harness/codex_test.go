@@ -699,7 +699,7 @@ func TestCodexDiscoversPickerVisibleModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 1 || models[0].ID != "model-a" || models[0].DisplayName != "Model A" || !models[0].Default || strings.Join(models[0].Efforts, ",") != "low,medium,ultra" || len(models[0].ServiceModes) != 1 || models[0].ServiceModes[0].ID != "fast" {
+	if len(models) != 1 || models[0].ID != "model-a" || models[0].DisplayName != "Model A" || !models[0].Default || strings.Join(models[0].Efforts, ",") != "low,medium,ultra" || len(models[0].ServiceModes) != 2 || models[0].ServiceModes[0].ID != "default" || models[0].ServiceModes[0].DisplayName != "Normal" || models[0].ServiceModes[1].ID != "priority" {
 		t.Fatalf("Models() = %#v", models)
 	}
 }
@@ -715,33 +715,53 @@ func TestCodexPassesCapturedEffortAndServiceTier(t *testing.T) {
 	if err := codex.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan struct{}, 1)
-	selection := InferenceSelection{Model: "model-a", Effort: "medium", ServiceMode: "fast"}
-	if _, _, err := codex.SendWithInference(ctx, "chat", "test", selection, func(event core.Event) {
-		if event.Done {
-			done <- struct{}{}
+	defer codex.Close()
+	// Use the same thread: Fast must not become its default for later Inherit.
+	modes := []string{"priority", "default", ""}
+	for _, mode := range modes {
+		done := make(chan struct{}, 1)
+		selection := InferenceSelection{Model: "model-a", Effort: "medium", ServiceMode: mode}
+		if _, _, err := codex.SendWithInference(ctx, "chat", "test", selection, func(event core.Event) {
+			if event.Done {
+				done <- struct{}{}
+			}
+		}); err != nil {
+			t.Fatal(err)
 		}
-	}); err != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			t.Fatal("timed out")
+		}
+	}
+	if err := codex.Close(); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-done:
-	case <-ctx.Done():
-		t.Fatal("timed out")
-	}
-	_ = codex.Close()
+	turns := 0
 	for _, record := range readFixtureRecords(t, logPath) {
 		if record.Method != "turn/start" {
 			continue
+		}
+		if turns >= len(modes) {
+			t.Fatal("unexpected extra turn")
 		}
 		var params map[string]any
 		if err := json.Unmarshal(record.Params, &params); err != nil {
 			t.Fatal(err)
 		}
-		if params["model"] != "model-a" || params["effort"] != "medium" || params["serviceTier"] != "fast" {
+		mode := modes[turns]
+		if params["model"] != "model-a" || params["effort"] != "medium" {
 			t.Fatalf("turn/start params = %#v", params)
 		}
-		return
+		if _, sticky := params["serviceTier"]; sticky {
+			t.Fatalf("speed selection changed thread defaults: %#v", params)
+		}
+		if value, present := params["serviceTierForTurn"]; present != (mode != "") || present && value != mode {
+			t.Fatalf("speed %q params = %#v", mode, params)
+		}
+		turns++
 	}
-	t.Fatal("turn/start request not recorded")
+	if turns != len(modes) {
+		t.Fatalf("recorded %d turns, want %d", turns, len(modes))
+	}
 }

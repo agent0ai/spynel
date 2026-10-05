@@ -5149,6 +5149,9 @@ func TestDependentModelSelectionPreservesParentAndRefreshesCommittedControl(t *t
 				if step == 0 || step == 2 {
 					screen.Controls = []core.ScreenControl{{Key: "custom", Kind: "text"}, {Key: "custom:select", Kind: "action", Value: "Continue"}}
 				}
+				if step == 3 {
+					screen.Controls = []core.ScreenControl{{Key: "select:", Kind: "action", Value: "Inherit"}, {Key: "select:default", Kind: "action", Value: "Normal"}, {Key: "select:priority", Kind: "action", Value: "Fast"}}
+				}
 				next, _ := m.Update(screenActionResult{action: "custom", screen: screen})
 				m = next.(model)
 				if m.screen == nil || m.screen.ID != id || len(m.screenStack) != 1 {
