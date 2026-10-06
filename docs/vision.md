@@ -16,6 +16,6 @@ The experience should feel like working with a capable operations manager. A use
 
 Spynel can dispatch bounded work in parallel. Durable claims prevent duplicate ownership, and an agent can put overlapping work into an explicit waiting or rework path when concurrent tasks meet the same files. This is coordinated workflow state, not a claim that Spynel automatically predicts or semantically merges every file conflict.
 
-Spynel does not recreate the features of Codex, Claude Code, Pi, ACP agents, or future coding harnesses. It concentrates on using their strengths consistently. Better harness planning, tools, models, and execution therefore make the overall Spynel experience better rather than making its orchestration layer obsolete.
+Spynel does not recreate the features of Codex, Claude Code, Pi, Oh My Pi, ACP agents, or future coding harnesses. It concentrates on using their strengths consistently. Better harness planning, tools, models, and execution therefore make the overall Spynel experience better rather than making its orchestration layer obsolete.
 
 **Simplicity. Leverage. Quality.**

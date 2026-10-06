@@ -28,7 +28,7 @@ After a job finishes or the primary restarts, use `/jobs recent`, then `/job inf
 
 - If no supported harness is detected, open the harness setup and follow its installation guidance. Spynel does not copy credentials; sign in with the harness itself.
 - A working harness cannot be replaced while a turn is active, and Spynel will not replace it with a missing executable.
-- Pi and ACP permission mappings are application-level controls, not an operating-system sandbox. Review the [harness compatibility guide](harness-compatibility.md) and [configuration](configuration.md) before relying on a profile.
+- Pi, Oh My Pi, and ACP permission mappings are application-level controls, not an operating-system sandbox. Review the [harness compatibility guide](harness-compatibility.md) and [configuration](configuration.md) before relying on a profile.
 
 ## Telegram or WhatsApp
 

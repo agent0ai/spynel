@@ -22,6 +22,15 @@ other oversized messages, which still require investigation using that error.
 Transport failure also closes stdin so a native child behind the npm launcher
 receives EOF instead of retaining an unreadable connection and thread ownership.
 
+Oh My Pi documentation and the installed CLI were inspected on **2026-10-03**.
+The `omp 18.2.6` build negotiated the Pi JSONL RPC handshake keylessly:
+`get_state` matched upstream, `get_available_models` embedded per-model
+`thinking.efforts` while `get_available_thinking_levels` answered `Unknown
+command`, `set_steering_mode`/`set_follow_up_mode` accepted `all`, and
+`--tools read,grep,glob` launched while upstream Pi's `ls` was rejected. Turns
+complete on `agent_end` with `isTerminal` and `yielded` not false because no
+`agent_settled` event exists. No authenticated model request was sent.
+
 Any future authenticated or native-provider run must follow the separately
 reviewed [provider-canary threat model and authorization plan](provider-canary-threat-model.md).
 That plan is a gate, not evidence that a canary has run.
@@ -37,7 +46,9 @@ That plan is a gate, not evidence that a canary has run.
 - **Unsupported** means Spynel deliberately has no integration for the surface.
 
 Spynel integrates with Codex app-server, Claude Code non-interactive print
-mode, Agent Zero CLI through its ACP stdio command, Pi JSONL RPC, and stable ACP v1 JSON-RPC over stdio. The
+mode, Agent Zero CLI through its ACP stdio command, Pi JSONL RPC, Oh My Pi
+through the same protocol with fork dialect differences, and stable ACP v1
+JSON-RPC over stdio. The
 provider-neutral contract is `Harness`, with optional model and follow-up
 capabilities ([implementation](../internal/harness/harness.go)); registration,
 aliases, fixed arguments, and executable discovery are centralized in the
@@ -63,6 +74,7 @@ interchangeable.
 | Claude Code CLI | `claude -p` with `stream-json` output and either text or `stream-json` input | **Not established.** No primary evidence establishes one numeric lower bound. At startup Spynel requires every CLI flag needed by the configured mode from `claude --help`; the first turn must negotiate the documented `system/init` event with `session_id`. | Claude Code `2.1.224` was found at `/root/.local/bin/claude` on Linux arm64; `claude --help` exposed every flag Spynel uses. Synthetic current and incompatible help/stream variants pass; no authenticated request was sent. | Supported implementation boundary with fail-closed flag and stream-initialization diagnostics; provider-version compatibility remains provisional until versioned canaries exist. See [Claude adapter](../internal/harness/claude.go), [variant tests](../internal/harness/compatibility_test.go), and Anthropic's [programmatic-use documentation](https://code.claude.com/docs/en/headless). |
 | Agent Zero CLI | `a0 acp`; stable ACP v1 JSON-RPC over stdio | The executable must pass `a0 acp --check`. ACP first appears in the inspected unreleased `development` branch identifying itself as `2.10`; released `2.9` is not accepted merely because `a0` exists. | The exact inspected development revision was installed into an isolated disposable `uv tool` environment. `a0 --version` returned `2.10` and `a0 acp --check` returned its expected success marker. Shared synthetic ACP lifecycle/cancellation tests and Agent Zero profile discovery/command tests pass. No live Agent Zero connection or authenticated request was made. | Supported native catalog profile with capability-gated discovery and the shared ACP adapter. The CLI retains normal Agent Zero host discovery and authentication; Spynel adds no host-secret store or automatic installer. Until upstream publishes ACP, users need an ACP-capable development build. See the [catalog](../internal/harness/catalog.go), [ACP adapter](../internal/harness/acp.go), and [A0 CLI connector](https://github.com/agent0ai/a0-connector). |
 | Pi coding agent | `pi --mode rpc`; documented JSONL commands and events | **Not established.** Spynel requires a non-empty `--version`, successful `get_state`, and both queue-mode configuration commands. | `@earendil-works/pi-coding-agent` `0.84.1` was installed on Linux arm64. Keyless `PI_OFFLINE=1` RPC negotiation succeeded; synthetic lifecycle, steering, cancellation, model, and resume tests pass. No model request was sent. | Supported native RPC boundary; authenticated model/tool behavior remains unverified. See the [Pi adapter](../internal/harness/pi.go), [tests](../internal/harness/pi_test.go), and official [RPC documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md). |
+| Oh My Pi | `omp --mode rpc`; the Pi JSONL commands and events with fork dialect differences | **Not established.** Spynel requires a non-empty `--version`, successful `get_state`, and both queue-mode configuration commands, as with Pi. | `@oh-my-pi/pi-coding-agent` `18.2.6` was installed on macOS arm64. Keyless RPC negotiation succeeded; catalog thinking efforts verified; synthetic lifecycle, model, and resume tests pass. No authenticated model request was sent. | Supported native RPC boundary through the shared Pi adapter; authenticated model/tool behavior remains unverified. See the [Pi adapter](../internal/harness/pi.go), [tests](../internal/harness/pi_test.go), and the fork's [RPC documentation](https://github.com/can1357/oh-my-pi/blob/main/docs/rpc.md). |
 | ACP v1 agents | Newline-delimited JSON-RPC 2.0 over a launched command's stdin/stdout | Protocol version **1**, negotiated by `initialize`; there is no numeric minimum agent release. | Synthetic initialize, session setup/resume, config-option, streaming, permission, cancellation, persistence, and shell-free argument tests pass. Alias commands were checked against official ACP registry manifests; no alias executable or authenticated provider was run. | Supported shared adapter for catalog aliases and custom commands. Stable v1 stdio is supported; draft HTTP transport is deliberately unsupported. See the [ACP adapter](../internal/harness/acp.go), [tests](../internal/harness/acp_test.go), official [transport](https://agentclientprotocol.com/protocol/v1/transports), and [initialization](https://agentclientprotocol.com/protocol/v1/initialization) specifications. |
 | ChatGPT desktop app / Codex workspace | None | Not applicable | The app was not available on the Linux audit host. Official app documentation was reviewed; it does not document an app-local automation interface usable by Spynel. | **Unsupported as an integration surface.** Users need a separately discoverable `codex` CLI. See the [catalog](../internal/harness/catalog.go) and official [desktop app page](https://developers.openai.com/codex/app/). |
 
@@ -72,28 +84,32 @@ prove authentication, tool execution, or provider-side session recovery. An
 incompatible executable now fails at startup or the earliest documented
 negotiation point, before a new or resumed session identifier is overwritten.
 
-## Pi and ACP lifecycle coverage
+## Pi, Oh My Pi, and ACP lifecycle coverage
 
 The older matrix below remains the detailed Codex/Claude/desktop comparison.
 The newer adapters have this narrower evidence:
 
-| Capability | Pi RPC | ACP v1 and aliases |
-| --- | --- | --- |
-| Startup and transport | **Tested:** exact executable/cwd launch, bounded `--version`, strict JSONL, `get_state`, and queue modes. Non-JSON stdout fails closed. | **Tested:** exact command plus argument vector, absolute cwd, JSON-RPC 2.0 framing, and protocol-version-1 initialize. ACP stable transport is stdio; custom URL configuration is intentionally absent. |
-| Streaming and completion | **Tested:** text deltas and authoritative assistant-message endings are aggregated; only `agent_settled` is terminal because `agent_end` may precede retry or continuation. | **Tested:** `session/update` agent chunks and tool status stream until the `session/prompt` response supplies a stop reason. |
-| Follow-up and interruption | **Tested native steer:** `steer` transfers output to the newest emitter; `abort` interrupts. | **Tested queue/cancel:** ACP v1 has no prompt-steer method. Accumulated adjacent chat messages form one ordered next prompt; `/stop` sends `session/cancel`. |
-| Resume and settings | **Tested:** session-file path and policy fingerprint persist; model/thought/tool choices become RPC CLI flags. | **Tested:** opaque session IDs persist; advertised `session/resume` is preferred over `session/load`; advertised model overrides use category-matched config options. Thought-level selection is unsupported because choices arrive only after session creation. |
-| Permissions | **Tested mapping:** read-only enables only Pi read/search tools. Pi provides no OS sandbox through RPC. | **Tested mapping:** Spynel advertises no filesystem/terminal client callbacks. Read-only auto-rejects unsafe permission requests; broader modes choose one-time allowance. Agents that skip permission requests remain trusted local processes. |
+| Capability | Pi RPC | Oh My Pi RPC | ACP v1 and aliases |
+| --- | --- | --- | --- |
+| Startup and transport | **Tested:** exact executable/cwd launch, bounded `--version`, strict JSONL, `get_state`, and queue modes. Non-JSON stdout fails closed. | **Tested:** the shared launch contract with fork flags: `--no-extensions --no-skills`, `--resume`, and `--tools read,grep,glob`; startup also emits ignorable `ready` and `available_commands_update` frames. | **Tested:** exact command plus argument vector, absolute cwd, JSON-RPC 2.0 framing, and protocol-version-1 initialize. ACP stable transport is stdio; custom URL configuration is intentionally absent. |
+| Streaming and completion | **Tested:** text deltas and authoritative assistant-message endings are aggregated; only `agent_settled` is terminal because `agent_end` may precede retry or continuation. | **Tested:** deltas and message endings aggregate as with Pi, but only an `agent_end` whose `isTerminal` and `yielded` are not false is terminal, because retries, compaction, and queued input emit earlier non-terminal `agent_end` frames and no `agent_settled` event exists. | **Tested:** `session/update` agent chunks and tool status stream until the `session/prompt` response supplies a stop reason. |
+| Follow-up and interruption | **Tested native steer:** `steer` transfers output to the newest emitter; `abort` interrupts. | **Tested:** the shared native steer/abort path; the queue-mode commands accepted `all` in the 2026-10-03 keyless probe. | **Tested queue/cancel:** ACP v1 has no prompt-steer method. Accumulated adjacent chat messages form one ordered next prompt; `/stop` sends `session/cancel`. |
+| Resume and settings | **Tested:** session-file path and policy fingerprint persist; model/thought/tool choices become RPC CLI flags. | **Tested:** persistence runs through the shared adapter; `--resume` reopens the stored session file instead of `--session`, and each model's efforts come from `get_available_models` because `get_available_thinking_levels` is not a fork command. | **Tested:** opaque session IDs persist; advertised `session/resume` is preferred over `session/load`; advertised model overrides use category-matched config options. Thought-level selection is unsupported because choices arrive only after session creation. |
+| Permissions | **Tested mapping:** read-only enables only Pi read/search tools. Pi provides no OS sandbox through RPC. | **Tested mapping:** read-only enables only `read,grep,glob`; the fork rejects upstream Pi's `ls`/`find` at launch. No OS sandbox through RPC. | **Tested mapping:** Spynel advertises no filesystem/terminal client callbacks. Read-only auto-rejects unsafe permission requests; broader modes choose one-time allowance. Agents that skip permission requests remain trusted local processes. |
 
 ## Synthetic protocol variants
 
 The portable fixture process and compatibility suite are labelled
 `codex-app-server-public-schema-retrieved-2026-08-07`,
 `claude-code-stream-json-docs-retrieved-2026-08-07`,
-`pi-jsonl-rpc-docs-retrieved-2026-08-08`, and
-`acp-stable-v1-schema-retrieved-2026-08-08`. They exercise supported lifecycle
+`pi-jsonl-rpc-docs-retrieved-2026-08-08`,
+`acp-stable-v1-schema-retrieved-2026-08-08`, and
+`oh-my-pi-18.2.6-rpc-docs-retrieved-2026-10-03`. They exercise supported lifecycle
 shapes plus representative missing methods/flags/identity fields, renamed
-fields, changed initialization events/versions, and changed terminal statuses.
+fields, changed initialization events/versions, changed terminal statuses, and
+the Oh My Pi dialect: ignorable startup frames, an unknown-command rejection,
+catalog-embedded thinking efforts, and an intermediate non-terminal `agent_end`
+before the terminal one.
 Incompatible session and initialization cases assert that no invalid mapping
 is persisted.
 
