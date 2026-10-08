@@ -550,7 +550,7 @@ func (s *Service) recoveryEmitter(origin orchestrator.Origin) core.Emit {
 				if event.Kind == core.EventError {
 					text = "Error " + text
 				}
-				if err := router.Deliver(context.Background(), origin.Channel, origin.Conversation, "recovery-"+id, text); err != nil {
+				if err := router.Deliver(context.Background(), origin.Channel, origin.Conversation, "recovery-"+id, text, event.Attachments); err != nil {
 					s.Runtime.LogEvent("error", "recovery", "delivery_failed", "Recovered conversation response could not be delivered")
 				}
 			}

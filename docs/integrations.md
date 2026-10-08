@@ -18,6 +18,12 @@ Configuration forms replace chat only in the TUI. Text transports use the same s
 
 Every non-empty `/jobs` result places `Use /job info <number> to inspect a job.` immediately above its `/job kill` hint.
 
+## Native notification attachments
+
+Remote `spynel notify` messages support the same standalone `[Send attachment](</absolute/path/to/file>)` and `[Send photo](</absolute/path/to/image.png>)` directives as final replies. The shared application service validates all directives under the current attachment limit before sending anything, strips them from the caption, and forwards validated files to the native Telegram or encrypted WhatsApp uploader. Ordinary Markdown links and inbound attachment references remain inert; local TUI/CLI notifications retain literal text.
+
+Files precede the caption. `queued notification` and HTTP Accepted confirm durable admission, not upload or user receipt. Native upload, HTTP/API rejection, and caption failures leave the message pending for ordinary retries; successful remote history is committed only after all sends succeed. Retries replay the whole message: Telegram may duplicate files already accepted before a later failure, while WhatsApp reuses stable per-file and text IDs. A configured local fallback records local delivery and does not establish remote file delivery. Files are reopened and checked on each attempt, so removing or enlarging a queued file can prevent delivery until expiry.
+
 ## TUI
 
 Before the normal TUI and primary-owner election start, bare `spynel` checks whether its canonical launch directory is uninitialized beneath an initialized workspace. In that case a required themed screen offers exactly **Use parent workspace** (default), **Initialize here**, and **Exit**. Up/Down, Tab/Shift+Tab, Space/Enter, Escape, and Ctrl+C follow the standard required-screen controls; the two exit keys choose the non-mutating exit path. Server and automation commands never display this screen.

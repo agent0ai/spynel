@@ -103,7 +103,7 @@ type concurrentInterruptHarness struct {
 
 type notificationRouter struct{ calls []string }
 
-func (r *notificationRouter) Deliver(_ context.Context, channelName, conversation, eventID, text string) error {
+func (r *notificationRouter) Deliver(_ context.Context, channelName, conversation, eventID, text string, _ []core.OutboundAttachment) error {
 	r.calls = append(r.calls, channelName+"/"+conversation+"/"+eventID+"/"+text)
 	return nil
 }
@@ -113,7 +113,7 @@ type conversationEventRouter struct {
 	events []core.Event
 }
 
-func (r *conversationEventRouter) Deliver(context.Context, string, string, string, string) error {
+func (r *conversationEventRouter) Deliver(context.Context, string, string, string, string, []core.OutboundAttachment) error {
 	return nil
 }
 

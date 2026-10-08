@@ -41,7 +41,7 @@ func TestUsernameAuthorizedInboundPersistsIdentityForProactiveDelivery(t *testin
 
 	restarted := NewWithIdentityStore(config.Telegram{AllowedUsers: []string{"FIXTURE_USER"}}, "token", path)
 	restarted.baseURL = server.URL
-	if err := restarted.Deliver(context.Background(), "TG-123456", "event", "complete"); err != nil {
+	if err := restarted.Deliver(context.Background(), "TG-123456", "event", "complete", nil); err != nil {
 		t.Fatalf("restart delivery using verified username mapping: %v", err)
 	}
 	if requests.Load() == 0 {

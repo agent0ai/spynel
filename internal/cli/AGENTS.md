@@ -6,6 +6,7 @@
 
 ## Local Contracts
 
+- Managed Telegram and WhatsApp builders bind recipient authorization to the live configuration store, returning unavailable authorization when disabled; snapshots alone never authorize a retained adapter generation.
 - Route shared behavior through the same application service and local API as interactive channels; deterministic commands must not start a harness merely because no owner exists.
 - Before an ownerless plain-CLI `/cleanup`, hold the shared election mutation boundary through the destructive operation and recheck that the primary lease is absent and the durable clean-release grace period has expired. If ownership appeared or failover is still fenced, join the healthy owner or fail closed during the transition; never run cleanup from a separate process-local service beside an owner or an already-open successor awaiting promotion.
 - While running a workspace server/election, absorb SIGTSTP from startup through shutdown so terminal job control cannot suspend a shared primary. Unregister the signal channel afterward. Ctrl+Z has no shell-suspend action; explicit SIGSTOP cannot be prevented and still requires operator recovery. Never steal a fresh lease because readiness fails.

@@ -1,6 +1,7 @@
 package media
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +35,45 @@ func TestParseOutboundExtractsAttachmentAndPhoto(t *testing.T) {
 	}
 	if attachments[1].Kind != "photo" || attachments[1].MediaType != "image/png" {
 		t.Fatalf("photo = %#v", attachments[1])
+	}
+}
+
+func TestOpenOutboundBoundsGrowthAndRejectsNonregularReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fixture.txt")
+	if err := os.WriteFile(path, []byte("exact"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, attachments, err := ParseOutbound("[Send attachment](<"+path+">)", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenOutbound(attachments[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, err := io.ReadAll(reader); err != nil || string(data) != "exact" {
+		t.Fatalf("exact limit = %q, %v", data, err)
+	}
+	_ = reader.Close()
+	reader, err = OpenOutbound(attachments[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if err := os.WriteFile(path, []byte("grew beyond limit"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := io.ReadAll(reader); err == nil || len(data) != 5 || !strings.Contains(err.Error(), "grew") {
+		t.Fatalf("growth = %q, %v", data, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenOutbound(attachments[0]); err == nil {
+		t.Fatal("nonregular replacement accepted")
 	}
 }
 

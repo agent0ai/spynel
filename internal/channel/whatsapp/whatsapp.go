@@ -10,6 +10,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,7 +82,7 @@ type incomingMessage struct {
 
 const whatsAppDeviceName = "Spynel"
 
-var errWhatsAppRuntimeAuthorization = errors.New("WhatsApp runtime authorization is unavailable: allowed_numbers has no valid number")
+var errWhatsAppRuntimeAuthorization = errors.New("WhatsApp runtime authorization is unavailable: allowed_numbers changed or has no valid number")
 
 func New(cfg config.WhatsApp, database string) *Client {
 	client := &Client{
@@ -133,7 +134,8 @@ func (c *Client) liveAllowedNumbers() []string {
 }
 
 func (c *Client) ValidateRuntimeAuthorization() error {
-	if c.revoked.Load() || !config.HasAllowedWhatsAppNumber(c.liveAllowedNumbers()) {
+	allowed := c.liveAllowedNumbers()
+	if c.revoked.Load() || !slices.Equal(c.config.AllowedNumbers, allowed) || !config.HasAllowedWhatsAppNumber(allowed) {
 		return errWhatsAppRuntimeAuthorization
 	}
 	return nil
@@ -157,7 +159,7 @@ func (c *Client) requireRuntimeAuthorization() error {
 	return nil
 }
 
-func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string) error {
+func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string, attachments []core.OutboundAttachment) error {
 	if err := c.requireRuntimeAuthorization(); err != nil {
 		return err
 	}
@@ -179,6 +181,12 @@ func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string
 		chat = types.NewJID(number, types.DefaultUserServer)
 	} else {
 		return errors.New("invalid WhatsApp conversation origin")
+	}
+	for index, attachment := range attachments {
+		id := stableWhatsAppMessageID(eventID+":attachment", index)
+		if err := c.sendAttachment(ctx, chat, attachment, id); err != nil {
+			return err
+		}
 	}
 	_, err := c.sendEvent(ctx, chat, eventID, text)
 	return err
@@ -213,7 +221,7 @@ func (c *Client) DeliverEvent(ctx context.Context, conversation, eventID string,
 		if event.Kind == core.EventError {
 			text = channel.ErrorResponse(text)
 		}
-		return c.Deliver(ctx, conversation, eventID, text)
+		return c.Deliver(ctx, conversation, eventID, text, event.Attachments)
 	}
 	return nil
 }
@@ -288,15 +296,7 @@ func (c *Client) sendEvent(ctx context.Context, chat types.JID, eventID, text st
 			return nil, err
 		}
 		id := stableWhatsAppMessageID(eventID, index)
-		var response whatsmeow.SendResponse
-		var err error
-		if c.deliverID != nil {
-			response, err = c.deliverID(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)}, id)
-		} else if c.deliver != nil {
-			response, err = c.deliver(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)})
-		} else {
-			response, err = c.client.SendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)}, whatsmeow.SendRequestExtra{ID: id})
-		}
+		response, err := c.sendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)}, id)
 		if err != nil {
 			return nil, err
 		}
@@ -994,7 +994,7 @@ func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, t
 			_ = c.send(ctx, chat, text)
 		}
 		for _, attachment := range event.Attachments {
-			if err := c.sendAttachment(ctx, chat, attachment); err != nil {
+			if err := c.sendAttachment(ctx, chat, attachment, ""); err != nil {
 				_ = c.send(ctx, chat, channel.ErrorResponse("Spynel attachment delivery error: "+err.Error()))
 			}
 		}
@@ -1049,7 +1049,7 @@ func (c *Client) send(ctx context.Context, chat types.JID, text string) error {
 		return errors.New("WhatsApp is not connected")
 	}
 	for _, chunk := range split(markdownfmt.WhatsApp(text), 60000) {
-		response, err := c.sendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)})
+		response, err := c.sendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)}, "")
 		if err != nil {
 			return err
 		}
@@ -1058,11 +1058,11 @@ func (c *Client) send(ctx context.Context, chat types.JID, text string) error {
 	return nil
 }
 
-func (c *Client) sendAttachment(ctx context.Context, chat types.JID, attachment core.OutboundAttachment) error {
+func (c *Client) sendAttachment(ctx context.Context, chat types.JID, attachment core.OutboundAttachment, id types.MessageID) error {
 	if err := c.requireRuntimeAuthorization(); err != nil {
 		return err
 	}
-	if (c.client == nil && c.upload == nil) || (c.client == nil && c.deliver == nil) {
+	if (c.client == nil && c.upload == nil) || (c.client == nil && c.deliver == nil && c.deliverID == nil) {
 		return errors.New("WhatsApp is not connected")
 	}
 	file, err := media.OpenOutbound(attachment)
@@ -1100,7 +1100,7 @@ func (c *Client) sendAttachment(ctx context.Context, chat types.JID, attachment 
 			Mimetype: proto.String(attachment.MediaType), FileName: proto.String(attachment.Name), Title: proto.String(attachment.Name),
 		}}
 	}
-	response, err := c.sendMessage(ctx, chat, message)
+	response, err := c.sendMessage(ctx, chat, message, id)
 	if err != nil {
 		return err
 	}
@@ -1108,14 +1108,17 @@ func (c *Client) sendAttachment(ctx context.Context, chat types.JID, attachment 
 	return nil
 }
 
-func (c *Client) sendMessage(ctx context.Context, chat types.JID, message *waE2E.Message) (whatsmeow.SendResponse, error) {
+func (c *Client) sendMessage(ctx context.Context, chat types.JID, message *waE2E.Message, id types.MessageID) (whatsmeow.SendResponse, error) {
 	if err := c.requireRuntimeAuthorization(); err != nil {
 		return whatsmeow.SendResponse{}, err
+	}
+	if id != "" && c.deliverID != nil {
+		return c.deliverID(ctx, chat, message, id)
 	}
 	if c.deliver != nil {
 		return c.deliver(ctx, chat, message)
 	}
-	return c.client.SendMessage(ctx, chat, message)
+	return c.client.SendMessage(ctx, chat, message, whatsmeow.SendRequestExtra{ID: id})
 }
 
 func (c *Client) recordSent(id types.MessageID) {

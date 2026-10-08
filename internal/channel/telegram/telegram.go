@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,7 +50,7 @@ type Bot struct {
 	listen            func(string, string) (net.Listener, error)
 }
 
-var errTelegramRuntimeAuthorization = errors.New("Telegram runtime authorization is unavailable: allowed_users has no valid user")
+var errTelegramRuntimeAuthorization = errors.New("Telegram runtime authorization is unavailable: allowed_users changed or has no valid user")
 
 func New(cfg config.Telegram, token string) *Bot {
 	return NewWithIdentityStore(cfg, token, "")
@@ -100,7 +101,8 @@ func (b *Bot) liveAllowedUsers() []string {
 }
 
 func (b *Bot) ValidateRuntimeAuthorization() error {
-	if b.revoked.Load() || !config.HasAllowedTelegramUser(b.liveAllowedUsers()) {
+	allowed := b.liveAllowedUsers()
+	if b.revoked.Load() || !slices.Equal(b.config.AllowedUsers, allowed) || !config.HasAllowedTelegramUser(allowed) {
 		return errTelegramRuntimeAuthorization
 	}
 	return nil
@@ -124,7 +126,7 @@ func (b *Bot) requireRuntimeAuthorization() error {
 	return nil
 }
 
-func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string) error {
+func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string, attachments []core.OutboundAttachment) error {
 	if err := b.requireRuntimeAuthorization(); err != nil {
 		return err
 	}
@@ -145,6 +147,12 @@ func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string) e
 	if _, err := strconv.ParseInt(chatID, 10, 64); err != nil {
 		return errors.New("invalid Telegram chat identifier")
 	}
+	// Send files before text so a failed upload does not duplicate the caption on retry.
+	for _, attachment := range attachments {
+		if err := b.sendAttachment(ctx, chatID, attachment, 0); err != nil {
+			return err
+		}
+	}
 	_, err := b.sendWithIDs(ctx, chatID, text, 0, false)
 	return err
 }
@@ -156,6 +164,9 @@ func (b *Bot) DeliverEvent(ctx context.Context, conversation, eventID string, ev
 	chatID, err := b.deliveryChatID(conversation)
 	if err != nil {
 		return err
+	}
+	if _, err := strconv.ParseInt(chatID, 10, 64); err != nil {
+		return errors.New("invalid Telegram chat identifier")
 	}
 	if event.Kind == core.EventActivity {
 		b.activityMu.Lock()
@@ -188,7 +199,7 @@ func (b *Bot) DeliverEvent(ctx context.Context, conversation, eventID string, ev
 		if event.Kind == core.EventError {
 			text = channel.ErrorResponse(text)
 		}
-		return b.Deliver(ctx, conversation, eventID, text)
+		return b.Deliver(ctx, conversation, eventID, text, event.Attachments)
 	}
 	return nil
 }

@@ -10,6 +10,7 @@
 - The supervisor consumes refreshed shared configuration snapshots, replaces only changed adapters, revokes stale adapter authority before cancellation, isolates failures, publishes lifecycle state, and retries only eligible unchanged configurations.
 - Activity references must be balanced and overlap-safe so an older turn cannot clear a newer turn's visible activity.
 - Route proactive canonical conversation events only through the currently connected channel generation and bind their activity references to that generation's cancellation context so disconnect, replacement, and shutdown clean up safely.
+- The proactive delivery contract carries validated attachments as well as text without communication activity. Canonical terminal events forward the same payload through it. Adapters upload files before the caption and return native upload/send failures; the outbox retries the whole message under each transport's existing identity contract.
 
 ## Child DOX Index
 

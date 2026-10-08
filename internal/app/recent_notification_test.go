@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
@@ -17,7 +18,7 @@ type recentNotificationRouter struct {
 	calls []string
 }
 
-func (r *recentNotificationRouter) Deliver(_ context.Context, channelName, conversation, eventID, text string) error {
+func (r *recentNotificationRouter) Deliver(_ context.Context, channelName, conversation, eventID, text string, _ []core.OutboundAttachment) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, channelName+"/"+conversation+"/"+eventID+"/"+text)

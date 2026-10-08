@@ -1154,7 +1154,26 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 		return nil, cacheErr
 	}
 	speech := media.NewParakeet(service.Settings, cacheRoot, cacheErr, service.Runtime.Writer("media"))
-	managed := []channel.Managed{
+	managed := managedChannels(service, speech)
+	supervisor := channel.NewSupervisor(service.Settings, service.Handle, managed, report, service.Runtime.Writer("channel"))
+	supervisor.SetEventLogger(service.Runtime.LogEvent)
+	service.PairingControl = supervisor
+	service.DeliveryControl = supervisor
+	service.SetConversationDelivery(supervisor)
+	done := make(chan error, 1)
+	go func() {
+		defer service.Runtime.RecoverPanic("channel", "supervisor_panic")
+		err := supervisor.Run(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			service.Runtime.LogEvent("error", "channel", "supervisor_stopped", "Channel supervisor: "+err.Error())
+		}
+		done <- err
+	}()
+	return done, nil
+}
+
+func managedChannels(service *app.Service, speech media.Transcriber) []channel.Managed {
+	return []channel.Managed{
 		{
 			Name:    "telegram",
 			Enabled: func(cfg config.Config) bool { return cfg.Channels.Telegram.Enabled },
@@ -1168,6 +1187,13 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 			},
 			Build: func(cfg config.Config) (channel.Channel, error) {
 				bot := telegram.NewWithIdentityStore(cfg.Channels.Telegram, cfg.TelegramToken(), cfg.StatePath("runtime", "telegram-identities.json"))
+				bot.SetAllowedUsersSource(func() []string {
+					current := service.Settings.Snapshot().Channels.Telegram
+					if !current.Enabled {
+						return nil
+					}
+					return current.AllowedUsers
+				})
 				bot.SetNoticeReporter(service.SetNotice)
 				store := &media.Store{Directory: cfg.StatePath("attachments", "telegram"), MaxBytes: int64(cfg.Workspace.AttachmentMaxMB) * 1024 * 1024}
 				var transcriber media.Transcriber
@@ -1190,6 +1216,13 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 			},
 			Build: func(cfg config.Config) (channel.Channel, error) {
 				client := whatsapp.New(cfg.Channels.WhatsApp, cfg.Resolve(cfg.Channels.WhatsApp.Database))
+				client.SetAllowedNumbersSource(func() []string {
+					current := service.Settings.Snapshot().Channels.WhatsApp
+					if !current.Enabled {
+						return nil
+					}
+					return current.AllowedNumbers
+				})
 				client.SetPairingReporter(service.SetPairing)
 				store := &media.Store{Directory: cfg.StatePath("attachments", "whatsapp"), MaxBytes: int64(cfg.Workspace.AttachmentMaxMB) * 1024 * 1024}
 				var transcriber media.Transcriber
@@ -1201,21 +1234,6 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 			},
 		},
 	}
-	supervisor := channel.NewSupervisor(service.Settings, service.Handle, managed, report, service.Runtime.Writer("channel"))
-	supervisor.SetEventLogger(service.Runtime.LogEvent)
-	service.PairingControl = supervisor
-	service.DeliveryControl = supervisor
-	service.SetConversationDelivery(supervisor)
-	done := make(chan error, 1)
-	go func() {
-		defer service.Runtime.RecoverPanic("channel", "supervisor_panic")
-		err := supervisor.Run(ctx)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			service.Runtime.LogEvent("error", "channel", "supervisor_stopped", "Channel supervisor: "+err.Error())
-		}
-		done <- err
-	}()
-	return done, nil
 }
 
 func configFingerprint(value any) string {

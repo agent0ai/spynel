@@ -350,7 +350,7 @@ func TestSendAttachmentUsesNativeWhatsAppMediaMessage(t *testing.T) {
 	chat := types.NewJID("15551234567", types.DefaultUserServer)
 	if err := client.sendAttachment(context.Background(), chat, core.OutboundAttachment{
 		Kind: "photo", Name: "photo.png", Path: path, MediaType: "image/png", MaxBytes: 1024,
-	}); err != nil {
+	}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if sent == nil || sent.ImageMessage == nil || sent.ImageMessage.GetMimetype() != "image/png" || sent.DocumentMessage != nil {

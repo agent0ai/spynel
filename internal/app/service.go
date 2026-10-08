@@ -271,13 +271,22 @@ func (s *Service) deliverNotification(ctx context.Context, origin orchestrator.O
 		if s.DeliveryControl == nil {
 			return fmt.Errorf("%s is disconnected", origin.Channel)
 		}
+		maxBytes := int64(s.Settings.Snapshot().Workspace.AttachmentMaxMB) * 1024 * 1024
+		cleaned, attachments, err := media.ParseOutbound(text, maxBytes)
+		if err != nil {
+			return err
+		}
 		if _, err := s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: "notification_sending", EventID: eventID}); err != nil {
 			return err
 		}
-		err := s.DeliveryControl.Deliver(ctx, origin.Channel, origin.Conversation, eventID, text)
+		err = s.DeliveryControl.Deliver(ctx, origin.Channel, origin.Conversation, eventID, cleaned, attachments)
 		if err != nil {
 			_, _ = s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: "notification_failed", EventID: eventID, Content: err.Error()})
 			return err
+		}
+		text = cleaned
+		for _, attachment := range attachments {
+			text = strings.TrimSpace(text + "\n\n[Sent " + attachment.Kind + " " + attachment.Name + "]")
 		}
 	}
 	role := "assistant"
