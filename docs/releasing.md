@@ -45,6 +45,8 @@ The npm postinstall script maps supported Node platforms to the four archive nam
 
 Before publishing, reproduce the local gates and build a runnable archive for the host target:
 
+Linux packaging requires `patchelf` to remove dependency build paths from the executable's loader metadata. The packaged executable uses only `$ORIGIN/lib` to find its companion libraries.
+
 ```bash
 ./scripts/dev.sh test
 ./scripts/smoke.sh

@@ -463,7 +463,8 @@ func visualAutostartResultModel(failed bool) model {
 	value := visualConfigModel()
 	value.screen.Controls[5] = core.ScreenControl{Key: "autostart:disable", Kind: "action", Value: "Disable autostart", Description: "Autostart enabled. Registration verified."}
 	if failed {
-		value.screen.Status = "Action failed: autostart registration unverified: reload autostart registration: systemctl: permission denied (preference saved)"
+		value.screen.Controls[5] = core.ScreenControl{Key: "autostart:check", Kind: "action", Value: "Check autostart", Description: "Autostart state unknown: autostart requires a reachable systemd manager."}
+		value.screen.Status = "Action failed: autostart registration unverified: autostart requires a reachable systemd manager: System has not been booted with systemd as init system (PID 1). Can't operate."
 	}
 	return value
 }
@@ -534,7 +535,7 @@ func visualResumeModel() model {
 			{Key: "␛", Action: "exit"},
 		},
 		Controls: []core.ScreenControl{
-			{Key: "resume:telegram", Kind: "action", Value: "TG   2026-08-07 15:21  TG-1029384756.jsonl", Description: "assistant: The deployment finished and all health checks passed. This deliberately long continuation must be trimmed rather than wrapped onto another row."},
+			{Key: "resume:telegram", Kind: "action", Value: "TG   2026-08-07 15:21  TG-12345.jsonl", Description: "assistant: The deployment finished and all health checks passed. This deliberately long continuation must be trimmed rather than wrapped onto another row."},
 			{Key: "resume:whatsapp", Kind: "action", Value: "WA   2026-08-07 14:03  WA-15551234567.jsonl", Description: "user: Check the background jobs and send me a concise update."},
 			{Key: "resume:tui", Kind: "action", Value: "TUI  2026-08-06 19:44  local-a1b2c3d4.jsonl", Description: "assistant: Configuration was saved successfully."},
 			{Key: "resume:cli", Kind: "action", Value: "CLI  2026-08-06 18:31  release-check.jsonl", Description: "user: Run the release checks."},

@@ -617,7 +617,7 @@ func TestNotificationCommandGuidanceShellQuotesFrameworkPaths(t *testing.T) {
 }
 
 func TestNotificationCommandsBindEveryTaskOriginAndWorkspace(t *testing.T) {
-	for _, origin := range []string{"tui/new-6rrwdamb", "cli/local", "telegram/TG-518743883", "whatsapp/WA-15551234567"} {
+	for _, origin := range []string{"tui/new-abcdefgh", "cli/local", "telegram/TG-123456", "whatsapp/WA-12025550100"} {
 		command := notificationCommand("/root/.local/bin/spynel", "/workspace", origin)
 		want := `/root/.local/bin/spynel notify --workdir /workspace --origin '` + origin + `' --message "Hello there"`
 		if command != want {

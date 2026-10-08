@@ -395,7 +395,7 @@ func TestLinuxActionsValidateEveryAttemptAndReportNativeFailures(t *testing.T) {
 		if err := manager.Sync(cfg, true); err != nil {
 			t.Fatal(err)
 		}
-		if got := strings.Join(calls, ","); got != "systemd-analyze,daemon-reload,list-unit-files" {
+		if got := strings.Join(calls, ","); got != "show,list-unit-files,systemd-analyze,daemon-reload,show,list-unit-files" {
 			t.Fatalf("enable did not revalidate: %s", got)
 		}
 	}
@@ -447,7 +447,7 @@ func TestLinuxNativeRegistrationQueries(t *testing.T) {
 	manager.SystemUnitDirectory = filepath.Join(root, "etc", "systemd", "system")
 	manager.RunCommand = func(ctx context.Context, name string, args ...string) (string, error) {
 		if name == "systemctl" {
-			if args[1] == "daemon-reload" {
+			if args[1] == "daemon-reload" || args[1] == "show" {
 				// No system manager runs in the test container. Native file-state
 				// queries and validation operate on this private filesystem root.
 				return "", nil
@@ -464,6 +464,141 @@ func TestLinuxNativeRegistrationQueries(t *testing.T) {
 		actual, err := manager.Enabled(cfg)
 		if err != nil || actual != enabled {
 			t.Fatalf("native state = %t, %v; expected %t", actual, err, enabled)
+		}
+	}
+}
+
+func TestLinuxStartupRequiresLiveManagerBeforeReadingOrWritingRegistration(t *testing.T) {
+	for _, systemWide := range []bool{false, true} {
+		t.Run(strconv.FormatBool(systemWide), func(t *testing.T) {
+			cfg := startupTestConfig(t, t.TempDir())
+			manager := startupTestManager(t, "linux")
+			manager.SystemWide = systemWide
+			// Even a valid, enabled on-disk registration is not evidence of a
+			// usable service manager, as in a container without systemd.
+			if err := manager.Sync(cfg, true); err != nil {
+				t.Fatal(err)
+			}
+			unit, link, _ := manager.linuxPaths(cfg)
+			before, _ := os.ReadFile(unit)
+			manager.RunCommand = func(_ context.Context, name string, args ...string) (string, error) {
+				if name != "systemctl" || !strings.Contains(strings.Join(args, " "), "show --property=Version --value") || strings.Contains(strings.Join(args, " "), "--user") == systemWide {
+					t.Fatalf("unreachable manager was bypassed: %s %v", name, args)
+				}
+				return "", errors.New("System has not been booted with systemd as init system")
+			}
+			if enabled, err := manager.Enabled(cfg); err == nil || enabled {
+				t.Fatalf("file-only state was accepted: %t, %v", enabled, err)
+			}
+			for _, enabled := range []bool{true, false} {
+				if err := manager.Sync(cfg, enabled); err == nil || !strings.Contains(err.Error(), "reachable systemd manager") {
+					t.Fatalf("unreachable manager accepted enabled=%t: %v", enabled, err)
+				}
+			}
+			if after, err := os.ReadFile(unit); err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("unreachable manager changed registration: %v", err)
+			}
+			if target, err := os.Readlink(link); err != nil || target != filepath.Join("..", filepath.Base(unit)) {
+				t.Fatalf("unreachable manager changed enabled link: %q, %v", target, err)
+			}
+		})
+	}
+}
+
+func TestNativeLinuxStartupWithoutSystemdLeavesNoRegistration(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux service manager")
+	}
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		t.Skip("systemctl unavailable")
+	}
+	manager := startupTestManager(t, "linux")
+	manager.SystemWide = true
+	manager.RunCommand = func(ctx context.Context, name string, args ...string) (string, error) {
+		return runCommand(ctx, nil, name, args...)
+	}
+	if _, err := manager.run(t.Context(), "systemctl", "--no-ask-password", "show", "--property=Version", "--value"); err == nil {
+		t.Skip("systemd manager is running")
+	}
+	cfg := startupTestConfig(t, t.TempDir())
+	for _, enabled := range []bool{true, false} {
+		if err := manager.Sync(cfg, enabled); err == nil || !strings.Contains(err.Error(), "reachable systemd manager") {
+			t.Fatalf("unavailable systemd accepted enabled=%t: %v", enabled, err)
+		}
+	}
+	if enabled, err := manager.Enabled(cfg); enabled || err == nil {
+		t.Fatalf("unavailable systemd reported registered: %t, %v", enabled, err)
+	}
+	entries, err := os.ReadDir(manager.SystemUnitDirectory)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("unavailable systemd left startup artifacts: %v, %v", entries, err)
+	}
+}
+
+func TestStartupFailureRestoresPreviousRegistration(t *testing.T) {
+	for _, goos := range []string{"linux", "darwin"} {
+		for _, previous := range []bool{false, true} {
+			for _, enabled := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%t-to-%t", goos, previous, enabled), func(t *testing.T) {
+					cfg := startupTestConfig(t, t.TempDir())
+					manager := startupTestManager(t, goos)
+					manager.SystemWide, manager.SystemLaunchDirectory = true, t.TempDir()
+					disabled := true
+					original := manager.RunCommand
+					manager.RunCommand = func(ctx context.Context, name string, args ...string) (string, error) {
+						if name == "launchctl" {
+							if args[0] == "print-disabled" {
+								return fmt.Sprintf("disabled services = {\n%q => %t\n}", "dev.spynel.workspace."+workspaceID(cfg), disabled), nil
+							}
+							disabled = args[0] == "disable"
+						}
+						return original(ctx, name, args...)
+					}
+					if previous {
+						if err := manager.Sync(cfg, true); err != nil {
+							t.Fatal(err)
+						}
+					}
+					unit, link, _ := manager.linuxPaths(cfg)
+					if goos == "darwin" {
+						_, _, unit = manager.darwinRegistration(cfg)
+					}
+					before, _ := os.ReadFile(unit)
+					// Force a different generated file so rollback must restore
+					// the original bytes, not merely recreate an enabled link.
+					t.Setenv("XDG_CACHE_HOME", t.TempDir())
+					base := manager.RunCommand
+					failed := false
+					manager.RunCommand = func(ctx context.Context, name string, args ...string) (string, error) {
+						lateStep := name == "systemctl" && args[1] == "daemon-reload" || name == "launchctl" && (args[0] == "enable" || args[0] == "disable")
+						if lateStep && !failed {
+							if name == "launchctl" {
+								disabled = args[0] == "disable"
+							}
+							failed = true
+							return "", errors.New("late registration failure")
+						}
+						return base(ctx, name, args...)
+					}
+					if err := manager.Sync(cfg, enabled); err == nil || !strings.Contains(err.Error(), "late registration failure") {
+						t.Fatalf("late failure was hidden: %v", err)
+					}
+					if after, err := os.ReadFile(unit); previous && (err != nil || !bytes.Equal(before, after)) || !previous && !os.IsNotExist(err) {
+						t.Fatalf("previous registration was not restored: %v", err)
+					}
+					if goos == "linux" {
+						if target, err := os.Readlink(link); previous && (err != nil || target != filepath.Join("..", filepath.Base(unit))) || !previous && !os.IsNotExist(err) {
+							t.Fatalf("previous startup link was not restored: %q, %v", target, err)
+						}
+					}
+					if actual, err := manager.Enabled(cfg); err != nil || actual != previous {
+						t.Fatalf("failed operation changed state: %t, %v", actual, err)
+					}
+					if goos == "darwin" && disabled == previous {
+						t.Fatal("failed operation changed launchd override")
+					}
+				})
+			}
 		}
 	}
 }
@@ -492,7 +627,7 @@ func TestNativeStartupStateReadDoesNotMutateRegistration(t *testing.T) {
 		{unit + " enabled-runtime enabled\n", false, true}, {"unrelated.service enabled enabled\n", false, true},
 	} {
 		m.RunCommand = func(_ context.Context, name string, args ...string) (string, error) {
-			if name != "systemctl" || !strings.Contains(strings.Join(args, " "), "list-unit-files") || strings.Contains(strings.Join(args, " "), "daemon-reload") {
+			if name != "systemctl" || !(strings.Contains(strings.Join(args, " "), "list-unit-files") || strings.Contains(strings.Join(args, " "), "show")) {
 				t.Fatalf("state inspection mutated OS: %s %v", name, args)
 			}
 			return test.output, nil

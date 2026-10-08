@@ -710,7 +710,7 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 		histories := history.New(cfg.StatePath("history"))
 		lease, leaseErr := election.Current()
 		becameInitialPrimary := leaseErr == nil && shouldResumeTUIHistory(hadHealthyPrimary, lease, election.ID())
-		conversation, err := selectTUIConversation(histories, election.ID(), becameInitialPrimary)
+		conversation, newConversation, err := selectTUIConversation(histories, election.ID(), becameInitialPrimary)
 		if err != nil {
 			return serverResult(fmt.Errorf("select startup TUI history: %w", err))
 		}
@@ -734,7 +734,7 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 		if historyErr != nil {
 			return serverResult(fmt.Errorf("inspect TUI history: %w", historyErr))
 		}
-		initialScreen, err := client.InitialScreen(ctx, hasHistory, !becameInitialPrimary)
+		initialScreen, err := client.InitialScreen(ctx, hasHistory, newConversation)
 		if err != nil {
 			return serverResult(fmt.Errorf("load initial TUI screen: %w", err))
 		}
@@ -844,17 +844,17 @@ func shouldResumeTUIHistory(hadHealthyPrimary bool, lease instance.Lease, instan
 	return !hadHealthyPrimary && lease.InstanceID == instanceID && lease.HandoffTo == ""
 }
 
-func selectTUIConversation(histories *history.Store, instanceID string, resumeLatest bool) (string, error) {
+func selectTUIConversation(histories *history.Store, instanceID string, resumeLatest bool) (conversation string, newConversation bool, err error) {
 	if resumeLatest {
 		latest, found, err := histories.Latest("tui")
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		if found {
-			return latest.Conversation, nil
+			return latest.Conversation, false, nil
 		}
 	}
-	return "local-" + instanceID, nil
+	return "local-" + instanceID, true, nil
 }
 
 func interactiveTerminal() bool {

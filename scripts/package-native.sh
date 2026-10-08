@@ -36,6 +36,11 @@ if [ "$host_os/$host_arch" != "$target_os/$target_arch" ]; then
   exit 1
 fi
 
+if [ "$target_os" = linux ] && ! command -v patchelf >/dev/null 2>&1; then
+  echo "Linux native packaging requires patchelf" >&2
+  exit 1
+fi
+
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 stage_dir="$work_dir/spynel_${version}_${target_os}_${target_arch}"
@@ -65,6 +70,9 @@ case "$target_os" in
     cp "$module_dir/lib/$library_arch/libsherpa-onnx-c-api.so" "$stage_dir/lib/"
     cp "$module_dir/lib/$library_arch/libonnxruntime.so" "$stage_dir/lib/"
     cp "$module_dir/LICENSE" "$stage_dir/licenses/sherpa-onnx/LICENSE"
+    # The dependency embeds its absolute build directory in the executable RUNPATH.
+    patchelf --set-rpath '$ORIGIN/lib' "$stage_dir/$binary"
+    [ "$(patchelf --print-rpath "$stage_dir/$binary")" = '$ORIGIN/lib' ]
     ;;
   darwin)
     module_dir=$(cd "$project_dir" && "$go_bin" list -m -f '{{.Dir}}' github.com/k2-fsa/sherpa-onnx-go-macos)

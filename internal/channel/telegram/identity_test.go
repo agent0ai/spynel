@@ -24,24 +24,24 @@ func TestUsernameAuthorizedInboundPersistsIdentityForProactiveDelivery(t *testin
 	}))
 	defer server.Close()
 
-	bot := NewWithIdentityStore(config.Telegram{AllowedUsers: []string{" @FrD3L "}}, "token", path)
+	bot := NewWithIdentityStore(config.Telegram{AllowedUsers: []string{" @fixture_user "}}, "token", path)
 	bot.baseURL = server.URL
 	handled := false
 	bot.processUpdate(context.Background(), func(_ context.Context, message core.Message, emit core.Emit) error {
-		handled = message.Conversation == "TG-518743883"
+		handled = message.Conversation == "TG-123456"
 		emit(core.Event{Kind: core.EventFinal, Done: true})
 		return nil
 	}, telegramUpdate{Message: &telegramMessage{
-		From: telegramUser{ID: 518743883, Username: "frd3l"},
-		Chat: telegramChat{ID: 518743883, Type: "private"}, Text: "hello",
+		From: telegramUser{ID: 123456, Username: "fixture_user"},
+		Chat: telegramChat{ID: 123456, Type: "private"}, Text: "hello",
 	}})
 	if !handled {
 		t.Fatal("username-authorized inbound message was not handled")
 	}
 
-	restarted := NewWithIdentityStore(config.Telegram{AllowedUsers: []string{"FRD3L"}}, "token", path)
+	restarted := NewWithIdentityStore(config.Telegram{AllowedUsers: []string{"FIXTURE_USER"}}, "token", path)
 	restarted.baseURL = server.URL
-	if err := restarted.Deliver(context.Background(), "TG-518743883", "event", "complete"); err != nil {
+	if err := restarted.Deliver(context.Background(), "TG-123456", "event", "complete"); err != nil {
 		t.Fatalf("restart delivery using verified username mapping: %v", err)
 	}
 	if requests.Load() == 0 {

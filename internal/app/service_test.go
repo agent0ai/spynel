@@ -25,6 +25,7 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instructions"
 	"github.com/agent0ai/spynel/internal/orchestrator"
+	"github.com/agent0ai/spynel/internal/startup"
 	"github.com/agent0ai/spynel/internal/updater"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
@@ -185,17 +186,17 @@ func TestNotifyUsesVerifiedTelegramUsernameMappingAndRechecksRevocation(t *testi
 		t.Fatal(err)
 	}
 	cfg, _ := config.Load(config.PathForRoot(root))
-	cfg.Channels.Telegram.AllowedUsers = []string{" @FrD3L "}
+	cfg.Channels.Telegram.AllowedUsers = []string{" @fixture_user "}
 	service := New(cfg, newServiceHarness())
 	service.DeliveryControl = &notificationRouter{}
-	if _, err := service.History.Append("telegram", "TG-518743883", history.Entry{Role: "user", Content: "known"}); err != nil {
+	if _, err := service.History.Append("telegram", "TG-123456", history.Entry{Role: "user", Content: "known"}); err != nil {
 		t.Fatal(err)
 	}
 	identities := telegram.NewIdentityStore(cfg.StatePath("runtime", "telegram-identities.json"))
-	if err := identities.RecordVerifiedPrivate(518743883, 518743883, "frd3l"); err != nil {
+	if err := identities.RecordVerifiedPrivate(123456, 123456, "fixture_user"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Notify(context.Background(), "telegram/TG-518743883", "complete"); err != nil {
+	if _, err := service.Notify(context.Background(), "telegram/TG-123456", "complete"); err != nil {
 		t.Fatalf("verified username notification: %v", err)
 	}
 	if _, err := service.Settings.Update(func(next *config.Config) error {
@@ -204,7 +205,7 @@ func TestNotifyUsesVerifiedTelegramUsernameMappingAndRechecksRevocation(t *testi
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.validateOrigin(orchestrator.Origin{Channel: "telegram", Conversation: "TG-518743883"}); err == nil {
+	if err := service.validateOrigin(orchestrator.Origin{Channel: "telegram", Conversation: "TG-123456"}); err == nil {
 		t.Fatal("revoked mapped username remained authorized")
 	}
 }
@@ -3195,7 +3196,7 @@ func TestSandboxSettingReconfiguresHarnessWithoutWorkspaceConfinement(t *testing
 	}
 }
 
-func TestStartupSettingReloadsBeforeRegistrationErrorReturns(t *testing.T) {
+func TestStartupFailureDoesNotSaveSettings(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
@@ -3211,15 +3212,92 @@ func TestStartupSettingReloadsBeforeRegistrationErrorReturns(t *testing.T) {
 		t.Fatalf("startup enable = calls %#v config %#v", manager.calls, service.Settings.Snapshot().Startup)
 	}
 	manager.err = fmt.Errorf("registration denied")
-	if _, err := service.ApplySettings(map[string]string{"startup.enabled": "off"}); err == nil {
+	before, _ := os.ReadFile(cfg.Path)
+	<-service.Settings.Updates()
+	if _, err := service.ApplySettings(map[string]string{"startup.enabled": "off", "workspace.history_char_limit": "13000"}); err == nil {
 		t.Fatal("failed startup removal did not report its OS error")
 	}
-	if service.Settings.Snapshot().Startup.Enabled {
-		t.Fatal("saved startup setting was not reloaded before the OS error returned")
+	if !service.Settings.Snapshot().Startup.Enabled || service.Settings.Snapshot().Workspace.HistoryCharLimit != cfg.Workspace.HistoryCharLimit {
+		t.Fatal("failed registration saved settings")
 	}
 	reloaded, err := config.Load(config.PathForRoot(root))
-	if err != nil || reloaded.Startup.Enabled {
+	if err != nil || !reloaded.Startup.Enabled || reloaded.Workspace.HistoryCharLimit != cfg.Workspace.HistoryCharLimit {
 		t.Fatalf("saved startup setting = %#v, %v", reloaded.Startup, err)
+	}
+	if after, _ := os.ReadFile(cfg.Path); string(before) != string(after) {
+		t.Fatal("failed registration rewrote configuration")
+	}
+	select {
+	case <-service.Settings.Updates():
+		t.Fatal("failed registration published a configuration change")
+	default:
+	}
+}
+
+func TestStartupPersistenceFailureRestoresObservedNativeState(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	cfg.Startup.Enabled = true // Saved preference differs from native registration.
+	service := New(cfg, newServiceHarness())
+	manager := &fakeStartupManager{}
+	service.Startup = manager
+	if err := os.Remove(cfg.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(cfg.Path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ApplySettings(map[string]string{"startup.enabled": "on"}); err == nil {
+		t.Fatal("configuration persistence failure was hidden")
+	}
+	if manager.enabled || !reflect.DeepEqual(manager.calls, []bool{true, false}) {
+		t.Fatalf("native state was not restored: enabled=%t, calls=%v", manager.enabled, manager.calls)
+	}
+}
+
+func TestAutostartNativeFailureDoesNotEnableButtonOrPreference(t *testing.T) {
+	for _, failStep := range []string{"show", "daemon-reload", "verification"} {
+		t.Run(failStep, func(t *testing.T) {
+			root := t.TempDir()
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, _ := config.Load(config.PathForRoot(root))
+			service := New(cfg, newServiceHarness())
+			manager := &startup.Manager{GOOS: "linux", Home: t.TempDir(), Executable: os.Args[0], SystemWide: true, SystemUnitDirectory: t.TempDir()}
+			service.Startup = manager
+			failed := false
+			manager.RunCommand = func(_ context.Context, name string, args ...string) (string, error) {
+				if name != "systemctl" {
+					return "", nil
+				}
+				step := args[1]
+				units, _ := filepath.Glob(filepath.Join(manager.SystemUnitDirectory, "*.service"))
+				if !failed && (step == failStep || failStep == "verification" && step == "list-unit-files" && len(units) > 0) {
+					failed = true
+					return "", errors.New("native startup failure")
+				}
+				if step == "list-unit-files" {
+					unit := args[len(args)-1]
+					if _, err := os.Stat(filepath.Join(manager.SystemUnitDirectory, unit)); err == nil {
+						return unit + " enabled enabled\n", nil
+					}
+				}
+				return "", nil
+			}
+			result, err := service.ScreenAction(context.Background(), "config", "autostart:enable", nil)
+			if err == nil || result.SavedControl.Key == "autostart:disable" || service.Settings.Snapshot().Startup.Enabled {
+				t.Fatalf("failed action enabled autostart: %#v, %v", result, err)
+			}
+			reloaded, _ := config.Load(cfg.Path)
+			units, _ := filepath.Glob(filepath.Join(manager.SystemUnitDirectory, "*.service"))
+			if reloaded.Startup.Enabled || len(units) != 0 {
+				t.Fatal("failed action persisted autostart")
+			}
+		})
 	}
 }
 
@@ -3264,6 +3342,9 @@ func TestAutostartButtonsReportValidationAndDoNotSaveOtherFormEdits(t *testing.T
 		screen, err := service.ScreenAction(context.Background(), "config", action, nil)
 		if screen == nil || screen.SavedControl == nil || err == nil || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "private-startup-token") {
 			t.Fatalf("failed %s returned success or lost/redacted the wrong evidence: %#v, %v", action, screen, err)
+		}
+		if screen.SavedControl.Key != "autostart:enable" || service.Settings.Snapshot().Startup.Enabled {
+			t.Fatal("failed autostart action changed the button or preference to enabled")
 		}
 	}
 	if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "test", Text: "/config set startup.enabled on"}, nil); err == nil || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "private-startup-token") {

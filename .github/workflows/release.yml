@@ -83,6 +83,10 @@ jobs:
           CGO_LDFLAGS_ALLOW: '^-Wl,-rpath,@loader_path/lib$'
         run: go test ./internal/startup ./internal/updater
 
+      - name: Install Linux packaging tool
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends patchelf
+
       - name: Build native release archive
         shell: bash
         env:

@@ -13,6 +13,7 @@
 - Publish the released root README as the npm README after pinning relative document links to the release tag on GitHub and relative image sources to the same tag on `raw.githubusercontent.com`.
 - Preserve least-privilege permissions, OIDC trusted publishing, provenance, and the documented token-only bootstrap fallback.
 - Archives include the executable, target-matched sherpa-onnx and ONNX Runtime libraries, license notices, a packaged-command smoke pass, and bounded target evidence.
+- Linux native jobs install `patchelf`; packaging replaces absolute dependency build-directory RUNPATH entries with exactly `$ORIGIN/lib` and verifies packaged execution.
 
 - Before publishing, every native target tests startup/updater cleanup and the plain installer/uninstaller against a verified 0.12.1 baseline archive, including simultaneous running npm/GitHub installations and modeled authorization for a regular user with no writable PATH entry.
 

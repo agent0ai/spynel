@@ -1388,6 +1388,10 @@ func TestBuildServiceUsesConfiguredHarnessSandbox(t *testing.T) {
 
 func TestTUIStartupResumesHistoryOnlyForInitialElectionWinner(t *testing.T) {
 	store := history.New(t.TempDir())
+	conversation, newConversation, err := selectTUIConversation(store, "first", true)
+	if err != nil || conversation != "local-first" || !newConversation {
+		t.Fatalf("fresh workspace conversation = %q, new = %t, %v", conversation, newConversation, err)
+	}
 	if _, err := store.Append("tui", "local-old", history.Entry{At: time.Now().Add(-time.Hour), Role: "user", Content: "old"}); err != nil {
 		t.Fatal(err)
 	}
@@ -1411,13 +1415,13 @@ func TestTUIStartupResumesHistoryOnlyForInitialElectionWinner(t *testing.T) {
 			t.Fatalf("%s unexpectedly qualified to resume TUI history", test.name)
 		}
 	}
-	conversation, err := selectTUIConversation(store, "winner", true)
-	if err != nil || conversation != "local-latest" {
-		t.Fatalf("resumed conversation = %q, %v", conversation, err)
+	conversation, newConversation, err = selectTUIConversation(store, "winner", true)
+	if err != nil || conversation != "local-latest" || newConversation {
+		t.Fatalf("resumed conversation = %q, new = %t, %v", conversation, newConversation, err)
 	}
-	conversation, err = selectTUIConversation(store, "secondary", false)
-	if err != nil || conversation != "local-secondary" {
-		t.Fatalf("secondary conversation = %q, %v", conversation, err)
+	conversation, newConversation, err = selectTUIConversation(store, "secondary", false)
+	if err != nil || conversation != "local-secondary" || !newConversation {
+		t.Fatalf("secondary conversation = %q, new = %t, %v", conversation, newConversation, err)
 	}
 }
 
