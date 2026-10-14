@@ -112,3 +112,107 @@ func TestUncertainProviderCloseRetainsOwnership(t *testing.T) {
 		t.Fatal("uncertain effects admitted another owner")
 	}
 }
+
+func TestUncertainFailedStartCannotReadmit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "harness-owner")
+	registry := NewRegistry()
+	registry.Register("uncertain", func(HarnessConfig) (Harness, error) {
+		return &uncertainCloseHarness{supervisorHarness{startErr: errors.New("synthetic startup failure")}}, nil
+	})
+	registry.Register("healthy", func(HarnessConfig) (Harness, error) { return &supervisorHarness{}, nil })
+	s := NewSupervisor(registry, HarnessConfig{Name: "uncertain"})
+	admissions := 0
+	s.SetProcessStartGuard(path, func() error { admissions++; return nil })
+	if err := s.Start(context.Background()); err == nil {
+		t.Fatal("synthetic startup unexpectedly succeeded")
+	}
+	if err := s.Reconfigure(HarnessConfig{Name: "healthy"}); err == nil {
+		t.Fatal("uncertain failed startup admitted a replacement")
+	}
+	if err := s.Start(context.Background()); err == nil {
+		t.Fatal("uncertain failed startup was retried")
+	}
+	if admissions != 1 {
+		t.Fatalf("provider admissions = %d, want 1", admissions)
+	}
+	if available, _ := s.Available(); available {
+		t.Fatal("uncertain provider is available")
+	}
+	if err := s.Close(); err == nil {
+		t.Fatal("uncertain close was accepted")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("uncertain marker was cleared")
+	}
+}
+
+func TestReplacementCloseFailureRefusesAdmission(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "harness-owner")
+	registry := NewRegistry()
+	registry.Register("uncertain", func(HarnessConfig) (Harness, error) { return &uncertainCloseHarness{}, nil })
+	registry.Register("healthy", func(HarnessConfig) (Harness, error) { return &supervisorHarness{}, nil })
+	s := NewSupervisor(registry, HarnessConfig{Name: "uncertain"})
+	admissions := 0
+	s.SetProcessStartGuard(path, func() error { admissions++; return nil })
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.Reconfigure(HarnessConfig{Name: "healthy"}); err == nil {
+			t.Fatal("unconfirmed provider close admitted a replacement")
+		}
+	}
+	if admissions != 1 {
+		t.Fatalf("provider admissions = %d, want 1", admissions)
+	}
+	if available, _ := s.Available(); available {
+		t.Fatal("replacement is available after uncertain close")
+	}
+	if _, _, err := s.Send(context.Background(), "fixture", "synthetic effect", nil); err == nil {
+		t.Fatal("dispatch remained available after uncertain close")
+	}
+	if s.HarnessConfig().Name != "uncertain" {
+		t.Fatal("failed replacement changed the saved selection")
+	}
+	if err := s.Close(); err == nil {
+		t.Fatal("uncertain close was accepted")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("uncertain marker was cleared")
+	}
+}
+
+func TestReplacementJoinsPreviousBeforeAdmission(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "harness-owner")
+	registry := NewRegistry()
+	previous := &supervisorHarness{}
+	registry.Register("previous", func(HarnessConfig) (Harness, error) { return previous, nil })
+	registry.Register("healthy", func(HarnessConfig) (Harness, error) { return &supervisorHarness{}, nil })
+	s := NewSupervisor(registry, HarnessConfig{Name: "previous"})
+	admissions := 0
+	s.SetProcessStartGuard(path, func() error {
+		admissions++
+		if admissions > 1 && !previous.closed {
+			t.Fatal("replacement admitted effects before prior close")
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatal("replacement released ownership between providers")
+		}
+		return nil
+	})
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reconfigure(HarnessConfig{Name: "healthy"}); err != nil {
+		t.Fatal(err)
+	}
+	if admissions != 2 {
+		t.Fatalf("provider admissions = %d, want 2", admissions)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("orderly replacement retained ownership")
+	}
+}

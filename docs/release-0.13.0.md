@@ -8,6 +8,8 @@ Updates discover stable supervisors even without an executor, replace the superv
 
 Provider admission conservatively suppresses crash retry and creates a private workspace ownership fence. Abrupt executor loss or uncertain provider shutdown prevents every successor from starting another provider until prior work and effects are inspected and reconciled. Ordinary owned shutdown joins direct providers before releasing that fence. This avoids replay over uncertain orphan work; it does not guarantee that arbitrary descendants or remote effects ended.
 
+Idle harness changes confirm the previous provider's shutdown before starting its replacement. A failed close blocks later admission even within the same executor. If replacement startup fails after the old provider stopped, saved settings remain unchanged and the harness is visibly unavailable.
+
 Go/runtime/native stderr, recovered TUI panic causes and actual native/executor exit results use the existing private redacted log store and retention bounds. Missing clean end records remain unclean or unknown termination. See [troubleshooting](troubleshooting.md#native-recovery-and-provider-ownership) for ownership reconciliation and [process diagnostics](troubleshooting.md#process-failures-and-missing-stop-records) for retained evidence.
 
 Exit supervision does not detect frozen children or guarantee survival after parent, host, container or resource loss. These changes do not reproduce or establish the cause of the previously unexplained incident. macOS and Linux amd64/arm64 remain the four native distribution targets with their companion libraries and licenses.

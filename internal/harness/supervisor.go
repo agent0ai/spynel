@@ -139,7 +139,10 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	cfg := s.config
 	s.mu.Unlock()
 
-	target, err := s.startTarget(ctx, cfg)
+	target, err := s.createTarget(cfg)
+	if err == nil {
+		err = s.startTarget(ctx, target)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
@@ -159,7 +162,10 @@ func (s *Supervisor) SetProcessStartGuard(path string, guard func() error) {
 	s.processStartGuard = guard
 }
 
-func (s *Supervisor) startTarget(ctx context.Context, cfg HarnessConfig) (Harness, error) {
+func (s *Supervisor) createTarget(cfg HarnessConfig) (Harness, error) {
+	if s.uncleanClose {
+		return nil, errors.New("previous provider shutdown was not confirmed; provider admission remains fenced")
+	}
 	target, err := s.registry.Create(cfg)
 	if err != nil {
 		return nil, err
@@ -169,25 +175,32 @@ func (s *Supervisor) startTarget(ctx context.Context, cfg HarnessConfig) (Harnes
 			return nil, err
 		}
 	}
+	return target, nil
+}
+
+// operationMu serializes provider starts and confirmed closes, including reuse
+// of this supervisor's already-acquired workspace marker.
+func (s *Supervisor) startTarget(ctx context.Context, target Harness) error {
 	if err := s.processOwner.acquire(); err != nil {
-		return nil, err
+		return err
 	}
 	if s.processStartGuard != nil {
 		if err := s.processStartGuard(); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if err := target.Start(ctx); err != nil {
 		if target.Close() != nil {
 			s.uncleanClose = true
 		}
-		return nil, err
+		return err
 	}
-	return target, nil
+	return nil
 }
 
-// Reconfigure validates a new harness by starting it before replacing the old
-// one. This makes configuration transactional from the user's perspective.
+// Reconfigure validates construction before closing the idle provider. Its
+// confirmed shutdown must precede successor effects; failed startup leaves
+// the saved selection unchanged and the runtime visibly unavailable.
 func (s *Supervisor) Reconfigure(cfg HarnessConfig) error {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
@@ -210,27 +223,39 @@ func (s *Supervisor) Reconfigure(cfg HarnessConfig) error {
 		return nil
 	}
 
-	target, err := s.startTarget(ctx, cfg)
+	target, err := s.createTarget(cfg)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	if s.closed || len(s.active) > 0 {
 		s.mu.Unlock()
-		_ = target.Close()
 		return errors.New("harness became busy while applying configuration")
 	}
 	previous := s.current
-	s.current = target
-	s.config = cfg
-	s.startErr = nil
+	s.current = nil
+	s.startErr = errors.New("harness is being reconfigured")
 	s.mu.Unlock()
-	s.signalReady()
 	if previous != nil {
-		if previous.Close() != nil {
+		if err = previous.Close(); err != nil {
 			s.uncleanClose = true
+			err = fmt.Errorf("previous provider shutdown was not confirmed; provider admission remains fenced: %w", err)
 		}
 	}
+	if err == nil {
+		err = s.startTarget(ctx, target)
+	}
+	s.mu.Lock()
+	s.startErr = err
+	if err == nil {
+		s.current = target
+		s.config = cfg
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	s.signalReady()
 	return nil
 }
 

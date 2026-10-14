@@ -366,6 +366,65 @@ type reconfigurableServiceHarness struct {
 	calls  int
 }
 
+type uncertainShutdownServiceHarness struct{ *serviceHarness }
+
+func (*uncertainShutdownServiceHarness) Close() error {
+	return errors.New("synthetic provider join failure")
+}
+
+func TestHarnessSettingsRefuseReplacementAfterUnconfirmedShutdown(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Harness.Name, cfg.Harness.ACPCommand = "acp", command
+	cfg.Harness.Sandbox = "read-only"
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	registry := harness.NewRegistry()
+	registry.Register("acp", func(harness.HarnessConfig) (harness.Harness, error) {
+		return &uncertainShutdownServiceHarness{newServiceHarness()}, nil
+	})
+	supervisor := harness.NewSupervisor(registry, harness.HarnessConfig{Name: "acp", Command: command, Sandbox: "read-only"})
+	marker := filepath.Join(root, ".spynel", "runtime", "harness-owner")
+	admissions := 0
+	supervisor.SetProcessStartGuard(marker, func() error { admissions++; return nil })
+	if err := supervisor.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, supervisor)
+	for i := 0; i < 2; i++ {
+		if _, err := service.ApplySettings(map[string]string{"harness.sandbox": "workspace-write"}); err == nil || !strings.Contains(err.Error(), "shutdown was not confirmed") {
+			t.Fatalf("replacement failure = %v", err)
+		}
+	}
+	if admissions != 1 {
+		t.Fatalf("provider admissions = %d, want 1", admissions)
+	}
+	reloaded, err := config.Load(config.PathForRoot(root))
+	if err != nil || reloaded.Harness.Sandbox != "read-only" || service.Settings.Snapshot().Harness.Sandbox != "read-only" {
+		t.Fatalf("failed replacement changed settings: %v", err)
+	}
+	if available, detail := supervisor.Available(); available || !strings.Contains(detail, "shutdown was not confirmed") {
+		t.Fatalf("harness availability = %t, %q", available, detail)
+	}
+	if err := supervisor.Close(); err == nil {
+		t.Fatal("uncertain shutdown was accepted")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("uncertain provider marker was cleared")
+	}
+}
+
 func (r *reconfigurableServiceHarness) HarnessConfig() harness.HarnessConfig {
 	return r.config
 }

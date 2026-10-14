@@ -84,7 +84,7 @@ The plain CLI is another adapter over this control plane. `send` uses an indepen
 
 ## Harness lifecycle
 
-The harness supervisor owns at most one running harness and exposes readiness without preventing the rest of Spynel from starting. A missing selection or executable can be recorded for setup when no harness is running. Reconfiguration constructs a replacement before swapping a working harness and refuses to switch while the current harness has active work.
+The harness supervisor owns at most one running harness and exposes readiness without preventing the rest of Spynel from starting. A missing selection or executable can be recorded for setup when no harness is running. Idle reconfiguration validates replacement construction and its executable before removing the current provider from dispatch, confirming its shutdown, and starting the successor. The private ownership marker remains held throughout. Unconfirmed shutdown blocks every later start, including reuse of the same supervisor. Failed successor startup leaves the saved selection unchanged and the runtime unavailable; it cannot preserve the previous running provider by overlapping effects.
 
 Codex starts one `codex app-server --stdio` process, performs the initialize handshake, and maps stable Spynel session keys to persisted thread IDs. An idle message uses `turn/start`; a message arriving during an active turn uses `turn/steer`; `/stop` uses `turn/interrupt` for that conversation only. `model/list` supplies its model catalog.
 

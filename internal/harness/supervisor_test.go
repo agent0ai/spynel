@@ -1024,7 +1024,7 @@ func TestSupervisorPreparesEachQueuedControlTurnAfterTerminal(t *testing.T) {
 	target.finish("job")
 }
 
-func TestSupervisorKeepsPreviousHarnessWhenReplacementFails(t *testing.T) {
+func TestSupervisorKeepsPreviousSelectionWhenReplacementStartFails(t *testing.T) {
 	registry := NewRegistry()
 	registry.Register("codex", func(HarnessConfig) (Harness, error) {
 		return &supervisorHarness{name: "codex", active: map[string]bool{}, emits: map[string]core.Emit{}}, nil
@@ -1041,6 +1041,9 @@ func TestSupervisorKeepsPreviousHarnessWhenReplacementFails(t *testing.T) {
 	}
 	if got := supervisor.HarnessConfig().Name; got != "codex" {
 		t.Fatalf("active harness = %q, want codex", got)
+	}
+	if available, detail := supervisor.Available(); available || !strings.Contains(detail, "not installed") {
+		t.Fatalf("failed replacement availability = %t, %q", available, detail)
 	}
 }
 
