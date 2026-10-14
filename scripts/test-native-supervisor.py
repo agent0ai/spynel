@@ -27,6 +27,17 @@ def wait_for(check, timeout=45):
     raise AssertionError("fixture did not reach expected state")
 
 
+def assert_terminal_restored(master, original):
+    actual = termios.tcgetattr(master)
+    # Darwin sets PENDIN on raw-to-canonical restoration; it is kernel state.
+    pending = termios.PENDIN if sys.platform == "darwin" else 0
+    assert (actual[3] ^ original[3]) & ~pending == 0, (
+        f"terminal local flags differ: actual={actual[3]:#x} "
+        f"expected={original[3]:#x} ignored={pending:#x}"
+    )
+    assert actual[:3] + actual[4:] == original[:3] + original[4:], "terminal input/output/control state was not restored"
+
+
 def main():
     repo = Path(__file__).resolve().parent.parent
     if sys.platform == "linux":
@@ -114,7 +125,8 @@ def main():
             if args == []:
                 wait_for(lambda: b"Use parent workspace" in output, 15)
                 os.write(master, b"\r")
-            wait_for(lambda: child() is not None and b"\x1b[?1049h" in output)
+            screens = 2 if args == [] else 1
+            wait_for(lambda: child() is not None and output.count(b"\x1b[?1049h") >= screens)
             assert process.poll() is None
             assert len(records()) == 2, "supervised capture spawned another reader/runtime"
             if sys.platform == "linux" and len(processes) == 1:
@@ -138,7 +150,7 @@ def main():
             assert process.wait(timeout=15) == status
             wait_for(lambda: not records(), 3)
             # Check real kernel termios, not escape emission alone.
-            assert termios.tcgetattr(master)[3] == original[3], "terminal flags were not restored"
+            assert_terminal_restored(master, original)
 
         try:
             launchers = ([str(binary)], [shutil.which("node"), str(package / "npm" / "bin" / "spynel.js")])
@@ -172,9 +184,9 @@ def main():
             old = child()["pid"]
             os.kill(old, signal.SIGKILL)
             wait_for(lambda: b"bounded delay" in output, 5)
-            assert termios.tcgetattr(master)[3] == original[3], "crash left raw mode enabled"
+            assert_terminal_restored(master, original)
             try:
-                wait_for(lambda: child() is not None and child()["pid"] != old and output.count(b"\x1b[?1049h") >= 2)
+                wait_for(lambda: child() is not None and child()["pid"] != old and output.count(b"\x1b[?1049h") >= 3)
             except AssertionError:
                 raise AssertionError((process.poll(), records(), bytes(output[-2500:])))
             assert len(records()) == 2, "dead executor registration was not retired"
@@ -199,7 +211,7 @@ def main():
             process.kill()
             process.wait(timeout=3)
             wait_for(lambda: not any(r["pid"] == executor_pid for r in records()), 12)
-            assert termios.tcgetattr(master)[3] == original[3], "parent loss left executor/terminal detached"
+            assert_terminal_restored(master, original)
             if sys.platform == "linux":
                 os.waitpid(executor_pid, 0)
                 adopted.remove(executor_pid)
@@ -239,7 +251,7 @@ while True:
             os.kill(child()["pid"], signal.SIGKILL)
             assert process.wait(timeout=8) != 0
             wait_for(lambda: b"recovery suppressed" in output, 3)
-            assert termios.tcgetattr(master)[3] == original[3]
+            assert_terminal_restored(master, original)
             marker = directory / ".spynel" / "runtime" / "harness-owner"
             assert marker.exists(), "crash cleared uncertain provider ownership"
             before = (root / "synthetic-effects").stat().st_size

@@ -30,6 +30,7 @@
 - `test-instance-updates.py` runs the native npm launcher against an isolated replacement package and local registry: a headless primary plus secondary and primary TUIs span two workspaces. Verify stable supervisor PIDs, new linked executor generations and working PTYs, channel-driven current-version restart without npm replacement, and rejection of older instances or older launchers supervising updated binaries. Build only a synthetic updated executable, keep all user homes/workspaces private, and stop only fixture-owned subprocesses.
 
 - test-native-supervisor.py validates native/npm real PTY clear/quit/Ctrl+C, F6/resize, raw-mode restoration after child kill, lawful immediate primary takeover, direct-child reaping and refusal of new providers while synthetic orphan effects persist. It owns only disposable homes/workspaces/children; Linux adopts and waits only its fixture orphan provider. Never run public killall against the live environment.
+- Its kernel termios checks compare all saved fields, excluding only Darwin's transient PENDIN local flag, which the kernel sets when restoring canonical mode. Wait for the runtime's alternate-screen entry separately from any preceding workspace chooser before injecting a crash.
 
 ## Child DOX Index
 
