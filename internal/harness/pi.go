@@ -32,6 +32,7 @@ type Pi struct {
 	cancel       context.CancelFunc
 	closed       bool
 	processes    map[string]*piProcess
+	processWait  sync.WaitGroup
 	sessions     map[string]piSession
 	keyMu        sync.Mutex
 	keyLocks     map[string]*sync.Mutex
@@ -364,7 +365,7 @@ func (p *Pi) Close() error {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
-		return nil
+		return waitProviderProcesses(&p.processWait)
 	}
 	p.closed = true
 	cancel := p.cancel
@@ -380,7 +381,7 @@ func (p *Pi) Close() error {
 	for _, process := range processes {
 		process.close()
 	}
-	return nil
+	return waitProviderProcesses(&p.processWait)
 }
 
 func (p *Pi) Models(ctx context.Context) ([]Model, error) {
@@ -558,6 +559,7 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 	}
 	command := exec.CommandContext(processContext, cfg.Command, args...)
 	command.Dir = cfg.Cwd
+	command.WaitDelay = 2 * time.Second
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -571,10 +573,19 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 	if cfg.Stderr != nil {
 		command.Stderr = cfg.Stderr
 	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		cancel()
+		return nil, errors.New("Pi harness is closed")
+	}
 	if err := command.Start(); err != nil {
+		p.mu.Unlock()
 		cancel()
 		return nil, fmt.Errorf("start Pi RPC process: %w", err)
 	}
+	p.processWait.Add(1)
+	p.mu.Unlock()
 	process := &piProcess{owner: p, key: key, cmd: command, cancel: cancel, stdin: stdin, nextID: 1, pending: map[string]chan piResponse{}}
 	go process.readLoop(stdout)
 	go process.waitLoop()
@@ -893,6 +904,7 @@ func (process *piProcess) finishTurn(turn *piTurn) {
 
 func (process *piProcess) waitLoop() {
 	err := process.cmd.Wait()
+	process.owner.processWait.Done()
 	if err == nil {
 		err = errors.New("Pi RPC process exited")
 	}

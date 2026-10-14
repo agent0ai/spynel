@@ -18,6 +18,8 @@
 - Build commands without shell interpolation, bound scanner/event payloads, surface startup and negotiation diagnostics, and keep portable fixture providers synthetic.
 - Keep Agent Zero CLI as the fixed `agent-zero` profile backed by the shared ACP adapter, launch `a0 acp`, and require a bounded successful `a0 acp --check` before reporting it available.
 
+- Own the private no-clobber workspace runtime/harness-owner marker before provider start. Hold it through replacement and clear only the exact owned identity after orderly bounded direct-provider joins; failed close or abrupt executor death retains it across contenders and one-shot CLI. Refuse provider admission while prior ownership is unresolved; neither lease expiry nor a dead executor proves arbitrary descendants/effects ended. Native recovery suppression is acknowledged before provider Start.
+
 ## Child DOX Index
 
 No child DOX files.

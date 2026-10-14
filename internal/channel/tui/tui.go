@@ -124,6 +124,7 @@ type historyRenderResult struct {
 type diagnosticResultMsg struct{}
 
 type Options struct {
+	Initialized        func() error
 	Conversation       string
 	Version            string
 	Attachments        string
@@ -194,6 +195,7 @@ type screenFrame struct {
 }
 
 type model struct {
+	initialized              func() error
 	ctx                      context.Context
 	handler                  channel.Handler
 	title                    string
@@ -533,8 +535,18 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 		return inputErr
 	}
 	defer closeInput()
+	var startupErr error
+	m.initialized = func() error {
+		if options.Initialized != nil {
+			startupErr = options.Initialized()
+		}
+		return startupErr
+	}
 	program := tea.NewProgram(m, tea.WithInput(terminal), tea.WithOutput(output), tea.WithAltScreen(), tea.WithContext(ctx), tea.WithFilter(filterTerminalEvents))
 	_, err = program.Run()
+	if startupErr != nil {
+		return startupErr
+	}
 	return err
 }
 
@@ -644,6 +656,11 @@ func newWorkingSpinner() bubblespinner.Model {
 }
 
 func (m model) Init() tea.Cmd {
+	if m.initialized != nil {
+		if err := m.initialized(); err != nil {
+			return tea.Quit
+		}
+	}
 	// Tea owns enabling and restoring mouse, paste, focus, and alternate screen modes.
 	var logo tea.Cmd
 	if m.logoAnimation != logoStopped {

@@ -2,10 +2,15 @@
 
 package updater
 
-import "os"
+import (
+	"errors"
+	"os"
+)
 
 func processAlive(int) bool { return false }
 
 func RestartSignal() os.Signal                   { return os.Interrupt }
 func terminationSignal() os.Signal               { return os.Interrupt }
 func processImagePath(_ int, path string) string { return path }
+
+func processParentID(int) (int, error) { return 0, errors.New("unsupported process inspection") }

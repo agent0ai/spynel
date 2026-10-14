@@ -22,6 +22,8 @@
 
 - Screen-action failures retain an error HTTP status and may return a refreshed `SavedControl` beside the error. The client preserves both so forms can show native errors and update observed registration state together.
 
+- Shared readiness is 40 seconds (30-second election expiry plus ten seconds startup), cancellable and still environment/lease fenced. This resolves prompt primary replacement without caller retries or lease deletion.
+
 ## Child DOX Index
 
 No child DOX files.

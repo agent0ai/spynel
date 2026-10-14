@@ -46,12 +46,25 @@ const (
 )
 
 func Run(args []string, version string) (runErr error) {
+	if len(args) > 0 && args[0] == "__executor" {
+		var err error
+		args, err = enterExecutor(args, version)
+		if err != nil {
+			return err
+		}
+	} else if supervisorEligible(args) {
+		return runSupervisor(args, version)
+	}
+
+	if len(args) == 2 && args[0] == "__diagnostics" {
+		return runProcessDiagnostics(args[1], os.Stdin)
+	}
 	defer func() {
 		if value := recover(); value != nil {
 			if path, ok := failureConfigPath(args); ok {
 				if cfg, err := config.Load(path); err == nil {
 					runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d", os.Getpid()))
-					runtimeState.LogEvent("fatal", "process", "top_level_panic", fmt.Sprintf("panic: %v\n%s", value, debug.Stack()))
+					runtimeState.LogEvent("fatal", "process", "top_level_panic", newProcessDiagnostic(cfg.StatePath("runtime", "logs"), version).identity()+fmt.Sprintf(" boundary=command panic: %v\n%s", value, debug.Stack()))
 					runtimeState.Close()
 				}
 			}
@@ -59,15 +72,20 @@ func Run(args []string, version string) (runErr error) {
 		}
 		if runErr != nil {
 			if _, controlledExit := runErr.(interface{ ExitCode() int }); !controlledExit {
-				recordCommandFailure(args, runErr)
+				recordCommandFailure(args, runErr, version)
 			}
 		}
 	}()
-	runErr = completeRun(run(args, version), replaceCurrentProcess)
+	if executor != nil {
+		defer executor.unregister()
+		runErr = completeExecutorRun(run(args, version))
+	} else {
+		runErr = completeRun(run(args, version), replaceCurrentProcess)
+	}
 	return runErr
 }
 
-func recordCommandFailure(args []string, runErr error) {
+func recordCommandFailure(args []string, runErr error, version string) {
 	path, ok := failureConfigPath(args)
 	if !ok {
 		return
@@ -77,7 +95,7 @@ func recordCommandFailure(args []string, runErr error) {
 		return
 	}
 	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d-error", os.Getpid()))
-	runtimeState.LogEvent("error", "process", "command_failed", fmt.Sprintf("Spynel command failed (%T)", runErr))
+	runtimeState.LogEvent("error", "process", "command_failed", newProcessDiagnostic(cfg.StatePath("runtime", "logs"), version).identity()+" boundary=command\n"+runErr.Error())
 	runtimeState.Close()
 }
 
@@ -169,7 +187,7 @@ func run(args []string, version string) error {
 		if len(args) != 1 {
 			return errors.New("usage: spynel restart-instances")
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), updater.RestartTimeout+5*time.Second)
 		defer cancel()
 		count, err := updater.Detect(version).RestartInstances(ctx, version)
 		if err == nil {
@@ -399,7 +417,7 @@ func runBareInteractiveWithRuntime(version string, runtime bareInteractiveRuntim
 		return err
 	}
 	if discovery.discoveredConfig == "" {
-		initialized, setupErr := runtime.runInitialization(context.Background(), launchRoot, func() error {
+		initialized, setupErr := runtime.runInitialization(executorContext(), launchRoot, func() error {
 			return runtime.initializeWorkspace(launchRoot, false)
 		})
 		if setupErr != nil || !initialized {
@@ -414,7 +432,7 @@ func runBareInteractiveWithRuntime(version string, runtime bareInteractiveRuntim
 		return runtime.startServer(discovery.localConfig, true, version, nil)
 	}
 
-	choice, choiceErr := runtime.runParentChoice(context.Background(), launchRoot, discovery.parentRoot, func() error {
+	choice, choiceErr := runtime.runParentChoice(executorContext(), launchRoot, discovery.parentRoot, func() error {
 		return runtime.initializeWorkspace(launchRoot, false)
 	})
 	if choiceErr != nil {
@@ -530,6 +548,10 @@ func (r *updateRequest) writeRestartArgs() {
 }
 
 func completeRun(err error, restart func([]string) error) error {
+	return completeRunContext(context.Background(), err, restart)
+}
+
+func completeRunContext(parent context.Context, err error, restart func([]string) error) error {
 	var update *updateRequest
 	if errors.As(err, &update) && update.standalone {
 		if update.manager == nil {
@@ -539,10 +561,13 @@ func completeRun(err error, restart func([]string) error) error {
 		if update.result.Available {
 			version = update.result.Latest
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+		ctx, cancel := context.WithTimeout(parent, updater.RestartTimeout+5*time.Second)
 		defer cancel()
 		if _, err := update.manager.RestartInstances(ctx, version); err != nil {
 			return err
+		}
+		if parent.Err() != nil {
+			return parent.Err()
 		}
 		return restart(append([]string(nil), update.args...))
 	}
@@ -557,7 +582,7 @@ func runServer(configPath string, withTUI bool, version string, restartArgs []st
 	return runServerWithSocket(configPath, withTUI, version, restartArgs, "")
 }
 
-func runServerWithSocket(configPath string, withTUI bool, version string, restartArgs []string, socketPath string) error {
+func runServerWithSocket(configPath string, withTUI bool, version string, restartArgs []string, socketPath string) (runErr error) {
 	// This process may own the shared primary even before the TUI enters raw
 	// mode. Shell suspension must not pause its API, heartbeat and agent jobs.
 	defer preventJobSuspension()()
@@ -565,8 +590,58 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 	if err != nil {
 		return err
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	restartArgs = normalizedRestartArgs(cfg, withTUI, restartArgs, socketPath)
+	diagnostics, stopCapture := beginProcessDiagnostics(cfg, version)
+	var stoppedBy atomic.Value
+	defer func() {
+		panicked := recover()
+		reason := "normal_quit"
+		result := "success"
+		if runErr != nil {
+			result = "error"
+			reason = "error"
+			var restart *restartRequest
+			var update *updateRequest
+			if errors.As(runErr, &restart) {
+				reason = "restart"
+				result = "controlled"
+			} else if errors.As(runErr, &update) {
+				reason = "update"
+				result = "controlled"
+			}
+		}
+		if executor != nil && executorContext().Err() != nil {
+			reason = "handled_signal signal=supervisor_stop"
+		}
+		if observed := stoppedBy.Load(); observed != nil {
+			reason = "handled_signal"
+			reason += " signal=" + observed.(string)
+		}
+		if panicked != nil {
+			reason = "panic"
+			result = "error"
+		}
+		diagnostics.LogEvent("info", "process", "process_end", newProcessDiagnostic(cfg.StatePath("runtime", "logs"), version).identity()+" boundary=server reason="+reason+" result="+result)
+		diagnostics.Close()
+		stopCapture()
+		if panicked != nil {
+			panic(panicked)
+		}
+	}()
+	ctx, cancel := context.WithCancel(executorContext())
 	defer cancel()
+	termination := make(chan os.Signal, 1)
+	signal.Notify(termination, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(termination)
+	go func() {
+		select {
+		case observed := <-termination:
+			_ = executorIntent("stop")
+			stoppedBy.Store(fmt.Sprintf("%s(%d)", observed, observed))
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	election, err := instance.New(cfg.StatePath())
 	if err != nil {
 		return err
@@ -593,6 +668,7 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			select {
 			case <-ctx.Done():
 			case <-timer.C:
+				_ = executorIntent("restart_intent")
 				restarting.Store(true)
 				cancel()
 			}
@@ -609,6 +685,7 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			select {
 			case <-ctx.Done():
 			case <-timer.C:
+				_ = executorIntent("update_intent")
 				updating.Store(true)
 				cancel()
 			}
@@ -618,7 +695,12 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 	restartSignals := make(chan os.Signal, 1)
 	signal.Notify(restartSignals, updater.RestartSignal())
 	defer signal.Stop(restartSignals)
-	registered, err := manager.RegisterProcess()
+	var registered func()
+	if executor != nil {
+		registered = func() {}
+	} else {
+		registered, err = manager.RegisterProcess()
+	}
 	if err != nil {
 		return fmt.Errorf("register running Spynel instance: %w", err)
 	}
@@ -630,6 +712,15 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			requestRestart()
 		}
 	}()
+	if executor != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+			case <-executor.restart:
+				requestRestart()
+			}
+		}()
+	}
 	ownerResult := make(chan error, 1)
 	options := primaryOptions{}
 	if !withTUI {
@@ -756,6 +847,9 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 		}
 		err = tui.Run(ctx, shared.Title, client.Handle, app.SlashCommands(), initialHistory, tui.Options{
 			Conversation: conversation,
+			Initialized: func() error {
+				return admitExecutor(cfg.StatePath("runtime", "logs"), version, restartArgs)
+			},
 			Version:      version,
 			Attachments:  cfg.StatePath("attachments"),
 			TitlePath:    cfg.StatePath("tui-title"),
@@ -791,6 +885,9 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			Diagnostic:    client.Diagnostic,
 			RegisterLive:  client.RegisterLiveTUI,
 		})
+		return serverResult(err)
+	}
+	if err := admitExecutor(cfg.StatePath("runtime", "logs"), version, restartArgs); err != nil {
 		return serverResult(err)
 	}
 	select {
@@ -836,6 +933,9 @@ func (s startupConnectionStatus) failed(err error) {
 }
 
 func terminalOutput(file *os.File) bool {
+	if file == os.Stderr && capturedStderrTerminal {
+		return true // The diagnostic reader retains the original terminal destination.
+	}
 	info, err := file.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
@@ -1134,6 +1234,7 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 		Network: false, SessionsFile: cfg.HarnessSessionsPath(cfg.Harness.Name),
 		Version: version, Stderr: runtimeState.Writer("harness"),
 	})
+	target.SetProcessStartGuard(cfg.StatePath("runtime", "harness-owner"), func() error { return executorIntent("unsafe") })
 	service := app.NewWithRuntime(cfg, target, runtimeState)
 	service.Updates = updater.Detect(version)
 	startup, err := startupmanager.New("")
@@ -1446,4 +1547,20 @@ func standaloneChecksEligible(args []string, interactive bool) bool {
 		}
 	}
 	return true // Called only by the actual TUI launch path.
+}
+
+func normalizedRestartArgs(cfg config.Config, tui bool, args []string, socket string) []string {
+	result := []string{"serve", "--config", cfg.Path}
+	if tui {
+		result = append(result, "--tui")
+	}
+	if socket != "" {
+		result = append(result, "--socket", socket)
+	}
+	for _, arg := range args {
+		if arg == "--automatic-startup" || strings.HasPrefix(arg, "--automatic-startup=") {
+			result = append(result, arg)
+		}
+	}
+	return result
 }

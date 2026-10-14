@@ -26,12 +26,22 @@ func TestLifecycleProcessFixture(t *testing.T) {
 	}
 	version := os.Getenv("SPYNEL_TEST_LIFECYCLE_VERSION")
 	manager := &Manager{InstallRoot: root, CurrentVersion: version}
-	closeRecord, err := manager.RegisterProcess()
+	diagnostic := os.Getenv("SPYNEL_TEST_DIAGNOSTIC_READER") == "1"
+	supervised := os.Getenv("SPYNEL_TEST_SUPERVISOR") == "1"
+	var closeRecord func()
+	var err error
+	if diagnostic {
+		closeRecord, err = manager.RegisterDiagnosticReader()
+	} else if supervised {
+		closeRecord, err = manager.RegisterSupervisor()
+	} else {
+		closeRecord, err = manager.RegisterProcess()
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeRecord()
-	if version != "2.0.0" || os.Getenv("SPYNEL_TEST_NOT_READY") != "1" {
+	if !diagnostic && (version != "2.0.0" || os.Getenv("SPYNEL_TEST_NOT_READY") != "1") {
 		if err := MarkProcessReady(); err != nil {
 			t.Fatal(err)
 		}
@@ -40,12 +50,56 @@ func TestLifecycleProcessFixture(t *testing.T) {
 	signal.Notify(signals, RestartSignal(), syscall.SIGTERM)
 	fmt.Println("ready")
 	if <-signals == RestartSignal() {
+		if diagnostic {
+			t.Fatal("diagnostic reader received an application restart")
+		}
 		closeRecord()
 		_ = os.Setenv("SPYNEL_TEST_LIFECYCLE_VERSION", "2.0.0")
 		executable, _ := os.Executable()
 		if err := syscall.Exec(executable, os.Args, os.Environ()); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if supervised {
+		if err := SetExecutor(0, false, true); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestDiagnosticReaderIsDiscoverableWithoutBecomingARestartTarget(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	server := lifecycleFixture(t, root)
+	t.Setenv("SPYNEL_TEST_DIAGNOSTIC_READER", "1")
+	reader := lifecycleFixture(t, root)
+	directory, _ := processDirectory()
+	path := filepath.Join(directory, strconv.Itoa(reader.Process.Pid)+".json")
+	before, err := readProcess(path)
+	if err != nil || !before.DiagnosticReader || before.Ready {
+		t.Fatalf("diagnostic registration lost its role: %#v %v", before, err)
+	}
+	manager := &Manager{InstallRoot: root, CurrentVersion: "1.0.0"}
+	if err := manager.CheckRestartable(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if count, err := manager.RestartInstances(ctx, "2.0.0"); err != nil || count != 1 {
+		t.Fatalf("diagnostic reader changed restart targets: %d %v", count, err)
+	}
+	after, err := readProcess(path)
+	if err != nil || after.Generation != before.Generation || after.Ready {
+		t.Fatalf("diagnostic reader was restarted: %#v %v", after, err)
+	}
+	records, err := processRecords([]int{server.Process.Pid, reader.Process.Pid})
+	if err != nil || len(records) != 2 {
+		t.Fatalf("shutdown discovery lost the reader: %d %v", len(records), err)
+	}
+	if err := stopProcessRecords(ctx, records); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -237,5 +291,70 @@ func TestRestartAfterRunningExecutableIsUnlinked(t *testing.T) {
 	defer cancel()
 	if count, err := (&Manager{InstallRoot: root}).RestartInstances(ctx, "2.0.0"); err != nil || count != 1 {
 		t.Fatalf("restart after executable replacement: %d %v", count, err)
+	}
+}
+
+func TestSupervisorWithoutExecutorRemainsDiscoverableAndStops(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SPYNEL_TEST_SUPERVISOR", "1")
+	fixture := lifecycleFixture(t, t.TempDir())
+	records, err := processRecords([]int{fixture.Process.Pid})
+	if err != nil || len(records) != 1 || !records[0].Supervisor || !restartTarget(records[0]) {
+		t.Fatalf("lost supervisor in backoff: %v %v", records, err)
+	}
+	if verifiedExecutor(records[0], records[0].Version) {
+		t.Fatal("missing executor reported ready")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	if err := stopProcessRecords(ctx, records); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupervisorGenerationChangeRejectsSignal(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SPYNEL_TEST_SUPERVISOR", "1")
+	fixture := lifecycleFixture(t, t.TempDir())
+	records, err := processRecords([]int{fixture.Process.Pid})
+	if err != nil || len(records) != 1 {
+		t.Fatal(err)
+	}
+	record := records[0]
+	current := record
+	current.Generation = "11111111111111111111111111111111"
+	data, _ := json.Marshal(current)
+	directory, _ := processDirectory()
+	if err := os.WriteFile(filepath.Join(directory, strconv.Itoa(record.PID)+".json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := signalRegisteredProcess(record, terminationSignal()); err == nil {
+		t.Fatal("changed generation was signalled")
+	}
+	if err := fixture.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatal("new generation was stopped")
+	}
+}
+
+func TestCancelledCoordinatorPreservesPeerGeneration(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	peer := lifecycleFixture(t, root)
+	before, err := ProcessRecord(peer.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	count, err := (&Manager{InstallRoot: root}).RestartInstances(ctx, "2.0.0")
+	if !errors.Is(err, context.Canceled) || count != 0 {
+		t.Fatalf("cancelled coordination = %d %v", count, err)
+	}
+	after, err := ProcessRecord(peer.Process.Pid)
+	if err != nil || after.Generation != before.Generation {
+		t.Fatal("cancelled coordinator signalled the peer")
 	}
 }

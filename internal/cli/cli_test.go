@@ -37,13 +37,13 @@ type heldCLIHarness struct {
 	threads map[string]string
 }
 
-func TestRecordCommandFailurePersistsGenericEvidenceWithoutErrorContent(t *testing.T) {
+func TestRecordCommandFailureRetainsRedactedCause(t *testing.T) {
 	root := t.TempDir()
 	if err := workspace.Init(root, false); err != nil {
 		t.Fatal(err)
 	}
 	configPath := config.PathForRoot(root)
-	recordCommandFailure([]string{"serve", "--config", configPath}, errors.New("authorization: Bearer must-not-persist"))
+	recordCommandFailure([]string{"serve", "--config", configPath}, errors.New("listener failed: address already in use\nauthorization: Bearer must-not-persist"), "test-version")
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +52,7 @@ func TestRecordCommandFailurePersistsGenericEvidenceWithoutErrorContent(t *testi
 	defer runtimeState.Close()
 	found := false
 	for _, entry := range runtimeState.Logs() {
-		found = found || entry.Component == "process" && entry.Event == "command_failed"
+		found = found || entry.Component == "process" && entry.Event == "command_failed" && strings.Contains(entry.Text, "address already in use") && strings.Contains(entry.Text, "version=test-version")
 		if strings.Contains(entry.Text, "must-not-persist") {
 			t.Fatalf("top-level error content leaked into runtime log: %#v", entry)
 		}
@@ -782,13 +782,13 @@ func TestOfflineUpdateInstallReturnsControlToNPMLauncher(t *testing.T) {
 	t.Setenv("SPYNEL_NPM_PACKAGE_ROOT", packageRoot)
 	t.Setenv("SPYNEL_NPM_LAUNCHER_MANAGED", "1")
 	t.Setenv("SPYNEL_NPM_REGISTRY_URL", registry.URL)
-	t.Setenv("SPYNEL_NPM_COORDINATED_UPDATES", "")
+	t.Setenv("SPYNEL_NPM_COORDINATED_UPDATES", "1")
 	var output bytes.Buffer
 	err = runFrameworkMessageMode(config.PathForRoot(root), "updates", "/update install", "1.2.0", messageRunOptions{Output: &output})
 	if err == nil || !strings.Contains(err.Error(), "launcher does not support coordinated updates") {
 		t.Fatalf("older launcher accepted an update: %v", err)
 	}
-	t.Setenv("SPYNEL_NPM_COORDINATED_UPDATES", "1")
+	t.Setenv("SPYNEL_NPM_COORDINATED_UPDATES", "2")
 	err = runFrameworkMessageMode(config.PathForRoot(root), "updates", "/update install", "1.2.0", messageRunOptions{Output: &output})
 	exit, ok := err.(interface{ ExitCode() int })
 	if !ok || exit.ExitCode() != npmUpdateExitCode || !strings.Contains(output.String(), "Updating Spynel") {

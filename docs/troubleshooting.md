@@ -14,6 +14,40 @@ For heartbeat or notification jobs, an initial `Codex turn started` event proves
 
 After a job finishes or the primary restarts, use `/jobs recent`, then `/job info <number>` and `/job output <number>`. A record without an end timestamp is shown as interrupted or running; recovery of the same durable work keeps its number and continues the last atomic snapshot. Numbers wrap after 9999, so an intentionally reused number selects its newest generation. Output is capped, terminal controls and common credential forms are removed, and truncation markers identify omitted data. Archived output is debugging material only and never controls task, goal, heartbeat, or notification state.
 
+## Process failures and missing stop records
+
+Use the existing private log queries:
+
+```bash
+spynel log search native_stderr
+spynel log search command_failed
+spynel log search process_end
+spynel log search native_exit
+spynel log search executor_exit
+```
+
+Server/TUI launches record UTC, native PID, run identity and version/revision. `process_end` distinguishes normal quit, handled termination, restart/update and returned errors. `native_stderr` retains a bounded excerpt of terminal stderr, including unhandled Go goroutine panics, runtime fatal errors and native-library diagnostics. Recovered Bubble Tea event-loop and command panics retain their cause and stack in `command_failed`. Harness/child failures remain attributed to their existing components; they do not by themselves mean the native application failed.
+
+On supervised Linux/macOS launches, the surviving native parent captures executor stderr and its actual Wait result (`executor_exit`), with no extra reader. Direct externally managed launches use a small reader of the same executable that mirrors descriptor 2 to the original terminal and drains it through EOF, keeping at most 64 KiB for diagnosis. It preserves the start of recognizable fatal dumps and otherwise keeps a tail. Existing redaction, terminal-control removal and the 4,096-rune entry bound apply before storage. Records remain in private `.spynel/runtime/logs` JSONL files with existing 2 MiB rotation and eight-file retention; there is no separate raw crash archive. Do not publish these records: redaction recognizes common credential forms but cannot certify arbitrary failure prose as safe to share.
+
+The reader has no restart, election or application-work authority. Normal shutdown restores stderr, flushes/closes the process logger and waits only a bounded interval for the reader. Storage, rotation or reader failure emits a content-free terminal warning and preserves the original application result. Capture begins after server configuration resolves; earlier startup failures and unavailable storage still need retained terminal stderr. Offline documentation/version commands do not start the reader.
+
+When the npm launcher survives, `native_exit` records its child's actual exit code or signal before update/relaunch. A handled signal can produce a successful native exit; compare it with `process_end`. Supervised in-place restarts retain the supervisor PID and verify a new executor generation; direct service restarts retain the executor PID, while separate launches and concurrent instances remain distinct. `session_start` and `session_end` describe individual runtime log sessions, including primary ownership changes and diagnostic readers. They are not process exit records.
+
+A missing `process_end` or `native_exit` means **unclean or unknown termination**, not a proven crash mechanism or termination time. Do not infer a crash from another instance's session or a rotated-away record. SIGKILL cannot run native cleanup; the surviving reader may retain preceding stderr and the npm parent may observe SIGKILL, but that signal does not establish OOM. If the reader/launcher is also killed, or the host/container disappears, obtain the host's timestamped process-exit or kernel OOM-victim record with PID-namespace/cgroup correlation. Undated cgroup OOM counters and a last-activity timestamp cannot identify the victim or date its death. These logs never authorize replaying active work.
+
+A hang that produces neither stderr nor an exit still requires external stack/resource inspection. This capture adds no watchdog or periodic profiler.
+
+## Native recovery and provider ownership
+
+A native parent retries only unexpected executor failures after completed startup admission, while it survives and no provider was admitted. Normal quit, an exiting Ctrl+C, deliberate stop and update/restart teardown suppress retries. Ctrl+C that copies, clears input or cancels an active turn leaves the runtime alive. A crash exhausts three delayed retries unless an attempt runs for at least a minute after admission. Immediate primary recovery may wait through the ordinary 30-second stale-election fence; the shared readiness budget is 40 seconds. Never delete a primary lease to accelerate it.
+
+After provider admission, an abrupt executor death can leave provider/tool processes or external effects live. Automatic retry is therefore suppressed, and the private `.spynel/runtime/harness-owner` marker prevents every successor from starting another provider. Status/configuration remain usable with the harness unavailable. Failed or timed-out provider shutdown also retains this fence. A dead executor, stale task lease or elapsed time is insufficient reason to remove it.
+
+Inspect retained logs and durable task progress, establish that prior providers/tools and pending effects have ended, and explicitly stop or reconcile that prior work before removing only the affected workspace's `harness-owner` marker and relaunching/reconfiguring. Do not clear runtime leases or blindly resume unfinished actions. Ordinary owned graceful shutdown removes its exact marker after joining direct providers. Arbitrary escaped descendants and remote side effects still require operator inspection; no portable tree-cleanup or exactly-once side-effect guarantee is provided.
+
+Use the supervisor PID or ordinary quit/stop commands for deliberate termination. Child-only SIGKILL has no explicit stop intent and is indistinguishable from an unexpected kill. Exit supervision cannot detect a frozen child and may be defeated by parent/container/host loss or resource pressure. These changes do not establish or fix the cause of any previously unexplained incident.
+
 ## Installation or startup
 
 - The standalone public one-liner requires URL routing and a release containing standalone installer support. If it is unavailable, use npm or the development steps in [getting started](getting-started.md).

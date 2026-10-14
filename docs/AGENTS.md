@@ -7,6 +7,7 @@
 ## Local Contracts
 
 - Commands and configuration examples must match executable behavior and embedded defaults.
+- Diagnostic guidance distinguishes native process/run records, runtime session rotations and harness failures. Document bounded private stderr and parent-observed exit results without promising a cause for SIGKILL, OOM or host loss; a missing clean end has no established cause or termination timestamp. No private crash artifacts belong in documentation or releases.
 - Keep public positioning aligned with the root product contract and `docs/vision.md`: Spynel is a classic non-AI orchestration program, external harnesses provide intelligence, and the single “agent” in the relationship slogan denotes the human-facing assistant interface. Adapt copy length to its surface without inventing product facts or treating conceptual scale as a resource guarantee.
 - Keep root-README image assets under `.github/resources/`; `docs/` owns documentation content rather than repository-presentation artwork.
 - Document `.spynel/config.yaml` as the canonical private configuration, workspace-root-relative path resolution, the fixed non-configurable `.spynel` state directory, and validation of current settings, ignored unused input keys, and their removal on the next canonical save.
@@ -36,6 +37,8 @@
 - Keep the README install and uninstall examples short. The plain install pipe must support an immediate `spynel` command for root and regular users; detailed permission and override behavior belongs in getting started. Public `uninstall.sh` automatically stops matching processes, removes startup registrations, and removes both standalone and npm installations while keeping workspace data.
 
 - Document update-by-default, explicit read-only `update check`, caller-installation versus channel-primary selection, cross-workspace instance restart, and shell `killall` with preserved future autostart registrations. State per-user process discovery and the one-time stop/relaunch requirement for older releases without coordinated restart.
+
+- Document native supervision for manual runtime launches, direct externally managed executors, verified supervisor/executor update generations, finite retries and conservative unresolved-provider ownership. Never promise frozen-child recovery, arbitrary orphan cleanup or an incident root-cause fix.
 
 ## Child DOX Index
 

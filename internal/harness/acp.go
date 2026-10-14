@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/fsx"
@@ -29,21 +30,22 @@ const (
 type ACP struct {
 	config HarnessConfig
 
-	keyMu    sync.Mutex
-	keyLocks map[string]*sync.Mutex
-	writeMu  sync.Mutex
-	mu       sync.Mutex
-	ctx      context.Context
-	cancel   context.CancelFunc
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	nextID   uint64
-	pending  map[string]chan acpResponse
-	sessions map[string]acpSession
-	live     map[string]bool
-	active   map[string]*acpTurn
-	caps     acpAgentCapabilities
-	closed   bool
+	keyMu       sync.Mutex
+	keyLocks    map[string]*sync.Mutex
+	writeMu     sync.Mutex
+	mu          sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	cmd         *exec.Cmd
+	processDone chan struct{}
+	stdin       io.WriteCloser
+	nextID      uint64
+	pending     map[string]chan acpResponse
+	sessions    map[string]acpSession
+	live        map[string]bool
+	active      map[string]*acpTurn
+	caps        acpAgentCapabilities
+	closed      bool
 }
 
 type acpSession struct {
@@ -151,6 +153,7 @@ func (a *ACP) Start(parent context.Context) error {
 	a.ctx, a.cancel = context.WithCancel(parent)
 	command := exec.CommandContext(a.ctx, a.config.Command, a.config.Args...)
 	command.Dir = a.config.Cwd
+	command.WaitDelay = 2 * time.Second
 	if len(a.config.Env) != 0 {
 		command.Env = append(os.Environ(), a.config.Env...)
 	}
@@ -180,6 +183,7 @@ func (a *ACP) Start(parent context.Context) error {
 		a.mu.Unlock()
 		return fmt.Errorf("start ACP agent %q: %w", a.config.Command, err)
 	}
+	a.processDone = make(chan struct{})
 	a.cmd = command
 	a.stdin = stdin
 	a.nextID = 1
@@ -398,10 +402,12 @@ func (a *ACP) IsActive(key string) bool {
 func (a *ACP) Close() error {
 	a.mu.Lock()
 	if a.closed {
+		done := a.processDone
 		a.mu.Unlock()
-		return nil
+		return waitProviderProcess(done)
 	}
 	a.closed = true
+	done := a.processDone
 	cancel := a.cancel
 	stdin := a.stdin
 	a.stdin = nil
@@ -412,7 +418,7 @@ func (a *ACP) Close() error {
 	if cancel != nil {
 		cancel()
 	}
-	return nil
+	return waitProviderProcess(done)
 }
 
 func (a *ACP) ensureSession(ctx context.Context, key, model string) (acpSession, error) {
@@ -795,6 +801,7 @@ func (a *ACP) respond(value any) error {
 
 func (a *ACP) waitLoop() {
 	err := a.cmd.Wait()
+	close(a.processDone)
 	if err == nil {
 		err = errors.New("ACP agent process exited")
 	}

@@ -17,10 +17,15 @@
 - Extract and validate downloads in sibling staging state, then replace `npm/vendor/` as one directory so a failed install retains the prior runtime whenever npm itself permits rollback.
 - Proactive registry checks have a ten-second total deadline and run only before interactive TUI starts. Pass explicit current-launch periodic-check eligibility, the attempted lookup timestamp, and any valid latest version to the launched binary so its hourly TUI indicator does not duplicate the startup lookup. Clear inherited eligibility and snapshot state for every launch; skipped noninteractive, plain-command, and `--automatic-startup` launches must make neither immediate nor periodic proactive checks. When an update is found, present the available/current versions and an explicit styled yes/no offer with a live ten-second countdown; timeout, EOF, interruption, and unrelated answers skip safely. Never let registry failure prevent Spynel from starting.
 - The launcher supervises explicit update requests from the Go process, runs the appropriate local or global `npm update` only after that executable exits, and starts the resulting binary with npm installation metadata in its environment.
+- The native executable owns bounded private stderr capture. The wrapper retains only its parent-observed native exit result through the same native log sink; offline commands without a workspace diagnostic handshake create no log store. Preserve terminal descriptors, exit codes, signals and update ordering even if diagnostic persistence fails.
 
 - Both accepted startup offers and explicit update requests use the native updater's preflight and post-publication restart coordination. Updates restart all registered instances of this package across workspaces, then relaunch the requester. The native coordinator verifies new generations and versions; failures stay explicit. A request already at the latest version skips npm replacement but still restarts instances.
 
-- The current npm wrapper explicitly advertises coordinated-update support. Bind that capability to validated launcher ownership and include it in process registration; an older wrapper supervising a newer native executable must fail preflight with one-time stop/relaunch guidance instead of silently using the old single-process update protocol.
+- The current npm wrapper explicitly advertises coordinated-update protocol 2 for native supervision and latched asynchronous shutdown; older protocol 1 is not sufficient. Bind that capability to validated launcher ownership and include it in process registration; an older wrapper supervising a newer native executable must fail preflight with one-time stop/relaunch guidance instead of silently using the old single-process update protocol.
+
+- Native owns manual runtime crash recovery; Node loops only for explicit code-75 updates. Keep signal cancellation latched across startup prompts, asynchronous npm/coordination helpers and between launches, never resurrecting a requester after stop. Helpers are bounded and waited before proceeding.
+
+- Code 75 authorizes replacement only with its current private, bounded structured request (normalized arguments, install boolean and semantic version). Missing or invalid intent preserves status 75 and stops without an update; never infer intent from the exit code alone.
 
 ## Child DOX Index
 

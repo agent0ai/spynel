@@ -21,6 +21,8 @@
 
 - `StopInstallation` shares exact registration ownership and native stop/unload with removal, but retains registration files and enabled links. `spynel killall` uses it before process termination to prevent service-manager respawn without changing future boot/login preferences.
 
+- --automatic-startup also selects external crash-restart ownership: systemd/launchd policy supervises a direct executor, with no native retry loop competing with the manager.
+
 ## Child DOX Index
 
 No child DOX files.

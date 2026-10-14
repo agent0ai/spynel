@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +40,9 @@ type Supervisor struct {
 	controlOps        map[string]*sync.Mutex
 	ready             chan struct{}
 	closed            bool
+	processStartGuard func() error
+	processOwner      processOwnership
+	uncleanClose      bool
 }
 
 type pendingSend struct {
@@ -148,13 +152,35 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	return nil
 }
 
+// SetProcessStartGuard is configured before Start. It fences process-level
+// recovery before a provider can acquire descendants or external effects.
+func (s *Supervisor) SetProcessStartGuard(path string, guard func() error) {
+	s.processOwner.path = path
+	s.processStartGuard = guard
+}
+
 func (s *Supervisor) startTarget(ctx context.Context, cfg HarnessConfig) (Harness, error) {
 	target, err := s.registry.Create(cfg)
 	if err != nil {
 		return nil, err
 	}
+	if cfg.Command != "" {
+		if _, err := exec.LookPath(cfg.Command); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.processOwner.acquire(); err != nil {
+		return nil, err
+	}
+	if s.processStartGuard != nil {
+		if err := s.processStartGuard(); err != nil {
+			return nil, err
+		}
+	}
 	if err := target.Start(ctx); err != nil {
-		_ = target.Close()
+		if target.Close() != nil {
+			s.uncleanClose = true
+		}
 		return nil, err
 	}
 	return target, nil
@@ -201,7 +227,9 @@ func (s *Supervisor) Reconfigure(cfg HarnessConfig) error {
 	s.mu.Unlock()
 	s.signalReady()
 	if previous != nil {
-		_ = previous.Close()
+		if previous.Close() != nil {
+			s.uncleanClose = true
+		}
 	}
 	return nil
 }
@@ -843,7 +871,12 @@ func (s *Supervisor) Close() error {
 	s.current = nil
 	s.mu.Unlock()
 	if target != nil {
-		return target.Close()
+		if err := target.Close(); err != nil {
+			return err
+		}
 	}
-	return nil
+	if s.uncleanClose {
+		return errors.New("previous provider shutdown was not confirmed")
+	}
+	return s.processOwner.release()
 }

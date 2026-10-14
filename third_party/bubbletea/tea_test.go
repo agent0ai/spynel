@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -492,6 +493,9 @@ func TestTeaPanic(t *testing.T) {
 	}()
 
 	_, err := p.Run()
+	if err == nil || !strings.Contains(err.Error(), "testing panic behavior") || !strings.Contains(err.Error(), "goroutine") {
+		t.Fatalf("panic cause/stack lost: %v", err)
+	}
 
 	if !errors.Is(err, ErrProgramPanic) {
 		t.Fatalf("Expected %v, got %v", ErrProgramPanic, err)
@@ -524,6 +528,9 @@ func TestTeaGoroutinePanic(t *testing.T) {
 	}()
 
 	_, err := p.Run()
+	if err == nil || !strings.Contains(err.Error(), "testing goroutine panic behavior") || !strings.Contains(err.Error(), "panicCmd") {
+		t.Fatalf("command panic cause/stack lost: %v", err)
+	}
 
 	if !errors.Is(err, ErrProgramPanic) {
 		t.Fatalf("Expected %v, got %v", ErrProgramPanic, err)

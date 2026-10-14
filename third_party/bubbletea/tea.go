@@ -639,7 +639,7 @@ func (p *Program) Run() (returnModel Model, returnErr error) {
 	if !p.startupOptions.has(withoutCatchPanics) {
 		defer func() {
 			if r := recover(); r != nil {
-				returnErr = fmt.Errorf("%w: %w", ErrProgramKilled, ErrProgramPanic)
+				returnErr = fmt.Errorf("%w: %w: %v\n%s", ErrProgramKilled, ErrProgramPanic, r, debug.Stack())
 				p.recoverFromPanic(r)
 			}
 		}()
@@ -844,7 +844,7 @@ func (p *Program) shutdown(kill bool) {
 // the terminal to a usable state.
 func (p *Program) recoverFromPanic(r interface{}) {
 	select {
-	case p.errs <- ErrProgramPanic:
+	case p.errs <- fmt.Errorf("%w: %v\n%s", ErrProgramPanic, r, debug.Stack()):
 	default:
 	}
 	p.shutdown(true) // Ok to call here, p.Run() cannot do it anymore.
@@ -856,7 +856,7 @@ func (p *Program) recoverFromPanic(r interface{}) {
 // signals for the program to be killed and terminal restored to a usable state.
 func (p *Program) recoverFromGoPanic(r interface{}) {
 	select {
-	case p.errs <- ErrProgramPanic:
+	case p.errs <- fmt.Errorf("%w: %v\n%s", ErrProgramPanic, r, debug.Stack()):
 	default:
 	}
 	p.cancel()
