@@ -205,12 +205,33 @@ def main():
             stopped(process, master, original, status=1)
 
             directory = workspace("parent loss")
-            process, master, output, original = launch(launchers[0], directory)
+            # Keep the shell's controlling session alive when its supervisor dies.
+            session_owner = root / "session-owner.py"
+            session_owner.write_text('''import signal, subprocess, sys
+def stop(*_):
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+child = subprocess.Popen(sys.argv[1:])
+try:
+    child.wait()
+    signal.pause()
+finally:
+    if child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+''')
+            process, master, output, original = launch([sys.executable, str(session_owner), str(binary)], directory)
+            supervisor_pid = next(r["pid"] for r in records() if r.get("supervisor"))
+            assert supervisor_pid != process.pid and os.getsid(supervisor_pid) == process.pid
             executor_pid = child()["pid"]
             adopted.append(executor_pid)
-            process.kill()
-            process.wait(timeout=3)
+            os.kill(supervisor_pid, signal.SIGKILL)
             wait_for(lambda: not any(r["pid"] == executor_pid for r in records()), 12)
+            assert process.poll() is None, "fixture shell died with its supervisor"
             assert_terminal_restored(master, original)
             if sys.platform == "linux":
                 os.waitpid(executor_pid, 0)
@@ -218,8 +239,10 @@ def main():
             # Only the killed supervisor's inert record may remain.
             for path in registry.glob("*.json"):
                 record = json.loads(path.read_text())
-                assert record["pid"] == process.pid
+                assert record["pid"] == supervisor_pid
                 path.unlink()
+            process.terminate()
+            assert process.wait(timeout=3) == 0
 
             directory = workspace("external service")
             managed = subprocess.Popen([str(binary), "serve", "--automatic-startup"], cwd=directory, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

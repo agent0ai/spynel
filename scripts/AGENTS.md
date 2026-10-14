@@ -31,6 +31,7 @@
 
 - test-native-supervisor.py validates native/npm real PTY clear/quit/Ctrl+C, F6/resize, raw-mode restoration after child kill, lawful immediate primary takeover, direct-child reaping and refusal of new providers while synthetic orphan effects persist. It owns only disposable homes/workspaces/children; Linux adopts and waits only its fixture orphan provider. Never run public killall against the live environment.
 - Its kernel termios checks compare all saved fields, excluding only Darwin's transient PENDIN local flag, which the kernel sets when restoring canonical mode. Wait for the runtime's alternate-screen entry separately from any preceding workspace chooser before injecting a crash.
+- Its parent-loss fixture keeps a separate shell-like controlling-session owner alive while killing only the registered native supervisor. Check executor control-EOF cleanup and full terminal restoration before closing that session; session-leader death revokes the Darwin terminal and is outside this recovery contract.
 
 ## Child DOX Index
 
