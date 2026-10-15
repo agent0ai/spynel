@@ -42,8 +42,17 @@ func TestProcessOwnershipHelper(t *testing.T) {
 	}
 	if mode == "tool" {
 		signal.Ignore(syscall.SIGTERM)
-		_ = os.NewFile(3, "closed-by-provider").Close()
-		_ = os.NewFile(4, "closed-by-provider").Close()
+		info, err := os.Stat(os.Getenv("SPYNEL_TEST_OWNERSHIP_PATH"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lock := info.Sys().(*syscall.Stat_t)
+		for _, fd := range []int{3, 4} {
+			var inherited syscall.Stat_t
+			if syscall.Fstat(fd, &inherited) == nil && inherited.Dev == lock.Dev && inherited.Ino == lock.Ino {
+				t.Fatal("private ownership lock leaked into provider")
+			}
+		}
 		fmt.Fprintln(os.Stdout, os.Getpid())
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		return
@@ -119,7 +128,7 @@ func TestProviderGuardianRetainsLockAndCleansUpAfterOwnerLoss(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestProcessOwnershipHelper$")
-	command.Env = append(os.Environ(), "SPYNEL_TEST_OWNERSHIP_MODE=tool")
+	command.Env = append(os.Environ(), "SPYNEL_TEST_OWNERSHIP_MODE=tool", "SPYNEL_TEST_OWNERSHIP_PATH="+owner.path)
 	input, err := command.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +153,7 @@ func TestProviderGuardianRetainsLockAndCleansUpAfterOwnerLoss(t *testing.T) {
 	}
 	contender := processOwnership{path: owner.path}
 	// Close the owner's lock descriptor, as SIGKILL would, while the provider
-	// has already closed inherited descriptors and still has live stdin.
+	// does not inherit private ownership descriptors and still has live stdin.
 	if err := owner.file.Close(); err != nil {
 		t.Fatal(err)
 	}

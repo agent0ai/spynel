@@ -44,6 +44,8 @@ func RunProvider(arguments []string) error {
 	lock, life := os.NewFile(3, "provider-ownership"), os.NewFile(4, "provider-lifetime")
 	defer lock.Close()
 	defer life.Close()
+	unix.CloseOnExec(3)
+	unix.CloseOnExec(4)
 	info, err := lock.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
 		return errors.New("invalid provider ownership descriptor")
