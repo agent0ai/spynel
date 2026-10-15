@@ -100,7 +100,7 @@ for line in sys.stdin:
             for path in registry.glob("*.json"):
                 try:
                     record = json.loads(path.read_text())
-                    if not record.get("diagnostic_reader") and not record.get("supervisor_pid"):
+                    if not record.get("diagnostic_reader") and not record.get("provider_guardian") and not record.get("supervisor_pid"):
                         result.append(record)
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
