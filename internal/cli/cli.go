@@ -64,6 +64,11 @@ func Run(args []string, version string) (runErr error) {
 	}
 
 	if len(args) == 2 && args[0] == "__diagnostics" {
+		unregister, err := updater.Detect(version).RegisterDiagnosticReader()
+		if err != nil {
+			return errors.New("diagnostic process registration unavailable")
+		}
+		defer unregister()
 		return runProcessDiagnostics(args[1], os.Stdin)
 	}
 	defer func() {

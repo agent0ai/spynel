@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/app"
+	"github.com/agent0ai/spynel/internal/updater"
 )
 
 func TestMain(m *testing.M) {
@@ -54,7 +55,7 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	if len(os.Args) == 3 && os.Args[1] == "__diagnostics" {
-		if runProcessDiagnostics(os.Args[2], os.Stdin) != nil {
+		if Run(os.Args[1:], "synthetic-version") != nil {
 			os.Exit(1)
 		}
 		os.Exit(0)
@@ -97,6 +98,41 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
+}
+
+func TestExitRecorderRegistersBeforeReadingItsInput(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	command := exec.Command(os.Args[0], "__diagnostics", "exit")
+	input, err := command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = command.Process.Kill(); _ = command.Wait() }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		record, err := updater.ProcessRecord(command.Process.Pid)
+		if err == nil && record.DiagnosticReader && !record.Ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("exit recorder remained an unregistered process")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	diagnostic := newProcessDiagnostic(filepath.Join(t.TempDir(), "logs"), "synthetic-version")
+	diagnostic.Status = intPointer(0)
+	if err := json.NewEncoder(input).Encode(diagnostic); err != nil {
+		t.Fatal(err)
+	}
+	_ = input.Close()
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 //go:noinline

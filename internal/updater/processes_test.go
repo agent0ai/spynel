@@ -44,6 +44,19 @@ func TestLifecycleProcessFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeRecord()
+	if transition := os.Getenv("SPYNEL_TEST_REGISTRATION_TRANSITION"); transition != "" {
+		closeRecord()
+		fmt.Println("ready")
+		time.Sleep(150 * time.Millisecond)
+		if transition == "exit" {
+			return
+		}
+		closeNewRecord, registerErr := manager.RegisterProcess()
+		if registerErr != nil {
+			t.Fatal(registerErr)
+		}
+		defer closeNewRecord()
+	}
 	if !diagnostic && !guardian && (version != "2.0.0" || os.Getenv("SPYNEL_TEST_NOT_READY") != "1") {
 		if err := MarkProcessReady(); err != nil {
 			t.Fatal(err)
@@ -68,6 +81,33 @@ func TestLifecycleProcessFixture(t *testing.T) {
 			t.Fatal(err)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func TestProcessDiscoveryReconcilesRegistrationTransitions(t *testing.T) {
+	for _, transition := range []string{"start", "exit"} {
+		t.Run(transition, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			t.Setenv("HOME", t.TempDir())
+			t.Setenv("SPYNEL_TEST_REGISTRATION_TRANSITION", transition)
+			fixture := lifecycleFixture(t, t.TempDir())
+			if transition == "exit" {
+				done := make(chan struct{})
+				go func() { _ = fixture.Wait(); close(done) }()
+				t.Cleanup(func() { <-done })
+			}
+			records, err := processRecords([]int{fixture.Process.Pid})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if transition == "exit" {
+				if len(records) != 0 {
+					t.Fatal("exited process became an unregistered legacy instance")
+				}
+			} else if len(records) != 1 || records[0].Generation == "" {
+				t.Fatal("starting process became an unregistered legacy instance")
+			}
+		})
 	}
 }
 

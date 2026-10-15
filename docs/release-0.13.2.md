@@ -14,6 +14,13 @@ with the complete current request; unsafe files and publication failures return
 an explicit retained error. Reading an exit code no longer writes a request.
 Supervised and one-shot launches use the same completion boundary.
 
+Process discovery also rechecks unknown instances after a bounded registration
+transition window, preventing an instance entering or leaving the registry from
+being mistaken for a persistent unregistered legacy server. Live unregistered
+applications still fail update preflight. Native exit recorders now register as
+diagnostic helpers before reading input, so bookkeeping cannot become an
+application restart target.
+
 `/status` now shows the serving process's version directly above the adjacent
 instance IDs. Structured status includes the same `version` field. This reports
 the running primary's version even when a newer CLI connects to it; an installed

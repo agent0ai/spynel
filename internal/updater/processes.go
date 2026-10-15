@@ -171,6 +171,21 @@ func liveProcesses() ([]ProcessRegistration, error) {
 }
 
 func processRecords(ids []int) ([]ProcessRegistration, error) {
+	records, err := collectProcessRecords(ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, record := range records {
+		if record.Generation == "" {
+			// Kernel PIDs and atomic registration files can straddle startup or exit.
+			time.Sleep(2 * time.Second)
+			return collectProcessRecords(ids)
+		}
+	}
+	return records, nil
+}
+
+func collectProcessRecords(ids []int) ([]ProcessRegistration, error) {
 	directory, err := processDirectory()
 	if err != nil {
 		return nil, err
@@ -206,7 +221,7 @@ func processRecords(ids []int) ([]ProcessRegistration, error) {
 			continue
 		}
 		info, err := buildinfo.ReadFile(processImagePath(pid, path))
-		if err == nil && info.Path == own.Path {
+		if err == nil && info.Path == own.Path && processAlive(pid) {
 			executable := strings.TrimSuffix(path, " (deleted)")
 			root := npmRootFromExecutable(executable)
 			if strings.HasPrefix(filepath.Base(root), ".spynel-") {
