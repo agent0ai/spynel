@@ -7,6 +7,7 @@
 ## Local Contracts
 
 - Keep topic and section IDs stable, content classified and bounded, and text/JSON output deterministic under the documented record and size limits.
+- Keep the logs topic explicit about native stderr/process boundaries, parent-observed exits, private retention and the host-evidence limits of missing stops, SIGKILL and OOM attribution.
 - Never read workspace state, environment values, histories, credentials, or arbitrary files; content is compiled from `content.go` and prompt guidance from `prompt.go`.
 - Synchronize behavior facts with user documentation, CLI examples, and tests for pagination, search, formatting, and bounds.
 - Keep model/effort/speed commands and atomic dispatch-boundary guidance synchronized with the harness capability mapping.
@@ -16,6 +17,8 @@
 - The integration topic documents committed conversation subscriptions, honest retry/completion boundaries, optional private Unix sockets, and content-free headless stderr. Distinguish explicit same-kernel socket access from unchanged foreign-loopback discovery/election fences.
 
 - Keep compiled update guidance explicit about update-by-default, `update check`, all-instance restart within the selected installation, shell `killall`, and older-instance restart limitations.
+
+- Describe native supervisor/manual versus external service ownership, explicit stop/update and finite recovery limits, shared 40-second readiness, and live provider ownership that prevents overlap while automatically retrying after confirmed cleanup; stale file presence never blocks startup.
 
 ## Child DOX Index
 

@@ -35,7 +35,11 @@ See npm's official [Trusted Publishing](https://docs.npmjs.com/trusted-publisher
 
 ## Release procedure
 
-For changes to cross-platform process lifecycle, first run the release workflow manually on the intended commit with the proposed version tag. This runs the same verification and four native jobs, including live npm replacement across workspaces and TUI terminals, but cannot publish a GitHub Release or npm package. Confirm that every native job passed for that exact commit before creating its release tag.
+Freeze the exact combined candidate and independently assess correctness, security and privacy before any public source push or artifact upload. Inspect new history, source archives, defaults/fixtures/assets/notes, native bytes and npm inventory. Repeat the applicable assessment after any candidate change; after nonpublishing native gates, inspect the actual four retained archives/evidence before immutable tag, release and npm publication. Publisher scans alone do not constitute independent acceptance.
+
+The native standalone fixture uses the verified 0.12.17 prior release, whose caller-installation/update-by-default contract matches the current shell interface. It tests real older direct-instance upgrade into native supervision; older unregistered process/launcher rejection remains covered separately.
+
+For changes to cross-platform process lifecycle, first run the release workflow manually on the intended commit with the proposed version tag. This runs the same verification and four native jobs, including live npm replacement across workspaces, TUI terminals and packaged native supervision/ownership fixtures, but cannot publish a GitHub Release or npm package. Confirm that every native job passed for that exact commit before creating its release tag.
 
 Create a GitHub Release with a `v`-prefixed semantic version tag, for example `v0.2.1`. Mark a version such as `v0.3.0-beta.1` as a GitHub prerelease. Publishing the release starts the workflow; creating or editing a draft does not. The committed `package.json` uses `0.0.0-development` because npm requires a version field; both verification and publication replace it with the tag-derived version in their isolated checkouts.
 
@@ -44,6 +48,8 @@ The npm package uses the root repository `README.md` from the released commit. B
 The npm postinstall script maps supported Node platforms to the four archive names, downloads the matching archive and `checksums.txt`, verifies SHA-256, validates the executable, and atomically replaces `npm/vendor/` with the complete extracted runtime. It rejects Windows before any download and never runs Spynel during package installation. `SPYNEL_DOWNLOAD_BASE` may point installation at a trusted compatible mirror.
 
 Before publishing, reproduce the local gates and build a runnable archive for the host target:
+
+Linux packaging requires `patchelf` to remove dependency build paths from the executable's loader metadata. The packaged executable uses only `$ORIGIN/lib` to find its companion libraries.
 
 ```bash
 ./scripts/dev.sh test

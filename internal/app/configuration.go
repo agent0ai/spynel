@@ -1222,6 +1222,13 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	if startupRequested && s.Startup == nil {
 		return nil, errors.New("autostart registration is unavailable")
 	}
+	var previousStartup, startupSynced bool
+	if startupRequested {
+		previousStartup, err = s.Startup.Enabled(previous)
+		if err != nil {
+			return nil, fmt.Errorf("autostart registration unverified: %s", boundAndRedactLogText(err.Error()))
+		}
+	}
 	if harnessChanged {
 		if err := s.reconfigureHarness(next); err != nil {
 			return nil, err
@@ -1235,6 +1242,13 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	}
 	var reloaded config.Config
 	update := func() error {
+		if startupRequested {
+			if err := s.Startup.Sync(next, next.Startup.Enabled); err != nil {
+				s.Runtime.LogEvent("error", "startup", "registration_failed", err.Error())
+				return fmt.Errorf("autostart registration unverified: %s", boundAndRedactLogText(err.Error()))
+			}
+			startupSynced = true
+		}
 		var updateErr error
 		reloaded, updateErr = s.Settings.Update(func(current *config.Config) error {
 			*current = next
@@ -1250,10 +1264,15 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	if err != nil {
 		var rollback error
 		if harnessChanged {
-			rollback = s.reconfigureHarness(previous)
+			rollback = wrapRollback("harness", s.reconfigureHarness(previous))
+		}
+		if startupSynced {
+			if restoreErr := s.Startup.Sync(previous, previousStartup); restoreErr != nil {
+				rollback = errors.Join(rollback, fmt.Errorf("rollback autostart: %s", boundAndRedactLogText(restoreErr.Error())))
+			}
 		}
 		s.Runtime.LogEvent("error", "config", "persist_failed", "Configuration persistence failed")
-		return nil, errors.Join(err, wrapRollback("harness", rollback))
+		return nil, errors.Join(err, rollback)
 	}
 	next = reloaded
 	for _, setting := range changed {
@@ -1274,10 +1293,6 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 	}
 	s.Runtime.LogEvent("info", "config", "persisted", fmt.Sprintf("Configuration persisted (%d settings changed)", len(changed)))
 	if startupRequested {
-		if err := s.Startup.Sync(next, next.Startup.Enabled); err != nil {
-			s.Runtime.LogEvent("error", "startup", "registration_failed", err.Error())
-			return nil, fmt.Errorf("autostart registration unverified: %s (preference saved)", boundAndRedactLogText(err.Error()))
-		}
 		s.Runtime.LogEvent("info", "startup", "registration_verified", autostartConfirmation(next.Startup.Enabled))
 	}
 	return changed, nil

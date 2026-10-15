@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,8 @@ const (
 	maxPendingControls  = 8
 	controlDedupeWindow = time.Minute
 )
+
+var errProviderShutdownPending = errors.New("previous provider shutdown was not confirmed; waiting for cleanup")
 
 // Supervisor keeps the rest of Spynel provider-neutral while allowing the
 // selected harness to be replaced at runtime. It only swaps an idle harness;
@@ -39,6 +42,10 @@ type Supervisor struct {
 	controlOps        map[string]*sync.Mutex
 	ready             chan struct{}
 	closed            bool
+	processStartGuard func() error
+	processOwner      processOwnership
+	closing           Harness
+	recovering        bool
 }
 
 type pendingSend struct {
@@ -135,11 +142,18 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	cfg := s.config
 	s.mu.Unlock()
 
-	target, err := s.startTarget(ctx, cfg)
+	target, err := s.createTarget(cfg)
+	if err == nil {
+		err = s.startTarget(ctx, target)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err != nil {
 		s.startErr = err
+		if (errors.Is(err, errProcessOwnershipBusy) || errors.Is(err, errProviderShutdownPending)) && !s.recovering {
+			s.recovering = true
+			go s.recoverOwnership(ctx)
+		}
 		return err
 	}
 	s.current = target
@@ -148,20 +162,87 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	return nil
 }
 
-func (s *Supervisor) startTarget(ctx context.Context, cfg HarnessConfig) (Harness, error) {
+func (s *Supervisor) recoverOwnership(ctx context.Context) {
+	defer func() {
+		s.operationMu.Lock()
+		s.recovering = false
+		s.mu.RLock()
+		if !s.closed && s.ctx != nil && s.ctx.Err() == nil && (errors.Is(s.startErr, errProcessOwnershipBusy) || errors.Is(s.startErr, errProviderShutdownPending)) {
+			s.recovering = true
+			go s.recoverOwnership(s.ctx)
+		}
+		s.mu.RUnlock()
+		s.operationMu.Unlock()
+	}()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.Start(ctx); !errors.Is(err, errProcessOwnershipBusy) && !errors.Is(err, errProviderShutdownPending) {
+				return
+			}
+		}
+	}
+}
+
+// SetProcessStartGuard is configured before Start. It fences process-level
+// recovery before a provider can acquire descendants or external effects.
+func (s *Supervisor) SetProcessStartGuard(path string, guard func() error) {
+	s.processOwner.path = path
+	s.processStartGuard = guard
+}
+
+func (s *Supervisor) createTarget(cfg HarnessConfig) (Harness, error) {
+	if s.closing != nil {
+		if err := s.confirmProviderClose(s.closing); err != nil {
+			return nil, err
+		}
+	}
+	cfg.processOwner = &s.processOwner
 	target, err := s.registry.Create(cfg)
 	if err != nil {
 		return nil, err
 	}
-	if err := target.Start(ctx); err != nil {
-		_ = target.Close()
-		return nil, err
+	if cfg.Command != "" {
+		if _, err := exec.LookPath(cfg.Command); err != nil {
+			return nil, err
+		}
 	}
 	return target, nil
 }
 
-// Reconfigure validates a new harness by starting it before replacing the old
-// one. This makes configuration transactional from the user's perspective.
+// operationMu serializes provider starts and confirmed closes, including reuse
+// of this supervisor's already-acquired workspace marker.
+func (s *Supervisor) startTarget(ctx context.Context, target Harness) error {
+	if err := s.processOwner.acquire(); err != nil {
+		return err
+	}
+	if s.processStartGuard != nil {
+		if err := s.processStartGuard(); err != nil {
+			return err
+		}
+	}
+	if err := target.Start(ctx); err != nil {
+		return errors.Join(err, s.confirmProviderClose(target))
+	}
+	return nil
+}
+
+func (s *Supervisor) confirmProviderClose(target Harness) error {
+	if err := target.Close(); err != nil {
+		s.closing = target
+		return fmt.Errorf("%w: %v", errProviderShutdownPending, err)
+	}
+	s.closing = nil
+	return nil
+}
+
+// Reconfigure validates construction before closing the idle provider. Its
+// confirmed shutdown must precede successor effects; failed startup leaves
+// the saved selection unchanged and the runtime visibly unavailable.
 func (s *Supervisor) Reconfigure(cfg HarnessConfig) error {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
@@ -184,25 +265,40 @@ func (s *Supervisor) Reconfigure(cfg HarnessConfig) error {
 		return nil
 	}
 
-	target, err := s.startTarget(ctx, cfg)
+	target, err := s.createTarget(cfg)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	if s.closed || len(s.active) > 0 {
 		s.mu.Unlock()
-		_ = target.Close()
 		return errors.New("harness became busy while applying configuration")
 	}
 	previous := s.current
-	s.current = target
-	s.config = cfg
-	s.startErr = nil
+	s.current = nil
+	s.startErr = errors.New("harness is being reconfigured")
 	s.mu.Unlock()
-	s.signalReady()
 	if previous != nil {
-		_ = previous.Close()
+		err = s.confirmProviderClose(previous)
 	}
+	if err == nil {
+		err = s.startTarget(ctx, target)
+	}
+	s.mu.Lock()
+	s.startErr = err
+	if err == nil {
+		s.current = target
+		s.config = cfg
+	}
+	s.mu.Unlock()
+	if err != nil {
+		if errors.Is(err, errProviderShutdownPending) && !s.recovering {
+			s.recovering = true
+			go s.recoverOwnership(ctx)
+		}
+		return err
+	}
+	s.signalReady()
 	return nil
 }
 
@@ -834,7 +930,7 @@ func (s *Supervisor) Close() error {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	s.mu.Lock()
-	if s.closed {
+	if s.closed && s.closing == nil {
 		s.mu.Unlock()
 		return nil
 	}
@@ -843,7 +939,14 @@ func (s *Supervisor) Close() error {
 	s.current = nil
 	s.mu.Unlock()
 	if target != nil {
-		return target.Close()
+		if err := s.confirmProviderClose(target); err != nil {
+			return err
+		}
 	}
-	return nil
+	if s.closing != nil {
+		if err := s.confirmProviderClose(s.closing); err != nil {
+			return err
+		}
+	}
+	return s.processOwner.release()
 }

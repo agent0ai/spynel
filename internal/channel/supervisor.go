@@ -244,7 +244,7 @@ func (s *Supervisor) PairPhone(ctx context.Context, name, phone string) (string,
 	return controller.PairPhone(ctx, phone)
 }
 
-func (s *Supervisor) Deliver(ctx context.Context, name, conversation, eventID, text string) error {
+func (s *Supervisor) Deliver(ctx context.Context, name, conversation, eventID, text string, attachments []core.OutboundAttachment) error {
 	s.mu.Lock()
 	running := s.running[name]
 	var instance Channel
@@ -259,7 +259,7 @@ func (s *Supervisor) Deliver(ctx context.Context, name, conversation, eventID, t
 	if !ok {
 		return fmt.Errorf("%s does not support proactive delivery", name)
 	}
-	return deliverer.Deliver(ctx, conversation, eventID, text)
+	return deliverer.Deliver(ctx, conversation, eventID, text, attachments)
 }
 
 func (s *Supervisor) DeliverEvent(ctx context.Context, name, conversation, eventID string, event core.Event) error {

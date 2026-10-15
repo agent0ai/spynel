@@ -28,9 +28,10 @@ import (
 // autonomous tools. Claude Code owns the agent loop and durable transcript;
 // Spynel stores only conversation-to-session mappings.
 type Claude struct {
-	config HarnessConfig
-	ctx    context.Context
-	cancel context.CancelFunc
+	config      HarnessConfig
+	processWait sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
 
 	keyMu    sync.Mutex
 	keyLocks map[string]*sync.Mutex
@@ -203,6 +204,7 @@ func checkClaudeCapabilities(parent context.Context, cfg HarnessConfig) error {
 	output := newTailBuffer(256 * 1024)
 	cmd := exec.CommandContext(ctx, cfg.Command, "--help")
 	cmd.Dir = cfg.Cwd
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Stdout = output
 	cmd.Stderr = output
 	if err := cmd.Run(); err != nil {
@@ -410,6 +412,7 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 	args = append(args, claudePermissionArgs(cfg)...)
 	cmd := exec.CommandContext(turnContext, cfg.Command, args...)
 	cmd.Dir = cfg.Cwd
+	cmd.WaitDelay = 2 * time.Second
 	var stdin io.WriteCloser
 	if streamingInput {
 		var err error
@@ -436,11 +439,18 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 		diagnosticOutput = io.MultiWriter(cfg.Stderr, stderr)
 	}
 	cmd.Stderr = &claudeLifecycleWriter{dst: diagnosticOutput, turn: turn}
-	if err := cmd.Start(); err != nil {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		cancel()
+		return "", false, errors.New("Claude Code harness is closed")
+	}
+	if err := startProvider(cmd, cfg.processOwner); err != nil {
+		c.mu.Unlock()
 		cancel()
 		return "", false, fmt.Errorf("start Claude Code: %w", err)
 	}
-	c.mu.Lock()
+	c.processWait.Add(1)
 	c.active[key] = turn
 	c.mu.Unlock()
 	go c.runTurn(turn, stdout)
@@ -677,6 +687,7 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 		}
 	}
 	waitErr := turn.cmd.Wait()
+	c.processWait.Done()
 	turn.cancel()
 	if completed {
 		if waitErr != nil && c.config.Stderr != nil {
@@ -785,7 +796,7 @@ func (c *Claude) Close() error {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return nil
+		return waitProviderProcesses(&c.processWait)
 	}
 	c.closed = true
 	cancel := c.cancel
@@ -800,7 +811,7 @@ func (c *Claude) Close() error {
 	for _, turn := range turns {
 		turn.cancel()
 	}
-	return nil
+	return waitProviderProcesses(&c.processWait)
 }
 
 func (c *Claude) lockForKey(key string) *sync.Mutex {

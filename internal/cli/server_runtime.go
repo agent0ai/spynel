@@ -40,14 +40,14 @@ type primaryTerm struct {
 	stopOnce         sync.Once
 }
 
-func runOwnerElection(ctx context.Context, cfg config.Config, version string, election *instance.Election, restart func(), update func(updater.Result), options ...primaryOptions) error {
+func runOwnerElection(ctx context.Context, cfg config.Config, version string, election *instance.Election, restart func(), update func(updater.Result), options ...primaryOptions) (runErr error) {
 	ticker := time.NewTicker(instance.RetryInterval)
 	defer ticker.Stop()
 	var term *primaryTerm
 	var nextHeartbeat time.Time
 	defer func() {
 		if term != nil {
-			term.stop()
+			runErr = errors.Join(runErr, term.stop())
 		}
 	}()
 
@@ -57,9 +57,9 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 			select {
 			case err := <-term.apiError:
 				term.service.Runtime.LogEvent("error", "localapi", "stopped", "Workspace API stopped: "+errorText(err))
-				term.stop()
+				stopErr := term.stop()
 				term = nil
-				return nil
+				return stopErr
 			default:
 			}
 			if now.Before(nextHeartbeat) {
@@ -70,9 +70,9 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 				term.service.Runtime.LogEvent("error", "instance", "lease_renew_failed", "Renew primary lease: "+err.Error())
 			}
 			if err != nil || !owned {
-				term.stop()
+				stopErr := term.stop()
 				term = nil
-				return nil
+				return stopErr
 			}
 			nextHeartbeat = now.Add(instance.HeartbeatInterval)
 			return nil
@@ -127,6 +127,7 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 			term.service.Runtime.LogEvent("info", "instance", "handoff", "Handing primary ownership to instance "+targetID)
 			if err := term.handoff(targetID); err != nil {
 				term.service.Runtime.LogEvent("error", "instance", "handoff_failed", "Primary handoff: "+err.Error())
+				return err
 			}
 			term = nil
 		case <-ticker.C:
@@ -252,8 +253,8 @@ func runPrimaryOrchestrator(ctx context.Context, service *app.Service) error {
 	return service.Orchestrator.Run(ctx)
 }
 
-func (term *primaryTerm) stop() {
-	_ = term.stopFor("")
+func (term *primaryTerm) stop() error {
+	return term.stopFor("")
 }
 
 func (term *primaryTerm) handoff(targetID string) error {
@@ -269,12 +270,15 @@ func (term *primaryTerm) stopFor(targetID string) error {
 		term.service.SetPrimaryInstanceID("")
 		term.cancel()
 		_ = term.listener.Close()
-		_ = term.service.Harness.Close()
+		if err := term.service.Harness.Close(); err != nil {
+			term.service.Runtime.LogEvent("error", "harness", "shutdown_failed", err.Error())
+			stopErr = err
+		}
 		<-term.apiDone
 		<-term.channelsDone
 		<-term.orchestratorDone
 		term.service.Orchestrator.Wait()
-		if targetID != "" {
+		if targetID != "" && stopErr == nil {
 			_, handedOff, err := term.election.Handoff(term.token, targetID)
 			if err == nil && handedOff {
 				return
@@ -290,6 +294,7 @@ func (term *primaryTerm) stopFor(targetID string) error {
 		}
 		if err := term.election.Release(term.token); err != nil {
 			term.service.Runtime.LogEvent("error", "instance", "lease_release_failed", "Release primary lease: "+err.Error())
+			stopErr = errors.Join(stopErr, err)
 		}
 	})
 	if !stopped && targetID != "" {

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/fsx"
@@ -31,14 +32,16 @@ type CodexConfig struct {
 	SessionsFile   string
 	Version        string
 	Stderr         io.Writer
+	processOwner   *processOwnership
 }
 
 type Codex struct {
-	config CodexConfig
-	ctx    context.Context
-	cancel context.CancelFunc
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
+	config      CodexConfig
+	ctx         context.Context
+	cancel      context.CancelFunc
+	cmd         *exec.Cmd
+	processDone chan struct{}
+	stdin       io.WriteCloser
 
 	writeMu sync.Mutex
 	// ponytail: one app-server stream serializes callbacks; use per-thread
@@ -251,6 +254,7 @@ func (c *Codex) Start(parent context.Context) error {
 	c.ctx, c.cancel = context.WithCancel(parent)
 	c.cmd = exec.CommandContext(c.ctx, c.config.Command, "app-server", "--stdio")
 	c.cmd.Dir = c.config.Cwd
+	c.cmd.WaitDelay = 2 * time.Second
 	stdout, err := c.cmd.StdoutPipe()
 	if err != nil {
 		c.mu.Unlock()
@@ -265,11 +269,12 @@ func (c *Codex) Start(parent context.Context) error {
 	if c.config.Stderr != nil {
 		c.cmd.Stderr = c.config.Stderr
 	}
-	if err := c.cmd.Start(); err != nil {
+	if err := startProvider(c.cmd, c.config.processOwner); err != nil {
 		c.cmd = nil
 		c.mu.Unlock()
 		return fmt.Errorf("start codex app-server: %w", err)
 	}
+	c.processDone = make(chan struct{})
 	c.mu.Unlock()
 	go c.readLoop(stdout)
 	go c.waitLoop()
@@ -939,6 +944,7 @@ func (c *Codex) waitLoop() {
 		return
 	}
 	err := cmd.Wait()
+	close(c.processDone)
 	if err == nil {
 		err = errors.New("codex app-server exited")
 	}
@@ -975,13 +981,15 @@ func (c *Codex) failAll(err error) {
 func (c *Codex) Close() error {
 	c.mu.Lock()
 	if c.closed {
+		done := c.processDone
 		c.mu.Unlock()
-		return nil
+		return waitProviderProcess(done)
 	}
 	c.closed = true
 	stdin := c.stdin
 	c.stdin = nil
 	cancel := c.cancel
+	done := c.processDone
 	c.mu.Unlock()
 	if stdin != nil {
 		_ = stdin.Close()
@@ -989,7 +997,7 @@ func (c *Codex) Close() error {
 	if cancel != nil {
 		cancel()
 	}
-	return nil
+	return waitProviderProcess(done)
 }
 
 func (c *Codex) loadSessions() error {

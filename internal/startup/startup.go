@@ -100,7 +100,7 @@ func New(executable string) (*Manager, error) {
 	return manager, nil
 }
 
-func (m *Manager) Sync(cfg config.Config, enabled bool) error {
+func (m *Manager) Sync(cfg config.Config, enabled bool) (err error) {
 	if cfg.Path == "" {
 		return errors.New("cannot configure startup without a loaded .spynel/config.yaml")
 	}
@@ -110,6 +110,52 @@ func (m *Manager) Sync(cfg config.Config, enabled bool) error {
 		if err := m.validatePaths(cfg); err != nil {
 			return err
 		}
+	}
+	// Verify the live manager before changing persistent registration. File-only
+	// systemctl queries can succeed even when systemd is not running.
+	var paths []string
+	var restoreNative func() error
+	switch m.GOOS {
+	case "linux":
+		previous, inspectErr := m.linuxEnabled(ctx, "spynel-"+workspaceID(cfg)+".service")
+		if inspectErr != nil {
+			return inspectErr
+		}
+		unit, link, _ := m.linuxPaths(cfg)
+		paths = []string{unit, link}
+		restoreNative = func() error { return m.verifyLinux(ctx, filepath.Base(unit), previous) }
+	case "darwin":
+		domain, label, path := m.darwinRegistration(cfg)
+		output, inspectErr := m.run(ctx, "launchctl", "print-disabled", domain)
+		if inspectErr != nil {
+			return fmt.Errorf("check autostart registration: %w", inspectErr)
+		}
+		disabled, inspectErr := launchdDisabled(output, label)
+		if inspectErr != nil {
+			return inspectErr
+		}
+		paths = []string{path}
+		restoreNative = func() error {
+			action := "enable"
+			if disabled {
+				action = "disable"
+			}
+			_, restoreErr := m.run(ctx, "launchctl", action, domain+"/"+label)
+			return restoreErr
+		}
+	}
+	if len(paths) > 0 {
+		restore, snapshotErr := registrationRollback(paths...)
+		if snapshotErr != nil {
+			return snapshotErr
+		}
+		defer func() {
+			if err != nil {
+				if restoreErr := errors.Join(restore(), restoreNative()); restoreErr != nil {
+					err = errors.Join(err, fmt.Errorf("restore autostart registration: %w", restoreErr))
+				}
+			}
+		}()
 	}
 	switch m.GOOS {
 	case "linux":
@@ -129,11 +175,8 @@ func (m *Manager) Sync(cfg config.Config, enabled bool) error {
 		if err != nil {
 			return err
 		}
-		domain := "gui/" + strconv.Itoa(os.Getuid())
-		if m.SystemWide {
-			domain = "system"
-		}
-		_, err = m.run(ctx, "launchctl", action, domain+"/dev.spynel.workspace."+workspaceID(cfg))
+		domain, label, _ := m.darwinRegistration(cfg)
+		_, err = m.run(ctx, "launchctl", action, domain+"/"+label)
 		if err != nil {
 			return fmt.Errorf("%s autostart registration: %w", action, err)
 		}
@@ -150,6 +193,52 @@ func (m *Manager) Sync(cfg config.Config, enabled bool) error {
 	default:
 		return fmt.Errorf("run at startup is not supported on %s", m.GOOS)
 	}
+}
+
+// Capture only the bounded files and links owned by this registration.
+func registrationRollback(paths ...string) (func() error, error) {
+	var restores []func() error
+	for _, path := range paths {
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			restores = append(restores, func() error {
+				err := os.Remove(path)
+				if os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			})
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return nil, err
+			}
+			restores = append(restores, func() error {
+				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+				return os.Symlink(target, path)
+			})
+			continue
+		}
+		data, err := readRegistration(path)
+		if err != nil {
+			return nil, err
+		}
+		restores = append(restores, func() error { return fsx.AtomicWriteFile(path, data, info.Mode().Perm()) })
+	}
+	return func() error {
+		var err error
+		for _, restore := range restores {
+			err = errors.Join(err, restore())
+		}
+		return err
+	}, nil
 }
 
 func (m *Manager) run(ctx context.Context, name string, arguments ...string) (string, error) {
@@ -242,19 +331,25 @@ func (m *Manager) startupCommand(cfg config.Config) (string, []string) {
 	return executable, arguments
 }
 
+func (m *Manager) linuxPaths(cfg config.Config) (unit, link, target string) {
+	unitName := "spynel-" + workspaceID(cfg) + ".service"
+	unitDirectory := filepath.Join(m.Home, ".config", "systemd", "user")
+	target = "default.target"
+	if m.SystemWide {
+		unitDirectory = m.SystemUnitDirectory
+		target = "multi-user.target"
+	}
+	return filepath.Join(unitDirectory, unitName), filepath.Join(unitDirectory, target+".wants", unitName), target
+}
+
 func (m *Manager) enableLinux(ctx context.Context, cfg config.Config) error {
 	workingDirectory, err := systemdWorkingDirectory(cfg.Root)
 	if err != nil {
 		return err
 	}
-	unitName := "spynel-" + workspaceID(cfg) + ".service"
-	unitDirectory := filepath.Join(m.Home, ".config", "systemd", "user")
-	target := "default.target"
-	if m.SystemWide {
-		unitDirectory = m.SystemUnitDirectory
-		target = "multi-user.target"
-	}
-	wantsDirectory := filepath.Join(unitDirectory, target+".wants")
+	unitPath, linkPath, target := m.linuxPaths(cfg)
+	unitName := filepath.Base(unitPath)
+	wantsDirectory := filepath.Dir(linkPath)
 	if err := os.MkdirAll(wantsDirectory, 0o700); err != nil {
 		return err
 	}
@@ -292,7 +387,6 @@ func (m *Manager) enableLinux(ctx context.Context, cfg config.Config) error {
 		"WantedBy=" + target,
 		"",
 	}, "\n")
-	unitPath := filepath.Join(unitDirectory, unitName)
 	verifyArgs := []string{"verify", "--man=no"}
 	if !m.SystemWide {
 		verifyArgs = append(verifyArgs, "--user")
@@ -300,7 +394,6 @@ func (m *Manager) enableLinux(ctx context.Context, cfg config.Config) error {
 	if err := m.writeValidated(ctx, unitPath, []byte(unit), "systemd-analyze", verifyArgs...); err != nil {
 		return err
 	}
-	linkPath := filepath.Join(wantsDirectory, unitName)
 	if target, err := os.Readlink(linkPath); err == nil {
 		if target != filepath.Join("..", unitName) {
 			return fmt.Errorf("startup link %s already points to %s", linkPath, target)
@@ -314,19 +407,13 @@ func (m *Manager) enableLinux(ctx context.Context, cfg config.Config) error {
 }
 
 func (m *Manager) disableLinux(ctx context.Context, cfg config.Config) error {
-	unitName := "spynel-" + workspaceID(cfg) + ".service"
-	unitDirectory := filepath.Join(m.Home, ".config", "systemd", "user")
-	target := "default.target"
-	if m.SystemWide {
-		unitDirectory = m.SystemUnitDirectory
-		target = "multi-user.target"
-	}
-	for _, path := range []string{filepath.Join(unitDirectory, target+".wants", unitName), filepath.Join(unitDirectory, unitName)} {
+	unitPath, linkPath, _ := m.linuxPaths(cfg)
+	for _, path := range []string{linkPath, unitPath} {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
-	return m.verifyLinux(ctx, unitName, false)
+	return m.verifyLinux(ctx, filepath.Base(unitPath), false)
 }
 
 func (m *Manager) verifyLinux(ctx context.Context, unitName string, enabled bool) error {
@@ -351,6 +438,9 @@ func (m *Manager) linuxEnabled(ctx context.Context, unitName string) (bool, erro
 	arguments := []string{"--no-ask-password"}
 	if !m.SystemWide {
 		arguments = append(arguments, "--user")
+	}
+	if _, err := m.run(ctx, "systemctl", append(arguments, "show", "--property=Version", "--value")...); err != nil {
+		return false, fmt.Errorf("autostart requires a reachable systemd manager: %w", err)
 	}
 	output, err := m.run(ctx, "systemctl", append(arguments, "list-unit-files", "--no-legend", "--no-pager", unitName)...)
 	var exit *exec.ExitError
@@ -391,12 +481,7 @@ func (m *Manager) enabled(ctx context.Context, cfg config.Config) (bool, error) 
 	case "linux":
 		return m.linuxEnabled(ctx, "spynel-"+workspaceID(cfg)+".service")
 	case "darwin":
-		label := "dev.spynel.workspace." + workspaceID(cfg)
-		domain := "gui/" + strconv.Itoa(os.Getuid())
-		directory := filepath.Join(m.Home, "Library", "LaunchAgents")
-		if m.SystemWide {
-			domain, directory = "system", m.SystemLaunchDirectory
-		}
+		domain, label, path := m.darwinRegistration(cfg)
 		output, err := m.run(ctx, "launchctl", "print-disabled", domain)
 		if err != nil {
 			return false, fmt.Errorf("check autostart registration: %w", err)
@@ -405,7 +490,6 @@ func (m *Manager) enabled(ctx context.Context, cfg config.Config) (bool, error) 
 		if err != nil {
 			return false, err
 		}
-		path := filepath.Join(directory, label+".plist")
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			return false, nil
 		} else if err != nil {
@@ -421,6 +505,16 @@ func (m *Manager) enabled(ctx context.Context, cfg config.Config) (bool, error) 
 	default:
 		return false, fmt.Errorf("autostart state inspection is not supported on %s", m.GOOS)
 	}
+}
+
+func (m *Manager) darwinRegistration(cfg config.Config) (domain, label, path string) {
+	label = "dev.spynel.workspace." + workspaceID(cfg)
+	domain = "gui/" + strconv.Itoa(os.Getuid())
+	directory := filepath.Join(m.Home, "Library", "LaunchAgents")
+	if m.SystemWide {
+		domain, directory = "system", m.SystemLaunchDirectory
+	}
+	return domain, label, filepath.Join(directory, label+".plist")
 }
 
 func launchdDisabled(output, label string) (bool, error) {
@@ -446,7 +540,7 @@ func launchdDisabled(output, label string) (bool, error) {
 }
 
 func (m *Manager) enableDarwin(ctx context.Context, cfg config.Config) error {
-	label := "dev.spynel.workspace." + workspaceID(cfg)
+	_, label, path := m.darwinRegistration(cfg)
 	executable, arguments := m.startupCommand(cfg)
 	plist := struct {
 		XMLName xml.Name  `xml:"plist"`
@@ -462,24 +556,15 @@ func (m *Manager) enableDarwin(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	data = append([]byte(xml.Header+`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`+"\n"), append(data, '\n')...)
-	directory := filepath.Join(m.Home, "Library", "LaunchAgents")
-	if m.SystemWide {
-		directory = m.SystemLaunchDirectory
-	}
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	path := filepath.Join(directory, label+".plist")
 	return m.writeValidated(ctx, path, data, "plutil", "-lint")
 }
 
 func (m *Manager) disableDarwin(cfg config.Config) error {
-	label := "dev.spynel.workspace." + workspaceID(cfg)
-	directory := filepath.Join(m.Home, "Library", "LaunchAgents")
-	if m.SystemWide {
-		directory = m.SystemLaunchDirectory
-	}
-	err := os.Remove(filepath.Join(directory, label+".plist"))
+	_, _, path := m.darwinRegistration(cfg)
+	err := os.Remove(path)
 	if os.IsNotExist(err) {
 		return nil
 	}

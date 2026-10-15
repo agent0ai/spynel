@@ -20,16 +20,24 @@ import (
 	"github.com/agent0ai/spynel/internal/fsx"
 )
 
-// ProcessRegistration identifies a live server/TUI, including secondary TUIs
-// and servers in other workspaces. It contains no workspace credentials.
+// ProcessRegistration identifies a server/TUI or its diagnostic reader,
+// including other workspaces. It contains no workspace credentials.
 type ProcessRegistration struct {
-	PID                int    `json:"pid"`
-	Generation         string `json:"generation"`
-	Executable         string `json:"executable"`
-	Installation       string `json:"installation,omitempty"`
-	Version            string `json:"version"`
-	Ready              bool   `json:"ready"`
-	CoordinatedUpdates bool   `json:"coordinated_updates"`
+	PID                  int    `json:"pid"`
+	Generation           string `json:"generation"`
+	Executable           string `json:"executable"`
+	Installation         string `json:"installation,omitempty"`
+	Version              string `json:"version"`
+	Ready                bool   `json:"ready"`
+	CoordinatedUpdates   bool   `json:"coordinated_updates"`
+	DiagnosticReader     bool   `json:"diagnostic_reader,omitempty"`
+	ProviderGuardian     bool   `json:"provider_guardian,omitempty"`
+	Supervisor           bool   `json:"supervisor,omitempty"`
+	SupervisorPID        int    `json:"supervisor_pid,omitempty"`
+	SupervisorGeneration string `json:"supervisor_generation,omitempty"`
+	ExecutorPID          int    `json:"executor_pid,omitempty"`
+	ExecutorGeneration   string `json:"executor_generation,omitempty"`
+	Stopping             bool   `json:"stopping,omitempty"`
 }
 
 func processDirectory() (string, error) {
@@ -57,6 +65,20 @@ func (m *Manager) InstallationRoot() string {
 // RegisterProcess is held for the complete server/election/TUI lifetime.
 // A new generation is published only by the newly started executable.
 func (m *Manager) RegisterProcess() (func(), error) {
+	return m.registerProcess(ProcessRegistration{})
+}
+
+// RegisterDiagnosticReader keeps executable discovery honest without making a
+// pipe reader an application-readiness or coordinated-restart target.
+func (m *Manager) RegisterDiagnosticReader() (func(), error) {
+	return m.registerProcess(ProcessRegistration{DiagnosticReader: true})
+}
+
+func (m *Manager) RegisterProviderGuardian() (func(), error) {
+	return m.registerProcess(ProcessRegistration{ProviderGuardian: true})
+}
+
+func (m *Manager) registerProcess(role ProcessRegistration) (func(), error) {
 	directory, err := processDirectory()
 	if err != nil {
 		return nil, err
@@ -69,7 +91,9 @@ func (m *Manager) RegisterProcess() (func(), error) {
 	if err != nil {
 		return nil, err
 	}
-	record := ProcessRegistration{PID: os.Getpid(), Generation: hex.EncodeToString(nonce[:]), Executable: executable, Installation: m.InstallationRoot(), Version: m.CurrentVersion}
+	record := role
+	record.PID, record.Generation, record.Executable = os.Getpid(), hex.EncodeToString(nonce[:]), executable
+	record.Installation, record.Version = m.InstallationRoot(), m.CurrentVersion
 	record.CoordinatedUpdates = m.PackageRoot == "" || m.CoordinatedUpdates
 	path := filepath.Join(directory, strconv.Itoa(record.PID)+".json")
 	data, err := json.Marshal(record)
@@ -211,6 +235,15 @@ func (m *Manager) CheckRestartable() error {
 		return err
 	}
 	for _, record := range records {
+		if record.DiagnosticReader || record.ProviderGuardian {
+			continue
+		}
+		if record.SupervisorPID != 0 && (record.Installation == root || m.ownsProcessPath(root, record.Executable)) {
+			parent, err := ProcessRecord(record.SupervisorPID)
+			if err != nil || !parent.Supervisor || parent.Generation != record.SupervisorGeneration || !relatedProcesses(parent, record) {
+				return errors.New("linked executor has no verified supervisor; run spynel killall once, then relaunch Spynel")
+			}
+		}
 		if (record.Installation == root || m.ownsProcessPath(root, record.Executable)) && (record.Generation == "" || record.Installation != root || m.PackageRoot != "" && !record.CoordinatedUpdates) {
 			return fmt.Errorf("Spynel process %d has no valid coordinated-restart registration; run spynel killall once, then launch the current version", record.PID)
 		}
@@ -221,6 +254,9 @@ func (m *Manager) CheckRestartable() error {
 // RestartInstances waits for every other instance of this installation to
 // publish a new generation using the updated version, preserving its terminal.
 func (m *Manager) RestartInstances(ctx context.Context, version string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if err := m.CheckRestartable(); err != nil {
 		return 0, err
 	}
@@ -230,7 +266,10 @@ func (m *Manager) RestartInstances(ctx context.Context, version string) (int, er
 	}
 	var pending []ProcessRegistration
 	for _, record := range records {
-		if record.Installation == m.InstallationRoot() {
+		if restartTarget(record) && record.Installation == m.InstallationRoot() {
+			if err := ctx.Err(); err != nil {
+				return len(pending), err
+			}
 			if err := signalRegisteredProcess(record, RestartSignal()); err != nil {
 				return len(pending), err
 			}
@@ -241,7 +280,7 @@ func (m *Manager) RestartInstances(ctx context.Context, version string) (int, er
 	if err != nil {
 		return len(pending), err
 	}
-	deadline := time.NewTimer(30 * time.Second)
+	deadline := time.NewTimer(RestartTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -251,7 +290,7 @@ func (m *Manager) RestartInstances(ctx context.Context, version string) (int, er
 			before := pending[index]
 			after, err := readProcess(filepath.Join(directory, strconv.Itoa(before.PID)+".json"))
 			path, pathErr := installationProcessPath(before.PID)
-			if err == nil && pathErr == nil && after.Ready && processMatches(after, path) && after.Installation == before.Installation && after.Generation != before.Generation && after.Version == version {
+			if err == nil && pathErr == nil && after.Ready && processMatches(after, path) && after.Installation == before.Installation && after.Generation != before.Generation && after.Version == version && (!before.Supervisor || verifiedExecutor(after, version)) {
 				pending = append(pending[:index], pending[index+1:]...)
 			}
 		}
@@ -282,6 +321,12 @@ func signalRegisteredProcess(record ProcessRegistration, signal os.Signal) error
 	if !processMatches(record, path) {
 		return errors.New("Spynel process identity changed before signal delivery")
 	}
+	if record.Generation != "" {
+		current, err := ProcessRecord(record.PID)
+		if err != nil || current.Generation != record.Generation {
+			return errors.New("Spynel generation changed before signal delivery")
+		}
+	}
 	return process.Signal(signal)
 }
 
@@ -301,7 +346,41 @@ func KillAll(ctx context.Context, beforeStop func([]ProcessRegistration) error) 
 }
 
 func stopProcessRecords(ctx context.Context, records []ProcessRegistration) error {
+	// Supervisors acknowledge recovery suppression before executor teardown.
 	for _, record := range records {
+		if !record.Supervisor {
+			continue
+		}
+		if err := signalRegisteredProcess(record, terminationSignal()); !processGone(err) {
+			return err
+		}
+		deadline := time.NewTimer(2 * time.Second)
+		for {
+			current, err := ProcessRecord(record.PID)
+			if !processAlive(record.PID) {
+				break
+			}
+			if err == nil && current.Generation != record.Generation {
+				return errors.New("supervisor generation changed during shutdown; executors were preserved")
+			}
+			if err == nil && current.Stopping {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				deadline.Stop()
+				return ctx.Err()
+			case <-deadline.C:
+				return errors.New("supervisor did not acknowledge shutdown; executors were preserved")
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		deadline.Stop()
+	}
+	for _, record := range records {
+		if record.Supervisor {
+			continue
+		}
 		if err := signalRegisteredProcess(record, terminationSignal()); !processGone(err) {
 			return err
 		}
@@ -317,7 +396,7 @@ func stopProcessRecords(ctx context.Context, records []ProcessRegistration) erro
 			if time.Now().After(deadline) {
 				return fmt.Errorf("Spynel process %d did not stop", record.PID)
 			}
-			if time.Now().After(killAt) {
+			if time.Now().After(killAt) && (!record.Supervisor || time.Now().After(killAt.Add(2*time.Second))) {
 				if err := signalRegisteredProcess(record, os.Kill); !processGone(err) {
 					return err
 				}

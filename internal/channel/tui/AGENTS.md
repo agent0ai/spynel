@@ -38,6 +38,8 @@
 
 - All form, wizard, channel, and selector screens accept mouse-wheel scrolling and clicks on buttons, disclosures and choices. Hit regions come from the same row layout used for rendering, including scroll offsets, titles and tabs; dialogs capture clicks before covered forms. Text/password fields reuse the composer textarea for grapheme-safe caret placement, drag/Shift/multiple-click selection, replacement, clipboard, and undo/redo. Password rendering stays masked; clipboard completions are fenced to the field and screen generation. Do not add mouse usage hints or instructional UI copy for these ordinary interactions.
 
+- Invoke the CLI startup-admission callback once from model Init, after Tea has initialized its terminal and all fatal TUI setup checks passed. A failed callback quits and returns that error; copy/clear/stop/quit priorities remain unchanged. The surviving native parent restores kernel terminal flags/modes only after confirmed executor death.
+
 ## Child DOX Index
 
 Direct child DOX files:

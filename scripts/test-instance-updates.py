@@ -99,7 +99,9 @@ for line in sys.stdin:
             result = []
             for path in registry.glob("*.json"):
                 try:
-                    result.append(json.loads(path.read_text()))
+                    record = json.loads(path.read_text())
+                    if not record.get("diagnostic_reader") and not record.get("provider_guardian") and not record.get("supervisor_pid"):
+                        result.append(record)
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
             return result
@@ -150,8 +152,8 @@ for line in sys.stdin:
             before = {record["pid"]: record["generation"] for record in records()}
             result = subprocess.run([*launcher, "update"], cwd=temp, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
             assert result.returncode == 0, result.stderr
-            wait_for(lambda: len(records()) == 3 and all(record["version"] == updated and before.get(record["pid"]) != record["generation"] for record in records()))
-            assert set(before) == {record["pid"] for record in records()}, "restart lost native PIDs or terminal attachment"
+            wait_for(lambda: len(records()) == 3 and all(record["ready"] and record["version"] == updated and before.get(record["pid"]) != record["generation"] for record in records()))
+            assert set(before) == {record["pid"] for record in records()}, "restart lost logical instance PIDs or terminal attachment"
             wait_for(lambda: all(output.count(b"\x1b[?1049h") >= 2 for _, output in terminals))
             wait_for(lambda: all(updated.encode() in output for _, output in terminals))
             for fd, output in terminals:
@@ -160,7 +162,7 @@ for line in sys.stdin:
             wait_for(lambda: all(b"Instance ID" in output for _, output in terminals))
             before = {record["generation"] for record in records()}
             os.write(terminals[0][0], b"/update\r")
-            wait_for(lambda: len(records()) == 3 and all(record["generation"] not in before for record in records()))
+            wait_for(lambda: len(records()) == 3 and all(record["ready"] and record["generation"] not in before for record in records()))
             assert (temp / "npm-calls").read_text() == "update\n", "current-version restart invoked npm replacement"
             # A registered native process made legacy must block publication without a signal.
             record = records()[0]

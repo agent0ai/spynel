@@ -131,10 +131,35 @@ function samePath(left, right) {
   }
 }
 
-function npmInvocation(packageRoot = path.resolve(__dirname, "..")) {
+function runCommand(command, args, options = {}) {
+  return new Promise(resolve => {
+    const child = childProcess.spawn(command, args, { ...options, timeout: options.timeout || 120_000 });
+    let error;
+    let stdout = "";
+    let escalation;
+    const forcedTimeout = setTimeout(() => child.kill("SIGKILL"), (options.timeout || 120_000) + 10_000);
+    if (options.input !== undefined && child.stdin) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(options.input);
+    }
+    const escalate = () => { escalation = setTimeout(() => child.kill("SIGKILL"), 10_000); };
+    if (options.signal) options.signal.addEventListener("abort", escalate, { once: true });
+    child.on("error", observed => { error = observed; });
+    if (child.stdout) child.stdout.on("data", chunk => { stdout = (stdout + chunk.toString("utf8")).slice(0, 4097); });
+    child.once("close", (status, signal) => {
+      clearTimeout(escalation);
+      clearTimeout(forcedTimeout);
+      if (options.signal) options.signal.removeEventListener("abort", escalate);
+      resolve({ status, signal, error, stdout });
+    });
+  });
+}
+
+async function npmInvocation(packageRoot = path.resolve(__dirname, ".."), signal) {
   const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-  const rootResult = childProcess.spawnSync(npm, ["root", "--global"], { encoding: "utf8", windowsHide: true, timeout: DEFAULT_TIMEOUT_MS });
-  const globalRoot = rootResult.status === 0 ? rootResult.stdout.trim() : "";
+  const rootResult = await runCommand(npm, ["root", "--global"], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true, timeout: DEFAULT_TIMEOUT_MS, signal });
+  if (signal && signal.aborted) throw new Error("Spynel update stopped");
+  const globalRoot = rootResult.status === 0 && rootResult.stdout.length <= 4096 ? rootResult.stdout.trim() : "";
   if (globalRoot && samePath(packageRoot, path.join(globalRoot, pkg.name))) {
     return { command: npm, args: ["update", "--global", pkg.name], display: `npm update --global ${pkg.name}` };
   }
@@ -143,14 +168,12 @@ function npmInvocation(packageRoot = path.resolve(__dirname, "..")) {
   return { command: npm, args: ["update", pkg.name, "--prefix", prefix], display: `npm update ${pkg.name}` };
 }
 
-function runNPMUpdate(options = {}) {
+async function runNPMUpdate(options = {}) {
   const packageRoot = options.packageRoot || path.resolve(__dirname, "..");
   const before = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")).version;
-  const invocation = npmInvocation(packageRoot);
-  const result = childProcess.spawnSync(invocation.command, invocation.args, {
-    cwd: packageRoot,
-    stdio: options.stdio || "inherit",
-    windowsHide: false
+  const invocation = await npmInvocation(packageRoot, options.signal);
+  const result = await runCommand(invocation.command, invocation.args, {
+    cwd: packageRoot, stdio: options.stdio || "inherit", windowsHide: false, signal: options.signal
   });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`${invocation.display} exited with status ${result.status}`);
@@ -166,7 +189,7 @@ async function promptForStartupUpdate(result, options = {}) {
   const output = options.output || process.stdout;
   if (!input.isTTY || !output.isTTY) return false;
 
-  const invocation = npmInvocation(options.packageRoot);
+  if (options.signal && options.signal.aborted) return false;
   const environment = options.environment || process.env;
   const timeoutMs = options.timeoutMs || STARTUP_PROMPT_TIMEOUT_MS;
   const tickMs = options.tickMs || 1_000;
@@ -204,6 +227,7 @@ async function promptForStartupUpdate(result, options = {}) {
       settled = true;
       clearInterval(interval);
       clearTimeout(timeout);
+      if (options.signal) options.signal.removeEventListener("abort", aborted);
       terminal.close();
       if (cursorControl) {
         readline.cursorTo(output, 0);
@@ -215,9 +239,11 @@ async function promptForStartupUpdate(result, options = {}) {
       output.write("\n");
       resolve(update);
     };
+    const aborted = () => finish(false, "stopped.");
+    if (options.signal) options.signal.addEventListener("abort", aborted, { once: true });
     terminal.once("line", answer => {
       const normalized = answer.trim().toLowerCase();
-      finish(normalized === "y" || normalized === "yes", normalized === "y" || normalized === "yes" ? `running ${invocation.display}…` : "skipping.");
+      finish(normalized === "y" || normalized === "yes", normalized === "y" || normalized === "yes" ? "updating Spynel…" : "skipping.");
     });
     terminal.once("SIGINT", () => finish(false, "skipping."));
     terminal.once("close", () => finish(false, "skipping."));
@@ -240,6 +266,7 @@ module.exports = {
   npmInvocation,
   parseVersion,
   promptForStartupUpdate,
+  runCommand,
   runNPMUpdate,
   shouldCheckAtStartup
 };

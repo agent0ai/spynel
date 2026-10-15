@@ -7,6 +7,7 @@
 ## Local Contracts
 
 - Commands and configuration examples must match executable behavior and embedded defaults.
+- Diagnostic guidance distinguishes native process/run records, runtime session rotations and harness failures. Document bounded private stderr and parent-observed exit results without promising a cause for SIGKILL, OOM or host loss; a missing clean end has no established cause or termination timestamp. No private crash artifacts belong in documentation or releases.
 - Keep public positioning aligned with the root product contract and `docs/vision.md`: Spynel is a classic non-AI orchestration program, external harnesses provide intelligence, and the single “agent” in the relationship slogan denotes the human-facing assistant interface. Adapt copy length to its surface without inventing product facts or treating conceptual scale as a resource guarantee.
 - Keep root-README image assets under `.github/resources/`; `docs/` owns documentation content rather than repository-presentation artwork.
 - Document `.spynel/config.yaml` as the canonical private configuration, workspace-root-relative path resolution, the fixed non-configurable `.spynel` state directory, and validation of current settings, ignored unused input keys, and their removal on the next canonical save.
@@ -14,7 +15,7 @@
 - Clearly distinguish server-only operation, the interactive TUI, and the non-visual automation CLI.
 - Document persistent per-agent instruction role mapping, precedence, fresh loading, safe file constraints, memory-edit behavior, and the content-free inspection command distinctly from prompts, DOX, workflows, history, and harness configuration.
 - Document secret handling, fail-closed Telegram and WhatsApp access lists, required Telegram webhook verification, transport delivery/account modes, WhatsApp QR/session persistence, Codex, Claude Code, Agent Zero CLI, Pi, Oh My Pi, ACP-alias, and custom-ACP prerequisites, local Parakeet languages/formats/resource limits, startup registration, conversation branching, and extension trust.
-- Describe autostart as one action selected from verified native state, with disable/enable repair and explicit errors. Distinguish a saved preference, verified registration, and running-process health; document root boot versus per-user login startup and preserved home/config/cache paths.
+- Describe autostart as one action selected from verified native state, with disable/enable repair and explicit errors. Require a reachable service manager, including in containers; failed native operations restore registration and leave saved settings unchanged. Distinguish a saved preference, verified registration, and running-process health; document root boot versus per-user login startup and preserved home/config/cache paths.
 - Document detected model reasoning/service capabilities and Custom model/effort entry when discovery is missing or incorrect, including provider validation of manual identifiers, dependent selection, inherit/reset semantics, invalidation behavior, and atomic dispatch snapshots. Preserve the ACP effort and capability-validated service boundaries.
 - Document that WhatsApp setup automatically saves and enables the channel after access configuration, then opens pairing without a separate enable-choice step.
 - Document that WhatsApp QR pairing uses a chrome-free full-terminal view exited by any key, expired/error sessions retry automatically without restarting Spynel, the manual retry action is only an immediate override, and phone-number linking codes are the supported non-QR alternative.
@@ -36,6 +37,8 @@
 - Keep the README install and uninstall examples short. The plain install pipe must support an immediate `spynel` command for root and regular users; detailed permission and override behavior belongs in getting started. Public `uninstall.sh` automatically stops matching processes, removes startup registrations, and removes both standalone and npm installations while keeping workspace data.
 
 - Document update-by-default, explicit read-only `update check`, caller-installation versus channel-primary selection, cross-workspace instance restart, and shell `killall` with preserved future autostart registrations. State per-user process discovery and the one-time stop/relaunch requirement for older releases without coordinated restart.
+
+- Document native supervision for manual runtime launches, direct externally managed executors, verified supervisor/executor update generations, finite retries, kernel-held provider ownership, guarded direct-provider cleanup and automatic retry when prior cleanup completes. Never promise frozen-child recovery, arbitrary orphan cleanup or an incident root-cause fix.
 
 ## Child DOX Index
 

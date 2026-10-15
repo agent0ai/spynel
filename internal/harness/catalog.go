@@ -100,6 +100,7 @@ func newCodexFromHarnessConfig(cfg HarnessConfig) (Harness, error) {
 		ServiceMode:    cfg.ServiceMode,
 		ApprovalPolicy: cfg.ApprovalPolicy, Sandbox: cfg.Sandbox, Network: cfg.Network,
 		SessionsFile: cfg.SessionsFile, Version: cfg.Version, Stderr: cfg.Stderr,
+		processOwner: cfg.processOwner,
 	})
 }
 

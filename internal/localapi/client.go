@@ -20,7 +20,7 @@ import (
 	"github.com/agent0ai/spynel/internal/instance"
 )
 
-const ReadinessTimeout = 10 * time.Second
+const ReadinessTimeout = instance.StaleAfter + 10*time.Second
 
 var ErrForeignLoopback = errors.New("workspace primary uses a foreign loopback environment")
 var ErrReadinessTimeout = errors.New("workspace primary readiness timed out")

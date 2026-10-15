@@ -91,10 +91,10 @@ def main():
         uninstall_script = (repo / "uninstall.sh").read_bytes().replace(b"https://spynel.agent-zero.ai/install.sh", (base + "/install.sh").encode()).replace(b"=https", b"=http,https")
         process = None
         try:
-            def run(*args, executable=None):
+            def run(*args, executable=None, failure=False):
                 result = subprocess.run([str(executable or install / "spynel"), *args], cwd=workspace, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-                assert result.returncode == 0, (args, result.stderr)
-                return result.stdout
+                assert (result.returncode != 0 if failure else result.returncode == 0), (args, result.stderr)
+                return result.stdout + (result.stderr if failure else "")
 
             # When a writable PATH directory exists, even a bare pipe makes
             # spynel available in the ORIGINAL shell without a profile reload.
@@ -171,7 +171,7 @@ def main():
             sentinel = workspace / ".spynel" / "tasks" / "todo" / "preserved.md"
             sentinel.write_text("---\nid: preserved\nstatus: todo\nreview_required: true\n---\nSynthetic task preserved across restart.\n")
             original_config, original_task = config.read_bytes(), sentinel.read_bytes()
-            assert "GitHub" in run("update")
+            assert "GitHub" in run("update", "check")
             checks = fixture["checks"]
             # An unmanaged copy remains unmanaged even with inherited npm metadata.
             archive_copy = temp / "unmanaged"
@@ -183,12 +183,12 @@ def main():
             (vendor / ".installed.json").write_text(json.dumps({"version": old_version}))
             (vendor / "spynel").write_text("unrelated npm executable\n")
             env.update(SPYNEL_NPM_PACKAGE_ROOT=str(npm_root), SPYNEL_NPM_LAUNCHER_MANAGED="1")
-            assert "unmanaged" in run("update", executable=archive_copy / "spynel")
+            assert "unmanaged" in run("update", executable=archive_copy / "spynel", failure=True)
             assert fixture["checks"] == checks
             fixture["new"] = True
             for failure in ("checksum", "incomplete"):
                 fixture["failure"] = failure
-                assert "failed" in run("update", "install")
+                assert run("update", "install", failure=True).strip()
                 rejected = subprocess.run(["sh"], input=script, cwd=workspace, env={**env, "SPYNEL_VERSION": new_version}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
                 assert rejected.returncode != 0, "bootstrap accepted a corrupt download"
                 assert (install / "spynel").resolve() == old_executable
@@ -197,7 +197,7 @@ def main():
             # Headless startup must not query either update source.
             checks = fixture["checks"]
             with (temp / "server.log").open("w") as log:
-                process = subprocess.Popen([str(install / "spynel"), "serve", "--automatic-startup", "--config", str(config)], cwd=workspace, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+                process = subprocess.Popen([str(install / "spynel"), "serve", "--config", str(config)], cwd=workspace, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
                 primary = workspace / ".spynel" / "runtime" / "primary.json"
 
                 def wait_for(predicate):
@@ -252,13 +252,18 @@ def main():
                 if mode == "json":
                     events = [json.loads(line) for line in output.splitlines()]
                     assert len(events) == 1, events
-                    assert events[0]["kind"] == "final" and events[0]["done"] and events[0]["request_id"], events
+                    assert events[0]["kind"] == "final" and events[0]["done"], events
                     assert "Updating Spynel" in events[0]["text"], events
                 else:
                     assert "spynel " + new_version in output
                 assert run("--version", executable=offline_launcher).strip() == "spynel " + new_version
                 assert (install / "spynel").resolve() == previous_primary_bundle
                 assert "GitHub" in run("update", "check", executable=offline_launcher)
+                if mode == "json":
+                    # The immutable prior CLI owns its upgrade acknowledgment.
+                    # Verify current correlation at the newly installed emitter.
+                    current_events = [json.loads(line) for line in run("update", "--json", executable=offline_launcher).splitlines()]
+                    assert len(current_events) == 1 and current_events[0]["kind"] == "final" and current_events[0]["done"] and current_events[0]["request_id"], current_events
                 removed = subprocess.run(["sh"], input=uninstall_script, cwd=workspace, env={**env, "SPYNEL_INSTALL_DIR": str(offline_install), "SPYNEL_VERSION": new_version}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
                 assert removed.returncode == 0, removed.stderr.decode()
                 assert not offline_install.exists() and not offline_launcher.is_symlink()

@@ -10,7 +10,7 @@ const { once } = require("events");
 const { resolve } = require("./platform");
 const { install, validateArchiveEntries, validateExtractedTree } = require("./install");
 const { prepareRelease, releaseMetadata, rewriteReadme } = require("./prepare-release");
-const { STARTUP_PROMPT_TIMEOUT_MS, checkForUpdate, compareVersions, promptForStartupUpdate, shouldCheckAtStartup } = require("./update");
+const { runCommand, STARTUP_PROMPT_TIMEOUT_MS, checkForUpdate, compareVersions, promptForStartupUpdate, shouldCheckAtStartup } = require("./update");
 const { createLaunchEnvironment } = require("./bin/spynel");
 const pkg = require("../package.json");
 
@@ -28,7 +28,7 @@ assert.strictEqual(failedSnapshot.SPYNEL_NPM_PERIODIC_UPDATE_CHECKS, "1");
 assert.strictEqual(failedSnapshot.SPYNEL_NPM_UPDATE_CHECKED_AT, "2026-08-16T07:00:00Z");
 assert.strictEqual(failedSnapshot.SPYNEL_NPM_UPDATE_LATEST, undefined);
 const skippedSnapshot = createLaunchEnvironment(staleSnapshot, false);
-assert.strictEqual(skippedSnapshot.SPYNEL_NPM_COORDINATED_UPDATES, "1");
+assert.strictEqual(skippedSnapshot.SPYNEL_NPM_COORDINATED_UPDATES, "2");
 assert.strictEqual(skippedSnapshot.SPYNEL_NPM_PERIODIC_UPDATE_CHECKS, undefined);
 assert.strictEqual(skippedSnapshot.SPYNEL_NPM_UPDATE_CHECKED_AT, undefined);
 assert.strictEqual(skippedSnapshot.SPYNEL_NPM_UPDATE_LATEST, undefined);
@@ -159,6 +159,52 @@ setInterval(() => {}, 1000);
   }
 }
 
+function checkLauncherDiagnostics() {
+  const directory = fs.mkdtempSync(path.join(__dirname, ".tmp-diagnostics-"));
+  try {
+    fs.mkdirSync(path.join(directory, "npm", "bin"), { recursive: true });
+    fs.mkdirSync(path.join(directory, "npm", "vendor"));
+    for (const file of ["bin/spynel.js", "platform.js", "update.js"]) {
+      fs.copyFileSync(path.join(__dirname, file), path.join(directory, "npm", file));
+    }
+    fs.copyFileSync(path.join(__dirname, "..", "package.json"), path.join(directory, "package.json"));
+    const record = path.join(directory, "observed.json");
+    fs.writeFileSync(path.join(directory, "npm", "vendor", "spynel"), `#!${process.execPath}
+const fs = require("fs");
+if (process.argv[2] === "__diagnostics") {
+  fs.writeFileSync(${JSON.stringify(record)}, fs.readFileSync(0), {mode: 0o600});
+  process.exit(process.env.DIAGNOSTIC_TEST_MODE === "recorder-failure" ? 1 : 0);
+}
+fs.writeSync(3, JSON.stringify({directory: "unused", instance: "synthetic-run", version: "test", revision: "test", pid: process.pid}));
+console.log("intentional-stdout");
+process.stderr.write("panic: synthetic-native-cause\\n" + "x".repeat(200000), () => {
+  const mode = process.env.DIAGNOSTIC_TEST_MODE;
+  if (mode.startsWith("SIG")) process.kill(process.pid, mode);
+  else process.exit(mode === "normal" ? 0 : 7);
+});
+`, { mode: 0o700 });
+    for (const mode of ["normal", "error", "SIGTERM", "SIGKILL", "recorder-failure"]) {
+      const result = spawnSync(process.execPath, [path.join(directory, "npm", "bin", "spynel.js"), "serve"], {
+        encoding: "utf8", timeout: 5000, maxBuffer: 1 << 20,
+        env: { ...process.env, DIAGNOSTIC_TEST_MODE: mode }
+      });
+      assert.ifError(result.error);
+      assert.strictEqual(result.signal, mode.startsWith("SIG") ? mode : null);
+      assert.strictEqual(result.status, mode.startsWith("SIG") ? null : mode === "normal" ? 0 : 7);
+      assert.strictEqual(result.stdout, "intentional-stdout\n");
+      assert(result.stderr.includes("synthetic-native-cause"));
+      assert(result.stderr.length >= 200000, "stderr must continue reaching its original destination");
+      const observed = JSON.parse(fs.readFileSync(record, "utf8"));
+      assert.strictEqual(observed.signal, mode.startsWith("SIG") ? mode : "");
+      assert.strictEqual(observed.status, mode.startsWith("SIG") ? null : mode === "normal" ? 0 : 7);
+      assert.strictEqual(observed.stderr, undefined, "exit metadata must not contain application output");
+      if (mode === "recorder-failure") assert(result.stderr.includes("native exit diagnostics unavailable"));
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 function checkLauncherUpdates() {
   const directory = fs.mkdtempSync(path.join(require("os").tmpdir(), "spynel-update-"));
   try {
@@ -174,7 +220,9 @@ const action = process.argv[2];
 fs.appendFileSync(process.env.UPDATE_TEST_LOG, action + "\\n");
 if (action === process.env.UPDATE_TEST_FAIL) process.exit(1);
 if (action === "update") {
-  fs.writeFileSync(process.env.SPYNEL_NPM_UPDATE_STATE, JSON.stringify({args: ["version"], install: process.env.UPDATE_TEST_CURRENT !== "1", version: "2.0.0"}));
+  if (process.env.UPDATE_TEST_FAIL === "raw75") process.exit(75);
+  if (process.env.UPDATE_TEST_FAIL === "invalid75") { fs.writeFileSync(process.env.SPYNEL_NPM_UPDATE_STATE, "{}", {mode: 0o600}); process.exit(75); }
+  fs.writeFileSync(process.env.SPYNEL_NPM_UPDATE_STATE, JSON.stringify({args: ["version"], install: process.env.UPDATE_TEST_CURRENT !== "1", version: "2.0.0"}), {mode: 0o600});
   process.exit(75);
 }
 `;
@@ -186,7 +234,7 @@ fs.appendFileSync(process.env.UPDATE_TEST_LOG, "npm\\n");
 if (process.env.UPDATE_TEST_FAIL === "npm") process.exit(1);
 fs.writeFileSync("package.json", JSON.stringify({name: "spynel", version: "2.0.0"}));
 `, { mode: 0o700 });
-    for (const failure of ["", "check-restartable", "npm", "restart-instances", "current"]) {
+    for (const failure of ["", "check-restartable", "npm", "restart-instances", "current", "raw75", "invalid75"]) {
       const log = path.join(directory, "calls");
       fs.writeFileSync(log, "");
       fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({ name: "spynel", version: "1.0.0" }));
@@ -195,18 +243,33 @@ fs.writeFileSync("package.json", JSON.stringify({name: "spynel", version: "2.0.0
         env: { ...process.env, PATH: path.join(directory, "tools") + path.delimiter + process.env.PATH, UPDATE_TEST_LOG: log, UPDATE_TEST_FAIL: failure, UPDATE_TEST_CURRENT: failure === "current" ? "1" : "0" }
       });
       assert.ifError(result.error);
-      const expected = ["update", "check-restartable", ...(failure === "current" ? [] : ["npm"]), "restart-instances", "version"];
+      const expected = ["raw75", "invalid75"].includes(failure) ? ["update"] : ["update", "check-restartable", ...(failure === "current" ? [] : ["npm"]), "restart-instances", "version"];
       const failed = expected.indexOf(failure);
       assert.deepStrictEqual(fs.readFileSync(log, "utf8").trim().split("\n"), failed >= 0 ? expected.slice(0, failed + 1) : expected);
-      assert.strictEqual(result.status, failed >= 0 ? 1 : 0, result.stderr);
+      assert.strictEqual(result.status, ["raw75", "invalid75"].includes(failure) ? 75 : failed >= 0 ? 1 : 0, result.stderr);
     }
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }
 }
 
+async function checkUpdateHelperCancellation() {
+  const controller = new AbortController();
+  const pending = runCommand(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { signal: controller.signal, stdio: "ignore", timeout: 2000 });
+  controller.abort();
+  const result = await pending;
+  assert(result.error && result.error.code === "ABORT_ERR");
+  assert.strictEqual(result.signal, "SIGTERM");
+  const stopped = new AbortController();
+  stopped.abort();
+  const never = await runCommand(process.execPath, ["-e", "process.exit(99)"], { signal: stopped.signal, stdio: "ignore" });
+  assert(never.error && never.error.code === "ABORT_ERR");
+}
+
 async function main() {
+  await checkUpdateHelperCancellation();
   checkLauncherUpdates();
+  checkLauncherDiagnostics();
   await checkLauncherSignals();
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
   try {

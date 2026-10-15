@@ -55,3 +55,11 @@ func installationProcessPath(pid int) (string, error) {
 	}
 	return C.GoString((*C.char)(unsafe.Pointer(&path[0]))), nil
 }
+
+func processParentID(pid int) (int, error) {
+	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return 0, err
+	}
+	return int(info.Eproc.Ppid), nil
+}

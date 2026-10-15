@@ -100,14 +100,15 @@ type RuntimeAuthorizer interface {
 }
 
 // ProactiveDeliverer sends a complete assistant message after the inbound
-// request lifecycle has ended. Implementations must re-apply transport
-// authorization rather than trusting a locally supplied origin string.
+// request lifecycle has ended, including validated native attachments.
+// Implementations must re-apply transport authorization rather than trusting
+// a locally supplied origin string.
 type ProactiveDeliverer interface {
-	Deliver(context.Context, string, string, string) error
+	Deliver(context.Context, string, string, string, []core.OutboundAttachment) error
 }
 
 type DeliveryRouter interface {
-	Deliver(context.Context, string, string, string, string) error
+	Deliver(context.Context, string, string, string, string, []core.OutboundAttachment) error
 }
 
 // ConversationEventRouter routes the canonical communication-agent lifecycle

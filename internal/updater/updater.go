@@ -141,7 +141,7 @@ func Detect(currentVersion string) *Manager {
 	if validNPMRoot(root, currentVersion) && sameFile(executable, filepath.Join(root, "npm", "vendor", "spynel")) {
 		manager.PackageRoot = root
 		manager.LauncherManaged = os.Getenv("SPYNEL_NPM_LAUNCHER_MANAGED") == "1" && sameFile(root, launcherRoot)
-		manager.CoordinatedUpdates = manager.LauncherManaged && os.Getenv("SPYNEL_NPM_COORDINATED_UPDATES") == "1"
+		manager.CoordinatedUpdates = manager.LauncherManaged && os.Getenv("SPYNEL_NPM_COORDINATED_UPDATES") == "2"
 		manager.PeriodicChecks = os.Getenv(periodicChecksEnv) == "1"
 	}
 	return manager

@@ -44,12 +44,19 @@ func runUpdateCommand(args []string, version string) error {
 		fmt.Fprintf(os.Stdout, "Spynel %s; latest %s release: %s.\n", result.Current, result.Source, result.Latest)
 		return nil
 	}
+	requestID := ""
+	if *jsonOutput {
+		requestID, err = core.NewSourceMessageID()
+		if err != nil {
+			return err
+		}
+	}
 	if err := manager.PrepareUpdate(ctx, result); err != nil {
 		return err
 	}
 	message := "Updating Spynel and restarting all instances of this installation."
 	if *jsonOutput {
-		if err := json.NewEncoder(os.Stdout).Encode(core.Event{Kind: core.EventFinal, Text: message, Done: true, Local: true}); err != nil {
+		if err := json.NewEncoder(os.Stdout).Encode(core.Event{Kind: core.EventFinal, RequestID: requestID, Text: message, Done: true, Local: true}); err != nil {
 			return err
 		}
 	} else {
