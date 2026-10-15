@@ -86,7 +86,11 @@ case "$target_os" in
     cp "$module_dir/LICENSE" "$stage_dir/licenses/sherpa-onnx/LICENSE"
     # The dependency also embeds its absolute module-cache directory on macOS.
     install_name_tool -delete_rpath "$module_dir/lib/$library_arch" "$stage_dir/$binary"
-    codesign --force --sign - "$stage_dir/$binary"
+    # Pinned companions can carry stale signatures; seal the complete staged code.
+    for code in "$stage_dir"/lib/*.dylib "$stage_dir/$binary"; do
+      codesign --force --sign - "$code"
+      codesign --verify --strict "$code"
+    done
     rpaths=$(otool -l "$stage_dir/$binary" | awk '$1 == "cmd" { rpath = ($2 == "LC_RPATH") } rpath && $1 == "path" { print $2 }')
     [ "$rpaths" = '@loader_path/lib' ]
     ;;

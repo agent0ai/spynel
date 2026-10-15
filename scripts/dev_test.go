@@ -61,6 +61,82 @@ func TestDeveloperVerificationPaths(t *testing.T) {
 	}
 }
 
+func TestMacNativePackagingSealsCompanions(t *testing.T) {
+	for _, failure := range []string{"", "sign", "verify"} {
+		t.Run("failure="+failure, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "native package")
+			bin := t.TempDir()
+			module := filepath.Join(dir, "module")
+			lib := filepath.Join(module, "lib", "aarch64-apple-darwin")
+			for _, path := range []string{bin, lib} {
+				if err := os.MkdirAll(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, name := range []string{"LICENSE", "lib/aarch64-apple-darwin/libsherpa-onnx-c-api.dylib", "lib/aarch64-apple-darwin/libonnxruntime.1.27.0.dylib"} {
+				if err := os.WriteFile(filepath.Join(module, name), []byte("unsealed\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Model invalid dependency signatures and native-tool failures without a Mac host.
+			tool := `#!/bin/sh
+set -eu
+case "${0##*/}" in
+go)
+  case "$1" in
+  env) case "$2" in GOOS) echo darwin;; GOARCH) echo arm64;; esac;;
+  list) printf '%s\n' "$FIXTURE_MODULE";;
+  build)
+    while [ "$1" != -o ]; do shift; done
+    cat >"$2" <<'EXECUTABLE'
+#!/bin/sh
+set -eu
+root=$(dirname "$0")
+for library in "$root"/lib/*.dylib; do
+  [ "$(cat "$library")" = sealed ] || { echo 'unsealed companion' >&2; exit 1; }
+done
+EXECUTABLE
+    chmod +x "$2";;
+  esac;;
+codesign)
+  action=$1
+  for file do :; done
+  case "$file" in
+  *.dylib)
+    case "$action" in
+    --force) [ "$FIXTURE_FAILURE" != sign ] || exit 7; echo sealed >"$file";;
+    --verify) [ "$FIXTURE_FAILURE" != verify ] || exit 8; [ "$(cat "$file")" = sealed ];;
+    *) exit 9;;
+    esac;;
+  esac;;
+otool) printf '%s\n' 'cmd LC_RPATH' 'path @loader_path/lib (offset 12)';;
+install_name_tool) :;;
+*) exit 10;;
+esac
+`
+			for _, name := range []string{"go", "codesign", "otool", "install_name_tool"} {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(tool), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out := filepath.Join(dir, "release")
+			command := exec.Command("sh", "package-native.sh", "0.13.0", "darwin", "arm64", out)
+			command.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "SPYNEL_GO_BINARY="+filepath.Join(bin, "go"), "FIXTURE_MODULE="+module, "FIXTURE_FAILURE="+failure)
+			output, err := command.CombinedOutput()
+			if failure == "" && err != nil {
+				t.Fatalf("package sealed companions: %v\n%s", err, output)
+			}
+			if failure != "" && err == nil {
+				t.Fatalf("ignored companion %s failure", failure)
+			}
+			_, statErr := os.Stat(filepath.Join(out, "spynel_0.13.0_darwin_arm64.tar.gz"))
+			if (failure == "" && statErr != nil) || (failure != "" && !os.IsNotExist(statErr)) {
+				t.Fatalf("unexpected archive after %q failure: %v", failure, statErr)
+			}
+		})
+	}
+}
+
 func TestColdCacheHelperCleansCancelledRunOutsideWorkspace(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux procfs cancellation contract")
