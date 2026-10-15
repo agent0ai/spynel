@@ -38,6 +38,8 @@ def main():
             shutil.copy2(repo / "npm" / name, target)
         (package / "package.json").write_text(json.dumps({"name": "spynel", "version": version}))
         (vendor / ".installed.json").write_text(json.dumps({"version": version}))
+        legacy_replacement = temp / "legacy-replacement"
+        shutil.copytree(package, legacy_replacement)
         replacement = temp / "replacement"
         shutil.copytree(package, replacement)
         updated = "9.9.9"
@@ -84,7 +86,7 @@ for line in sys.stdin:
                 pass
 
             def do_GET(self):
-                data = json.dumps({"version": updated}).encode()
+                data = json.dumps({"version": version if self.path == "/legacy/latest" else updated}).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -176,17 +178,62 @@ for line in sys.stdin:
             finally:
                 path.write_bytes(saved)
                 path.chmod(0o600)
-            # A new native binary can still have an older supervising Node launcher.
-            old_environment = {**env, "SPYNEL_NPM_PACKAGE_ROOT": str(package), "SPYNEL_NPM_LAUNCHER_MANAGED": "1"}
+            # Run the exact old wrapper through package replacement; its loaded code stays old.
+            legacy = temp / "legacy" / "lib" / "node_modules" / "spynel"
+            shutil.copytree(legacy_replacement, legacy)
+            for name in ("bin/spynel.js", "platform.js", "update.js"):
+                source = subprocess.check_output(["git", "show", "v0.12.14:npm/" + name], cwd=repo)
+                (legacy / "npm" / name).write_bytes(source)
+            (legacy / "package.json").write_text(json.dumps({"name": "spynel", "version": "0.12.14"}))
+            (legacy / "npm" / "vendor" / ".installed.json").write_text(json.dumps({"version": "0.12.14"}))
+            legacy_native = legacy / "npm" / "vendor" / "spynel"
+            legacy_native.write_text(f'''#!{sys.executable}
+import json, os, pathlib, sys
+if sys.argv[1] == "serve":
+    state = pathlib.Path(os.environ["SPYNEL_NPM_UPDATE_STATE"])
+    state.write_text(json.dumps({{"args": ["serve", "--automatic-startup"], "install": True, "version": "{version}"}}))
+    state.chmod(0o600)
+    sys.exit(75)
+assert sys.argv[1] == "check-restartable", sys.argv
+''')
+            legacy_native.chmod(0o700)
+            legacy_calls = temp / "legacy-npm-calls"
+            old_environment = {**env, "INSTANCE_TEST_PACKAGE": str(legacy), "INSTANCE_TEST_CALLS": str(legacy_calls), "INSTANCE_TEST_REPLACEMENT": str(legacy_replacement), "SPYNEL_NPM_REGISTRY_URL": f"http://127.0.0.1:{server.server_port}/legacy/latest"}
+            legacy_launcher = [shutil.which("node"), str(legacy / "npm" / "bin" / "spynel.js")]
             log = (temp / "older-launcher.log").open("w")
             logs.append(log)
-            older = subprocess.Popen([str(vendor / "spynel"), "serve"], cwd=workspaces[2], env=old_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            older = subprocess.Popen([*legacy_launcher, "serve", "--automatic-startup"], cwd=workspaces[2], env=old_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
             processes.append(older)
-            wait_for(lambda: len(records()) == 4)
-            failed = subprocess.run([*launcher, "update"], cwd=temp, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-            assert failed.returncode != 0 and "spynel killall" in failed.stderr, failed.stderr
+            wait_for(lambda: len(records()) == 4 and all(record["ready"] for record in records()))
+            legacy_record = next(record for record in records() if record["installation"] == str(legacy))
+            assert legacy_record["version"] == version and not legacy_record["coordinated_updates"], legacy_record
+            assert json.loads((legacy / "package.json").read_text())["version"] == version
+            refusal = "this npm launcher does not support coordinated updates; run the installed spynel killall command once, then relaunch Spynel"
+            assert refusal in (temp / "older-launcher.log").read_text()
+            failed = subprocess.run([*legacy_launcher, "command", "update"], cwd=workspaces[2], env=old_environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            assert refusal in failed.stdout + failed.stderr, failed
             assert all(p.poll() is None for p in processes), "preflight stopped an instance"
-            print("Verified npm replacement, all-instance restart across two workspaces, preserved PTYs, channel update, and rejection of older processes/launchers.")
+            assert legacy_calls.read_text() == "update\n", "refused update replaced the package again"
+            for protocol in ("", "unsupported"):
+                unsupported = {**old_environment, "SPYNEL_NPM_PACKAGE_ROOT": str(legacy), "SPYNEL_NPM_LAUNCHER_MANAGED": "1", "SPYNEL_NPM_COORDINATED_UPDATES": protocol}
+                failed = subprocess.run([str(legacy_native), "check-restartable"], env=unsupported, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                assert failed.returncode != 0 and refusal in failed.stderr, failed
+            # Stop only fixture-owned processes, then start the installed wrapper afresh.
+            older.terminate()
+            older.wait(timeout=30)
+            processes.remove(older)
+            wait_for(lambda: len(records()) == 3)
+            fresh = subprocess.Popen([*legacy_launcher, "serve", "--automatic-startup"], cwd=workspaces[2], env=old_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            processes.append(fresh)
+            wait_for(lambda: len(records()) == 4 and all(record["ready"] for record in records()))
+            before_recovery = next(record for record in records() if record["installation"] == str(legacy))
+            assert before_recovery["coordinated_updates"], before_recovery
+            # Use the other installation as the channel client, proving primary-owned selection.
+            recovered = subprocess.run([*launcher, "command", "update"], cwd=workspaces[2], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            assert recovered.returncode == 0 and "Restarting" in recovered.stdout, recovered
+            wait_for(lambda: any(record["installation"] == str(legacy) and record["ready"] and record["version"] == version and record["generation"] != before_recovery["generation"] for record in records()))
+            assert legacy_calls.read_text() == "update\n", "already-current recovery invoked npm replacement"
+            print("Verified npm replacement, cross-workspace ready generations and PTYs, channel updates, exact v0.12.14 stale-launcher refusal, and fresh-launcher recovery with a subsequent /update.")
         finally:
             for process in processes:
                 if process.poll() is None:

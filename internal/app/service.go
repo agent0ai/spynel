@@ -1615,6 +1615,7 @@ func (s *Service) conversationDelivery() channel.DeliveryRouter {
 // plain CLI clients and rendered by /status on every channel.
 type StatusSnapshot struct {
 	Title                string                             `json:"title"`
+	Version              string                             `json:"version"`
 	Instance             string                             `json:"instance,omitempty"`
 	PrimaryInstance      string                             `json:"primary_instance,omitempty"`
 	Connections          []channel.ConnectionStatus         `json:"connections"`
@@ -1673,8 +1674,12 @@ func (s *Service) Status(message core.Message) (StatusSnapshot, error) {
 			harnessDetail = detail
 		}
 	}
+	version := ""
+	if s.Updates != nil {
+		version = s.Updates.CurrentVersion
+	}
 	return StatusSnapshot{
-		Title:    s.currentTitle(),
+		Title: s.currentTitle(), Version: version,
 		Instance: shortid.Display(instanceID), PrimaryInstance: shortid.Display(primaryInstanceID),
 		Connections: []channel.ConnectionStatus{s.connectionStatus("telegram"), s.connectionStatus("whatsapp")},
 		Runtime:     s.Runtime.Status(), Harness: cfg.Harness.Name, HarnessState: harnessState,
@@ -1720,6 +1725,7 @@ func FormatStatus(status StatusSnapshot) string {
 		"# Status",
 		"",
 		"- Title: " + status.Title,
+		"- Version: " + emptyAs(status.Version, "not available"),
 		"- Instance ID: " + statusID(status.Instance),
 		"- Primary instance ID: " + statusID(status.PrimaryInstance),
 		fmt.Sprintf("- Jobs: %d — `/jobs`", status.Runtime.Jobs),

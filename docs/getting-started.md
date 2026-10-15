@@ -68,6 +68,19 @@ Only interactive TUI starts perform proactive checks, bounded to ten seconds and
 
 Standalone updates stage a complete verified bundle before switching the stable launcher; failed downloads or validation leave the previous bundle usable. Older bundles and any interrupted temporary stages are retained so running processes keep their libraries. If reclaiming that space manually, stop every process using that installation first and preserve the bundle targeted by `current`. A concurrent installer returns a retry message; a crashed install automatically releases its lock. Development builds and manually extracted archives remain unmanaged and must be replaced using their original installation method.
 
+### npm launcher recovery
+
+The installed version and a running npm launcher can differ. A Node launcher started from 0.12.14 keeps its loaded JavaScript and protocol 1 even after npm installs 0.13.0. The new native executable requires protocol 2 and refuses coordinated updates under that old launcher. A version check showing 0.13.0 does not establish that the surviving launcher was refreshed.
+
+After replacement, the launcher hands off to the newly installed JavaScript and its dependencies in the same Node process, then coordinates native restarts. It retains normalized launch arguments and shutdown signals without adding a restart owner. Failed replacement or coordination stops explicitly; npm finishing alone is insufficient. This source change cannot retrofit an already-running old wrapper, which needs one fresh launch:
+
+1. Wait for any npm installation/update to finish. Allow active work to finish, or arrange its interruption. Recovery stops channels, servers, TUIs and active agent work; saved workspace data is retained. It does not establish that arbitrary escaped provider processes or external effects have finished. Keep ownership safeguards intact.
+2. If PM2 or a custom service owns the launcher, stop that application through its manager first so it cannot respawn during cleanup. Spynel's built-in service cleanup covers its generated registrations, not arbitrary external managers.
+3. From a separate shell, use the newly installed `spynel` command for the intended npm prefix, with the same account and configuration home: `spynel killall`. This stops verified Spynel processes across installations and workspaces that the caller can control, not just the affected workspace. Resolve any reported stop failure before relaunching; do not override the protocol environment variable or delete ownership files.
+4. For a manual launch, return to the original workspace and run `spynel` or the original `spynel serve` arguments once. For a managed launch, start the existing registration instead: for example, `systemctl --user start <unit>`, `systemctl start <unit>` for a system service with appropriate privileges, or `pm2 restart <app>`. Use the installed npm launcher and `--automatic-startup` for externally managed servers. Do not also start a foreground copy. A launchd registration unloaded by cleanup must be loaded from its saved plist again; future boot/login registrations remain intact.
+
+Confirm the expected primary is available with `/status`, then request `/update`. Even when already current it should restart through fresh native registrations without the launcher refusal. `/update check` only compares versions and does not verify restart readiness. The affected host's actual launch method, account, npm prefix and service identity must be established locally before selecting these commands.
+
 ## Run from a development checkout
 
 The development helper can download a pinned Go toolchain into the ignored, disposable repository-level `.tmp-toolchains/` directory when Go is unavailable:

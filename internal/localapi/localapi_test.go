@@ -23,6 +23,7 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/shortid"
+	"github.com/agent0ai/spynel/internal/updater"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -422,7 +423,7 @@ func TestClientStatusIdentifiesCallerAndPrimaryInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Instance != shortid.Display(secondary.ID()) || snapshot.PrimaryInstance != shortid.Display(primary.ID()) || len(snapshot.Connections) != 2 {
+	if snapshot.Version != "primary-version" || snapshot.Instance != shortid.Display(secondary.ID()) || snapshot.PrimaryInstance != shortid.Display(primary.ID()) || len(snapshot.Connections) != 2 {
 		t.Fatalf("structured status = %#v", snapshot)
 	}
 	var final core.Event
@@ -434,7 +435,7 @@ func TestClientStatusIdentifiesCallerAndPrimaryInstances(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"Instance ID: `" + shortid.Display(secondary.ID()) + "`",
+		"Version: primary-version\n- Instance ID: `" + shortid.Display(secondary.ID()) + "`",
 		"Primary instance ID: `" + shortid.Display(primary.ID()) + "`",
 	} {
 		if !strings.Contains(final.Text, want) {
@@ -458,6 +459,7 @@ func startTestServer(t *testing.T, state string) (*instance.Election, *Server, *
 	}
 	target := newAPIHarness()
 	service := app.New(cfg, target)
+	service.Updates = &updater.Manager{CurrentVersion: "primary-version"}
 	election, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)

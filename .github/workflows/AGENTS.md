@@ -18,6 +18,7 @@
 - Before publishing, every native target tests startup/updater cleanup and the plain installer/uninstaller against a verified 0.12.17 baseline archive, including simultaneous running npm/GitHub installations and modeled authorization for a regular user with no writable PATH entry.
 
 - All four native targets also run the isolated npm multi-instance update test against the candidate archive, including real TUI terminals and a synthetic newer executable; this gate precedes asset/npm publication.
+- Native build checkouts include tags/history for the exact v0.12.14 launcher migration fixture; a shallow candidate-only checkout cannot run that regression.
 
 - Manual release-workflow dispatch validates the selected commit with an explicit version through the same verification/native matrix, records the actual commit as evidence, and cannot enter the publication job. Use this gate before publishing a release that changes cross-platform lifecycle behavior.
 

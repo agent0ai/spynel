@@ -37,6 +37,7 @@
 - Keep the README install and uninstall examples short. The plain install pipe must support an immediate `spynel` command for root and regular users; detailed permission and override behavior belongs in getting started. Public `uninstall.sh` automatically stops matching processes, removes startup registrations, and removes both standalone and npm installations while keeping workspace data.
 
 - Document update-by-default, explicit read-only `update check`, caller-installation versus channel-primary selection, cross-workspace instance restart, and shell `killall` with preserved future autostart registrations. State per-user process discovery and the one-time stop/relaunch requirement for older releases without coordinated restart.
+- Explain that npm package replacement cannot refresh an immutable running old Node wrapper. Recovery must distinguish manual and externally managed launchers, stop external respawn first, state killall's cross-installation scope and work interruption, preserve ownership safeguards, and verify a subsequent ready restart rather than only installed-version equality. Source handoff improvements do not imply a published release or live host diagnosis.
 
 - Document native supervision for manual runtime launches, direct externally managed executors, verified supervisor/executor update generations, finite retries, kernel-held provider ownership, guarded direct-provider cleanup and automatic retry when prior cleanup completes. Never promise frozen-child recovery, arbitrary orphan cleanup or an incident root-cause fix.
 

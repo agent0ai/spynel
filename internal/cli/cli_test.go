@@ -989,7 +989,7 @@ func TestStatusCLIEmitsStructuredNonSecretState(t *testing.T) {
 	if err := json.Unmarshal(output.Bytes(), &status); err != nil {
 		t.Fatal(err)
 	}
-	if status.Title == "" || status.Sandbox == "" || status.HarnessState == "" || len(status.Connections) != 2 {
+	if status.Version != "test" || status.Title == "" || status.Sandbox == "" || status.HarnessState == "" || len(status.Connections) != 2 {
 		t.Fatalf("CLI status = %#v", status)
 	}
 	if status.TasksActive != 1 || status.TasksWaiting != 1 {
@@ -1008,10 +1008,17 @@ func TestStatusCLIEmitsStructuredNonSecretState(t *testing.T) {
 	if _, ok := fields["thread"]; ok {
 		t.Fatalf("structured CLI status retained thread: %s", output.String())
 	}
-	for _, field := range []string{"tasks_active", "tasks_waiting", "goals_active", "heartbeat_state"} {
+	for _, field := range []string{"version", "tasks_active", "tasks_waiting", "goals_active", "heartbeat_state"} {
 		if _, ok := fields[field]; !ok {
 			t.Fatalf("structured CLI status is missing %q: %s", field, output.String())
 		}
+	}
+	output.Reset()
+	if err := runStatusCLICommand([]string{"--config", cfg.Path}, "dev", &output); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(output.String(), "\n- Version:") != 1 || !strings.Contains(output.String(), "\n- Version: dev\n- Instance ID:") {
+		t.Fatalf("CLI text status lost the running version or its placement:\n%s", output.String())
 	}
 }
 
@@ -1095,6 +1102,7 @@ func TestCLIJoinsWorkspaceOwnerAndStrictlySteersActiveConversation(t *testing.T)
 	}
 	target := newHeldCLIHarness()
 	service := app.New(cfg, target)
+	service.Updates = &updater.Manager{CurrentVersion: "1.2.3"}
 	election, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)
@@ -1127,6 +1135,14 @@ func TestCLIJoinsWorkspaceOwnerAndStrictlySteersActiveConversation(t *testing.T)
 	defer stopWaiting()
 	if _, err := localapi.NewClient(election).WaitReady(readyContext); err != nil {
 		t.Fatal(err)
+	}
+	var statusOutput bytes.Buffer
+	if err := runStatusCLICommand([]string{"--config", cfg.Path, "--json"}, "9.9.9", &statusOutput); err != nil {
+		t.Fatal(err)
+	}
+	var status app.StatusSnapshot
+	if err := json.Unmarshal(statusOutput.Bytes(), &status); err != nil || status.Version != "1.2.3" {
+		t.Fatalf("CLI must report the serving owner's version, not the newer client's: %#v, %v", status, err)
 	}
 	if runtime.GOOS != "windows" {
 		var toolOutput bytes.Buffer

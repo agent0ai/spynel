@@ -1586,6 +1586,7 @@ func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	target := newServiceHarness()
 	service := New(cfg, target)
 	service.SetPrimaryInstanceID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	service.Updates = &updater.Manager{CurrentVersion: "1.2.3"}
 	key := "chat:telegram:42"
 	target.threads[key] = "019c9f42-a3b1-7ced-9e10-123456789abc"
 	target.active[key] = true
@@ -1601,7 +1602,7 @@ func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "42", InstanceID: "11111111-2222-3333-4444-555555555555", Text: "/status"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"# Status", "Title: Production", "Instance ID: `11111111`", "Primary instance ID: `aaaaaaaa`", "Jobs: 1", "Tasks: 0 active (0 waiting)", "Goals: 0 active", "Orchestrator:", "Next heartbeat: unavailable", "Telegram: ● connected", "WhatsApp: ▲ error — offline", "Logs: 2", "Agent filesystem access: danger-full-access", "Turn: active"} {
+	for _, want := range []string{"# Status", "Title: Production", "Version: 1.2.3\n- Instance ID: `11111111`\n- Primary instance ID: `aaaaaaaa`", "Jobs: 1", "Tasks: 0 active (0 waiting)", "Goals: 0 active", "Orchestrator:", "Next heartbeat: unavailable", "Telegram: ● connected", "WhatsApp: ▲ error — offline", "Logs: 2", "Agent filesystem access: danger-full-access", "Turn: active"} {
 		if !strings.Contains(response.Text, want) {
 			t.Fatalf("status response does not contain %q:\n%s", want, response.Text)
 		}
@@ -1629,10 +1630,46 @@ func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	}
 }
 
+func TestStatusUsesRunningVersion(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	for _, test := range []struct {
+		name    string
+		updates *updater.Manager
+		version string
+		display string
+	}{
+		{"release", &updater.Manager{CurrentVersion: "1.2.3"}, "1.2.3", "1.2.3"},
+		{"prerelease", &updater.Manager{CurrentVersion: "v1.2.3-rc.1+build"}, "v1.2.3-rc.1+build", "v1.2.3-rc.1+build"},
+		{"development", &updater.Manager{CurrentVersion: "dev"}, "dev", "dev"},
+		{"empty", &updater.Manager{}, "", "not available"},
+		{"unavailable", nil, "", "not available"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service.Updates = test.updates
+			status, err := service.Status(core.Message{Channel: "cli", Conversation: "local"})
+			if err != nil || status.Version != test.version {
+				t.Fatalf("status version = %q, %v; want %q", status.Version, err, test.version)
+			}
+			text := FormatStatus(status)
+			if strings.Count(text, "\n- Version:") != 1 || !strings.Contains(text, "\n- Version: "+test.display+"\n- Instance ID:") {
+				t.Fatalf("running version missing, repeated, or misplaced:\n%s", text)
+			}
+		})
+	}
+}
+
 func TestFormatStatusGroupsWorkAndRoundsHeartbeatUp(t *testing.T) {
 	now := time.Date(2026, 8, 8, 14, 0, 0, 0, time.UTC)
 	status := StatusSnapshot{
-		Title: "Production", Instance: "instance", PrimaryInstance: "primary",
+		Title: "Production", Version: "1.2.3", Instance: "instance", PrimaryInstance: "primary",
 		Runtime: core.RuntimeStatus{Jobs: 3, Logs: 4}, TasksActive: 5, TasksWaiting: 2, GoalsActive: 2,
 		OrchestratorLease: 6, OrchestratorRuns: 1, HeartbeatState: "scheduled", NextHeartbeatAt: timePointer(now.Add(time.Second)),
 	}
@@ -1668,6 +1705,7 @@ func TestFormatStatusGroupsWorkAndRoundsHeartbeatUp(t *testing.T) {
 	text := FormatStatus(status)
 	want := "# Status\n\n" + strings.Join([]string{
 		"- Title: Production",
+		"- Version: 1.2.3",
 		"- Instance ID: `instance`",
 		"- Primary instance ID: `primary`",
 		"- Jobs: 3 — `/jobs`",
@@ -1689,7 +1727,7 @@ func TestFormatStatusGroupsWorkAndRoundsHeartbeatUp(t *testing.T) {
 	if text != want {
 		t.Fatalf("exact status changed:\ngot:\n%s\nwant:\n%s", text, want)
 	}
-	ordered := []string{"Title:", "Instance ID:", "Primary instance ID:", "Jobs:", "Tasks:", "Goals:", "Orchestrator:", "Next heartbeat:", "Telegram:", "Coding harness:", "Agent filesystem access:", "Autostart preference:", "Logs:", "Turn:"}
+	ordered := []string{"Title:", "Version:", "Instance ID:", "Primary instance ID:", "Jobs:", "Tasks:", "Goals:", "Orchestrator:", "Next heartbeat:", "Telegram:", "Coding harness:", "Agent filesystem access:", "Autostart preference:", "Logs:", "Turn:"}
 	previous := -1
 	for _, row := range ordered {
 		index := strings.Index(text, row)

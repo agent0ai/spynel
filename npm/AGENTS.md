@@ -21,6 +21,8 @@
 
 - Both accepted startup offers and explicit update requests use the native updater's preflight and post-publication restart coordination. Updates restart all registered instances of this package across workspaces, then relaunch the requester. The native coordinator verifies new generations and versions; failures stay explicit. A request already at the latest version skips npm replacement but still restarts instances.
 
+- After successful npm replacement, discard package-local CommonJS caches and hand off to the installed shim's exported `main(handoff, lifetime)` in the same Node process before post-publication coordination. Carry normalized arguments, startup-check eligibility/snapshot, and one lifetime shutdown latch; never add another Node parent or recovery loop. Failed replacement, incompatible handoff or failed coordination stops explicitly without resuming stale code. Already-running older shims cannot acquire this mechanism from disk and still require one fresh external launch.
+
 - The current npm wrapper explicitly advertises coordinated-update protocol 2 for native supervision and latched asynchronous shutdown; older protocol 1 is not sufficient. Bind that capability to validated launcher ownership and include it in process registration; an older wrapper supervising a newer native executable must fail preflight with one-time stop/relaunch guidance instead of silently using the old single-process update protocol.
 
 - Native owns manual runtime crash recovery; Node loops only for explicit code-75 updates. Keep signal cancellation latched across startup prompts, asynchronous npm/coordination helpers and between launches, never resurrecting a requester after stop. Helpers are bounded and waited before proceeding.

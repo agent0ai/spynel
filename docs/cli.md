@@ -98,7 +98,7 @@ spynel status [--config PATH] [--conversation NAME] [--json]
 spynel command [--config PATH] [--conversation NAME] [--json] NAME [ARGUMENTS...]
 ```
 
-`status` is a typed, non-secret snapshot rather than presentation Markdown. JSON keeps title plus abbreviated caller/primary IDs, then live-job, durable active task and waiting-subset counts, durable active goal counts, orchestrator lease/dispatch counts, semantic-heartbeat ownership/deadline, Telegram/WhatsApp state, logs, harness availability, model, sandbox, startup registration, and active-turn state. Theme and conversation thread are not status fields.
+`status` is a typed, non-secret snapshot rather than presentation Markdown. JSON keeps title, the serving process's startup `version` (including `dev`), and abbreviated caller/primary IDs, then live-job, durable active task and waiting-subset counts, durable active goal counts, orchestrator lease/dispatch counts, semantic-heartbeat ownership/deadline, Telegram/WhatsApp state, logs, harness availability, model, sandbox, startup registration, and active-turn state. Theme and conversation thread are not status fields.
 
 `command` routes a non-visual slash command through the shared application handler. It joins the live owner when present; an offline framework command does not start a coding harness merely to read or mutate deterministic Spynel state. Common commands also have direct aliases:
 
