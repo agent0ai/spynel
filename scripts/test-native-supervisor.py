@@ -128,7 +128,7 @@ def main():
             screens = 2 if args == [] else 1
             wait_for(lambda: child() is not None and output.count(b"\x1b[?1049h") >= screens)
             assert process.poll() is None
-            assert len(records()) == 2, "supervised capture spawned another reader/runtime"
+            assert sum(not r.get("provider_guardian") for r in records()) == 2, "supervised capture spawned another reader/runtime"
             if sys.platform == "linux" and len(processes) == 1:
                 parent = next(r for r in records() if r.get("supervisor"))
                 def memory(pid):
@@ -257,6 +257,7 @@ finally:
             provider.write_text(f'''#!{sys.executable}
 import json, os, pathlib, signal, sys, time
 signal.signal(signal.SIGHUP, signal.SIG_IGN)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
 root = pathlib.Path({str(root)!r})
 with (root / "provider-starts").open("a") as log: log.write(str(os.getpid()) + "\\n")
 request = json.loads(sys.stdin.readline())
@@ -271,25 +272,35 @@ while True:
             process, master, output, original = launch(launchers[0], directory)
             wait_for(lambda: (root / "provider-starts").exists())
             providers.extend(int(pid) for pid in (root / "provider-starts").read_text().split())
-            os.kill(child()["pid"], signal.SIGKILL)
-            assert process.wait(timeout=8) != 0
-            wait_for(lambda: b"recovery suppressed" in output, 3)
+            old = child()["pid"]
+            guardian = next(r["pid"] for r in records() if r.get("provider_guardian"))
+            adopted.append(guardian)
+            os.kill(old, signal.SIGKILL)
+            wait_for(lambda: b"bounded delay" in output, 5)
             assert_terminal_restored(master, original)
-            marker = directory / ".spynel" / "runtime" / "harness-owner"
-            assert marker.exists(), "crash cleared uncertain provider ownership"
+            # Recovery waits out election ownership, then admits exactly one replacement.
+            wait_for(lambda: child() is not None and child()["pid"] != old and len((root / "provider-starts").read_text().split()) == 2)
+            prior = providers.pop()
+            try:
+                os.kill(prior, 0)
+                raise AssertionError("successor admitted before prior provider was reaped")
+            except ProcessLookupError:
+                pass
+            if sys.platform == "linux":
+                os.waitpid(guardian, 0)
+                adopted.remove(guardian)
+            providers.append(int((root / "provider-starts").read_text().split()[-1]))
+            assert process.poll() is None, "native supervisor did not recover"
             before = (root / "synthetic-effects").stat().st_size
-            # Another contender may become primary, but cannot start a provider.
-            process, master, output, original = launch(launchers[0], directory)
-            assert (root / "provider-starts").read_text().split() == [str(pid) for pid in providers], "duplicate provider effects admitted"
-            assert (root / "synthetic-effects").stat().st_size > before, "fixture did not retain live orphan effects"
+            wait_for(lambda: (root / "synthetic-effects").stat().st_size > before, 3)
             os.kill(process.pid, signal.SIGTERM)
             stopped(process, master, original, status=1)
-            assert marker.exists(), "successor cleared prior provider ownership"
+            assert not (directory / ".spynel" / "runtime" / "harness-owner").exists()
 
             failure = subprocess.run([str(binary), "serve", "--invalid-fixture-flag"], cwd=directory, env=env, capture_output=True, timeout=5)
             assert failure.returncode != 0 and b"bounded delay" not in failure.stderr
             assert not records(), "startup failure left running instances"
-            print("Verified native/npm PTY quit and Ctrl+C, F6/resize, kernel terminal restoration, primary crash/takeover, direct-child reaping and refusal of duplicate orphan-provider effects.")
+            print("Verified native/npm PTY quit and Ctrl+C, F6/resize, kernel terminal restoration, primary crash/takeover, guarded provider reaping and automatic replacement after owner loss.")
         finally:
             for process in processes:
                 if process.poll() is None:

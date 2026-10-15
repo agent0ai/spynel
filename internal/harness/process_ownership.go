@@ -1,57 +1,86 @@
 package harness
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
-
-	"github.com/agent0ai/spynel/internal/fsx"
 )
 
-// A dead executor cannot prove its providers or their external effects ended.
-// Never age out this marker: only the owning orderly shutdown may release it.
+var errProcessOwnershipBusy = errors.New("a previous Spynel or provider process still holds harness ownership; reconnecting automatically")
+
+// Live process locks belong on the local per-user filesystem, not shared mounts.
+func ProcessOwnershipPath(workspace string) (string, error) {
+	root, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		return "", err
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	directory, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(directory, "spynel", "harness", fmt.Sprintf("%x.lock", sha256.Sum256([]byte(root)))), nil
+}
+
+// Provider guardians retain the lock until their direct provider has exited.
 type processOwnership struct {
-	path, identity string
+	path                string
+	file                *os.File
+	executable          string
+	lifeRead, lifeWrite *os.File
 }
 
 func (o *processOwnership) acquire() error {
-	if o.path == "" || o.identity != "" {
+	if o.path == "" || o.file != nil {
 		return nil
 	}
-	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
+	if err := os.MkdirAll(filepath.Dir(o.path), 0700); err != nil {
 		return err
 	}
-	identity := hex.EncodeToString(nonce[:]) + "\n"
-	if err := fsx.AtomicCreateFile(o.path, []byte(identity), 0600); err != nil {
-		return errors.New("harness ownership unavailable: a previous provider may still be running; inspect and stop prior work before clearing the private harness-owner marker")
+	var err error
+	o.file, err = lockProcessOwnership(o.path)
+	if err != nil {
+		return err
 	}
-	o.identity = identity
-	return nil
+	o.executable, err = os.Executable()
+	if err == nil {
+		o.lifeRead, o.lifeWrite, err = os.Pipe()
+	}
+	if err != nil {
+		_ = o.release()
+	}
+	return err
 }
 
 func (o *processOwnership) release() error {
-	if o.identity == "" {
+	if o.file == nil {
 		return nil
 	}
-	info, err := os.Lstat(o.path)
-	if err != nil {
-		return err
+	file := o.file
+	o.file = nil
+	_ = o.lifeWrite.Close()
+	_ = o.lifeRead.Close()
+	// Closing, rather than LOCK_UN, preserves locks held by surviving providers.
+	return file.Close()
+}
+
+func startProvider(command *exec.Cmd, owner *processOwnership) error {
+	if owner != nil && owner.file != nil {
+		arguments := append([]string{owner.executable, "__provider", command.Path}, command.Args[1:]...)
+		command.Path, command.Args = owner.executable, arguments
+		command.ExtraFiles = append(command.ExtraFiles, owner.file, owner.lifeRead)
+		command.Cancel = func() error { return command.Process.Signal(os.Interrupt) }
+		command.WaitDelay = 0 // The guardian retains ownership until provider exit is confirmed.
 	}
-	if !info.Mode().IsRegular() || info.Size() != int64(len(o.identity)) {
-		return errors.New("harness ownership changed during shutdown")
-	}
-	data, err := os.ReadFile(o.path)
-	if err != nil {
-		return err
-	}
-	if string(data) != o.identity {
-		return errors.New("harness ownership changed during shutdown")
-	}
-	return os.Remove(o.path)
+	return command.Start()
 }
 
 func waitProviderProcesses(group *sync.WaitGroup) error {

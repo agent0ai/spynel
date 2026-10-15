@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/updater"
+	"golang.org/x/sys/unix"
 )
 
 func supervisorExecutorFixture() error {
@@ -39,13 +40,18 @@ func supervisorExecutorFixture() error {
 	if err := admitExecutor(filepath.Join(root, "logs"), "synthetic-version", []string{"serve"}); err != nil {
 		return err
 	}
-	if mode == "unsafe" {
-		if err := executorIntent("unsafe"); err != nil {
+	if mode == "provider" {
+		file, err := os.OpenFile(filepath.Join(root, "harness-owner"), os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 			return err
 		}
 	}
 	switch mode {
-	case "panic", "unsafe":
+	case "panic", "provider":
 		go func() { panic("synthetic-supervisor-panic password=synthetic-secret") }()
 		select {}
 	case "kill":
@@ -78,7 +84,7 @@ func TestNativeSupervisorExitPolicyAndDiagnostics(t *testing.T) {
 	for _, test := range []struct {
 		mode             string
 		attempts, status int
-	}{{"normal", 1, 0}, {"startup", 1, 19}, {"stop", 1, 23}, {"unsafe", 1, 2}, {"panic", 4, 2}, {"kill", 4, 137}, {"native", 4, 17}} {
+	}{{"normal", 1, 0}, {"startup", 1, 19}, {"stop", 1, 23}, {"provider", 4, 2}, {"panic", 4, 2}, {"kill", 4, 137}, {"native", 4, 17}} {
 		t.Run(test.mode, func(t *testing.T) {
 			command, root := supervisorFixture(t, test.mode)
 			output, err := command.CombinedOutput()
@@ -160,7 +166,7 @@ func TestNativeSupervisorStopDuringBackoff(t *testing.T) {
 }
 
 func TestNativeSupervisorPrivateModeAndSingleRunSelection(t *testing.T) {
-	for _, args := range [][]string{{"docs"}, {"send"}, {"run", "--once"}, {"serve", "--automatic-startup"}, {"init", "--no-start"}, {"update"}, {"events"}} {
+	for _, args := range [][]string{{"docs"}, {"send"}, {"run", "--once"}, {"serve", "--automatic-startup"}, {"init", "--no-start"}, {"update"}, {"events"}, {"__provider"}} {
 		if supervisorEligible(args) {
 			t.Fatalf("replayed command %v", args)
 		}

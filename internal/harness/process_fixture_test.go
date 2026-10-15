@@ -33,6 +33,12 @@ type fixtureRecord struct {
 }
 
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "__provider" {
+		if err := RunProvider(os.Args[2:]); err != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if mode := os.Getenv(fixtureModeEnv); mode != "" {
 		os.Exit(runHarnessFixture(mode))
 	}

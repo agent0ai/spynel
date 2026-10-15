@@ -18,6 +18,8 @@ const (
 	controlDedupeWindow = time.Minute
 )
 
+var errProviderShutdownPending = errors.New("previous provider shutdown was not confirmed; waiting for cleanup")
+
 // Supervisor keeps the rest of Spynel provider-neutral while allowing the
 // selected harness to be replaced at runtime. It only swaps an idle harness;
 // active turns retain their original process and session semantics.
@@ -42,7 +44,8 @@ type Supervisor struct {
 	closed            bool
 	processStartGuard func() error
 	processOwner      processOwnership
-	uncleanClose      bool
+	closing           Harness
+	recovering        bool
 }
 
 type pendingSend struct {
@@ -147,12 +150,42 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	defer s.mu.Unlock()
 	if err != nil {
 		s.startErr = err
+		if (errors.Is(err, errProcessOwnershipBusy) || errors.Is(err, errProviderShutdownPending)) && !s.recovering {
+			s.recovering = true
+			go s.recoverOwnership(ctx)
+		}
 		return err
 	}
 	s.current = target
 	s.startErr = nil
 	s.signalReady()
 	return nil
+}
+
+func (s *Supervisor) recoverOwnership(ctx context.Context) {
+	defer func() {
+		s.operationMu.Lock()
+		s.recovering = false
+		s.mu.RLock()
+		if !s.closed && s.ctx != nil && s.ctx.Err() == nil && (errors.Is(s.startErr, errProcessOwnershipBusy) || errors.Is(s.startErr, errProviderShutdownPending)) {
+			s.recovering = true
+			go s.recoverOwnership(s.ctx)
+		}
+		s.mu.RUnlock()
+		s.operationMu.Unlock()
+	}()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := s.Start(ctx); !errors.Is(err, errProcessOwnershipBusy) && !errors.Is(err, errProviderShutdownPending) {
+				return
+			}
+		}
+	}
 }
 
 // SetProcessStartGuard is configured before Start. It fences process-level
@@ -163,9 +196,12 @@ func (s *Supervisor) SetProcessStartGuard(path string, guard func() error) {
 }
 
 func (s *Supervisor) createTarget(cfg HarnessConfig) (Harness, error) {
-	if s.uncleanClose {
-		return nil, errors.New("previous provider shutdown was not confirmed; provider admission remains fenced")
+	if s.closing != nil {
+		if err := s.confirmProviderClose(s.closing); err != nil {
+			return nil, err
+		}
 	}
+	cfg.processOwner = &s.processOwner
 	target, err := s.registry.Create(cfg)
 	if err != nil {
 		return nil, err
@@ -190,11 +226,17 @@ func (s *Supervisor) startTarget(ctx context.Context, target Harness) error {
 		}
 	}
 	if err := target.Start(ctx); err != nil {
-		if target.Close() != nil {
-			s.uncleanClose = true
-		}
-		return err
+		return errors.Join(err, s.confirmProviderClose(target))
 	}
+	return nil
+}
+
+func (s *Supervisor) confirmProviderClose(target Harness) error {
+	if err := target.Close(); err != nil {
+		s.closing = target
+		return fmt.Errorf("%w: %v", errProviderShutdownPending, err)
+	}
+	s.closing = nil
 	return nil
 }
 
@@ -237,10 +279,7 @@ func (s *Supervisor) Reconfigure(cfg HarnessConfig) error {
 	s.startErr = errors.New("harness is being reconfigured")
 	s.mu.Unlock()
 	if previous != nil {
-		if err = previous.Close(); err != nil {
-			s.uncleanClose = true
-			err = fmt.Errorf("previous provider shutdown was not confirmed; provider admission remains fenced: %w", err)
-		}
+		err = s.confirmProviderClose(previous)
 	}
 	if err == nil {
 		err = s.startTarget(ctx, target)
@@ -253,6 +292,10 @@ func (s *Supervisor) Reconfigure(cfg HarnessConfig) error {
 	}
 	s.mu.Unlock()
 	if err != nil {
+		if errors.Is(err, errProviderShutdownPending) && !s.recovering {
+			s.recovering = true
+			go s.recoverOwnership(ctx)
+		}
 		return err
 	}
 	s.signalReady()
@@ -887,7 +930,7 @@ func (s *Supervisor) Close() error {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	s.mu.Lock()
-	if s.closed {
+	if s.closed && s.closing == nil {
 		s.mu.Unlock()
 		return nil
 	}
@@ -896,12 +939,14 @@ func (s *Supervisor) Close() error {
 	s.current = nil
 	s.mu.Unlock()
 	if target != nil {
-		if err := target.Close(); err != nil {
+		if err := s.confirmProviderClose(target); err != nil {
 			return err
 		}
 	}
-	if s.uncleanClose {
-		return errors.New("previous provider shutdown was not confirmed")
+	if s.closing != nil {
+		if err := s.confirmProviderClose(s.closing); err != nil {
+			return err
+		}
 	}
 	return s.processOwner.release()
 }

@@ -176,7 +176,7 @@ func (a *ACP) Start(parent context.Context) error {
 	if a.config.Stderr != nil {
 		command.Stderr = a.config.Stderr
 	}
-	if err := command.Start(); err != nil {
+	if err := startProvider(command, a.config.processOwner); err != nil {
 		a.cancel()
 		a.ctx = nil
 		a.cancel = nil

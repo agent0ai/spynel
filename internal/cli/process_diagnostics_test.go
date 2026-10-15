@@ -20,6 +20,12 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "__provider" {
+		if err := Run(os.Args[1:], "synthetic-version"); err != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "__executor" {
 		var err error
 		if os.Getenv("SPYNEL_TEST_SUPERVISOR_MODE") != "" {
@@ -83,8 +89,9 @@ func TestMain(m *testing.M) {
 			os.Exit(17)
 		case "capture-failure":
 			_ = command.Process.Kill()
-			fmt.Fprintln(os.Stderr, "original-failure-after-reader-loss\n"+strings.Repeat("terminal data\n", 10000))
+			// Confirm reader loss before writing; SIGKILL can interrupt an in-flight tee.
 			stop()
+			fmt.Fprintln(os.Stderr, "original-failure-after-reader-loss\n"+strings.Repeat("terminal data\n", 10000))
 			os.Exit(17)
 		}
 		os.Exit(0)

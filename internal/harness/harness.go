@@ -32,6 +32,7 @@ type HarnessConfig struct {
 	SessionsFile   string
 	Version        string
 	Stderr         io.Writer
+	processOwner   *processOwnership
 }
 
 // Model describes one model choice exposed by a harness. IDs are the exact

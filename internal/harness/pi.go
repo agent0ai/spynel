@@ -579,7 +579,7 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 		cancel()
 		return nil, errors.New("Pi harness is closed")
 	}
-	if err := command.Start(); err != nil {
+	if err := startProvider(command, cfg.processOwner); err != nil {
 		p.mu.Unlock()
 		cancel()
 		return nil, fmt.Errorf("start Pi RPC process: %w", err)

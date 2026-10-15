@@ -46,6 +46,14 @@ const (
 )
 
 func Run(args []string, version string) (runErr error) {
+	if len(args) > 0 && args[0] == "__provider" {
+		unregister, err := updater.Detect(version).RegisterProviderGuardian()
+		if err != nil {
+			return err
+		}
+		defer unregister()
+		return harness.RunProvider(args[1:])
+	}
 	if len(args) > 0 && args[0] == "__executor" {
 		var err error
 		args, err = enterExecutor(args, version)
@@ -1219,6 +1227,10 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 	if err := workspace.Upgrade(cfg.Root); err != nil {
 		return nil, fmt.Errorf("upgrade Spynel workspace: %w", err)
 	}
+	ownershipPath, err := harness.ProcessOwnershipPath(cfg.Root)
+	if err != nil {
+		return nil, fmt.Errorf("locate harness ownership lock: %w", err)
+	}
 	runtimeState := app.NewRuntimeAt(cfg.StatePath("runtime", "logs"), fmt.Sprintf("pid-%d", os.Getpid()))
 	registry := harness.NewBuiltinRegistry()
 	command, commandErr := harness.ResolveConfiguredCommand(cfg.Harness.Name, cfg.Harness.ACPCommand, nil)
@@ -1234,7 +1246,7 @@ func buildService(cfg config.Config, version string) (*app.Service, error) {
 		Network: false, SessionsFile: cfg.HarnessSessionsPath(cfg.Harness.Name),
 		Version: version, Stderr: runtimeState.Writer("harness"),
 	})
-	target.SetProcessStartGuard(cfg.StatePath("runtime", "harness-owner"), func() error { return executorIntent("unsafe") })
+	target.SetProcessStartGuard(ownershipPath, nil)
 	service := app.NewWithRuntime(cfg, target, runtimeState)
 	service.Updates = updater.Detect(version)
 	startup, err := startupmanager.New("")

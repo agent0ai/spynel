@@ -24,14 +24,13 @@ func TestProviderOwnershipFencesAnotherContenderUntilOrderlyClose(t *testing.T) 
 		t.Fatal(err)
 	}
 	if intents != 1 {
-		t.Fatal("provider started without recovery suppression")
+		t.Fatal("provider started without its admission guard")
 	}
 	info, err := os.Stat(path)
 	if err != nil || info.Mode().Perm() != 0600 {
 		t.Fatal("ownership marker is not private")
 	}
-	// The contender has no local execution state from the prior process. Neither
-	// stale election nor dead owner evidence authorizes deleting this marker.
+	// A contender must not release another live process's lock.
 	second := NewSupervisor(registry, HarnessConfig{Name: "fixture"})
 	second.SetProcessStartGuard(path, func() error { t.Fatal("blocked contender reached native admission"); return nil })
 	if err := second.Start(context.Background()); err == nil {
@@ -74,7 +73,7 @@ func TestProviderGuardFailurePreventsStart(t *testing.T) {
 	}
 }
 
-func TestProviderOwnershipNeverClearsChangedIdentity(t *testing.T) {
+func TestProviderOwnershipUsesStableLockNotFileContents(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "harness-owner")
 	owner := processOwnership{path: path}
 	if err := owner.acquire(); err != nil {
@@ -83,8 +82,19 @@ func TestProviderOwnershipNeverClearsChangedIdentity(t *testing.T) {
 	if err := os.WriteFile(path, []byte("changed\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := owner.release(); err == nil {
-		t.Fatal("changed owner was cleared")
+	contender := processOwnership{path: path}
+	if err := contender.acquire(); !errors.Is(err, errProcessOwnershipBusy) {
+		t.Fatalf("file contents bypassed live lock: %v", err)
+	}
+	if err := owner.release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := contender.acquire(); err != nil {
+		t.Fatalf("unused marker blocked recovery: %v", err)
+	}
+	defer contender.release()
+	if data, err := os.ReadFile(path); err != nil || string(data) != "changed\n" {
+		t.Fatalf("ownership changed the stable lock file: %v", err)
 	}
 }
 
@@ -212,7 +222,9 @@ func TestReplacementJoinsPreviousBeforeAdmission(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("orderly replacement retained ownership")
+	contender := processOwnership{path: path}
+	if err := contender.acquire(); err != nil {
+		t.Fatalf("orderly replacement retained ownership: %v", err)
 	}
+	defer contender.release()
 }

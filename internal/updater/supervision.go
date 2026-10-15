@@ -67,7 +67,7 @@ func SetExecutor(pid int, ready, stopping bool) error {
 }
 
 func restartTarget(record ProcessRegistration) bool {
-	return !record.DiagnosticReader && record.SupervisorPID == 0
+	return !record.DiagnosticReader && !record.ProviderGuardian && record.SupervisorPID == 0
 }
 
 // RetireExecutor is called by its supervisor only after direct-child Wait.

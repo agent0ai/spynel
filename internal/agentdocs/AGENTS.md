@@ -18,7 +18,7 @@
 
 - Keep compiled update guidance explicit about update-by-default, `update check`, all-instance restart within the selected installation, shell `killall`, and older-instance restart limitations.
 
-- Describe native supervisor/manual versus external service ownership, explicit stop/update and finite recovery limits, shared 40-second readiness, and unresolved provider ownership that blocks all new provider starts.
+- Describe native supervisor/manual versus external service ownership, explicit stop/update and finite recovery limits, shared 40-second readiness, and live provider ownership that prevents overlap while automatically retrying after confirmed cleanup; stale file presence never blocks startup.
 
 ## Child DOX Index
 

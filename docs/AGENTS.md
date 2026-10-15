@@ -38,7 +38,7 @@
 
 - Document update-by-default, explicit read-only `update check`, caller-installation versus channel-primary selection, cross-workspace instance restart, and shell `killall` with preserved future autostart registrations. State per-user process discovery and the one-time stop/relaunch requirement for older releases without coordinated restart.
 
-- Document native supervision for manual runtime launches, direct externally managed executors, verified supervisor/executor update generations, finite retries and conservative unresolved-provider ownership. Never promise frozen-child recovery, arbitrary orphan cleanup or an incident root-cause fix.
+- Document native supervision for manual runtime launches, direct externally managed executors, verified supervisor/executor update generations, finite retries, kernel-held provider ownership, guarded direct-provider cleanup and automatic retry when prior cleanup completes. Never promise frozen-child recovery, arbitrary orphan cleanup or an incident root-cause fix.
 
 ## Child DOX Index
 

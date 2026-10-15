@@ -445,7 +445,7 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 		cancel()
 		return "", false, errors.New("Claude Code harness is closed")
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startProvider(cmd, cfg.processOwner); err != nil {
 		c.mu.Unlock()
 		cancel()
 		return "", false, fmt.Errorf("start Claude Code: %w", err)

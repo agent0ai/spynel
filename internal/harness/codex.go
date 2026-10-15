@@ -32,6 +32,7 @@ type CodexConfig struct {
 	SessionsFile   string
 	Version        string
 	Stderr         io.Writer
+	processOwner   *processOwnership
 }
 
 type Codex struct {
@@ -268,7 +269,7 @@ func (c *Codex) Start(parent context.Context) error {
 	if c.config.Stderr != nil {
 		c.cmd.Stderr = c.config.Stderr
 	}
-	if err := c.cmd.Start(); err != nil {
+	if err := startProvider(c.cmd, c.config.processOwner); err != nil {
 		c.cmd = nil
 		c.mu.Unlock()
 		return fmt.Errorf("start codex app-server: %w", err)

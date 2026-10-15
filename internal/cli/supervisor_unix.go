@@ -217,14 +217,14 @@ func (e supervisedExit) ExitCode() int         { return e.status }
 func (e supervisedExit) ExitSignal() os.Signal { return e.signal }
 
 type supervisorAttempt struct {
-	mu                            sync.Mutex
-	hello, ready, unsafe, stopped bool
-	action                        string
-	args                          []string
-	cwd                           string
-	diagnostic                    *processDiagnostic
-	update                        *updater.Result
-	admitted                      time.Time
+	mu                    sync.Mutex
+	hello, ready, stopped bool
+	action                string
+	args                  []string
+	cwd                   string
+	diagnostic            *processDiagnostic
+	update                *updater.Result
+	admitted              time.Time
 }
 
 func runSupervisor(args []string, version string) error {
@@ -357,8 +357,6 @@ func runSupervisor(args []string, version string) error {
 						attempt.ready, attempt.args, attempt.cwd, attempt.diagnostic = true, message.Args, message.CWD, message.Diagnostic
 						attempt.admitted = time.Now()
 						publishLauncherDiagnostic(*message.Diagnostic)
-					case "unsafe":
-						attempt.unsafe = true
 					case "stop":
 						attempt.stopped = true
 					case "restart_intent", "update_intent":
@@ -466,10 +464,6 @@ func runSupervisor(args []string, version string) error {
 			return request
 		}
 		if waitErr == nil || !attempt.ready || attempt.action != "" {
-			return executorExit(waitErr, command.ProcessState)
-		}
-		if attempt.unsafe {
-			fmt.Fprintln(os.Stderr, "spynel: automatic recovery suppressed: provider descendants may still be running; inspect work before relaunching")
 			return executorExit(waitErr, command.ProcessState)
 		}
 		if !attempt.admitted.IsZero() && time.Since(attempt.admitted) >= time.Minute {
