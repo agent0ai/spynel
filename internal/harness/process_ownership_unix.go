@@ -74,9 +74,7 @@ func RunProvider(arguments []string) error {
 	go func() { _, _ = io.Copy(io.Discard, life); close(lost) }()
 	select {
 	case err := <-done:
-		if err != nil {
-			_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
-		}
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 		return finish(err)
 	case <-lost:
 	case <-stop:

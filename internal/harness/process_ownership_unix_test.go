@@ -24,6 +24,22 @@ func TestProcessOwnershipHelper(t *testing.T) {
 	if mode == "" {
 		return
 	}
+	if mode == "group-parent" {
+		command := exec.Command(os.Args[0], "-test.run=^TestProcessOwnershipHelper$")
+		command.Env = append(os.Environ(), "SPYNEL_TEST_OWNERSHIP_MODE=group-child")
+		command.Stdout, command.Stderr = os.Stdout, os.Stderr
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		return
+	}
+	if mode == "group-child" {
+		signal.Ignore(syscall.SIGTERM)
+		fmt.Fprintln(os.Stdout, os.Getpid())
+		time.Sleep(time.Hour)
+		return
+	}
 	if mode == "tool" {
 		signal.Ignore(syscall.SIGTERM)
 		_ = os.NewFile(3, "closed-by-provider").Close()
@@ -47,6 +63,51 @@ func TestProcessOwnershipHelper(t *testing.T) {
 	}
 	fmt.Fprintln(os.Stdout, "ready")
 	_, _ = io.Copy(io.Discard, os.Stdin)
+}
+
+func TestProviderExitCleansUpRemainingProcessGroup(t *testing.T) {
+	owner := processOwnership{path: filepath.Join(t.TempDir(), "harness-owner")}
+	if err := owner.acquire(); err != nil {
+		t.Fatal(err)
+	}
+	defer owner.release()
+	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestProcessOwnershipHelper$")
+	command.Env = append(os.Environ(), "SPYNEL_TEST_OWNERSHIP_MODE=group-parent")
+	input, err := command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	command.Stdout, command.Stderr = writer, os.Stderr
+	if err := startProvider(command, &owner); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = command.Process.Kill(); _ = command.Wait() }()
+	_ = writer.Close()
+	_ = reader.SetReadDeadline(time.Now().Add(5 * time.Second))
+	output := bufio.NewReader(reader)
+	line, err := output.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Kill(pid, syscall.SIGKILL)
+	_ = input.Close()
+	if _, err := io.ReadAll(output); err != nil {
+		t.Fatalf("provider exit left its descendant holding stdout: %v", err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestProviderGuardianRetainsLockAndCleansUpAfterOwnerLoss(t *testing.T) {
