@@ -25,6 +25,7 @@ import (
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
@@ -60,8 +61,6 @@ func Run(args []string, version string) (runErr error) {
 		if err != nil {
 			return err
 		}
-	} else if supervisorEligible(args) {
-		return runSupervisor(args, version)
 	}
 
 	if len(args) == 2 && args[0] == "__diagnostics" {
@@ -87,6 +86,8 @@ func Run(args []string, version string) (runErr error) {
 	if executor != nil {
 		defer executor.unregister()
 		runErr = completeExecutorRun(run(args, version))
+	} else if supervisorEligible(args) {
+		runErr = completeRun(runSupervisor(args, version), replaceCurrentProcess)
 	} else {
 		runErr = completeRun(run(args, version), replaceCurrentProcess)
 	}
@@ -529,15 +530,12 @@ type updateRequest struct {
 }
 
 func (*updateRequest) Error() string { return "update and restart Spynel" }
-func (r *updateRequest) ExitCode() int {
-	r.writeRestartArgs()
-	return npmUpdateExitCode
-}
+func (*updateRequest) ExitCode() int { return npmUpdateExitCode }
 
-func (r *updateRequest) writeRestartArgs() {
+func (r *updateRequest) writeRestartArgs() error {
 	requestPath := strings.TrimSpace(os.Getenv("SPYNEL_NPM_UPDATE_STATE"))
 	if requestPath == "" || filepath.Clean(filepath.Dir(requestPath)) != filepath.Clean(os.TempDir()) || !strings.HasPrefix(filepath.Base(requestPath), "spynel-update-") {
-		return
+		return errors.New("npm update handoff channel is unavailable")
 	}
 	data, err := json.Marshal(struct {
 		Args    []string `json:"args"`
@@ -545,14 +543,16 @@ func (r *updateRequest) writeRestartArgs() {
 		Version string   `json:"version"`
 	}{Args: append([]string(nil), r.args...), Install: r.result.Available, Version: r.result.Latest})
 	if err != nil {
-		return
+		return err
 	}
-	file, err := os.OpenFile(requestPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return
+	if info, err := os.Lstat(requestPath); err == nil {
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return errors.New("npm update handoff must be a private regular file")
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
-	_, _ = file.Write(append(data, '\n'))
-	_ = file.Close()
+	return fsx.AtomicWriteFile(requestPath, append(data, '\n'), 0o600)
 }
 
 func completeRun(err error, restart func([]string) error) error {
@@ -561,6 +561,12 @@ func completeRun(err error, restart func([]string) error) error {
 
 func completeRunContext(parent context.Context, err error, restart func([]string) error) error {
 	var update *updateRequest
+	if errors.As(err, &update) && !update.standalone {
+		if publishErr := update.writeRestartArgs(); publishErr != nil {
+			return fmt.Errorf("publish npm update handoff: %w", publishErr)
+		}
+		return update
+	}
 	if errors.As(err, &update) && update.standalone {
 		if update.manager == nil {
 			return errors.New("update lost its installation owner")

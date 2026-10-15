@@ -711,8 +711,9 @@ func TestCompleteRunPreservesOrdinaryErrors(t *testing.T) {
 }
 
 func TestNPMUpdateRequestReturnsLauncherExitCodeWithoutReplacingProcess(t *testing.T) {
+	testNPMUpdateChannel(t)
 	called := false
-	err := completeRun(&updateRequest{}, func([]string) error {
+	err := completeRun(&updateRequest{args: []string{"version"}, result: updater.Result{Latest: "1.3.0"}}, func([]string) error {
 		called = true
 		return nil
 	})
@@ -722,7 +723,8 @@ func TestNPMUpdateRequestReturnsLauncherExitCodeWithoutReplacingProcess(t *testi
 	}
 }
 
-func TestNPMUpdateRequestPublishesInitContinuationArguments(t *testing.T) {
+func testNPMUpdateChannel(t *testing.T) string {
+	t.Helper()
 	placeholder, err := os.CreateTemp(os.TempDir(), "spynel-update-")
 	if err != nil {
 		t.Fatal(err)
@@ -731,25 +733,73 @@ func TestNPMUpdateRequestPublishesInitContinuationArguments(t *testing.T) {
 	if err := placeholder.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(statePath); err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() { _ = os.Remove(statePath) })
 	t.Setenv("SPYNEL_NPM_UPDATE_STATE", statePath)
+	return statePath
+}
+
+func TestNPMUpdateRequestPublishesInitContinuationArguments(t *testing.T) {
+	statePath := testNPMUpdateChannel(t)
+	// A prior interrupted publication must not poison this launcher's channel.
+	if err := os.WriteFile(statePath, []byte(`{"args":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	want := []string{"serve", "--tui", "--config", "/tmp/project/.spynel/config.yaml"}
-	request := &updateRequest{args: want}
-	if code := request.ExitCode(); code != npmUpdateExitCode {
-		t.Fatalf("update exit code = %d", code)
+	request := &updateRequest{args: want, result: updater.Result{Latest: "1.3.0"}}
+	if got := completeRun(request, func([]string) error { t.Fatal("unexpected exec"); return nil }); got != request {
+		t.Fatalf("update completion = %v", got)
 	}
 	data, err := os.ReadFile(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var state struct {
-		Args []string `json:"args"`
+		Args    []string `json:"args"`
+		Version string   `json:"version"`
 	}
-	if err := json.Unmarshal(data, &state); err != nil || strings.Join(state.Args, "\x00") != strings.Join(want, "\x00") {
+	if err := json.Unmarshal(data, &state); err != nil || strings.Join(state.Args, "\x00") != strings.Join(want, "\x00") || state.Version != "1.3.0" {
 		t.Fatalf("update state = %#v, %v", state, err)
+	}
+	info, err := os.Stat(statePath)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("update channel is not private: %v", err)
+	}
+}
+
+func TestNPMUpdateHandoffFailureNeverReturnsUpdateExitCode(t *testing.T) {
+	for _, kind := range []string{"missing", "directory", "public", "symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			path := testNPMUpdateChannel(t)
+			switch kind {
+			case "missing":
+				t.Setenv("SPYNEL_NPM_UPDATE_STATE", "")
+			case "directory":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "public":
+				if err := os.Chmod(path, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Join(t.TempDir(), "unrelated"), path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := completeRun(&updateRequest{args: []string{"version"}, result: updater.Result{Latest: "1.3.0"}}, func([]string) error { t.Fatal("unexpected exec"); return nil })
+			if err == nil || !strings.Contains(err.Error(), "publish npm update handoff") {
+				t.Fatalf("publication failure was hidden: %v", err)
+			}
+			if _, ok := err.(interface{ ExitCode() int }); ok {
+				t.Fatal("failed publication authorized an update exit")
+			}
+		})
 	}
 }
 

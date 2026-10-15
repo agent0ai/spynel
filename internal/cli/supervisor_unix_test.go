@@ -65,6 +65,8 @@ func supervisorExecutorFixture() error {
 		os.Exit(23)
 	case "normal":
 		return completeExecutorRun(nil)
+	case "update":
+		return completeExecutorRun(&updateRequest{args: []string{"serve"}, result: updater.Result{Current: "1.3.0", Latest: "1.3.0"}})
 	case "wait":
 		<-executor.ctx.Done()
 		return completeExecutorRun(nil)
@@ -76,8 +78,40 @@ func supervisorFixture(t *testing.T, mode string) (*exec.Cmd, string) {
 	t.Helper()
 	root := t.TempDir()
 	command := exec.Command(os.Args[0], "__supervisor_fixture")
+	command.Dir = root
 	command.Env = append(os.Environ(), "SPYNEL_TEST_SUPERVISOR_MODE="+mode, "SPYNEL_TEST_SUPERVISOR_ROOT="+root, "XDG_CONFIG_HOME="+filepath.Join(root, "config"), "HOME="+root)
 	return command, root
+}
+
+func TestNativeSupervisorUpdatePublishesHandoffBeforeExit(t *testing.T) {
+	for _, available := range []bool{false, true} {
+		t.Run(fmt.Sprint(available), func(t *testing.T) {
+			command, root := supervisorFixture(t, "update")
+			path := filepath.Join(root, "spynel-update-fixture")
+			channel := ""
+			if available {
+				channel = path
+			}
+			command.Env = append(command.Env, "TMPDIR="+root, "SPYNEL_NPM_UPDATE_STATE="+channel)
+			output, err := command.CombinedOutput()
+			if err == nil {
+				t.Fatal("update did not return an exit status")
+			}
+			if !available {
+				if command.ProcessState.ExitCode() != 1 || !strings.Contains(string(output), "publish npm update handoff") {
+					t.Fatalf("failed channel authorized an update: %v, %s", err, output)
+				}
+				return
+			}
+			if command.ProcessState.ExitCode() != npmUpdateExitCode {
+				t.Fatalf("update status: %v, %s", err, output)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || !bytes.Contains(data, []byte(`"version":"1.3.0"`)) || !bytes.Contains(data, []byte(`"args":["serve"]`)) {
+				t.Fatalf("native update was not published: %s, %v", data, err)
+			}
+		})
+	}
 }
 
 func TestNativeSupervisorExitPolicyAndDiagnostics(t *testing.T) {

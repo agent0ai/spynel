@@ -43,7 +43,7 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	if len(os.Args) > 1 && os.Args[1] == "__supervisor_fixture" {
-		err := runSupervisor([]string{"serve"}, "synthetic-version")
+		err := Run([]string{"serve"}, "synthetic-version")
 		if exit, ok := err.(interface{ ExitCode() int }); ok {
 			os.Exit(exit.ExitCode())
 		}
