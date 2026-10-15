@@ -8,6 +8,12 @@ updates still restart without replacing npm files. Replacement, handoff and
 coordination failures remain explicit; native protocol and ownership checks stay
 in force.
 
+Native npm update handoffs are now published atomically and checked before
+returning update exit code 75. An interrupted private request can be replaced
+with the complete current request; unsafe files and publication failures return
+an explicit retained error. Reading an exit code no longer writes a request.
+Supervised and one-shot launches use the same completion boundary.
+
 `/status` now shows the serving process's version directly above the adjacent
 instance IDs. Structured status includes the same `version` field. This reports
 the running primary's version even when a newer CLI connects to it; an installed
