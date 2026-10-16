@@ -138,10 +138,21 @@ func TestNativeSupervisorExitPolicyAndDiagnostics(t *testing.T) {
 			}
 			if test.mode != "startup" {
 				entries := readDiagnosticEntries(t, filepath.Join(root, "logs"))
-				var found bool
+				var found, evidence, stderr bool
 				for _, entry := range entries {
 					if entry.Event == "executor_exit" {
 						found = true
+						for _, field := range []string{"version=synthetic-version", "supervisor_pid=", "started_at=", "observed_exit_at=", "status="} {
+							if !strings.Contains(entry.Text, field) {
+								t.Fatalf("exit evidence missing %q: %s", field, entry.Text)
+							}
+						}
+					}
+					if entry.Event == "exit_evidence" {
+						evidence = strings.Contains(entry.Text, "attribution=unknown") && strings.Contains(entry.Text, "visible_cgroup_oom_kill") && strings.Contains(entry.Text, "PID mapping")
+					}
+					if entry.Event == "native_stderr" {
+						stderr = true
 					}
 					if strings.Contains(entry.Text, "synthetic-secret") {
 						t.Fatal("credential retained")
@@ -149,6 +160,12 @@ func TestNativeSupervisorExitPolicyAndDiagnostics(t *testing.T) {
 				}
 				if !found {
 					t.Fatal("no parent-observed exit evidence")
+				}
+				if test.mode == "kill" && !evidence {
+					t.Fatal("SIGKILL lacks explicit attribution limits")
+				}
+				if (test.mode == "native" || test.mode == "panic") && !stderr {
+					t.Fatal("native stderr was lost")
 				}
 			}
 		})
@@ -220,5 +237,31 @@ func TestQueuedStopHasPriorityOverRestart(t *testing.T) {
 	signals <- updater.RestartSignal()
 	if !queuedSupervisorStop(signals) {
 		t.Fatal("restart requests hid a queued stop")
+	}
+}
+
+func TestReadCgroupOOMKills(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.events")
+	if got := readCgroupOOMKills(path); got.available {
+		t.Fatal("missing counter reported as observed")
+	}
+	for _, test := range []struct {
+		text string
+		want cgroupOOMSample
+	}{
+		{"oom 4\noom_kill 3\noom_group_kill 1\n", cgroupOOMSample{kills: 3, available: true}},
+		{"oom_kill 0\n", cgroupOOMSample{available: true}},
+		{"oom_kill -1\n", cgroupOOMSample{}},
+		{"oom_kill invalid\n", cgroupOOMSample{}},
+		{"oom_kill 18446744073709551616\n", cgroupOOMSample{}},
+		{"oom 4\n", cgroupOOMSample{}},
+		{strings.Repeat(" ", 4097) + "oom_kill 2\n", cgroupOOMSample{}},
+	} {
+		if err := os.WriteFile(path, []byte(test.text), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if got := readCgroupOOMKills(path); got != test.want {
+			t.Fatalf("sample = %#v; want %#v", got, test.want)
+		}
 	}
 }

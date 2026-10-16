@@ -1,12 +1,145 @@
 package history
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestRecoveryWindowAndReservationIgnoreOldHistoryButKeepExactCoverage(t *testing.T) {
+	store := New(t.TempDir())
+	now := time.Now().UTC()
+	old := now.Add(-48 * time.Hour)
+	appendEntry := func(entry Entry) {
+		t.Helper()
+		if _, err := store.Append("cli", "long", entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2001; i++ {
+		appendEntry(Entry{At: old, Role: "assistant", Content: "old context"})
+	}
+	// Correlation timestamps may precede the recent user record they cover.
+	appendEntry(Entry{At: old, Role: "correlation", Covers: []string{"terminal"}, Outcome: "terminal_assistant"})
+	appendEntry(Entry{At: old, Role: "correlation", Covers: []string{"cancelled"}, Outcome: "intentional_cancellation"})
+	appendEntry(Entry{At: old, Role: "correlation", RetriggerOf: []string{"retried"}})
+	appendEntry(Entry{At: old, Role: "correlation", SourceMessageID: "pending", Admission: "new"})
+	for _, id := range []string{"pending", "terminal", "cancelled", "retried", "legacy"} {
+		accepted := now
+		if id == "legacy" {
+			accepted = old
+		}
+		appendEntry(Entry{At: now, AcceptedAt: accepted, Role: "user", SourceMessageID: id, Content: "recent request"})
+	}
+	cutoff, activation := now.Add(-24*time.Hour), now.Add(-time.Hour)
+	snapshot, err := store.RecoveryWindow("cli", "long", cutoff, 2000)
+	if err != nil || snapshot.Records != 5 || len(snapshot.Entries) != 5 || !snapshot.Admitted["pending"] || snapshot.Covered["terminal"] != "terminal_coverage" || snapshot.Covered["cancelled"] != "intentional_cancellation" || snapshot.Covered["retried"] != "prior_reservation" {
+		t.Fatalf("recent snapshot lost exact correlation: %#v, %v", snapshot, err)
+	}
+	requested := []string{"pending", "terminal", "cancelled", "retried", "legacy"}
+	var wg sync.WaitGroup
+	results := make(chan []Entry, 2)
+	errors := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			entries, err := store.ReserveRetrigger("cli", "long", requested, activation, cutoff, 2000)
+			results <- entries
+			errors <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	count := 0
+	for entries := range results {
+		count += len(entries)
+		for _, entry := range entries {
+			if entry.SourceMessageID != "pending" || entry.Admission != "admitted" {
+				t.Fatalf("unsafe reservation: %#v", entry)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("concurrent reservations recovered %d requests; want one", count)
+	}
+	appendEntry(Entry{At: now, RecoveryBaseline: true})
+	snapshot, err = store.RecoveryWindow("cli", "long", cutoff, 2000)
+	if err != nil || len(snapshot.Entries) != 0 {
+		t.Fatalf("baseline retained candidates: %#v, %v", snapshot, err)
+	}
+}
+
+func TestRecoveryWindowAndReservationFailClosed(t *testing.T) {
+	for _, kind := range []string{"corruption", "entries", "bytes", "oversized_old_entry"} {
+		t.Run(kind, func(t *testing.T) {
+			store := New(t.TempDir())
+			now := time.Now().UTC()
+			path, err := store.Append("cli", "bounded", Entry{At: now, AcceptedAt: now, Role: "user", SourceMessageID: "pending", Content: "request"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := ErrRecoveryEntryBound
+			switch kind {
+			case "corruption", "oversized_old_entry":
+				file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				data := "{invalid}\n"
+				want = ErrRecoveryCorrupt
+				if kind == "oversized_old_entry" {
+					data = strings.Repeat("x", maxHistoryEntryBytes+1) + "\n"
+					want = ErrRecoveryByteBound
+				}
+				_, err = file.WriteString(data)
+				closeErr := file.Close()
+				if err != nil || closeErr != nil {
+					t.Fatalf("write fixture: %v, %v", err, closeErr)
+				}
+			case "entries":
+				for i := 0; i < 4; i++ {
+					if _, err := store.Append("cli", "bounded", Entry{At: now, Role: "assistant"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "bytes":
+				want = ErrRecoveryByteBound
+				for i := 0; i < 3; i++ {
+					if _, err := store.Append("cli", "bounded", Entry{At: now, Role: "assistant", Content: strings.Repeat("x", 3*1024*1024)}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := store.RecoveryWindow("cli", "bounded", now.Add(-24*time.Hour), 4)
+			if !errors.Is(err, want) || len(snapshot.Entries) != 0 {
+				t.Fatalf("unsafe partial snapshot: %#v, %v; want %v", snapshot, err, want)
+			}
+			entries, err := store.ReserveRetrigger("cli", "bounded", []string{"pending"}, now.Add(-time.Hour), now.Add(-24*time.Hour), 4)
+			if !errors.Is(err, want) || len(entries) != 0 {
+				t.Fatalf("unsafe partial reservation: %#v, %v", entries, err)
+			}
+			after, err := os.Stat(path)
+			if err != nil || before.Size() != after.Size() {
+				t.Fatal("failed reservation modified history")
+			}
+		})
+	}
+}
 
 func TestHistoriesAreIndependentAndBounded(t *testing.T) {
 	store := New(t.TempDir())

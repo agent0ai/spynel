@@ -183,61 +183,25 @@ func (s *Store) appendLocked(channel, conversation string, entry Entry) (string,
 func (s *Store) ReserveRetrigger(channel, conversation string, requested []string, activation, cutoff time.Time, max int) ([]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	path := s.Path(channel, conversation)
-	file, err := os.Open(path)
+	snapshot, err := s.recoveryWindowLocked(channel, conversation, cutoff, max)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 	wanted := map[string]bool{}
 	for _, id := range requested {
 		if id != "" {
 			wanted[id] = true
 		}
 	}
-	covered := map[string]bool{}
-	admitted := map[string]bool{}
 	users := map[string]Entry{}
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
-	count := 0
-	for scanner.Scan() {
-		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
-			continue
-		}
-		count++
-		if max > 0 && count > max {
-			return nil, fmt.Errorf("conversation history exceeds recovery bound of %d entries", max)
-		}
-		var entry Entry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			return nil, errors.New("conversation history contains corrupt correlation data")
-		}
-		if entry.RecoveryBaseline {
-			covered = map[string]bool{}
-			admitted = map[string]bool{}
-			users = map[string]Entry{}
-			continue
-		}
-		for _, id := range entry.Covers {
-			covered[id] = true
-		}
-		for _, id := range entry.RetriggerOf {
-			covered[id] = true
-		}
-		if wanted[entry.SourceMessageID] && entry.Admission != "" {
-			admitted[entry.SourceMessageID] = true
-		}
-		if entry.Role == "user" && wanted[entry.SourceMessageID] && !entry.AcceptedAt.IsZero() && !entry.AcceptedAt.Before(activation) && !entry.At.Before(cutoff) {
+	for _, entry := range snapshot.Entries {
+		if wanted[entry.SourceMessageID] && !entry.AcceptedAt.IsZero() && !entry.AcceptedAt.Before(activation) {
 			users[entry.SourceMessageID] = entry
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
 	ids := make([]string, 0, len(users))
 	for id := range users {
-		if !covered[id] {
+		if snapshot.Covered[id] == "" {
 			ids = append(ids, id)
 		}
 	}
@@ -251,7 +215,7 @@ func (s *Store) ReserveRetrigger(channel, conversation string, requested []strin
 	result := make([]Entry, 0, len(ids))
 	for _, id := range ids {
 		entry := users[id]
-		if admitted[id] {
+		if snapshot.Admitted[id] {
 			entry.Admission = "admitted"
 		}
 		result = append(result, entry)
@@ -708,50 +672,128 @@ func (s *Store) RecoveryEntries(channel, conversation string, max int) ([]Entry,
 	return entries, path, nil
 }
 
-// RecoveryTail strictly validates a bounded file prefix while retaining only
-// the newest tailMax entries. It never treats omitted overflow as handled.
-func (s *Store) RecoveryTail(channel, conversation string, tailMax, scanMax int) ([]Entry, bool, string, error) {
+var (
+	ErrRecoveryEntryBound = errors.New("recovery recent-window entry bound exceeded")
+	ErrRecoveryByteBound  = errors.New("recovery recent-window byte bound exceeded")
+	ErrRecoveryCorrupt    = errors.New("conversation history contains corrupt correlation data")
+)
+
+const maxRecoveryWindowBytes = 8 * 1024 * 1024
+
+// RecoverySnapshot retains recent user bodies and only their exact correlation.
+// Records counts all recent records, including replies and private ledger facts.
+type RecoverySnapshot struct {
+	Entries  []Entry
+	Covered  map[string]string
+	Admitted map[string]bool
+	Records  int
+}
+
+// RecoveryWindow strictly streams all retained history. Old bodies do not count
+// against the recent-window bounds, but corruption anywhere still fails closed.
+func (s *Store) RecoveryWindow(channel, conversation string, cutoff time.Time, max int) (RecoverySnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	path := s.Path(channel, conversation)
-	file, err := os.Open(path)
+	return s.recoveryWindowLocked(channel, conversation, cutoff, max)
+}
+
+func (s *Store) recoveryWindowLocked(channel, conversation string, cutoff time.Time, max int) (RecoverySnapshot, error) {
+	result := RecoverySnapshot{Covered: map[string]string{}, Admitted: map[string]bool{}}
+	file, err := os.Open(s.Path(channel, conversation))
 	if os.IsNotExist(err) {
-		return nil, false, path, nil
+		return result, nil
 	}
 	if err != nil {
-		return nil, false, path, err
+		return RecoverySnapshot{}, err
 	}
 	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
-	entries := make([]Entry, 0, min(tailMax, 128))
-	count := 0
-	for scanner.Scan() {
-		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
-			continue
+	// Two passes keep correlation exact even with out-of-order timestamps while
+	// retaining no lifetime-sized source index or old message bodies.
+	scan := func(visit func(Entry, int) error) error {
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, historyReadChunk), maxHistoryEntryBytes)
+		for scanner.Scan() {
+			raw := scanner.Bytes()
+			if len(bytes.TrimSpace(raw)) == 0 {
+				continue
+			}
+			var entry Entry
+			if json.Unmarshal(raw, &entry) != nil {
+				return ErrRecoveryCorrupt
+			}
+			if err := visit(entry, len(raw)); err != nil {
+				return err
+			}
 		}
-		count++
-		if scanMax > 0 && count > scanMax {
-			return nil, true, path, fmt.Errorf("conversation history exceeds recovery scan bound of %d entries", scanMax)
+		if err := scanner.Err(); err != nil {
+			if errors.Is(err, bufio.ErrTooLong) {
+				return ErrRecoveryByteBound
+			}
+			return err
 		}
-		var entry Entry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			return nil, false, path, errors.New("conversation history contains corrupt correlation data")
-		}
-		if tailMax <= 0 {
-			continue
-		}
-		if len(entries) == tailMax {
-			copy(entries, entries[1:])
-			entries[len(entries)-1] = entry
-		} else {
-			entries = append(entries, entry)
-		}
+		return nil
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, false, path, err
+	retainedBytes := 0
+	err = scan(func(entry Entry, size int) error {
+		if !entry.At.Before(cutoff) {
+			result.Records++
+			retainedBytes += size
+			if max <= 0 || result.Records > max {
+				return ErrRecoveryEntryBound
+			}
+			if retainedBytes > maxRecoveryWindowBytes {
+				return ErrRecoveryByteBound
+			}
+		}
+		if entry.RecoveryBaseline {
+			result.Entries = nil
+			return nil
+		}
+		if entry.Role == "user" && !entry.At.Before(cutoff) {
+			result.Entries = append(result.Entries, entry)
+		}
+		return nil
+	})
+	if err != nil {
+		return RecoverySnapshot{}, err
 	}
-	return entries, tailMax > 0 && count > tailMax, path, nil
+	wanted := map[string]bool{}
+	for _, entry := range result.Entries {
+		wanted[entry.SourceMessageID] = true
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return RecoverySnapshot{}, err
+	}
+	err = scan(func(entry Entry, _ int) error {
+		if entry.RecoveryBaseline {
+			clear(result.Covered)
+			clear(result.Admitted)
+		}
+		for _, id := range entry.Covers {
+			if wanted[id] {
+				reason := "terminal_coverage"
+				if entry.Outcome == "intentional_cancellation" {
+					reason = "intentional_cancellation"
+				}
+				result.Covered[id] = reason
+			}
+		}
+		for _, id := range entry.RetriggerOf {
+			if wanted[id] {
+				if result.Covered[id] == "" {
+					result.Covered[id] = "prior_reservation"
+				}
+			}
+		}
+		if wanted[entry.SourceMessageID] && entry.Admission != "" {
+			result.Admitted[entry.SourceMessageID] = true
+		}
+		return nil
+	})
+	if err != nil {
+		return RecoverySnapshot{}, err
+	}
+	return result, nil
 }
 
 // List discovers conversations from disk and reads only one bounded tail entry

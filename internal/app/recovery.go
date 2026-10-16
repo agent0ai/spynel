@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,7 +22,6 @@ const (
 	recoveryInterval        = 5 * time.Minute
 	recoveryWindow          = 24 * time.Hour
 	recoveryConversationMax = 100
-	recoveryEntryMax        = 2000
 	recoveryTotalEntryMax   = 2000
 	recoveryDispatchMax     = 20
 )
@@ -41,15 +41,17 @@ type recoveryReservation struct {
 // RecoveryStatus is a bounded content-free projection of the most recent
 // primary-owned scan.
 type RecoveryStatus struct {
-	ScannedAt     time.Time `json:"scanned_at,omitempty"`
-	Trigger       string    `json:"trigger,omitempty"`
-	Conversations int       `json:"conversations,omitempty"`
-	Entries       int       `json:"entries,omitempty"`
-	Eligible      int       `json:"eligible,omitempty"`
-	Dispatched    int       `json:"dispatched,omitempty"`
-	Excluded      int       `json:"excluded,omitempty"`
-	FailedClosed  int       `json:"failed_closed,omitempty"`
-	Truncated     bool      `json:"truncated,omitempty"`
+	ScannedAt     time.Time      `json:"scanned_at,omitempty"`
+	Trigger       string         `json:"trigger,omitempty"`
+	Conversations int            `json:"conversations,omitempty"`
+	Entries       int            `json:"entries,omitempty"`
+	Eligible      int            `json:"eligible,omitempty"`
+	Dispatched    int            `json:"dispatched,omitempty"`
+	Excluded      int            `json:"excluded,omitempty"`
+	FailedClosed  int            `json:"failed_closed,omitempty"`
+	Truncated     bool           `json:"truncated,omitempty"`
+	Reasons       map[string]int `json:"reasons,omitempty"`
+	diagnostics   int
 }
 
 func (s *Service) reserveRecoveryExecution(message core.Message) (recoveryReservation, string, error) {
@@ -266,65 +268,68 @@ func (s *Service) conversationInFlight(key string) bool {
 }
 
 func (s *Service) scanRecovery(ctx context.Context, trigger string) RecoveryStatus {
-	result := RecoveryStatus{ScannedAt: time.Now().UTC(), Trigger: trigger}
+	result := RecoveryStatus{ScannedAt: time.Now().UTC(), Trigger: trigger, Reasons: map[string]int{}}
 	if !s.Settings.Snapshot().Orchestrator.RetriggerUnrespondedMessages || s.primaryInstanceID() == "" {
 		return result
 	}
 	if owned, err := s.withRecoveryOwnership(func() error { return nil }); err != nil || !owned {
 		result.FailedClosed++
+		s.recoveryDecision(&result, 0, 0, "ownership_unavailable", 1)
 		s.publishRecoveryStatus(result)
 		return result
 	}
 	if s.recoveryActivationErr != nil || s.recoveryActivation.IsZero() {
 		result.FailedClosed++
+		s.recoveryDecision(&result, 0, 0, "activation_unavailable", 1)
 		s.publishRecoveryStatus(result)
 		return result
 	}
 	conversations, err := s.History.List(recoveryConversationMax + 1)
 	if err != nil {
 		result.FailedClosed++
+		s.recoveryDecision(&result, 0, 0, "conversation_list_unreadable", 1)
 		s.publishRecoveryStatus(result)
 		return result
 	}
 	if len(conversations) > recoveryConversationMax {
 		conversations = conversations[:recoveryConversationMax]
 		result.Truncated = true
+		s.recoveryDecision(&result, 0, 0, "conversation_limit", 1)
 	}
 	cutoff := result.ScannedAt.Add(-recoveryWindow)
 	durableSources, durableErr := s.durableRecoverySources()
 	if durableErr != nil {
 		result.FailedClosed++
+		s.recoveryDecision(&result, 0, 0, "source_index_unreadable", 1)
 		s.publishRecoveryStatus(result)
 		return result
 	}
-	for _, conversation := range conversations {
+	for slot, conversation := range conversations {
 		if ctx.Err() != nil || result.Dispatched >= recoveryDispatchMax || result.Entries >= recoveryTotalEntryMax {
 			result.Truncated = true
+			s.recoveryDecision(&result, slot+1, 0, "scan_budget_or_cancelled", 1)
 			break
 		}
 		if conversation.UpdatedAt.Before(cutoff) {
+			s.recoveryDecision(&result, slot+1, 0, "outside_window", 1)
 			continue
 		}
 		result.Conversations++
-		entries, tailTruncated, _, readErr := s.History.RecoveryTail(conversation.Channel, conversation.Conversation, recoveryEntryMax, recoveryTotalEntryMax)
-		if tailTruncated {
-			result.Truncated = true
-		}
+		snapshot, readErr := s.History.RecoveryWindow(conversation.Channel, conversation.Conversation, cutoff, recoveryTotalEntryMax-result.Entries)
 		if readErr != nil {
+			result.Truncated = result.Truncated || errors.Is(readErr, history.ErrRecoveryEntryBound) || errors.Is(readErr, history.ErrRecoveryByteBound)
 			result.FailedClosed++
+			s.recoveryDecision(&result, slot+1, 0, recoveryReadReason(readErr), 1)
 			continue
 		}
-		if tailTruncated {
-			result.FailedClosed++
-			continue
-		}
-		result.Entries += len(entries)
-		candidates := classifyRecoveryEntries(entries, s.recoveryActivation, cutoff, &result)
+		result.Entries += snapshot.Records
+		candidates := s.classifyRecoveryEntries(snapshot, s.recoveryActivation, cutoff, &result, slot+1)
 		if len(candidates) > 0 {
 			filtered := candidates[:0]
 			for _, candidate := range candidates {
 				if durableSources[candidate.entry.SourceMessageID] {
 					result.Excluded++
+					s.recoveryDecision(&result, slot+1, 0, "linked_work", 1)
 					continue
 				}
 				filtered = append(filtered, candidate)
@@ -335,15 +340,27 @@ func (s *Service) scanRecovery(ctx context.Context, trigger string) RecoveryStat
 			continue
 		}
 		origin := orchestrator.Origin{Channel: conversation.Channel, Conversation: conversation.Conversation}
-		if strings.Contains(conversation.Conversation, "-group-") || s.validateOrigin(origin) != nil || s.conversationInFlight(sessionKey(core.Message{Channel: conversation.Channel, Conversation: conversation.Conversation})) {
+		reason := ""
+		switch {
+		case strings.Contains(conversation.Conversation, "-group-"):
+			reason = "group"
+		case s.validateOrigin(origin) != nil:
+			reason = "unauthorized"
+		case s.conversationInFlight(sessionKey(core.Message{Channel: conversation.Channel, Conversation: conversation.Conversation})):
+			reason = "active_or_queued"
+		}
+		if reason != "" {
 			result.FailedClosed += len(candidates)
+			s.recoveryDecision(&result, slot+1, 0, reason, len(candidates))
 			continue
 		}
 		result.Eligible += len(candidates)
 		if s.dispatchRecovery(ctx, origin, candidates) {
 			result.Dispatched++
+			s.recoveryDecision(&result, slot+1, 0, "recovery_admitted", len(candidates))
 		} else {
 			result.FailedClosed++
+			s.recoveryDecision(&result, slot+1, 0, "dispatch_not_admitted", len(candidates))
 		}
 	}
 	s.publishRecoveryStatus(result)
@@ -393,43 +410,27 @@ func (s *Service) durableRecoverySources() (map[string]bool, error) {
 	return result, nil
 }
 
-func classifyRecoveryEntries(entries []history.Entry, activation, cutoff time.Time, status *RecoveryStatus) []recoveryCandidate {
-	baseline := 0
-	for index, entry := range entries {
-		if entry.RecoveryBaseline {
-			baseline = index + 1
-		}
-	}
-	entries = entries[baseline:]
-	covered := map[string]bool{}
-	admitted := map[string]bool{}
-	for _, entry := range entries {
-		for _, id := range entry.Covers {
-			covered[id] = true
-		}
-		for _, id := range entry.RetriggerOf {
-			covered[id] = true
-		}
-		if entry.SourceMessageID != "" && entry.Admission != "" {
-			admitted[entry.SourceMessageID] = true
-		}
-	}
+func (s *Service) classifyRecoveryEntries(snapshot history.RecoverySnapshot, activation, cutoff time.Time, status *RecoveryStatus, slot int) []recoveryCandidate {
 	var candidates []recoveryCandidate
-	for _, entry := range entries {
-		if entry.Role != "user" {
-			continue
-		}
+	for candidateSlot, entry := range snapshot.Entries {
 		// Forward activation is categorical: missing IDs and pre-activation
 		// history are legacy, not ambiguous candidates.
 		if entry.SourceMessageID == "" || entry.AcceptedAt.IsZero() || entry.AcceptedAt.Before(activation) || entry.At.Before(cutoff) {
 			status.Excluded++
+			s.recoveryDecision(status, slot, candidateSlot+1, "legacy_or_pre_activation", 1)
 			continue
 		}
-		if !eligibleRecoveryCommand(entry.Content) || covered[entry.SourceMessageID] {
+		if !eligibleRecoveryCommand(entry.Content) {
 			status.Excluded++
+			s.recoveryDecision(status, slot, candidateSlot+1, "command_ineligible", 1)
 			continue
 		}
-		candidates = append(candidates, recoveryCandidate{entry: entry, admitted: admitted[entry.SourceMessageID]})
+		if reason := snapshot.Covered[entry.SourceMessageID]; reason != "" {
+			status.Excluded++
+			s.recoveryDecision(status, slot, candidateSlot+1, reason, 1)
+			continue
+		}
+		candidates = append(candidates, recoveryCandidate{entry: entry, admitted: snapshot.Admitted[entry.SourceMessageID]})
 	}
 	return candidates
 }
@@ -449,14 +450,18 @@ func eligibleRecoveryCommand(text string) bool {
 }
 
 func (s *Service) dispatchRecovery(ctx context.Context, origin orchestrator.Origin, candidates []recoveryCandidate) bool {
-	if ctx.Err() != nil || s.primaryInstanceID() == "" || !s.Settings.Snapshot().Orchestrator.RetriggerUnrespondedMessages || s.conversationInFlight(sessionKey(core.Message{Channel: origin.Channel, Conversation: origin.Conversation})) {
+	skip := func(reason string) bool {
+		s.Runtime.LogEvent("info", "recovery", "dispatch_skipped", "Recovery dispatch skipped: reason="+reason)
 		return false
+	}
+	if ctx.Err() != nil || s.primaryInstanceID() == "" || !s.Settings.Snapshot().Orchestrator.RetriggerUnrespondedMessages || s.conversationInFlight(sessionKey(core.Message{Channel: origin.Channel, Conversation: origin.Conversation})) {
+		return skip("inactive_or_ownership_changed")
 	}
 	if origin.Channel == "telegram" || origin.Channel == "whatsapp" {
 		cfg := s.Settings.Snapshot()
 		enabled := origin.Channel == "telegram" && cfg.Channels.Telegram.Enabled || origin.Channel == "whatsapp" && cfg.Channels.WhatsApp.Enabled
 		if !enabled || s.connectionStatus(origin.Channel).State != channel.ConnectionConnected || s.conversationDelivery() == nil {
-			return false
+			return skip("transport_unavailable")
 		}
 	}
 	ids := make([]string, 0, len(candidates))
@@ -512,10 +517,17 @@ func (s *Service) dispatchRecovery(ctx context.Context, origin orchestrator.Orig
 		dispatchErr = s.dispatchHarnessPrompt(ctx, message, base+"\n\n---\n\n"+prompt, s.recoveryEmitter(origin))
 		return nil
 	})
-	if err != nil || !owned || len(reserved) == 0 {
-		return false
+	if err != nil {
+		return skip(recoveryReadReason(err))
+	}
+	if !owned {
+		return skip("ownership_lost")
+	}
+	if len(reserved) == 0 {
+		return skip("reservation_suppressed")
 	}
 	if dispatchErr != nil {
+		s.Runtime.LogEvent("error", "recovery", "dispatch_failed", "Recovery provider admission failed")
 		s.recoveryFailure(origin, dispatchErr)
 	}
 	return true
@@ -579,15 +591,40 @@ func (s *Service) recoveryFailure(origin orchestrator.Origin, _ error) {
 	}
 }
 
+func recoveryReadReason(err error) string {
+	switch {
+	case errors.Is(err, history.ErrRecoveryEntryBound):
+		return "recent_entry_limit"
+	case errors.Is(err, history.ErrRecoveryByteBound):
+		return "history_entry_size_or_recent_byte_limit"
+	case errors.Is(err, history.ErrRecoveryCorrupt):
+		return "corrupt_history"
+	default:
+		return "history_or_reservation_unreadable"
+	}
+}
+
+func (s *Service) recoveryDecision(status *RecoveryStatus, conversationSlot, candidateSlot int, reason string, count int) {
+	status.Reasons[reason] += count
+	// Slots are local to this scan; no recipient, source ID, or body is logged.
+	if status.diagnostics < 100 {
+		s.Runtime.LogEvent("info", "recovery", "decision", fmt.Sprintf("scan=%s conversation_slot=%d candidate_slot=%d reason=%s count=%d", status.ScannedAt.Format(time.RFC3339Nano), conversationSlot, candidateSlot, reason, count))
+		status.diagnostics++
+	}
+}
+
 func (s *Service) publishRecoveryStatus(status RecoveryStatus) {
 	s.recoveryMu.Lock()
 	s.recoveryStatus = status
+	s.recoveryStatus.Reasons = maps.Clone(status.Reasons)
 	s.recoveryMu.Unlock()
-	s.Runtime.LogEvent("info", "recovery", "scan_completed", fmt.Sprintf("Conversation recovery scan completed: conversations=%d entries=%d eligible=%d dispatched=%d excluded=%d failed_closed=%d truncated=%t", status.Conversations, status.Entries, status.Eligible, status.Dispatched, status.Excluded, status.FailedClosed, status.Truncated))
+	s.Runtime.LogEvent("info", "recovery", "scan_completed", fmt.Sprintf("Conversation recovery scan completed: conversations=%d entries=%d eligible=%d dispatched=%d excluded=%d failed_closed=%d truncated=%t", status.Conversations, status.Entries, status.Eligible, status.Dispatched, status.Excluded, status.FailedClosed, status.Truncated)+fmt.Sprintf(" reasons=%v", status.Reasons))
 }
 
 func (s *Service) RecoveryStatus() RecoveryStatus {
 	s.recoveryMu.Lock()
 	defer s.recoveryMu.Unlock()
-	return s.recoveryStatus
+	status := s.recoveryStatus
+	status.Reasons = maps.Clone(status.Reasons)
+	return status
 }
