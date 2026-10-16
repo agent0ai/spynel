@@ -20,6 +20,26 @@ func TestCatalogKeepsLeadingHarnessChoicesInProductOrder(t *testing.T) {
 	}
 }
 
+func TestOhMyPiDefinitionFollowsPi(t *testing.T) {
+	names := Names()
+	piIndex, ompIndex := -1, -1
+	for index, name := range names {
+		switch name {
+		case "pi":
+			piIndex = index
+		case "oh-my-pi":
+			ompIndex = index
+		}
+	}
+	if piIndex < 0 || ompIndex != piIndex+1 {
+		t.Fatalf("catalog order around Pi = %d, %d in %#v", piIndex, ompIndex, names)
+	}
+	definition, ok := Lookup("oh-my-pi")
+	if !ok || definition.DisplayName != "Oh My Pi" || definition.Command != "omp" || !definition.SupportsEffort || definition.Custom || len(definition.Args) != 0 {
+		t.Fatalf("Oh My Pi definition = %#v, %t", definition, ok)
+	}
+}
+
 func TestEveryBuiltinHasExplicitInferenceCapabilityClassification(t *testing.T) {
 	for _, definition := range Catalog() {
 		reasoning, service := StaticCapabilities(definition.Name)
