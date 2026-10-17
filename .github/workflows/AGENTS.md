@@ -24,6 +24,8 @@
 
 - All four native jobs run test-native-supervisor.py on the packaged candidate before retaining evidence or publishing; combined supervision/privacy acceptance and exact-commit nonpublishing native gates precede public release actions.
 
+- All four native jobs also run `test-affected-upgrade.py` with checksum-verified published 0.13.3 host bytes and the pinned authentic npm package. Retain bounded synthetic JSONL as separate `spynel-upgrade-<os>-<arch>` artifacts; old preflight refusal, real npm failed-download rollback, drained work and candidate-owned ready restart must pass with the deliberate zombie unreaped. Local Linux evidence never substitutes for matching macOS execution.
+
 ## Child DOX Index
 
 No child DOX files.

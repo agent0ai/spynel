@@ -81,6 +81,18 @@ After replacement, the launcher hands off to the newly installed JavaScript and 
 
 Confirm the expected primary is available with `/status`, then request `/update`. Even when already current it should restart through fresh native registrations without the launcher refusal. `/update check` only compares versions and does not verify restart readiness. The affected host's actual launch method, account, npm prefix and service identity must be established locally before selecting these commands.
 
+### Registered zombies blocking an older npm updater
+
+The fixed process inspector distinguishes confirmed dead/zombie processes from live targets on Linux and macOS. Permission errors or unknown state remain conservative; a live registration with unverifiable executable identity still blocks updates. Registry files and workspace leases must remain intact.
+
+An already running 0.13.3 updater cannot acquire this correction before it installs the new package: its preflight can refuse an unreaped registered zombie even though `kill(pid, 0)` succeeds. Repeating that old `/update` cannot bootstrap the fix. Once a release containing the correction has passed its release gates, use the ordinary external npm installation followed by a fresh updater, under the same account and configuration home:
+
+1. Establish the intended npm prefix, launcher protocol and service ownership. Arrange a quiet intake window and allow active jobs to reach their normal terminal boundary before replacement/restart. This procedure does not automatically wait for active work or guarantee completion of arbitrary external effects.
+2. Install the **complete released package** with `npm install --global --prefix <verified-prefix> spynel@<fixed-version>`. This uses npm and the checksum-verified native installer; do not replace individual vendor files. Resolve any installation failure and verify the installed command before proceeding. The native regression covers npm rollback after a failed archive download; it is not a guarantee for every npm version, filesystem or interrupted transaction.
+3. Run `<verified-prefix>/bin/spynel update` from a fresh shell command using the newly installed launcher. The candidate's preflight and all-instance coordination now own liveness. With the already-current version it skips package replacement, keeps stable supervisor PIDs and requires new ready executor generations. Verify the serving version with `/status`, as well as the installed version. Leave registered zombies for their actual parent to reap; upgrade must not depend on removing their records or signaling that parent.
+
+This bridge applies to the verified protocol-2 0.13.3 launcher. An older protocol-1 wrapper still requires the separate stop/relaunch recovery above. Source tests or an unpublished local candidate do not establish that a fixed release is available or that a production installation has been activated.
+
 ## Run from a development checkout
 
 The development helper can download a pinned Go toolchain into the ignored, disposable repository-level `.tmp-toolchains/` directory when Go is unavailable:

@@ -38,6 +38,8 @@ type ProcessRegistration struct {
 	ExecutorPID          int    `json:"executor_pid,omitempty"`
 	ExecutorGeneration   string `json:"executor_generation,omitempty"`
 	Stopping             bool   `json:"stopping,omitempty"`
+	StartTime            string `json:"start_time,omitempty"`
+	start                string
 }
 
 func processDirectory() (string, error) {
@@ -91,8 +93,16 @@ func (m *Manager) registerProcess(role ProcessRegistration) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	alive, start, err := inspectProcess(os.Getpid())
+	if err != nil {
+		return nil, err
+	}
+	if !alive || start == "" {
+		return nil, errors.New("cannot verify own process start time")
+	}
 	record := role
 	record.PID, record.Generation, record.Executable = os.Getpid(), hex.EncodeToString(nonce[:]), executable
+	record.StartTime = start
 	record.Installation, record.Version = m.InstallationRoot(), m.CurrentVersion
 	record.CoordinatedUpdates = m.PackageRoot == "" || m.CoordinatedUpdates
 	path := filepath.Join(directory, strconv.Itoa(record.PID)+".json")
@@ -199,6 +209,10 @@ func collectProcessRecords(ids []int) ([]ProcessRegistration, error) {
 		if pid <= 1 || pid == os.Getpid() {
 			continue
 		}
+		alive, start, stateErr := inspectProcess(pid)
+		if stateErr == nil && !alive || stateErr != nil && !processAlive(pid) {
+			continue
+		}
 		path, err := installationProcessPath(pid)
 		if err != nil {
 			if _, recordErr := readProcess(filepath.Join(directory, strconv.Itoa(pid)+".json")); recordErr == nil && processAlive(pid) {
@@ -207,12 +221,16 @@ func collectProcessRecords(ids []int) ([]ProcessRegistration, error) {
 			continue
 		}
 		record, err := readProcess(filepath.Join(directory, strconv.Itoa(pid)+".json"))
-		if err == nil && processMatches(record, path) {
+		if err == nil && processMatches(record, path) && (record.StartTime == "" || record.StartTime == start) {
 			info, err := buildinfo.ReadFile(processImagePath(pid, path))
 			if err != nil {
 				info, err = buildinfo.ReadFile(record.Executable)
 			}
 			if err == nil && info.Path == own.Path {
+				if stateErr != nil {
+					return nil, fmt.Errorf("cannot verify start time of registered Spynel process %d: %w", pid, stateErr)
+				}
+				record.start = start
 				records = append(records, record)
 				continue
 			}
@@ -230,7 +248,10 @@ func collectProcessRecords(ids []int) ([]ProcessRegistration, error) {
 			if !validNPMRoot(root, "") {
 				root = ""
 			}
-			records = append(records, ProcessRegistration{PID: pid, Executable: executable, Installation: root})
+			if stateErr != nil {
+				return nil, fmt.Errorf("cannot verify start time of Spynel process %d: %w", pid, stateErr)
+			}
+			records = append(records, ProcessRegistration{PID: pid, Executable: executable, Installation: root, start: start})
 		}
 	}
 	return records, nil
@@ -305,7 +326,8 @@ func (m *Manager) RestartInstances(ctx context.Context, version string) (int, er
 			before := pending[index]
 			after, err := readProcess(filepath.Join(directory, strconv.Itoa(before.PID)+".json"))
 			path, pathErr := installationProcessPath(before.PID)
-			if err == nil && pathErr == nil && after.Ready && processMatches(after, path) && after.Installation == before.Installation && after.Generation != before.Generation && after.Version == version && (!before.Supervisor || verifiedExecutor(after, version)) {
+			alive, start, stateErr := inspectProcess(before.PID)
+			if err == nil && pathErr == nil && stateErr == nil && alive && start == before.start && (after.StartTime == "" || after.StartTime == start) && after.Ready && processMatches(after, path) && after.Installation == before.Installation && after.Generation != before.Generation && after.Version == version && (!before.Supervisor || verifiedExecutor(after, version)) {
 				pending = append(pending[:index], pending[index+1:]...)
 			}
 		}
@@ -335,6 +357,16 @@ func signalRegisteredProcess(record ProcessRegistration, signal os.Signal) error
 	}
 	if !processMatches(record, path) {
 		return errors.New("Spynel process identity changed before signal delivery")
+	}
+	alive, start, err := inspectProcess(record.PID)
+	if err != nil {
+		return err
+	}
+	if !alive {
+		return syscall.ESRCH
+	}
+	if record.start != "" && record.start != start || record.StartTime != "" && record.StartTime != start {
+		return errors.New("Spynel process start time changed before signal delivery")
 	}
 	if record.Generation != "" {
 		current, err := ProcessRecord(record.PID)
@@ -404,14 +436,20 @@ func stopProcessRecords(ctx context.Context, records []ProcessRegistration) erro
 	deadline := killAt.Add(5 * time.Second)
 	for _, record := range records {
 		for {
+			if !processAlive(record.PID) {
+				break
+			}
 			path, err := installationProcessPath(record.PID)
-			if err != nil || !processMatches(record, path) {
+			if err == nil && !processMatches(record, path) {
 				break
 			}
 			if time.Now().After(deadline) {
+				if err != nil {
+					return fmt.Errorf("cannot verify stopping Spynel process %d: %w", record.PID, err)
+				}
 				return fmt.Errorf("Spynel process %d did not stop", record.PID)
 			}
-			if time.Now().After(killAt) && (!record.Supervisor || time.Now().After(killAt.Add(2*time.Second))) {
+			if err == nil && time.Now().After(killAt) && (!record.Supervisor || time.Now().After(killAt.Add(2*time.Second))) {
 				if err := signalRegisteredProcess(record, os.Kill); !processGone(err) {
 					return err
 				}

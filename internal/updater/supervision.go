@@ -96,7 +96,8 @@ func RetireExecutor(pid int) error {
 func relatedProcesses(parent, child ProcessRegistration) bool {
 	pid, err := processParentID(child.PID)
 	path, pathErr := installationProcessPath(child.PID)
-	return err == nil && pid == parent.PID && pathErr == nil && processMatches(child, path) && child.Installation == parent.Installation
+	alive, start, stateErr := inspectProcess(child.PID)
+	return err == nil && pid == parent.PID && pathErr == nil && stateErr == nil && alive && (child.StartTime == "" || child.StartTime == start) && processMatches(child, path) && child.Installation == parent.Installation
 }
 
 func sameProcessImage(first, second int) bool {

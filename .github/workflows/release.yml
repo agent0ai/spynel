@@ -127,6 +127,22 @@ jobs:
           TARGET_ARCH: ${{ matrix.arch }}
         run: python3 scripts/test-native-supervisor.py "release/spynel_${RELEASE_TAG#v}_${TARGET_OS}_${TARGET_ARCH}.tar.gz"
 
+      - name: Verify authentic affected-version upgrade
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
+          TARGET_OS: ${{ matrix.os }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p .tmp-artifacts/affected-prior evidence
+          archive="spynel_0.13.3_${TARGET_OS}_${TARGET_ARCH}.tar.gz"
+          curl -LfS --retry 3 -o ".tmp-artifacts/affected-prior/$archive" "https://github.com/agent0ai/spynel/releases/download/v0.13.3/$archive"
+          curl -LfS --retry 3 -o .tmp-artifacts/affected-prior/checksums.txt https://github.com/agent0ai/spynel/releases/download/v0.13.3/checksums.txt
+          (cd .tmp-artifacts/affected-prior && grep "  $archive$" checksums.txt | shasum -a 256 -c -)
+          curl -LfS --retry 3 -o .tmp-artifacts/affected-prior/spynel-0.13.3.tgz https://registry.npmjs.org/spynel/-/spynel-0.13.3.tgz
+          (cd .tmp-artifacts/affected-prior && printf '%s  %s\n' c45bb8e1670a2d9f76dbfa1572da4cc230cb54561be53fa96f9ee4aaeac2674b spynel-0.13.3.tgz | shasum -a 256 -c -)
+          python3 scripts/test-affected-upgrade.py .tmp-artifacts/affected-prior/spynel-0.13.3.tgz ".tmp-artifacts/affected-prior/$archive" "release/spynel_${RELEASE_TAG#v}_${TARGET_OS}_${TARGET_ARCH}.tar.gz" | tee "evidence/affected-upgrade-${TARGET_OS}-${TARGET_ARCH}.jsonl"
+
       - name: Run native harness contract and packaged-archive smoke
         shell: bash
         env:
@@ -145,6 +161,13 @@ jobs:
         with:
           name: spynel-evidence-${{ matrix.os }}-${{ matrix.arch }}
           path: evidence/native-${{ matrix.os }}-${{ matrix.arch }}.json
+          if-no-files-found: error
+
+      - name: Retain affected-version upgrade evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: spynel-upgrade-${{ matrix.os }}-${{ matrix.arch }}
+          path: evidence/affected-upgrade-${{ matrix.os }}-${{ matrix.arch }}.jsonl
           if-no-files-found: error
 
   publish:

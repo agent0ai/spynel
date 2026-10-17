@@ -312,9 +312,26 @@ func TestRestartRequiresApplicationReadiness(t *testing.T) {
 	t.Setenv("SPYNEL_TEST_NOT_READY", "1")
 	root := t.TempDir()
 	process := lifecycleFixture(t, root)
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	if _, err := (&Manager{InstallRoot: root}).RestartInstances(ctx, "2.0.0"); !errors.Is(err, context.DeadlineExceeded) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	observed := make(chan struct{})
+	defer func() { cancel(); <-observed }()
+	go func() {
+		defer close(observed)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if record, err := ProcessRecord(process.Process.Pid); err == nil && record.Version == "2.0.0" {
+				cancel()
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	if _, err := (&Manager{InstallRoot: root}).RestartInstances(ctx, "2.0.0"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("restart claimed readiness: %v", err)
 	}
 	records, err := processRecords([]int{process.Process.Pid})
@@ -411,5 +428,114 @@ func TestCancelledCoordinatorPreservesPeerGeneration(t *testing.T) {
 	after, err := ProcessRecord(peer.Process.Pid)
 	if err != nil || after.Generation != before.Generation {
 		t.Fatal("cancelled coordinator signalled the peer")
+	}
+}
+
+func TestZombieRegistrationDoesNotBlockUpdates(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	peer := lifecycleFixture(t, root)
+	zombie := lifecycleFixture(t, root)
+	if err := zombie.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for processAlive(zombie.Process.Pid) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := zombie.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("child was reaped before assertion: %v", err)
+	}
+	if processAlive(zombie.Process.Pid) {
+		t.Fatal("unreaped zombie classified live")
+	}
+	if _, err := ProcessRecord(zombie.Process.Pid); err != nil {
+		t.Fatalf("lost retained registration: %v", err)
+	}
+	manager := &Manager{InstallRoot: root, CurrentVersion: "1.0.0"}
+	if err := manager.CheckRestartable(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if count, err := manager.RestartInstances(ctx, "2.0.0"); err != nil || count != 1 {
+		t.Fatalf("restart with zombie = %d, %v", count, err)
+	}
+	if records, err := processRecords([]int{peer.Process.Pid, zombie.Process.Pid}); err != nil || len(records) != 1 {
+		t.Fatalf("discovery = %v, %v", records, err)
+	}
+	if err := zombie.Wait(); err == nil {
+		t.Fatal("killed child unexpectedly succeeded")
+	}
+	if processAlive(zombie.Process.Pid) {
+		t.Fatal("reaped process classified live")
+	}
+	t.Log("real unreaped zombie and exited child excluded; live peer restarted with readiness and new generation")
+}
+
+func TestProcessInspectionFailuresAreConservative(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		alive             bool
+		inspection, probe error
+		want              bool
+	}{
+		{"live", true, nil, nil, true},
+		{"zombie", false, nil, nil, false},
+		{"exited", false, os.ErrNotExist, syscall.ESRCH, false},
+		{"permission", false, os.ErrPermission, syscall.EPERM, true},
+		{"unreadable", false, errors.New("unreadable state"), nil, true},
+		{"unknown", false, errors.New("unknown state"), errors.New("unknown probe"), true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := processMayBeAlive(test.alive, test.inspection, test.probe); got != test.want {
+				t.Fatalf("may be alive = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestReusedPIDStartTimeRejectsSignal(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	fixture := lifecycleFixture(t, t.TempDir())
+	records, err := processRecords([]int{fixture.Process.Pid})
+	if err != nil || len(records) != 1 || records[0].start == "" {
+		t.Fatalf("missing kernel identity: %v, %v", records, err)
+	}
+	record := records[0]
+	record.start += "-previous-process"
+	if err := signalRegisteredProcess(record, terminationSignal()); err == nil || !strings.Contains(err.Error(), "start time changed") {
+		t.Fatalf("reused PID accepted: %v", err)
+	}
+	if err := fixture.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatal("replacement process stopped")
+	}
+}
+
+func TestStaleRegistrationStartTimeIsNotAdopted(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	root := t.TempDir()
+	fixture := lifecycleFixture(t, root)
+	record, err := ProcessRecord(fixture.Process.Pid)
+	if err != nil || record.StartTime == "" {
+		t.Fatalf("missing registered start identity: %v, %v", record, err)
+	}
+	record.StartTime += "-previous-process"
+	data, _ := json.Marshal(record)
+	directory, _ := processDirectory()
+	if err := os.WriteFile(filepath.Join(directory, strconv.Itoa(record.PID)+".json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Manager{InstallRoot: root}).CheckRestartable(); err == nil {
+		t.Fatal("reused PID adopted a stale registration")
+	}
+	if err := signalRegisteredProcess(record, terminationSignal()); err == nil || !strings.Contains(err.Error(), "start time changed") {
+		t.Fatalf("stale registration signalled: %v", err)
+	}
+	if err := fixture.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatal("replacement process stopped")
 	}
 }
