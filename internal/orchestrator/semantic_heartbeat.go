@@ -159,16 +159,21 @@ func (m *Manager) runSemanticHeartbeat(ctx context.Context) {
 	}
 	configure()
 	startAudit := func() bool {
-		if auditActive || m.semanticHeartbeatProviderInFlight() || !termActive || !m.orchestratorEnabled.Load() || m.heartbeatMinutes.Load() <= 0 {
+		if auditActive || !termActive || !m.orchestratorEnabled.Load() || m.heartbeatMinutes.Load() <= 0 {
 			return false
 		}
 		m.heartbeatCommit.Lock()
 		defer m.heartbeatCommit.Unlock()
-		if m.heartbeatTerm != term || auditActive || m.semanticHeartbeatProviderInFlight() || !m.orchestratorEnabled.Load() || m.heartbeatMinutes.Load() <= 0 {
+		if m.heartbeatTerm != term || auditActive || !m.orchestratorEnabled.Load() || m.heartbeatMinutes.Load() <= 0 {
 			return false
 		}
 		stopTimer()
 		m.setSemanticHeartbeatScheduleForTerm(true, time.Time{}, term)
+		if m.semanticHeartbeatProviderInFlight() {
+			// A consumed tick must still recover after retained work or unknown connectivity.
+			waitForProvider()
+			return false
+		}
 		auditActive = true
 		m.jobs.Add(1)
 		go func(runCtx context.Context, runTerm uint64) {

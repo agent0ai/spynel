@@ -397,3 +397,98 @@ func TestWorkerAgentNotificationAttachmentKeepsIndependentIdentity(t *testing.T)
 	}
 	waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 0 && len(f.service.Runtime.Jobs()) == 0 })
 }
+
+func TestWorkerAgentHeartbeatRecoversAfterScheduledInspectionOutage(t *testing.T) {
+	f := newWorkerAgentFixture(t)
+	identity := f.client.Info()
+	// Keep this isolated owner fresh through the real one-minute timer.
+	renewCtx, renewCancel := context.WithCancel(t.Context())
+	renewDone := make(chan struct{})
+	renewErrors := make(chan error, 1)
+	go func() {
+		defer close(renewDone)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewCtx.Done():
+				return
+			case <-ticker.C:
+				if _, ok, err := f.owner.Renew(f.term); err != nil || !ok {
+					if err == nil {
+						err = errors.New("isolated renewal lost ownership")
+					}
+					select {
+					case renewErrors <- err:
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+	t.Cleanup(func() { renewCancel(); <-renewDone })
+	f.start(t)
+	waitWorkerAgent(t, func() bool { return !f.service.Orchestrator.WorkStatus().NextHeartbeatAt.IsZero() })
+	selected := f.service.Orchestrator.WorkStatus().NextHeartbeatAt
+	socket := identity.Socket
+	hidden := socket + ".scheduled-outage"
+	if err := os.Rename(socket, hidden); err != nil {
+		t.Fatal(err)
+	}
+	f.client.Close()
+	var restoreOnce sync.Once
+	restore := func() {
+		restoreOnce.Do(func() {
+			if err := os.Rename(hidden, socket); err != nil {
+				t.Error(err)
+			}
+			f.client.Close()
+		})
+	}
+	t.Cleanup(restore)
+	t.Logf("natural scheduled heartbeat deadline=%s; native worker pid=%d start=%s", selected.Format(time.RFC3339Nano), identity.PID, identity.Process.StartTime)
+	if _, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "inspect"}); err == nil {
+		t.Fatal("endpoint outage was not injected")
+	}
+	select {
+	case <-t.Context().Done():
+		t.Fatal(t.Context().Err())
+	case err := <-renewErrors:
+		t.Fatal("isolated election renewal failed", err)
+	case <-time.After(time.Until(selected.Add(1500 * time.Millisecond))):
+	}
+	restore()
+	current := f.inspect(t)
+	if len(current) != 0 {
+		t.Fatal("outage unexpectedly admitted a heartbeat")
+	}
+	if err := updater.VerifyProcess(identity.Process); err != nil {
+		t.Fatal("worker identity changed", err)
+	}
+	restoredAt := time.Now()
+	waitWorkerAgent(t, func() bool {
+		return f.service.Orchestrator.WorkStatus().NextHeartbeatAt.After(selected)
+	})
+	select {
+	case err := <-renewErrors:
+		t.Fatal("isolated election renewal failed", err)
+	default:
+	}
+	after := f.service.Orchestrator.WorkStatus()
+	if !after.NextHeartbeatAt.After(selected) || after.NextHeartbeatAt.Before(restoredAt.Add(time.Minute-time.Second)) || len(f.inspect(t)) != 0 {
+		t.Fatalf("natural heartbeat timer never recovered after authenticated endpoint restoration: deadline before=%s after=%s state=%s; no provider admission", selected.Format(time.RFC3339Nano), after.NextHeartbeatAt.Format(time.RFC3339Nano), after.HeartbeatState)
+	}
+	f.trigger(t, true)
+	waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 1 })
+	current = f.inspect(t)
+	if _, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "interrupt", Key: current[0].Key}); err != nil {
+		t.Fatal(err)
+	}
+	waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 0 && len(f.service.Runtime.Jobs()) == 0 })
+	data, err := os.ReadFile(f.log)
+	if err != nil || strings.Count(string(data), "turn/start\n") != 1 {
+		t.Fatal("recovery duplicated provider admission", err)
+	}
+	t.Logf("recovered fixed-delay deadline=%s; unchanged native generation=%s", after.NextHeartbeatAt.Format(time.RFC3339Nano), identity.Process.Generation)
+}
