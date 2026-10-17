@@ -55,6 +55,8 @@
 
 - Ordinary worker heartbeat/notification jobs use their independent admission WorkID and original start time for archive restoration; a referenced task file supplies no replacement task identity or parent linkage. The private Manager uses the same fallible archive delivery boundary as workflows. Normal production dispatch remains controller-owned.
 
+- Job message/ping/kill route through the orchestrator execution owner, including a privately bound surviving worker. Local harness controls retain their existing callbacks; worker controls validate the exact durable claim and reserve inside the worker. Preserve operator authorization, local acknowledgements, cancellation reservation and runtime cleanup behavior. This does not enable normal worker-backed conversation dispatch.
+
 ## Child DOX Index
 
 No child DOX files.

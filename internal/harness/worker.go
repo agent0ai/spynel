@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	WorkerProtocol      = 5
+	WorkerProtocol      = 6
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -72,6 +72,12 @@ type WorkerRequest struct {
 	Expected   uint64
 	Workflow   *WorkerWorkflow
 	Agent      *WorkerAgent
+	Control    *WorkerControl
+}
+
+type WorkerControl struct {
+	ID                 string
+	ContinuationPrompt string
 }
 
 // WorkerAgent retains an ordinary background turn, not a task transition or
@@ -103,7 +109,8 @@ type WorkerReservation struct {
 	ImplementationAttempts int
 }
 
-type WorkerReserve func(root, key string, work WorkerWorkflow) (WorkerReservation, error)
+// WorkerWorkflowAction runs inside the worker's exact-election fence.
+type WorkerWorkflowAction func(root, key string, work WorkerWorkflow, action string) (WorkerReservation, error)
 
 type WorkerEvent struct {
 	Cursor uint64
@@ -122,6 +129,7 @@ type WorkerExecution struct {
 	Workflow        *WorkerWorkflow
 	Reservation     *WorkerReservation
 	Agent           *WorkerAgent
+	Cancelled       bool
 }
 
 type WorkerSession struct {
@@ -137,6 +145,7 @@ type WorkerReply struct {
 	Events       []WorkerEvent
 	Interrupted  bool
 	Session      *WorkerSession
+	Control      *ControlResult
 }
 
 type workerExecution struct {
@@ -165,13 +174,13 @@ type workerHost struct {
 	executions map[uint64]*workerExecution
 	bytes      int64
 	failure    error
-	reserve    WorkerReserve
+	workflow   WorkerWorkflowAction
 }
 
 // RunWorker is a private same-binary entry point. Losing its bootstrap pipe,
 // HTTP clients or elected controller does not cancel its provider context.
 // Explicit shutdown, signal, journal failure or bounded detachment still do.
-func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *Registry, reserve WorkerReserve) (runErr error) {
+func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *Registry, workflow WorkerWorkflowAction) (runErr error) {
 	var bootstrap WorkerBootstrap
 	data, err := io.ReadAll(io.LimitReader(input, workerRequestBytes+1))
 	if err != nil || len(data) > workerRequestBytes {
@@ -261,7 +270,7 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	host = &workerHost{
 		supervisor: supervisor, election: election, info: info, token: bootstrap.Token, directory: directory,
 		stop: make(chan struct{}), lastSeen: time.Now(), next: 1, executions: map[uint64]*workerExecution{},
-		reserve: reserve,
+		workflow: workflow,
 	}
 	if err := publishWorkerRecord(recordPath, workerRecord{Info: info, Token: bootstrap.Token}); err != nil {
 		return err
@@ -370,6 +379,8 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 		return reply
 	case "send":
 		return h.send(request)
+	case "control":
+		return h.control(request)
 	case "events":
 		return h.events(request)
 	case "commit":
@@ -404,11 +415,7 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 		delete(h.executions, request.Sequence)
 		return WorkerReply{}
 	case "interrupt":
-		interrupted, err := h.supervisor.Interrupt(context.Background(), request.Key)
-		if err != nil {
-			return WorkerReply{Error: err.Error()}
-		}
-		return WorkerReply{Interrupted: interrupted}
+		return h.interrupt(request.Key)
 	case "session", "reset":
 		if request.Key == "" || len(request.Key) > 4096 {
 			return WorkerReply{Error: "invalid worker session key"}
@@ -504,10 +511,10 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 	h.mu.Unlock()
 	if request.Workflow != nil {
 		var reservation WorkerReservation
-		if h.reserve == nil {
+		if h.workflow == nil {
 			err = errors.New("worker workflow reservation unavailable")
 		} else {
-			reservation, err = h.reserve(h.supervisor.HarnessConfig().Cwd, request.Key, *request.Workflow)
+			reservation, err = h.workflow(h.supervisor.HarnessConfig().Cwd, request.Key, *request.Workflow, "reserve")
 		}
 		h.mu.Lock()
 		if err == nil {

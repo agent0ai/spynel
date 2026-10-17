@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
 )
 
@@ -60,6 +61,9 @@ func (m *Manager) attachWorkerWorkflows(ctx context.Context, executions []harnes
 		lease.WorkID, lease.OwnerID, lease.HeartbeatAt = work.WorkID, m.ownerID, time.Now().UTC()
 		if !execution.Done {
 			lease.State = "processing"
+		}
+		if execution.Cancelled {
+			lease.State = "cancelled"
 		}
 		if err := m.saveLease(lease); err != nil {
 			return err
@@ -128,8 +132,27 @@ func (m *Manager) runWorkerWorkflow(ctx context.Context, route workflowRoute, le
 			}
 			return
 		}
+		if current.Reservation != nil && (execution.Reservation == nil || *current.Reservation != *execution.Reservation) {
+			if err := m.Worker.RunOwned(ctx, func() error {
+				if m.JobTimingUpdated != nil {
+					m.JobTimingUpdated(jobID, current.Reservation.FirstAssignedAt, current.Reservation.ProviderIterations)
+				}
+				return nil
+			}); err != nil {
+				return
+			}
+			execution.Reservation = current.Reservation
+		}
 		if current.Done && current.CommittedCursor == current.LastCursor {
-			if current.Error != "" {
+			if current.Cancelled {
+				if err := m.Worker.RunOwned(ctx, func() error {
+					_, err := m.updateLease(lease, func(saved *Lease) { saved.State = "cancelled" })
+					return err
+				}); err != nil && !os.IsNotExist(err) {
+					return
+				}
+			}
+			if current.Error != "" && !current.Cancelled {
 				err := m.Worker.RunOwned(ctx, func() error {
 					saved, err := m.updateLease(lease, func(currentLease *Lease) {
 						currentLease.State, currentLease.LastError = "error", current.Error
@@ -150,7 +173,7 @@ func (m *Manager) runWorkerWorkflow(ctx context.Context, route workflowRoute, le
 				m.log("retire worker workflow: " + err.Error())
 				return
 			}
-			if current.Error != "" || !m.leaseExists(lease.ID) {
+			if current.Error != "" || current.Cancelled || !m.leaseExists(lease.ID) {
 				m.finishRuntimeJob(lease.ID)
 			}
 			return true
@@ -177,10 +200,13 @@ func (m *Manager) recordDispatchError(ctx context.Context, lease Lease, err erro
 	})
 }
 
-// ReserveWorkerTurn runs inside the worker's exact-election admission fence;
-// it must never reacquire election ownership or call the worker client.
-func ReserveWorkerTurn(root, key string, work harness.WorkerWorkflow) (harness.WorkerReservation, error) {
+// ApplyWorkerWorkflow runs under the worker's election fence and shares the
+// document lock for validation, continuation preparation and reservations.
+func ApplyWorkerWorkflow(root, key string, work harness.WorkerWorkflow, action string) (harness.WorkerReservation, error) {
 	var result harness.WorkerReservation
+	if action != "reserve" && action != "validate" && action != "continue" && action != "reserve-control" {
+		return result, errors.New("invalid worker workflow action")
+	}
 	path, leasePath, err := workerWorkflowPaths(root, key, work)
 	if err != nil {
 		return result, err
@@ -212,7 +238,7 @@ func ReserveWorkerTurn(root, key string, work harness.WorkerWorkflow) (harness.W
 	}
 	if lease.ID != work.LeaseID || lease.WorkID != "" && lease.WorkID != work.WorkID || lease.ClaimID != work.ClaimID || lease.OwnerID != work.OwnerID ||
 		lease.SessionKey != key || lease.File != path || lease.Route != work.Route || lease.Phase != work.Phase ||
-		lease.ClaimAttempt != work.ClaimAttempt || lease.State != "processing" && lease.State != "recovering" {
+		lease.ClaimAttempt != work.ClaimAttempt || lease.State != "processing" && lease.State != "recovering" && (action == "reserve" || lease.State != "awaiting_transition") {
 		return result, errors.New("worker workflow claim changed before admission")
 	}
 	document, err := ReadDocument(path)
@@ -223,7 +249,21 @@ func ReserveWorkerTurn(root, key string, work harness.WorkerWorkflow) (harness.W
 		numberValue(document.FrontMatter[phaseAttemptField(work.Phase)]) != work.ClaimAttempt {
 		return result, errors.New("worker workflow document changed before admission")
 	}
-	result.FirstAssignedAt, result.ProviderIterations, err = reserveProviderTurnLocked(path, time.Now().UTC(), document)
+	if action == "continue" {
+		lease.State, lease.LastError = "processing", ""
+		data, err := json.Marshal(lease)
+		if err != nil {
+			return result, err
+		}
+		if err := fsx.AtomicWriteFile(leasePath, append(data, '\n'), 0600); err != nil {
+			return result, err
+		}
+	}
+	result.FirstAssignedAt, _ = frontMatterTime(document.FrontMatter["first_assigned_at"])
+	result.ProviderIterations = numberValue(document.FrontMatter["provider_iterations"])
+	if action == "reserve" || action == "reserve-control" {
+		result.FirstAssignedAt, result.ProviderIterations, err = reserveProviderTurnLocked(path, time.Now().UTC(), document)
+	}
 	if work.Route == "tasks" {
 		result.ImplementationAttempts = numberValue(document.FrontMatter["attempt"])
 	}

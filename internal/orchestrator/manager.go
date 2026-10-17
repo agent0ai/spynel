@@ -856,7 +856,7 @@ func (m *Manager) dispatchExecution(ctx context.Context, route workflowRoute, le
 				if event.Kind == core.EventError {
 					current.LastError = event.Text
 				}
-				if terminal {
+				if terminal && current.State != "cancelled" {
 					current.State = "awaiting_transition"
 				} else if current.State == "recovering" && event.Execution != nil && event.Execution.State == "running" {
 					current.State = "processing"
@@ -1581,7 +1581,7 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 	}
 	now := time.Now()
 	for _, lease := range leases {
-		if lease.State == "hook_cancelled" {
+		if lease.State == "hook_cancelled" || lease.State == "cancelled" {
 			continue
 		}
 		if _, err := os.Stat(lease.File); os.IsNotExist(err) {

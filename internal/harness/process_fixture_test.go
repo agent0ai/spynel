@@ -37,9 +37,12 @@ type fixtureRecord struct {
 	Params     json.RawMessage `json:"params"`
 }
 
-func reserveWorkerFixture(root, key string, work WorkerWorkflow) (WorkerReservation, error) {
+func reserveWorkerFixture(root, key string, work WorkerWorkflow, action string) (WorkerReservation, error) {
 	if work.WorkID == "reject" {
 		return WorkerReservation{}, errors.New("synthetic rejected claim")
+	}
+	if action == "validate" || action == "continue" {
+		return WorkerReservation{}, nil
 	}
 	path := filepath.Join(root, "fixture-reservations")
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
@@ -415,8 +418,10 @@ func runPiFixture(mode string) int {
 		case "steer":
 			respond(message, map[string]any{})
 			delta(" second")
-			messageEnd("first second", "stop")
-			write(map[string]any{"type": "agent_settled"})
+			if mode != "pi-interrupt" {
+				messageEnd("first second", "stop")
+				write(map[string]any{"type": "agent_settled"})
+			}
 		case "abort":
 			respond(message, map[string]any{})
 			messageEnd("working", "aborted")

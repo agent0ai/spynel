@@ -435,7 +435,7 @@ func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selec
 }
 
 // Steer addresses only the current turn and cannot fall back to turn/start.
-func (c *Codex) Steer(ctx context.Context, key, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+func (c *Codex) Steer(ctx context.Context, key, prompt string, beforeDelivery func() bool) (string, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", errors.New("harness prompt is empty")
 	}
@@ -458,7 +458,6 @@ func (c *Codex) Steer(ctx context.Context, key, prompt string, emit core.Emit, b
 		active.deliveryMu.Unlock()
 		return threadID, errNativeDeliveryUnreserved
 	}
-	previousEmit := active.replaceEmit(emit)
 	params := map[string]any{
 		"threadId": threadID, "expectedTurnId": active.turnID,
 		"input": []map[string]any{{"type": "text", "text": prompt}},
@@ -469,20 +468,9 @@ func (c *Codex) Steer(ctx context.Context, key, prompt string, emit core.Emit, b
 		_, err = c.awaitCall(ctx, "turn/steer", id, response)
 	}
 	if err != nil {
-		c.mu.Lock()
-		stillActive := c.active[threadID] == active
-		c.mu.Unlock()
-		if stillActive {
-			active.replaceEmit(previousEmit)
-		}
 		return threadID, err
 	}
-	if previousEmit != nil {
-		previousEmit(core.Event{Kind: core.EventStatus, Done: true, ThreadID: threadID, TurnID: active.turnID})
-	}
-	if emit != nil {
-		emit(core.Event{Kind: core.EventStatus, Text: "Steering active Codex turn", ThreadID: threadID, TurnID: active.turnID})
-	}
+	active.emitEvent(core.Event{Kind: core.EventStatus, Text: "Steering active Codex turn", ThreadID: threadID, TurnID: active.turnID})
 	return threadID, nil
 }
 

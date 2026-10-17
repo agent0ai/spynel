@@ -29,12 +29,14 @@ type durableControlHarness struct{ *heldServiceHarness }
 
 func (h *durableControlHarness) FollowUpMode() harness.FollowUpMode { return harness.FollowUpSteer }
 
-func (h *durableControlHarness) Steer(ctx context.Context, key, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+func (h *durableControlHarness) Steer(_ context.Context, key, prompt string, beforeDelivery func() bool) (string, error) {
 	if beforeDelivery != nil && !beforeDelivery() {
 		return "", errors.New("provider-turn reservation failed")
 	}
-	threadID, _, err := h.Send(ctx, key, prompt, emit)
-	return threadID, err
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.prompts[key] = append(h.prompts[key], prompt)
+	return h.threads[key], nil
 }
 
 func (h *jobControlHarness) SendControl(_ context.Context, _ string, request harness.ControlRequest) (harness.ControlResult, error) {

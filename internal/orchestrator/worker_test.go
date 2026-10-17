@@ -52,7 +52,7 @@ func TestReserveWorkerTurnExactClaim(t *testing.T) {
 	} {
 		t.Run(scenario.phase, func(t *testing.T) {
 			root, key, work, _ := workerWorkflowFixture(t, scenario.route, scenario.phase)
-			result, err := ReserveWorkerTurn(root, key, work)
+			result, err := ApplyWorkerWorkflow(root, key, work, "reserve")
 			if err != nil || result.ProviderIterations != 5 || result.FirstAssignedAt.IsZero() || result.FirstAssignedAt.After(time.Now()) {
 				t.Fatalf("reservation = %+v, %v", result, err)
 			}
@@ -68,6 +68,45 @@ func TestReserveWorkerTurnExactClaim(t *testing.T) {
 				t.Fatal("reservation confused implementation and review attempts")
 			}
 		})
+	}
+}
+
+func TestWorkerControlActionsValidateAndReserveExactClaim(t *testing.T) {
+	root, key, work, manager := workerWorkflowFixture(t, "tasks", phaseTaskImplementation)
+	lease, _ := manager.loadLease(work.LeaseID)
+	lease.State, lease.LastError = "awaiting_transition", "previous diagnostic"
+	if err := manager.saveLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range []string{"validate", "continue", "reserve-control"} {
+		result, err := ApplyWorkerWorkflow(root, key, work, action)
+		want := 4
+		if action == "reserve-control" {
+			want++
+		}
+		if err != nil || result.ProviderIterations != want {
+			t.Fatal(action, result, err)
+		}
+	}
+	lease, _ = manager.loadLease(work.LeaseID)
+	if lease.State != "processing" || lease.LastError != "" {
+		t.Fatal("continuation did not prepare the exact durable execution")
+	}
+	lease.State = "cancelled"
+	if err := manager.saveLease(lease); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range []string{"reserve", "validate", "continue", "reserve-control", "unknown"} {
+		if _, err := ApplyWorkerWorkflow(root, key, work, action); err == nil {
+			t.Fatal("cancelled claim admitted", action)
+		}
+	}
+	if err := manager.recoverStale(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	document, err := ReadDocument(work.File)
+	if err != nil || numberValue(document.FrontMatter["provider_iterations"]) != 5 {
+		t.Fatal("refused control changed provider reservations", err)
 	}
 }
 
@@ -128,7 +167,7 @@ func TestReserveWorkerTurnRejectsChangedOrUnsafeClaim(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if result, err := ReserveWorkerTurn(root, key, work); err == nil || result.ProviderIterations != 0 {
+			if result, err := ApplyWorkerWorkflow(root, key, work, "reserve"); err == nil || result.ProviderIterations != 0 {
 				t.Fatalf("changed claim reserved work: %+v, %v", result, err)
 			}
 			if scenario == "moved-document" {

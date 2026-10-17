@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +28,13 @@ func runWorkerAdmissionProvider() int {
 		return 1
 	}
 	defer file.Close()
+	var outputMu sync.Mutex
+	write := func(value any) error {
+		outputMu.Lock()
+		defer outputMu.Unlock()
+		return json.NewEncoder(os.Stdout).Encode(value)
+	}
+	starts := 0
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		var request struct {
@@ -41,6 +50,8 @@ func runWorkerAdmissionProvider() int {
 		result := map[string]any{}
 		switch request.Method {
 		case "initialize", "turn/interrupt":
+		case "turn/steer":
+			result["turnId"] = "synthetic-turn"
 		case "thread/start", "thread/resume":
 			result["thread"] = map[string]string{"id": "synthetic-thread"}
 		case "turn/start":
@@ -48,12 +59,26 @@ func runWorkerAdmissionProvider() int {
 		default:
 			continue
 		}
-		if json.NewEncoder(os.Stdout).Encode(map[string]any{"id": request.ID, "result": result}) != nil {
+		if write(map[string]any{"id": request.ID, "result": result}) != nil {
 			return 1
 		}
 		if request.Method == "turn/interrupt" {
-			if json.NewEncoder(os.Stdout).Encode(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "synthetic-thread", "turn": map[string]string{"id": "synthetic-turn", "status": "interrupted"}}}) != nil {
+			if write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "synthetic-thread", "turn": map[string]string{"id": "synthetic-turn", "status": "interrupted"}}}) != nil {
 				return 1
+			}
+		}
+		if request.Method == "turn/start" {
+			starts++
+			if prefix := os.Getenv("SPYNEL_TEST_WORKER_COMPLETIONS"); prefix != "" {
+				go func(path string) {
+					for tick := 0; tick < 3000; tick++ {
+						if _, err := os.Stat(path); err == nil {
+							_ = write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "synthetic-thread", "turn": map[string]string{"id": "synthetic-turn", "status": "completed"}}})
+							return
+						}
+						time.Sleep(10 * time.Millisecond)
+					}
+				}(prefix + "." + strconv.Itoa(starts))
 			}
 		}
 	}

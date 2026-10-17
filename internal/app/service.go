@@ -1438,7 +1438,11 @@ func (s *Service) jobCommand(ctx context.Context, message core.Message, remainde
 	}
 	cancellationLeaseID := s.Orchestrator.MarkControlCancellation(job.SessionKey)
 	correlationCancellation := s.recoveryCancellationSnapshot(job.SessionKey)
-	stopped, err := s.Harness.Interrupt(ctx, job.SessionKey)
+	interrupt := s.Harness.Interrupt
+	if s.Orchestrator.Worker != nil {
+		interrupt = s.Orchestrator.Interrupt
+	}
+	stopped, err := interrupt(ctx, job.SessionKey)
 	if err != nil {
 		s.Runtime.RestoreJobAfterFailedCancellation(job)
 		s.Orchestrator.RestoreControlCancellation(cancellationLeaseID)
@@ -1486,6 +1490,9 @@ func (s *Service) jobControlCommand(ctx context.Context, message core.Message, i
 		return s.localReply(message, fmt.Sprintf("Job %d has no stable durable document identity for steering.", id), emit)
 	}
 	controller, ok := s.Harness.(harness.ControlSender)
+	if s.Orchestrator.Worker != nil {
+		controller, ok = s.Orchestrator, true
+	}
 	if !ok {
 		return s.localReply(message, fmt.Sprintf("Job %d uses a harness that does not expose safe job steering.", id), emit)
 	}

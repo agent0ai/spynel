@@ -107,7 +107,7 @@ func TestWorkerAdmissionStorageFailureFencesReservationAndSend(t *testing.T) {
 				}
 			}
 			reserved := 0
-			host.reserve = func(string, string, WorkerWorkflow) (WorkerReservation, error) {
+			host.workflow = func(string, string, WorkerWorkflow, string) (WorkerReservation, error) {
 				reserved++
 				if stage == "after-reservation" {
 					block()

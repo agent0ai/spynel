@@ -155,8 +155,9 @@ type FollowUpProvider interface {
 // beforeDelivery callback is the atomic durable reservation boundary: the
 // adapter calls it exactly once after fencing completion and immediately
 // before provider delivery, or not at all when the turn is already inactive.
+// Coordination preserves the existing emitter; it never hands off its stream.
 type NativeSteerer interface {
-	Steer(context.Context, string, string, core.Emit, func() bool) (threadID string, err error)
+	Steer(context.Context, string, string, func() bool) (threadID string, err error)
 }
 
 var (
@@ -174,6 +175,8 @@ type ControlRequest struct {
 	Validate            func() bool
 	PrepareContinuation func() bool
 	ReserveProviderTurn func() bool
+	// RunContinuation fences a queued delivery and its callbacks together.
+	RunContinuation func(func()) error
 }
 
 type ControlResult struct {

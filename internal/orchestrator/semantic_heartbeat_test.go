@@ -365,7 +365,12 @@ func TestSemanticHeartbeatBlockedAdmissionWaitsForRelease(t *testing.T) {
 				} else {
 					ticks <- time.Now()
 				}
-				wait(func() bool { return manager.WorkStatus().NextHeartbeatAt.IsZero() })
+				// WorkStatus also hides the deadline while a provider is active.
+				wait(func() bool {
+					manager.heartbeatStatusMu.RLock()
+					defer manager.heartbeatStatusMu.RUnlock()
+					return manager.heartbeatNext.IsZero()
+				})
 				cfg := manager.runtimeSnapshot()
 				if change == "interval" {
 					cfg.Orchestrator.SemanticHeartbeatMinutes = 2
@@ -392,7 +397,7 @@ func TestSemanticHeartbeatBlockedAdmissionWaitsForRelease(t *testing.T) {
 					delay := time.Duration(cfg.Orchestrator.SemanticHeartbeatMinutes) * time.Minute
 					next := manager.WorkStatus().NextHeartbeatAt
 					if next.Before(releasedAt.Add(delay)) || next.After(time.Now().Add(delay)) {
-						t.Fatal("release did not preserve the configured fixed delay")
+						t.Fatalf("release did not preserve the configured fixed delay: released=%s next=%s now=%s delay=%s", releasedAt.Format(time.RFC3339Nano), next.Format(time.RFC3339Nano), time.Now().Format(time.RFC3339Nano), delay)
 					}
 				}
 				if started, finished, _ := recorder.snapshot(); started != 1 || finished != 1 {

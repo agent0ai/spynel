@@ -57,6 +57,7 @@ type pendingSend struct {
 	preserveEmitter bool
 	generation      uint64
 	release         []core.Emit
+	terminal        *core.Event
 }
 
 type controlState struct {
@@ -65,6 +66,7 @@ type controlState struct {
 	validate            func() bool
 	prepareContinuation func() bool
 	reserveProviderTurn func() bool
+	runContinuation     func(func()) error
 	continued           bool
 }
 
@@ -491,7 +493,7 @@ func (s *Supervisor) SendControl(ctx context.Context, key string, request Contro
 		s.mu.Unlock()
 		return ControlResult{Duplicate: true}, nil
 	}
-	state := &controlState{id: request.ID, continuationPrompt: request.ContinuationPrompt, validate: request.Validate, prepareContinuation: request.PrepareContinuation, reserveProviderTurn: request.ReserveProviderTurn}
+	state := &controlState{id: request.ID, continuationPrompt: request.ContinuationPrompt, validate: request.Validate, prepareContinuation: request.PrepareContinuation, reserveProviderTurn: request.ReserveProviderTurn, runContinuation: request.RunContinuation}
 	owner := s.controlEmit[key]
 	if owner == nil {
 		s.mu.Unlock()
@@ -540,7 +542,7 @@ func (s *Supervisor) SendControl(ctx context.Context, key string, request Contro
 		s.mu.Unlock()
 		return ControlResult{}, errors.New("active harness declares native steering but has no steer-only control operation")
 	}
-	_, err = steerer.Steer(ctx, key, request.Prompt, owner, state.reserveProviderTurn)
+	_, err = steerer.Steer(ctx, key, request.Prompt, state.reserveProviderTurn)
 	if err != nil {
 		s.mu.Lock()
 		if s.controls[key] == state {
@@ -582,6 +584,7 @@ func inferenceSelection(cfg HarnessConfig) InferenceSelection {
 
 func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) core.Emit {
 	return func(event core.Event) {
+		terminal := event
 		var next *pendingSend
 		if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
 			s.mu.Lock()
@@ -590,6 +593,7 @@ func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) c
 				value, consumed := mergeQueuedConversationPrompts(queue)
 				value.generation = s.controlGeneration[key]
 				next = &value
+				next.terminal = &terminal
 				if len(queue) == consumed {
 					delete(s.pending, key)
 				} else {
@@ -618,6 +622,7 @@ func (s *Supervisor) executionEmit(key string, target Harness, emit core.Emit) c
 					control.continued = true
 					value := pendingSend{prompt: control.continuationPrompt, emit: s.controlEmit[key], control: control, preserveEmitter: true, generation: s.controlGeneration[key]}
 					next = &value
+					next.terminal = &terminal
 					event.Continues = true
 				} else {
 					delete(s.active, key)
@@ -741,6 +746,37 @@ func (s *Supervisor) controlOperation(key string) *sync.Mutex {
 }
 
 func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
+	if next.control != nil && next.control.runContinuation != nil {
+		ran := false
+		if err := next.control.runContinuation(func() { ran = true; s.startQueuedOwned(key, target, next) }); err != nil && !ran {
+			s.finishQueuedControl(key, next)
+		}
+		return
+	}
+	s.startQueuedOwned(key, target, next)
+}
+
+// A refused continuation still releases the original, already-ended turn.
+func (s *Supervisor) finishQueuedControl(key string, next pendingSend) {
+	s.mu.Lock()
+	if s.controlGeneration[key] != next.generation {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.pending, key)
+	delete(s.active, key)
+	delete(s.controls, key)
+	delete(s.controlEmit, key)
+	delete(s.seenControl, key)
+	s.mu.Unlock()
+	if next.terminal != nil && next.emit != nil {
+		event := *next.terminal
+		event.Continues = false
+		next.emit(event)
+	}
+}
+
+func (s *Supervisor) startQueuedOwned(key string, target Harness, next pendingSend) {
 	operation := s.controlOperation(key)
 	operation.Lock()
 	defer operation.Unlock()
@@ -778,15 +814,7 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 			valid = next.control.validate()
 		}
 		if !valid {
-			s.mu.Lock()
-			if s.controlGeneration[key] == next.generation {
-				delete(s.pending, key)
-				delete(s.active, key)
-				delete(s.controls, key)
-				delete(s.controlEmit, key)
-				delete(s.seenControl, key)
-			}
-			s.mu.Unlock()
+			s.finishQueuedControl(key, next)
 			return
 		}
 	}
@@ -799,15 +827,7 @@ func (s *Supervisor) startQueued(key string, target Harness, next pendingSend) {
 		return
 	}
 	if next.control != nil && next.control.reserveProviderTurn != nil && !next.control.reserveProviderTurn() {
-		s.mu.Lock()
-		if s.controlGeneration[key] == next.generation {
-			delete(s.pending, key)
-			delete(s.active, key)
-			delete(s.controls, key)
-			delete(s.controlEmit, key)
-			delete(s.seenControl, key)
-		}
-		s.mu.Unlock()
+		s.finishQueuedControl(key, next)
 		return
 	}
 	wrapper := next.emit

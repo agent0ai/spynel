@@ -205,7 +205,7 @@ func (p *Pi) SendWithInference(ctx context.Context, key, prompt string, selectio
 	active := process.active
 	process.mu.Unlock()
 	if active != nil {
-		threadID, err := p.steerLocked(ctx, process, prompt, emit, nil)
+		threadID, err := p.steerLocked(ctx, process, prompt, emit, true, nil)
 		return threadID, true, err
 	}
 	turn := &piTurn{emit: emit}
@@ -232,7 +232,7 @@ func (p *Pi) SendWithInference(ctx context.Context, key, prompt string, selectio
 	return process.session.ID, false, nil
 }
 
-func (p *Pi) Steer(ctx context.Context, key, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+func (p *Pi) Steer(ctx context.Context, key, prompt string, beforeDelivery func() bool) (string, error) {
 	if strings.TrimSpace(prompt) == "" {
 		return "", errors.New("harness prompt is empty")
 	}
@@ -245,10 +245,10 @@ func (p *Pi) Steer(ctx context.Context, key, prompt string, emit core.Emit, befo
 	if process == nil {
 		return p.ThreadID(key), fmt.Errorf("Pi turn is no longer active: %w", errNativeTurnInactive)
 	}
-	return p.steerLocked(ctx, process, prompt, emit, beforeDelivery)
+	return p.steerLocked(ctx, process, prompt, nil, false, beforeDelivery)
 }
 
-func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string, emit core.Emit, replace bool, beforeDelivery func() bool) (string, error) {
 	process.mu.Lock()
 	turn := process.active
 	process.mu.Unlock()
@@ -272,13 +272,15 @@ func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string,
 		reserved = true
 		turn.mu.Lock()
 		previous = turn.emit
-		turn.emit = emit
+		if replace {
+			turn.emit = emit
+		}
 		turn.mu.Unlock()
 		return true
 	})
 	if err != nil {
 		turn.mu.Lock()
-		if !turn.completed {
+		if !turn.completed && replace {
 			turn.emit = previous
 		}
 		turn.mu.Unlock()
@@ -287,12 +289,10 @@ func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string,
 		}
 		return process.session.ID, err
 	}
-	if previous != nil {
+	if previous != nil && replace {
 		previous(core.Event{Kind: core.EventStatus, Text: "Response continued on a newer message", ThreadID: process.session.ID, Done: true})
 	}
-	if emit != nil {
-		emit(core.Event{Kind: core.EventStatus, Text: "Steering active Pi turn", ThreadID: process.session.ID})
-	}
+	turn.emitEvent(core.Event{Kind: core.EventStatus, Text: "Steering active Pi turn", ThreadID: process.session.ID})
 	return process.session.ID, nil
 }
 
