@@ -32,6 +32,7 @@ type ProcessRegistration struct {
 	CoordinatedUpdates   bool   `json:"coordinated_updates"`
 	DiagnosticReader     bool   `json:"diagnostic_reader,omitempty"`
 	ProviderGuardian     bool   `json:"provider_guardian,omitempty"`
+	HarnessWorker        bool   `json:"harness_worker,omitempty"`
 	Supervisor           bool   `json:"supervisor,omitempty"`
 	SupervisorPID        int    `json:"supervisor_pid,omitempty"`
 	SupervisorGeneration string `json:"supervisor_generation,omitempty"`
@@ -78,6 +79,10 @@ func (m *Manager) RegisterDiagnosticReader() (func(), error) {
 
 func (m *Manager) RegisterProviderGuardian() (func(), error) {
 	return m.registerProcess(ProcessRegistration{ProviderGuardian: true})
+}
+
+func (m *Manager) RegisterHarnessWorker() (func(), error) {
+	return m.registerProcess(ProcessRegistration{HarnessWorker: true})
 }
 
 func (m *Manager) registerProcess(role ProcessRegistration) (func(), error) {
@@ -274,7 +279,7 @@ func (m *Manager) CheckRestartable() error {
 		return err
 	}
 	for _, record := range records {
-		if record.DiagnosticReader || record.ProviderGuardian {
+		if record.DiagnosticReader || record.ProviderGuardian || record.HarnessWorker {
 			continue
 		}
 		if record.SupervisorPID != 0 && (record.Installation == root || m.ownsProcessPath(root, record.Executable)) {

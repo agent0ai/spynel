@@ -366,6 +366,12 @@ func (e *Election) Current() (Lease, error) {
 // only while the caller's exact ownership term remains current. This lets an
 // owner make a short durable admission indivisible with respect to takeover.
 func (e *Election) RunWhileOwner(token string, action func() error) (bool, error) {
+	return e.RunForOwner(e.id, token, action)
+}
+
+// RunForOwner lets a separate local worker fence a request from the exact
+// elected controller. Possession of an old token never authorizes a new term.
+func (e *Election) RunForOwner(instanceID, token string, action func() error) (bool, error) {
 	ran := false
 	err := e.withLock("owner_action", func() error {
 		current, err := e.readLease()
@@ -375,7 +381,7 @@ func (e *Election) RunWhileOwner(token string, action func() error) (bool, error
 			}
 			return err
 		}
-		if current.InstanceID != e.id || current.Token != token || current.HandoffTo != "" || stale(current, e.now()) {
+		if instanceID == "" || token == "" || current.InstanceID != instanceID || current.Token != token || current.EnvironmentID != e.environmentID || current.HandoffTo != "" || stale(current, e.now()) {
 			return nil
 		}
 		ran = true

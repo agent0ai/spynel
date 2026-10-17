@@ -31,7 +31,7 @@ type HarnessConfig struct {
 	Network        bool
 	SessionsFile   string
 	Version        string
-	Stderr         io.Writer
+	Stderr         io.Writer `json:"-"`
 	processOwner   *processOwnership
 }
 

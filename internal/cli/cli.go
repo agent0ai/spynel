@@ -47,6 +47,16 @@ const (
 )
 
 func Run(args []string, version string) (runErr error) {
+	if len(args) == 1 && args[0] == "__worker" {
+		unregister, err := updater.Detect(version).RegisterHarnessWorker()
+		if err != nil {
+			return err
+		}
+		defer unregister()
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer cancel()
+		return harness.RunWorker(ctx, os.Stdin, os.Stdout, harness.NewBuiltinRegistry())
+	}
 	if len(args) > 0 && args[0] == "__provider" {
 		unregister, err := updater.Detect(version).RegisterProviderGuardian()
 		if err != nil {

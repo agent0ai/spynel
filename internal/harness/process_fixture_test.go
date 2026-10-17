@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/updater"
 )
 
 const (
@@ -23,6 +24,7 @@ const (
 )
 
 type fixtureRecord struct {
+	PID        int             `json:"pid"`
 	Kind       string          `json:"kind"`
 	Args       []string        `json:"args"`
 	Cwd        string          `json:"cwd"`
@@ -33,6 +35,19 @@ type fixtureRecord struct {
 }
 
 func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == "__worker" {
+		unregister, err := updater.Detect("fixture").RegisterHarnessWorker()
+		if err != nil {
+			os.Exit(1)
+		}
+		if err := RunWorker(context.Background(), os.Stdin, os.Stdout, NewBuiltinRegistry()); err != nil {
+			unregister()
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		unregister()
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "__provider" {
 		if err := RunProvider(os.Args[2:]); err != nil {
 			os.Exit(1)
@@ -169,9 +184,9 @@ func readFixtureRecords(t *testing.T, path string) []fixtureRecord {
 
 func runHarnessFixture(mode string) int {
 	executable, _ := os.Executable()
-	appendFixtureLog(map[string]any{"kind": "invocation", "args": os.Args[1:], "cwd": mustGetwd(), "executable": executable})
+	appendFixtureLog(map[string]any{"kind": "invocation", "pid": os.Getpid(), "args": os.Args[1:], "cwd": mustGetwd(), "executable": executable})
 	switch mode {
-	case "codex-lifecycle", "codex-interrupt", "codex-models", "codex-init-missing-method", "codex-resume-missing-method", "codex-resume-error", "codex-stream-overflow", "codex-thread-changed-field", "codex-terminal-changed-status":
+	case "codex-lifecycle", "codex-interrupt", "codex-worker", "codex-models", "codex-init-missing-method", "codex-resume-missing-method", "codex-resume-error", "codex-stream-overflow", "codex-thread-changed-field", "codex-terminal-changed-status":
 		return runCodexFixture(mode)
 	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero":
 		return runClaudeFixture(mode)
@@ -465,7 +480,7 @@ func runCodexFixture(mode string) int {
 				continue
 			}
 			threadID := "thr_test"
-			if mode == "codex-interrupt" {
+			if mode == "codex-interrupt" || mode == "codex-worker" {
 				threadID = "thr_stop"
 			}
 			if mode == "codex-lifecycle" && message.Method == "thread/resume" {
@@ -481,10 +496,19 @@ func runCodexFixture(mode string) int {
 			write(map[string]any{"id": message.ID, "result": map[string]any{"thread": map[string]any{"id": threadID}}})
 		case "turn/start":
 			threadID, turnID := "thr_test", "turn_test"
-			if mode == "codex-interrupt" {
+			if mode == "codex-interrupt" || mode == "codex-worker" {
 				threadID, turnID = "thr_stop", "turn_stop"
 			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{"turn": map[string]any{"id": turnID, "status": "inProgress"}}})
+			if mode == "codex-worker" {
+				appendFixtureLog(map[string]any{"kind": "effect", "pid": os.Getpid()})
+				go func() {
+					for tick := 0; tick < 100; tick++ {
+						time.Sleep(20 * time.Millisecond)
+						write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": threadID, "turnId": turnID, "delta": "."}})
+					}
+				}()
+			}
 			if mode == "codex-terminal-changed-status" {
 				write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": threadID, "turn": map[string]any{"id": turnID, "status": "done"}}})
 			}
