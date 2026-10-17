@@ -17,6 +17,8 @@
 
 - Generated configuration contains no orchestrator routes. Tasks and goals use their fixed `.spynel` status folders and prompts; goal rounds carry task IDs without copied route definitions.
 
+- Notification templates describe separately delimited current original-thread data and task evidence, natural continuation, and honest queue/send/receipt distinctions. Creation guidance writes the exact notify.on selection key. Heartbeat templates use task-origin-first routing and only owner-established explicit escalation; preserve customized workspace copies.
+
 ## Child DOX Index
 
 No child DOX files.

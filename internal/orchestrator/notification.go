@@ -36,6 +36,19 @@ func ParseOrigin(value string) (Origin, error) {
 	return Origin{Channel: channel, Conversation: conversation}, nil
 }
 
+// A remote fallback is an explicit owner-established same-operator route;
+// authorization or recent activity alone never establishes that association.
+func ParseFallbackOrigin(value string) (Origin, error) {
+	origin, err := ParseOrigin(value)
+	if err != nil {
+		return Origin{}, err
+	}
+	if (origin.Channel == "telegram" && strings.HasPrefix(origin.Conversation, "TG-group-")) || (origin.Channel == "whatsapp" && strings.HasPrefix(origin.Conversation, "WA-group-")) {
+		return Origin{}, errors.New("fallback origin must be a private conversation")
+	}
+	return origin, nil
+}
+
 type NotificationPolicy struct {
 	Enabled        bool
 	Origin         Origin
@@ -75,14 +88,9 @@ func NotificationFromDocument(document Document) (NotificationPolicy, error) {
 		if !ok {
 			return policy, errors.New("notify.fallback_origin must be a string")
 		}
-		fallback, err := ParseOrigin(fallbackValue)
+		fallback, err := ParseFallbackOrigin(fallbackValue)
 		if err != nil {
 			return policy, fmt.Errorf("notify.fallback_origin: %w", err)
-		}
-		// Remote identities cannot be linked safely. Only local workspace
-		// conversations can be an explicitly configured fallback.
-		if fallback.Channel != "tui" && fallback.Channel != "cli" {
-			return policy, errors.New("notify.fallback_origin must be a local tui or cli origin")
 		}
 		policy.FallbackOrigin = fallback
 	}
@@ -134,10 +142,12 @@ type Outbox struct {
 	Directory string
 	Deliver   func(context.Context, Origin, string, string) error
 	// FallbackAllowed rechecks that the primary origin remains authorized
-	// before an unavailable direct delivery can use a local fallback.
-	FallbackAllowed func(context.Context, Origin) error
-	Now             func() time.Time
-	mu              sync.Mutex
+	// before an unavailable direct delivery can use its explicit fallback.
+	FallbackAllowed  func(context.Context, Origin) error
+	PrimaryAvailable func(context.Context, Origin) error
+	DeliveryState    func(Origin, string) (string, error)
+	Now              func() time.Time
+	mu               sync.Mutex
 }
 
 func (o *Outbox) now() time.Time {
@@ -300,12 +310,8 @@ func (o *Outbox) EnqueueWithFallback(deliveryKey, class, origin, fallbackOrigin,
 		return OutboxEntry{}, err
 	}
 	if fallbackOrigin != "" {
-		fallback, err := ParseOrigin(fallbackOrigin)
-		if err != nil {
+		if _, err := ParseFallbackOrigin(fallbackOrigin); err != nil {
 			return OutboxEntry{}, err
-		}
-		if fallback.Channel != "tui" && fallback.Channel != "cli" {
-			return OutboxEntry{}, errors.New("fallback origin must be a local tui or cli origin")
 		}
 	}
 	message, err := NormalizeNotificationText(message)
@@ -404,12 +410,32 @@ func (o *Outbox) Process(ctx context.Context) error {
 		}
 		entry.Message = normalized
 		origin, parseErr := ParseOrigin(entry.Origin)
+		alreadyDelivered := false
+		if parseErr == nil && entry.FallbackOrigin != "" && o.DeliveryState != nil {
+			fallback, err := ParseFallbackOrigin(entry.FallbackOrigin)
+			parseErr = err
+			// A retry must not switch destinations after either history commits.
+			for _, destination := range []Origin{origin, fallback} {
+				if parseErr != nil {
+					break
+				}
+				state, err := o.DeliveryState(destination, entry.ID)
+				parseErr = err
+				if state == "sent" && err == nil {
+					alreadyDelivered = true
+					break
+				}
+			}
+		}
 		deliveryErr := parseErr
-		if deliveryErr == nil {
+		if deliveryErr == nil && !alreadyDelivered && entry.FallbackOrigin != "" && o.PrimaryAvailable != nil {
+			deliveryErr = o.PrimaryAvailable(ctx, origin)
+		}
+		if deliveryErr == nil && !alreadyDelivered {
 			deliveryErr = o.Deliver(ctx, origin, entry.ID, entry.Message)
 		}
 		if deliveryErr != nil && entry.FallbackOrigin != "" && parseErr == nil && (o.FallbackAllowed == nil || o.FallbackAllowed(ctx, origin) == nil) {
-			fallback, fallbackParseErr := ParseOrigin(entry.FallbackOrigin)
+			fallback, fallbackParseErr := ParseFallbackOrigin(entry.FallbackOrigin)
 			if fallbackParseErr != nil {
 				deliveryErr = errors.Join(deliveryErr, fallbackParseErr)
 			} else if fallbackErr := o.Deliver(ctx, fallback, entry.ID, entry.Message); fallbackErr != nil {

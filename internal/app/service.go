@@ -196,7 +196,17 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	manager.JobEvent = runtime.RecordJobEvent
 	manager.JobFinished = runtime.EndJob
 	manager.SetNotificationDelivery(service.deliverNotification)
+	manager.NotificationContext = service.notificationContext
 	manager.Outbox.FallbackAllowed = func(_ context.Context, origin orchestrator.Origin) error { return service.validateOrigin(origin) }
+	manager.Outbox.PrimaryAvailable = func(_ context.Context, origin orchestrator.Origin) error {
+		if origin.Channel == "tui" && !service.liveTUIConversations(time.Now().UTC())[origin.Conversation] {
+			return errors.New("original TUI conversation has no live presentation")
+		}
+		return nil
+	}
+	manager.Outbox.DeliveryState = func(origin orchestrator.Origin, eventID string) (string, error) {
+		return service.History.DeliveryState(origin.Channel, origin.Conversation, eventID)
+	}
 	return service
 }
 
@@ -211,6 +221,9 @@ func (s *Service) Close() error {
 }
 
 func (s *Service) validateOrigin(origin orchestrator.Origin) error {
+	if err := ValidateConversationName(origin.Conversation); err != nil {
+		return err
+	}
 	if _, err := os.Stat(s.History.Path(origin.Channel, origin.Conversation)); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("origin %s/%s is not a known conversation", origin.Channel, origin.Conversation)
@@ -261,14 +274,14 @@ func (s *Service) deliverNotification(ctx context.Context, origin orchestrator.O
 	if err := s.validateOrigin(origin); err != nil {
 		return err
 	}
+	state, err := s.History.DeliveryState(origin.Channel, origin.Conversation, eventID)
+	if err != nil {
+		return err
+	}
+	if state == "sent" {
+		return nil
+	}
 	if origin.Channel == "telegram" || origin.Channel == "whatsapp" {
-		state, stateErr := s.History.DeliveryState(origin.Channel, origin.Conversation, eventID)
-		if stateErr != nil {
-			return stateErr
-		}
-		if state == "sent" {
-			return nil
-		}
 		if s.DeliveryControl == nil {
 			return fmt.Errorf("%s is disconnected", origin.Channel)
 		}
@@ -294,7 +307,7 @@ func (s *Service) deliverNotification(ctx context.Context, origin orchestrator.O
 	if origin.Channel == "tui" && s.Harness.IsActive(sessionKey(core.Message{Channel: origin.Channel, Conversation: origin.Conversation})) {
 		role = "notification_pending"
 	}
-	_, err := s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: role, Sender: "Spy", Content: text, EventID: eventID})
+	_, err = s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: role, Sender: "Spy", Content: text, EventID: eventID})
 	return err
 }
 
@@ -329,12 +342,9 @@ func (s *Service) NotifyWithFallback(ctx context.Context, originText, fallbackOr
 		return "", err
 	}
 	if fallbackOriginText != "" {
-		fallback, err := orchestrator.ParseOrigin(fallbackOriginText)
+		fallback, err := orchestrator.ParseFallbackOrigin(fallbackOriginText)
 		if err != nil {
 			return "", err
-		}
-		if fallback.Channel != "tui" && fallback.Channel != "cli" {
-			return "", errors.New("fallback origin must be a local tui or cli origin")
 		}
 		if err := s.validateOrigin(fallback); err != nil {
 			return "", err
@@ -697,6 +707,7 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 func (s *Service) prepareChatHarnessPrompt(prompt string) (string, error) {
 	harnessSettings := s.Settings.Snapshot().Harness
 	prompt = strings.TrimRight(prompt, "\r\n") + "\n\n" + orchestrator.TaskReviewModeInstruction(harnessSettings.Reviews)
+	prompt += "\n\nFramework task notification metadata: select outcomes with `notify.on: [done, failed, waiting, cancelled]`, never a key named `outcomes`. Preserve the exact original `notify.origin`. Configure `notify.fallback_origin` only for an explicitly owner-established same-operator route; authorization or recency alone is not that association."
 	prompt = instructions.InjectScopeDiscipline(prompt)
 	prompt, err := instructions.Append(prompt, s.Config.StatePath(), instructions.Chat)
 	if err != nil {
@@ -734,9 +745,27 @@ func (s *Service) creationCommandPrompt(message core.Message, kind, userMessage 
 	return base + "\n\n---\n\n" + directive, nil
 }
 
-func (s *Service) chatPrompt(message core.Message) (string, error) {
+func (s *Service) recentConversation(channel, conversation string) (string, string, error) {
 	cfg := s.Settings.Snapshot()
-	recent, fullPath, err := s.History.RecentBounded(message.Channel, message.Conversation, cfg.Workspace.HistoryMaxMessages, cfg.Workspace.HistoryCharLimit)
+	return s.History.RecentBounded(channel, conversation, cfg.Workspace.HistoryMaxMessages, cfg.Workspace.HistoryCharLimit)
+}
+
+func (s *Service) notificationContext(origin orchestrator.Origin) (string, error) {
+	if err := s.validateOrigin(origin); err != nil {
+		return "", err
+	}
+	recent, _, err := s.recentConversation(origin.Channel, origin.Conversation)
+	if err != nil {
+		return "", err
+	}
+	if err := s.validateOrigin(origin); err != nil {
+		return "", err
+	}
+	return recent, nil
+}
+
+func (s *Service) chatPrompt(message core.Message) (string, error) {
+	recent, fullPath, err := s.recentConversation(message.Channel, message.Conversation)
 	if err != nil {
 		return "", err
 	}

@@ -60,6 +60,7 @@ func TestOrphanedClaimedTaskReceivesRecoveryLease(t *testing.T) {
 
 func TestOrphanedNotifiedTaskKeepsTransitionIdentityThroughReconciliation(t *testing.T) {
 	cfg, fake, manager := workflowTestManager(t)
+	manager.NotificationContext = func(Origin) (string, error) { return "", nil }
 	cfg.Orchestrator.TaskNotifications = config.TaskNotificationsAlways
 	manager.ApplyRuntimeConfig(cfg)
 	task, err := Create(cfg, "tasks", "recover and notify an interrupted claim", "")

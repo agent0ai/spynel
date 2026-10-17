@@ -402,6 +402,7 @@ func sanitizeHeartbeatTemplate(template string) string {
 		"Finish with only one JSON",
 		"exactly one audit outcome",
 		"Absence of an audit action",
+		"When useful, call the ordinary notification CLI with `--recent-authorized`",
 	}
 	paragraphs := strings.Split(template, "\n\n")
 	safe := paragraphs[:0]

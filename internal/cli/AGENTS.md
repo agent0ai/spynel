@@ -43,6 +43,8 @@
 
 - The dedicated shell update --json owner generates a private request identity before mutation, emits exactly one final/done correlated acknowledgment and re-execs version --quiet without extra protocol output. Check-only JSON remains an updater-state snapshot.
 
+- Ordinary notify accepts an explicit owner-established same-operator private remote fallback as well as local fallbacks; this is an association supplied by the operator, never inferred from allow-lists or recency. Admission remains queue acceptance.
+
 ## Child DOX Index
 
 No child DOX files.

@@ -222,7 +222,7 @@ func TestTaskCommandDelegatesCreationPolicyToCommunicationAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	prompts := harness.prompts["chat:cli:deploy"]
-	if len(prompts) != 1 || !strings.Contains(prompts[0], "explicitly invoked `/task`") || !strings.Contains(prompts[0], "ship it") || !strings.Contains(prompts[0], "origin `cli/deploy`") || !strings.Contains(prompts[0], "review_required") || !strings.Contains(prompts[0], "cancelled") {
+	if len(prompts) != 1 || !strings.Contains(prompts[0], "explicitly invoked `/task`") || !strings.Contains(prompts[0], "ship it") || !strings.Contains(prompts[0], `origin: "cli/deploy", on: [done, failed, waiting, cancelled]`) || !strings.Contains(prompts[0], "review_required") || !strings.Contains(prompts[0], "cancelled") {
 		t.Fatalf("task creation prompt = %#v", prompts)
 	}
 }
@@ -249,7 +249,7 @@ func TestCreationPromptsRetainFrameworkEvidenceGroundedHonestyWithCustomChatProm
 			t.Fatal(err)
 		}
 		prompt := harness.prompts["chat:cli:"+test.conversation][0]
-		if !strings.Contains(prompt, "preserved custom chat prompt") || strings.Count(prompt, instructions.EpistemicTrustGuidance) != 1 || !strings.Contains(prompt, "explicitly invoked `/"+test.kind+"`") {
+		if !strings.Contains(prompt, "preserved custom chat prompt") || strings.Count(prompt, instructions.EpistemicTrustGuidance) != 1 || !strings.Contains(prompt, "explicitly invoked `/"+test.kind+"`") || !strings.Contains(prompt, "notify.on: [done, failed, waiting, cancelled]") {
 			t.Errorf("/%s prompt omitted custom content, creation directive, or exact-once trust contract:\n%s", test.kind, prompt)
 		}
 	}
