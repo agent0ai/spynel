@@ -385,7 +385,7 @@ func (r *Runtime) tryBeginJobWithDetails(sessionKey, channel, conversation, desc
 		firstAssignedAt = now
 	}
 	iterations := details.ProviderIterations
-	if iterations < 1 {
+	if iterations < 1 && !durable {
 		iterations = 1
 	}
 	job := Job{

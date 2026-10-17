@@ -11,6 +11,30 @@ import (
 	"github.com/agent0ai/spynel/internal/harness"
 )
 
+func TestDurableJobAdmitsBeforeFirstProviderReservation(t *testing.T) {
+	r := NewRuntime()
+	defer r.Close()
+	r.ConfigureJobArchive(filepath.Join(t.TempDir(), "jobs"))
+	id, err := r.TryBeginJobWithDetails("synthetic", "orchestrator", "markdown", "synthetic", JobDetails{DurableFile: "synthetic.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _ := r.Job(id)
+	if job.ProviderIterations != 0 {
+		t.Fatal("job admission invented a provider reservation")
+	}
+	r.UpdateJobDurableTiming(id, job.FirstAssignedAt, 1)
+	job, _ = r.Job(id)
+	if job.ProviderIterations != 1 {
+		t.Fatal("actual provider reservation was not projected")
+	}
+	chat := r.BeginJob("synthetic-chat", "cli", "synthetic", "synthetic")
+	job, _ = r.Job(chat)
+	if job.ProviderIterations != 1 {
+		t.Fatal("conversation turn accounting changed")
+	}
+}
+
 func TestWorkerJobDeliveryPersistsAcrossRuntimeReplacement(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "jobs")
 	details := JobDetails{DurableFile: "synthetic.md", WorkID: "synthetic", Kind: "task", Phase: "task_implementation", PhaseAttempt: 2, ProviderIterations: 5}
