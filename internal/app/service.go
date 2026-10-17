@@ -961,12 +961,12 @@ func (s *Service) conversationEventConsumer(message core.Message, jobID int, dow
 				s.streamMu.Unlock()
 			}
 		}
-		if event.Execution != nil {
+		if event.Execution != nil && (worker == nil || !terminal) {
 			s.Runtime.UpdateJob(jobID, *event.Execution)
 		} else if event.Kind == core.EventDelta {
 			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobRunning)})
 		}
-		if terminal && !requestOnly {
+		if terminal && !requestOnly && worker == nil {
 			state := JobFinishing
 			if event.Kind == core.EventError {
 				state = JobError
@@ -1001,6 +1001,13 @@ func (s *Service) conversationEventConsumer(message core.Message, jobID int, dow
 			}
 		}
 		if terminal && !requestOnly {
+			if worker != nil {
+				state, detail := JobFinishing, ""
+				if event.Kind == core.EventError {
+					state, detail = JobError, event.Text
+				}
+				s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(state), Detail: detail})
+			}
 			level, outcome := "info", "completed"
 			if event.Kind == core.EventError {
 				level, outcome = "error", "failed"
