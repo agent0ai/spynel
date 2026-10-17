@@ -19,6 +19,8 @@
 - Notification delivery-state lookup recognizes committed assistant and pending-TUI entries by stable event ID. The application uses that existing ledger for local, remote and explicit-fallback retry suppression; normal context rendering retains notification timestamps/assistant semantics and hides send/failure bookkeeping.
 - `AppendOnce` persists an assistant/error/correlation effect and its private receipt in one synced record. Matching retries confirm durability without another append; changing any effect field except its retry timestamp fails closed. Read complete metadata with bounded body projection and reject corrupt or incomplete tails, including corruption after an existing receipt. Receipt identity/hash stay out of rendered context and committed event projections. The elected consumer must hold its exact cross-process ownership fence; a Store mutex alone is process-local. This primitive is not an arbitrary external-effect transaction or a replacement for notification delivery identity. Receipt lookup scans retained history; clear/retention remove its receipts along with the effects.
 
+- HasUserSourceIDs checks a bounded requested source set in one complete streaming validation pass; missing sources fail and corruption after a match still fails closed. Single-source duplicate admission uses that same owning implementation. This existence check does not reserve a source or prove provider admission.
+
 ## Child DOX Index
 
 No child DOX files.

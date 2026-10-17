@@ -38,7 +38,7 @@ func (r *Runtime) RecordJobDelivery(id int, delivery harness.WorkerDelivery) err
 }
 
 func (a *JobArchive) workerEvent(stableID string, at time.Time, delivery harness.WorkerDelivery) error {
-	data, err := json.Marshal(delivery.Event)
+	data, err := json.Marshal(delivery.WorkerEvent)
 	if err != nil {
 		return err
 	}
@@ -53,6 +53,9 @@ func (a *JobArchive) workerEvent(stableID string, at time.Time, delivery harness
 		return errors.New("worker job archive is not owned")
 	}
 	next.Iterations = record.ProviderIterations
+	if conversation := delivery.Conversation; conversation != nil && (record.Kind != "conversation" || record.WorkID != conversation.ExecutionID) {
+		return errors.New("worker conversation archive identity changed")
+	}
 	previous := record.workerReceipt
 	if previous != nil {
 		if previous.Worker != next.Worker || previous.Sequence != next.Sequence {

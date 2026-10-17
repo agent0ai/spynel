@@ -635,7 +635,19 @@ func (s *Store) HasEntries(channel, conversation string) (bool, error) {
 // HasUserSourceID strictly checks retained history with bounded memory.
 // Recovery's entry limit must not prevent new messages in long conversations.
 func (s *Store) HasUserSourceID(channel, conversation, sourceID string) (bool, error) {
-	if sourceID == "" {
+	return s.HasUserSourceIDs(channel, conversation, []string{sourceID})
+}
+
+// HasUserSourceIDs validates a retained source set in one complete bounded-memory scan.
+func (s *Store) HasUserSourceIDs(channel, conversation string, sourceIDs []string) (bool, error) {
+	wanted := make(map[string]bool, len(sourceIDs))
+	for _, source := range sourceIDs {
+		if source == "" {
+			return false, nil
+		}
+		wanted[source] = false
+	}
+	if len(wanted) == 0 {
 		return false, nil
 	}
 	s.mu.Lock()
@@ -650,17 +662,18 @@ func (s *Store) HasUserSourceID(channel, conversation, sourceID string) (bool, e
 	defer file.Close()
 	// shortcut: linear validation, add an index if admission latency requires it.
 	reader := bufio.NewReaderSize(file, historyReadChunk)
-	found := false
+	found := 0
 	for {
 		entry, _, err := readCorrelationEntry(reader)
 		if err == io.EOF {
-			return found, nil
+			return found == len(wanted), nil
 		}
 		if err != nil {
 			return false, err
 		}
-		if entry.Role == "user" && entry.SourceMessageID == sourceID {
-			found = true
+		if seen, exists := wanted[entry.SourceMessageID]; entry.Role == "user" && exists && !seen {
+			wanted[entry.SourceMessageID] = true
+			found++
 		}
 	}
 }

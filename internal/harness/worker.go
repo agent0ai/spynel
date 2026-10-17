@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	WorkerProtocol      = 8
+	WorkerProtocol      = 9
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -72,6 +72,7 @@ type WorkerRequest struct {
 	Expected       uint64
 	Workflow       *WorkerWorkflow
 	Agent          *WorkerAgent
+	Conversation   *WorkerConversation
 	Control        *WorkerControl
 	Config         *HarnessConfig
 	ExpectedConfig [32]byte
@@ -103,6 +104,14 @@ type WorkerAgent struct {
 	Deadline  time.Time
 }
 
+// WorkerConversation retains private correlation independently of a controller.
+// Sources identifies the complete admitted conversation batch.
+type WorkerConversation struct {
+	Channel, Conversation, SourceMessageID, ExecutionID string
+	Sources                                             []string
+	Recovery                                            bool
+}
+
 // WorkerWorkflow identifies the exact claimed work whose provider admission
 // the worker reserves. The orchestrator owns validation and durable counters.
 type WorkerWorkflow struct {
@@ -126,8 +135,11 @@ type WorkerReservation struct {
 type WorkerWorkflowAction func(root, key string, work WorkerWorkflow, action string) (WorkerReservation, error)
 
 type WorkerEvent struct {
-	Cursor uint64
-	Event  core.Event
+	Cursor       uint64
+	Event        core.Event
+	Conversation *WorkerConversation
+	RequestOnly  bool
+	Streamed     string
 }
 
 type WorkerExecution struct {
@@ -143,6 +155,7 @@ type WorkerExecution struct {
 	Reservation     *WorkerReservation
 	Agent           *WorkerAgent
 	Cancelled       bool
+	Conversation    *WorkerConversation
 }
 
 type WorkerSession struct {
@@ -173,6 +186,7 @@ type workerExecution struct {
 	admissionBytes      int64
 	deadlineInterrupted bool
 	cancel              context.CancelFunc
+	streamed            string
 }
 
 type workerHost struct {
@@ -480,7 +494,8 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		Key, Prompt, Message string
 		Workflow             *WorkerWorkflow
 		Agent                *WorkerAgent
-	}{request.Key, request.Prompt, request.Message, request.Workflow, request.Agent})
+		Conversation         *WorkerConversation
+	}{request.Key, request.Prompt, request.Message, request.Workflow, request.Agent, request.Conversation})
 	digest := sha256.Sum256(data)
 	h.mu.Lock()
 	if execution := h.executions[request.Sequence]; execution != nil {
@@ -495,6 +510,10 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 	if request.Sequence != h.next || request.Key == "" || request.Prompt == "" || len(request.Key) > 4096 {
 		h.mu.Unlock()
 		return WorkerReply{Error: "invalid or retired worker admission"}
+	}
+	if err := h.validateConversationLocked(request); err != nil {
+		h.mu.Unlock()
+		return WorkerReply{Error: err.Error()}
 	}
 	if agent := request.Agent; agent != nil {
 		if request.Workflow != nil || len(agent.ID) < 8 || len(agent.ID) > 128 ||
@@ -529,7 +548,7 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		h.mu.Unlock()
 		return WorkerReply{Error: "create worker journal failed"}
 	}
-	execution := &workerExecution{WorkerExecution: WorkerExecution{Sequence: request.Sequence, Key: request.Key, Workflow: request.Workflow, Agent: request.Agent}, file: file, digest: digest}
+	execution := &workerExecution{WorkerExecution: WorkerExecution{Sequence: request.Sequence, Key: request.Key, Workflow: request.Workflow, Agent: request.Agent, Conversation: request.Conversation}, file: file, digest: digest}
 	h.executions[request.Sequence] = execution
 	h.next++
 	if err := file.Sync(); err != nil || h.saveAdmissionLocked(execution) != nil {
@@ -643,12 +662,15 @@ func (h *workerHost) saveAdmissionLocked(execution *workerExecution) error {
 }
 
 func (h *workerHost) capture(execution *workerExecution, event core.Event) {
+	requestOnly := execution.Conversation != nil && event.Done && !event.Continues &&
+		(event.Kind == core.EventFinal || event.Kind == core.EventError) && h.supervisor.IsActive(execution.Key)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.failure != nil || execution.Done {
 		return
 	}
-	data, err := json.Marshal(WorkerEvent{Cursor: uint64(len(execution.offsets)) + 1, Event: event})
+	conversation, streamed := h.captureConversationLocked(execution, event, requestOnly)
+	data, err := json.Marshal(WorkerEvent{Cursor: uint64(len(execution.offsets)) + 1, Event: event, Conversation: conversation, RequestOnly: requestOnly, Streamed: streamed})
 	if err == nil && (len(data) > workerEventBytes || h.bytes+int64(len(data)+1) > workerJournalBytes || len(execution.offsets) >= workerMaxEvents) {
 		err = errors.New("worker event journal capacity exceeded")
 	}

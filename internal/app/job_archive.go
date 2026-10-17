@@ -89,7 +89,7 @@ func (a *JobArchive) allocate(now time.Time, workID, kind, phase string, phaseAt
 	}
 	defer unlockJobCounter(lock)
 
-	if workID != "" && phase != "" && phaseAttempt > 0 {
+	if workID != "" && (phase != "" && phaseAttempt > 0 || kind == "conversation" && phase == "" && phaseAttempt == 0) {
 		if item, ok := a.newestDispatchLocked(workID, kind, phase, phaseAttempt); ok {
 			claimed, claimErr := a.claimOwnershipLocked(item.ID)
 			if claimErr != nil {

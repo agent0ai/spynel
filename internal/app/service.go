@@ -809,9 +809,21 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 	}
 }
 
-// shortcut: receipt/activity identity is emitter-local, bind it to worker admission before cross-controller replay.
 func (s *Service) conversationConsumer(message core.Message, jobID int, downstream core.Emit) func(core.Event) error {
-	consumerID, setupErr := shortid.New()
+	return s.conversationEventConsumer(message, jobID, func(event core.Event) error {
+		if downstream != nil {
+			downstream(event)
+		}
+		return nil
+	}, nil)
+}
+
+func (s *Service) conversationEventConsumer(message core.Message, jobID int, downstream func(core.Event) error, worker *harness.WorkerDelivery) func(core.Event) error {
+	var consumerID string
+	var setupErr error
+	if worker == nil {
+		consumerID, setupErr = shortid.New()
+	}
 	var terminalMu sync.Mutex
 	terminalDelivered := false
 	var cursor uint64
@@ -826,21 +838,31 @@ func (s *Service) conversationConsumer(message core.Message, jobID int, downstre
 		}
 		terminal := event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError)
 		receipt := fmt.Sprintf("conversation:%s:%d", consumerID, cursor+1)
+		if worker != nil {
+			receipt = worker.ReceiptID()
+		}
 		key := sessionKey(message)
 		// A queued request can be cancelled while the shared provider turn is
 		// still active. Persist and deliver its result without settling that turn.
-		requestOnly := terminal && s.Harness.IsActive(key)
-		if terminal && !requestOnly {
+		requestOnly := false
+		if worker != nil {
+			requestOnly = worker.RequestOnly
+		} else {
+			requestOnly = terminal && s.Harness.IsActive(key)
+		}
+		if terminal && !requestOnly && worker == nil {
 			s.beginConversationSettlement(key)
 		}
-		if event.Kind == core.EventDelta {
+		if event.Kind == core.EventDelta && worker == nil {
 			s.streamMu.Lock()
 			s.streamText[key] += event.Text
 			s.streamMu.Unlock()
 		}
 		if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
 			var streamed string
-			if !requestOnly {
+			if worker != nil {
+				streamed = worker.Streamed
+			} else if !requestOnly {
 				s.streamMu.Lock()
 				streamed = s.streamText[key]
 				s.streamMu.Unlock()
@@ -916,10 +938,24 @@ func (s *Service) conversationConsumer(message core.Message, jobID int, downstre
 				entry.Sender = "Spy"
 				entry.Recovery = true
 			}
-			if err := s.appendConversationResult(message, entry, receipt+":result", !event.Continues && !requestOnly); err != nil {
-				return event, false, requestOnly, fmt.Errorf("save terminal conversation result: %w", err)
+			var saveErr error
+			if worker != nil {
+				if !event.Continues && !requestOnly {
+					entry.ExecutionID = worker.Conversation.ExecutionID
+					entry.Covers = worker.Conversation.Sources
+					entry.Outcome = "terminal_assistant"
+					if entry.Role == "error" {
+						entry.Outcome = "terminal_error"
+					}
+				}
+				_, saveErr = s.History.AppendOnce(message.Channel, message.Conversation, receipt+":result", entry)
+			} else {
+				saveErr = s.appendConversationResult(message, entry, receipt+":result", !event.Continues && !requestOnly)
 			}
-			if !requestOnly {
+			if saveErr != nil {
+				return event, false, requestOnly, fmt.Errorf("save terminal conversation result: %w", saveErr)
+			}
+			if !requestOnly && worker == nil {
 				s.streamMu.Lock()
 				delete(s.streamText, key)
 				s.streamMu.Unlock()
@@ -950,9 +986,19 @@ func (s *Service) conversationConsumer(message core.Message, jobID int, downstre
 
 		// Capture after extension and outbound-media processing so validated
 		// attachment paths and objects never enter the archive.
-		s.Runtime.RecordJobEvent(jobID, event)
+		if worker != nil {
+			delivery := *worker
+			delivery.Event = event
+			if err := s.Runtime.RecordJobDelivery(jobID, delivery); err != nil {
+				return err
+			}
+		} else {
+			s.Runtime.RecordJobEvent(jobID, event)
+		}
 		if downstream != nil {
-			downstream(event)
+			if err := downstream(event); err != nil {
+				return err
+			}
 		}
 		if terminal && !requestOnly {
 			level, outcome := "info", "completed"

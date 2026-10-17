@@ -66,11 +66,20 @@ func runWorkerAdmissionProvider() int {
 			return 1
 		}
 		if request.Method == "turn/interrupt" {
-			if write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "synthetic-thread", "turn": map[string]string{"id": "synthetic-turn", "status": "interrupted"}}}) != nil {
+			turn := map[string]any{"id": "synthetic-turn", "status": "interrupted"}
+			if os.Getenv("SPYNEL_TEST_WORKER_CONVERSATION_ERROR") == "1" {
+				turn["status"], turn["error"] = "failed", map[string]string{"message": "synthetic conversation failure"}
+			}
+			if write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "synthetic-thread", "turn": turn}}) != nil {
 				return 1
 			}
 		}
 		if request.Method == "turn/start" {
+			if os.Getenv("SPYNEL_TEST_WORKER_CONVERSATION_ERROR") == "1" {
+				if write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "synthetic-thread", "turnId": "synthetic-turn", "delta": "retained partial"}}) != nil {
+					return 1
+				}
+			}
 			if _, err := file.WriteString("selection:" + string(request.Params) + "\n"); err != nil {
 				return 1
 			}

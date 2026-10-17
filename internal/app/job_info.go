@@ -52,7 +52,7 @@ func (s *Service) archivedJobInfoCommand(message core.Message, number int, emit 
 	if item.Provider != "" {
 		lines = append(lines, "- Provider: "+safeJobText(item.Provider, 80))
 	}
-	if item.WorkID != "" {
+	if item.WorkID != "" && item.Kind != "conversation" {
 		lines = append(lines, "- Work ID: "+safeJobText(item.WorkID, maxJobMetadataRunes))
 	}
 	if item.ParentID != "" {
