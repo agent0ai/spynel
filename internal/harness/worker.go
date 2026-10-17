@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	WorkerProtocol      = 3
+	WorkerProtocol      = 4
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -69,7 +69,29 @@ type WorkerRequest struct {
 	Message    string
 	After      uint64
 	Expected   uint64
+	Workflow   *WorkerWorkflow
 }
+
+// WorkerWorkflow identifies the exact claimed work whose provider admission
+// the worker reserves. The orchestrator owns validation and durable counters.
+type WorkerWorkflow struct {
+	LeaseID      string
+	ClaimID      string
+	OwnerID      string
+	WorkID       string
+	File         string
+	Route        string
+	Phase        string
+	ClaimAttempt int
+}
+
+type WorkerReservation struct {
+	FirstAssignedAt        time.Time
+	ProviderIterations     int
+	ImplementationAttempts int
+}
+
+type WorkerReserve func(root, key string, work WorkerWorkflow) (WorkerReservation, error)
 
 type WorkerEvent struct {
 	Cursor uint64
@@ -85,6 +107,8 @@ type WorkerExecution struct {
 	Error           string
 	LastCursor      uint64
 	CommittedCursor uint64
+	Workflow        *WorkerWorkflow
+	Reservation     *WorkerReservation
 }
 
 type WorkerSession struct {
@@ -104,10 +128,11 @@ type WorkerReply struct {
 
 type workerExecution struct {
 	WorkerExecution
-	file    *os.File
-	offsets []int64
-	bytes   int64
-	digest  [32]byte
+	file           *os.File
+	offsets        []int64
+	bytes          int64
+	digest         [32]byte
+	admissionBytes int64
 }
 
 type workerHost struct {
@@ -125,12 +150,13 @@ type workerHost struct {
 	executions map[uint64]*workerExecution
 	bytes      int64
 	failure    error
+	reserve    WorkerReserve
 }
 
 // RunWorker is a private same-binary entry point. Losing its bootstrap pipe,
 // HTTP clients or elected controller does not cancel its provider context.
 // Explicit shutdown, signal, journal failure or bounded detachment still do.
-func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *Registry) (runErr error) {
+func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *Registry, reserve WorkerReserve) (runErr error) {
 	var bootstrap WorkerBootstrap
 	data, err := io.ReadAll(io.LimitReader(input, workerRequestBytes+1))
 	if err != nil || len(data) > workerRequestBytes {
@@ -220,6 +246,7 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	host = &workerHost{
 		supervisor: supervisor, election: election, info: info, token: bootstrap.Token, directory: directory,
 		stop: make(chan struct{}), lastSeen: time.Now(), next: 1, executions: map[uint64]*workerExecution{},
+		reserve: reserve,
 	}
 	if err := publishWorkerRecord(recordPath, workerRecord{Info: info, Token: bootstrap.Token}); err != nil {
 		return err
@@ -352,8 +379,12 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 			h.failJournalLocked()
 			return WorkerReply{Error: "retire worker cursor failed"}
 		}
+		if err := os.Remove(execution.file.Name() + ".admission"); err != nil && !os.IsNotExist(err) {
+			h.failJournalLocked()
+			return WorkerReply{Error: "retire worker admission failed"}
+		}
 		_ = execution.file.Close()
-		h.bytes -= execution.bytes
+		h.bytes -= execution.bytes + execution.admissionBytes
 		delete(h.executions, request.Sequence)
 		return WorkerReply{}
 	case "interrupt":
@@ -393,7 +424,10 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 }
 
 func (h *workerHost) send(request WorkerRequest) WorkerReply {
-	data, _ := json.Marshal([3]string{request.Key, request.Prompt, request.Message})
+	data, _ := json.Marshal(struct {
+		Key, Prompt, Message string
+		Workflow             *WorkerWorkflow
+	}{request.Key, request.Prompt, request.Message, request.Workflow})
 	digest := sha256.Sum256(data)
 	h.mu.Lock()
 	if execution := h.executions[request.Sequence]; execution != nil {
@@ -409,6 +443,13 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		h.mu.Unlock()
 		return WorkerReply{Error: "invalid or retired worker admission"}
 	}
+	for _, retained := range h.executions {
+		if retained.Workflow != nil && (retained.Key == request.Key || request.Workflow != nil &&
+			retained.Workflow.LeaseID == request.Workflow.LeaseID && retained.Workflow.ClaimAttempt == request.Workflow.ClaimAttempt) {
+			h.mu.Unlock()
+			return WorkerReply{Error: "workflow admission already retained; inspect and attach before any new dispatch"}
+		}
+	}
 	if len(h.executions) >= workerMaxExecutions {
 		h.mu.Unlock()
 		return WorkerReply{Error: "worker execution retention is full; consume completed executions"}
@@ -418,10 +459,40 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		h.mu.Unlock()
 		return WorkerReply{Error: "create worker journal failed"}
 	}
-	execution := &workerExecution{WorkerExecution: WorkerExecution{Sequence: request.Sequence, Key: request.Key}, file: file, digest: digest}
+	execution := &workerExecution{WorkerExecution: WorkerExecution{Sequence: request.Sequence, Key: request.Key, Workflow: request.Workflow}, file: file, digest: digest}
 	h.executions[request.Sequence] = execution
 	h.next++
+	if err := file.Sync(); err != nil || h.saveAdmissionLocked(execution) != nil {
+		h.failJournalLocked()
+		h.mu.Unlock()
+		return WorkerReply{Error: "persist worker admission failed"}
+	}
 	h.mu.Unlock()
+	if request.Workflow != nil {
+		var reservation WorkerReservation
+		if h.reserve == nil {
+			err = errors.New("worker workflow reservation unavailable")
+		} else {
+			reservation, err = h.reserve(h.supervisor.HarnessConfig().Cwd, request.Key, *request.Workflow)
+		}
+		h.mu.Lock()
+		if err == nil {
+			execution.Reservation = &reservation
+		} else {
+			execution.Error, execution.Done = err.Error(), true
+		}
+		if saveErr := h.saveAdmissionLocked(execution); saveErr != nil {
+			h.failJournalLocked()
+			h.mu.Unlock()
+			return WorkerReply{Error: "persist worker reservation failed"}
+		}
+		if err != nil {
+			reply := WorkerReply{Executions: []WorkerExecution{execution.WorkerExecution}}
+			h.mu.Unlock()
+			return reply
+		}
+		h.mu.Unlock()
+	}
 	// The worker lifetime, not a controller request, owns every admitted turn.
 	threadID, steered, err := h.supervisor.SendConversation(h.supervisor.ctx, request.Key, request.Prompt, request.Message, func(event core.Event) {
 		h.capture(execution, event)
@@ -431,9 +502,34 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 	if err != nil {
 		execution.Error, execution.Done = err.Error(), true
 	}
+	if err := h.saveAdmissionLocked(execution); err != nil {
+		h.failJournalLocked()
+		h.mu.Unlock()
+		return WorkerReply{Error: "persist worker dispatch result failed"}
+	}
 	reply := WorkerReply{Executions: []WorkerExecution{execution.WorkerExecution}}
 	h.mu.Unlock()
 	return reply
+}
+
+func (h *workerHost) saveAdmissionLocked(execution *workerExecution) error {
+	data, err := json.Marshal(struct {
+		Execution WorkerExecution
+		Digest    [32]byte
+	}{execution.WorkerExecution, execution.digest})
+	if err != nil {
+		return err
+	}
+	size := int64(len(data))
+	if size > workerRequestBytes || h.bytes-execution.admissionBytes+size > workerJournalBytes {
+		return errors.New("worker admission capacity exceeded")
+	}
+	if err := fsx.AtomicWriteFile(execution.file.Name()+".admission", data, 0600); err != nil {
+		return err
+	}
+	h.bytes += size - execution.admissionBytes
+	execution.admissionBytes = size
+	return nil
 }
 
 func (h *workerHost) capture(execution *workerExecution, event core.Event) {

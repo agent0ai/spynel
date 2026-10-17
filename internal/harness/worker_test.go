@@ -416,7 +416,7 @@ func TestWorkerCursorCommitStorageFailureStopsHost(t *testing.T) {
 }
 
 func TestWorkerCursorRetirementFailureStopsHost(t *testing.T) {
-	for _, failure := range []string{"journal", "cursor"} {
+	for _, failure := range []string{"journal", "cursor", "admission"} {
 		t.Run(failure, func(t *testing.T) {
 			file, err := os.CreateTemp(t.TempDir(), "journal-")
 			if err != nil {
@@ -434,8 +434,8 @@ func TestWorkerCursorRetirementFailureStopsHost(t *testing.T) {
 					t.Fatal(err)
 				}
 			} else {
-				path := file.Name() + ".cursor"
-				if err := os.Remove(path); err != nil {
+				path := file.Name() + "." + failure
+				if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 					t.Fatal(err)
 				}
 				if err := os.Mkdir(path, 0700); err != nil {

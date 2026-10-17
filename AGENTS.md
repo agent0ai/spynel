@@ -113,6 +113,8 @@ Update parent docs when parent-level structure, ownership, workflow, or child in
 
 - Notification context shares chat history selection through the application; orchestrator/app DOX own separate untrusted prompt inputs, explicit same-operator fallback and history deduplication. Heartbeat task alerts use the exact task origin and existing unanswered-question evidence; no new reminder engine or inferred recipient association exists.
 
+- Private worker workflow admissions now retain synced exact claim descriptors and reservation results. The orchestrator owns their validation and shared durable counter write under the worker's existing election fence; inspection/retry cannot reserve again, and retained workflow claims reject a second sequence. Ordinary application dispatch, restored consumers/jobs, conversation admission and controls remain unconnected.
+
 ## Child DOX Index
 
 Direct child DOX files:

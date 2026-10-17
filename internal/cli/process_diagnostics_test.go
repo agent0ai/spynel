@@ -21,11 +21,14 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	if len(os.Args) > 1 && os.Args[1] == "__provider" {
+	if len(os.Args) > 1 && (os.Args[1] == "__provider" || os.Args[1] == "__worker") {
 		if err := Run(os.Args[1:], "synthetic-version"); err != nil {
 			os.Exit(1)
 		}
 		os.Exit(0)
+	}
+	if os.Getenv("SPYNEL_TEST_WORKER_PROVIDER") == "1" {
+		os.Exit(runWorkerAdmissionProvider())
 	}
 	if len(os.Args) > 1 && os.Args[1] == "__executor" {
 		var err error

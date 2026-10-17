@@ -199,6 +199,10 @@ func reserveProviderTurn(path string, now time.Time, afterRead func()) (time.Tim
 	if afterRead != nil {
 		afterRead()
 	}
+	return reserveProviderTurnLocked(path, now, document)
+}
+
+func reserveProviderTurnLocked(path string, now time.Time, document Document) (time.Time, int, error) {
 	first, ok := frontMatterTime(document.FrontMatter["first_assigned_at"])
 	if !ok || first.After(now) {
 		first = now.UTC()

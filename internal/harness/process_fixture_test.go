@@ -37,6 +37,20 @@ type fixtureRecord struct {
 	Params     json.RawMessage `json:"params"`
 }
 
+func reserveWorkerFixture(root, key string, work WorkerWorkflow) (WorkerReservation, error) {
+	if work.WorkID == "reject" {
+		return WorkerReservation{}, errors.New("synthetic rejected claim")
+	}
+	path := filepath.Join(root, "fixture-reservations")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return WorkerReservation{}, err
+	}
+	_, err = file.WriteString(key + "\n")
+	err = errors.Join(err, file.Close())
+	return WorkerReservation{FirstAssignedAt: time.Unix(100, 0).UTC(), ProviderIterations: 7, ImplementationAttempts: work.ClaimAttempt}, err
+}
+
 func TestMain(m *testing.M) {
 	if len(os.Args) == 2 && os.Args[1] == "__worker-controller" {
 		if err := runWorkerControllerFixture(); err != nil {
@@ -50,7 +64,7 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			os.Exit(1)
 		}
-		if err := RunWorker(context.Background(), os.Stdin, os.Stdout, NewBuiltinRegistry()); err != nil {
+		if err := RunWorker(context.Background(), os.Stdin, os.Stdout, NewBuiltinRegistry(), reserveWorkerFixture); err != nil {
 			unregister()
 			_, _ = fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
