@@ -529,8 +529,21 @@ func TestStaleRegistrationStartTimeIsNotAdopted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(directory, strconv.Itoa(record.PID)+".json"), data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := (&Manager{InstallRoot: root}).CheckRestartable(); err == nil {
-		t.Fatal("reused PID adopted a stale registration")
+	if _, err := processRecords([]int{fixture.Process.Pid}); err == nil || !strings.Contains(err.Error(), "start time changed") {
+		t.Fatalf("stale registration discovery = %v", err)
+	}
+	manager := &Manager{InstallRoot: root}
+	for name, check := range map[string]func() error{
+		"preflight": manager.CheckRestartable,
+		"restart": func() error {
+			_, err := manager.RestartInstances(t.Context(), "2.0.0")
+			return err
+		},
+		"uninstall": func() error { return manager.stopProcesses(t.Context(), root) },
+	} {
+		if err := check(); err == nil || !strings.Contains(err.Error(), "start time changed") {
+			t.Fatalf("stale registration %s = %v", name, err)
+		}
 	}
 	if err := signalRegisteredProcess(record, terminationSignal()); err == nil || !strings.Contains(err.Error(), "start time changed") {
 		t.Fatalf("stale registration signalled: %v", err)

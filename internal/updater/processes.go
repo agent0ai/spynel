@@ -221,15 +221,18 @@ func collectProcessRecords(ids []int) ([]ProcessRegistration, error) {
 			continue
 		}
 		record, err := readProcess(filepath.Join(directory, strconv.Itoa(pid)+".json"))
-		if err == nil && processMatches(record, path) && (record.StartTime == "" || record.StartTime == start) {
+		if err == nil && processMatches(record, path) {
+			if stateErr != nil {
+				return nil, fmt.Errorf("cannot verify start time of registered Spynel process %d: %w", pid, stateErr)
+			}
+			if record.StartTime != "" && record.StartTime != start {
+				return nil, fmt.Errorf("registered Spynel process %d start time changed", pid)
+			}
 			info, err := buildinfo.ReadFile(processImagePath(pid, path))
 			if err != nil {
 				info, err = buildinfo.ReadFile(record.Executable)
 			}
 			if err == nil && info.Path == own.Path {
-				if stateErr != nil {
-					return nil, fmt.Errorf("cannot verify start time of registered Spynel process %d: %w", pid, stateErr)
-				}
 				record.start = start
 				records = append(records, record)
 				continue
