@@ -821,7 +821,7 @@ func TestConsolidatedTerminalCoversRapidFollowupSources(t *testing.T) {
 }
 
 func TestRecoveryEventuallyProcessesConversationAndCandidateBatches(t *testing.T) {
-	service, target, _ := newRecoveryTestService(t)
+	service, target, cfg := newRecoveryTestService(t)
 	now := time.Now().UTC()
 	for i := 0; i < recoveryConversationMax+5; i++ {
 		name := fmt.Sprintf("batch-%03d", i)
@@ -863,6 +863,117 @@ func TestRecoveryEventuallyProcessesConversationAndCandidateBatches(t *testing.T
 				t.Fatalf("unbounded or unexplained excerpt: %d bytes", len(prompt))
 			}
 		}
+	}
+	entries, _, err := service.History.RecoveryEntries("cli", "many", recoveryTotalEntryMax)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted, covered := map[string]int{}, map[string]int{}
+	terminals := 0
+	for _, entry := range entries {
+		if entry.Admission != "" {
+			admitted[entry.SourceMessageID]++
+		}
+		if entry.Outcome == "terminal_assistant" {
+			terminals++
+			for _, id := range entry.Covers {
+				covered[id]++
+			}
+		}
+	}
+	if terminals != 3 || len(admitted) != 41 || len(covered) != 41 {
+		t.Fatalf("batch correlation: terminals=%d admitted=%d covered=%d", terminals, len(admitted), len(covered))
+	}
+	for i := 0; i < 41; i++ {
+		id := fmt.Sprintf("source-%d", i)
+		if admitted[id] != 1 || covered[id] != 1 {
+			t.Fatalf("batch source %s: admissions=%d terminal coverage=%d", id, admitted[id], covered[id])
+		}
+	}
+	fresh := New(cfg, newServiceHarness())
+	defer fresh.Close()
+	fresh.SetPrimaryInstanceID("replacement")
+	for scan := 0; scan < 3; scan++ {
+		if result := fresh.scanRecovery(context.Background(), "reconnect"); result.Dispatched != 0 || result.FailedClosed != 0 {
+			t.Fatalf("completed batches not durably suppressed: %#v", result)
+		}
+	}
+}
+
+func TestRecoveryBatchTerminalAndCancellationCoverEverySource(t *testing.T) {
+	for _, command := range []string{"error", "/stop", "/job kill 1"} {
+		t.Run(command, func(t *testing.T) {
+			service, _, cfg := newRecoveryTestService(t)
+			target := &synchronousInterruptHarness{heldServiceHarness: newHeldServiceHarness()}
+			service.Harness = target
+			now := time.Now().UTC()
+			for _, id := range []string{"first", "second", "third"} {
+				if _, err := service.History.Append("cli", "batch-cancel", history.Entry{At: now, AcceptedAt: now, Role: "user", SourceMessageID: id, Content: "request"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if result := service.scanRecovery(context.Background(), "startup"); result.Dispatched != 1 || result.Eligible != 3 {
+				t.Fatalf("batch not admitted: %#v", result)
+			}
+			if result := service.scanRecovery(context.Background(), "reconnect"); result.Dispatched != 0 {
+				t.Fatalf("active batch duplicated: %#v", result)
+			}
+			want := "intentional_cancellation"
+			if command == "error" {
+				want = "terminal_coverage"
+				target.mu.Lock()
+				emit := target.emits["chat:cli:batch-cancel"]
+				target.active["chat:cli:batch-cancel"] = false
+				target.mu.Unlock()
+				emit(core.Event{Kind: core.EventError, Text: "provider failed", Done: true})
+			} else if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "batch-cancel", Text: command}, nil); err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := service.History.RecoveryWindow("cli", "batch-cancel", now.Add(-recoveryWindow), recoveryTotalEntryMax)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{"first", "second", "third"} {
+				if !snapshot.Admitted[id] || snapshot.Covered[id] != want {
+					t.Fatalf("batch source %s: admitted=%t, coverage=%q", id, snapshot.Admitted[id], snapshot.Covered[id])
+				}
+			}
+			fresh := New(cfg, newServiceHarness())
+			defer fresh.Close()
+			fresh.SetPrimaryInstanceID("replacement")
+			if result := fresh.scanRecovery(context.Background(), "startup"); result.Dispatched != 0 || result.Reasons[want] != 3 {
+				t.Fatalf("batch not durably suppressed: %#v", result)
+			}
+		})
+	}
+}
+
+func TestRecoveryBatchSendFailureRollsBackOnlyAddedSources(t *testing.T) {
+	for _, followup := range []bool{false, true} {
+		t.Run(fmt.Sprint(followup), func(t *testing.T) {
+			service, target, _ := newRecoveryTestService(t)
+			message := core.Message{Channel: "cli", Conversation: "batch-failure", SourceMessageID: "older"}
+			if followup {
+				if _, _, err := service.reserveRecoveryExecution(message); err != nil {
+					t.Fatal(err)
+				}
+			}
+			service.Harness = &failingServiceHarness{serviceHarness: target, err: errors.New("send failed")}
+			message.SourceMessageID = "attempted-first"
+			if err := service.dispatchHarnessPrompt(context.Background(), message, "prompt", nil, "attempted-second", "older"); err == nil {
+				t.Fatal("batch send failure was not returned")
+			}
+			snapshot := service.recoveryCancellationSnapshot(sessionKey(message))
+			if !followup {
+				if snapshot != nil {
+					t.Fatal("rejected new batch left execution correlation")
+				}
+			} else if snapshot == nil || len(snapshot.sources) != 1 {
+				t.Fatalf("rejected follow-up changed older correlation: %#v", snapshot)
+			} else if _, ok := snapshot.sources["older"]; !ok {
+				t.Fatal("rejected follow-up removed the older source")
+			}
+		})
 	}
 }
 

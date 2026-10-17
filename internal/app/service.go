@@ -619,7 +619,7 @@ func messageHookPayload(message core.Message) map[string]any {
 	}
 }
 
-func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Message, prompt string, emit core.Emit) error {
+func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Message, prompt string, emit core.Emit, additionalSourceIDs ...string) error {
 	if s.Config.Extensions.Enabled {
 		output, err := s.Hooks.Run(ctx, "harness.before", map[string]any{
 			"session_key": sessionKey(message), "prompt": prompt, "channel": message.Channel,
@@ -644,7 +644,7 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	if err != nil {
 		return fmt.Errorf("start job: %w", err)
 	}
-	reservation, admission, err := s.reserveRecoveryExecution(message)
+	reservation, admission, err := s.reserveRecoveryExecution(message, additionalSourceIDs...)
 	if err != nil {
 		if jobCreated {
 			s.Runtime.EndJob(jobID)
@@ -681,7 +681,9 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 		actualAdmission = "steered"
 	}
 	if admission == "followup" && admission != actualAdmission {
-		_, _ = s.History.Append(message.Channel, message.Conversation, history.Entry{Role: "correlation", SourceMessageID: message.SourceMessageID, ExecutionID: executionID, Admission: actualAdmission})
+		for _, source := range append([]string{message.SourceMessageID}, additionalSourceIDs...) {
+			_, _ = s.History.Append(message.Channel, message.Conversation, history.Entry{Role: "correlation", SourceMessageID: source, ExecutionID: executionID, Admission: actualAdmission})
+		}
 	}
 	s.Runtime.SetJobRunningIfStarting(jobID)
 	if emit != nil {

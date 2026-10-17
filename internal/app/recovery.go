@@ -33,10 +33,9 @@ type recoveryExecution struct {
 }
 
 type recoveryReservation struct {
-	executionID string
-	sourceID    string
-	created     bool
-	sourceAdded bool
+	executionID  string
+	addedSources []string
+	created      bool
 }
 
 // RecoveryStatus is a bounded content-free projection of the most recent
@@ -55,12 +54,12 @@ type RecoveryStatus struct {
 	diagnostics   int
 }
 
-func (s *Service) reserveRecoveryExecution(message core.Message) (recoveryReservation, string, error) {
+func (s *Service) reserveRecoveryExecution(message core.Message, additionalSourceIDs ...string) (recoveryReservation, string, error) {
 	s.recoveryMu.Lock()
 	defer s.recoveryMu.Unlock()
 	key := sessionKey(message)
 	current := s.recoveryExecution[key]
-	reservation := recoveryReservation{sourceID: message.SourceMessageID}
+	reservation := recoveryReservation{}
 	admission := "new"
 	if provider, ok := s.Harness.(interface{ ConversationAdmission(string) string }); ok {
 		if value := provider.ConversationAdmission(key); value == "new" || value == "queued" || value == "steered" {
@@ -79,19 +78,21 @@ func (s *Service) reserveRecoveryExecution(message core.Message) (recoveryReserv
 		admission = "followup"
 	}
 	reservation.executionID = current.id
-	if message.SourceMessageID != "" {
-		if _, exists := current.sources[message.SourceMessageID]; !exists {
-			current.sources[message.SourceMessageID] = struct{}{}
-			reservation.sourceAdded = true
+	for _, source := range append([]string{message.SourceMessageID}, additionalSourceIDs...) {
+		if source != "" {
+			if _, exists := current.sources[source]; !exists {
+				current.sources[source] = struct{}{}
+				reservation.addedSources = append(reservation.addedSources, source)
+			}
 		}
-	}
-	_, err := s.History.Append(message.Channel, message.Conversation, history.Entry{
-		Role: "correlation", SourceMessageID: message.SourceMessageID,
-		ExecutionID: current.id, Admission: admission,
-	})
-	if err != nil {
-		s.rollbackRecoveryReservationLocked(key, reservation)
-		return recoveryReservation{}, "", err
+		_, err := s.History.Append(message.Channel, message.Conversation, history.Entry{
+			Role: "correlation", SourceMessageID: source,
+			ExecutionID: current.id, Admission: admission,
+		})
+		if err != nil {
+			s.rollbackRecoveryReservationLocked(key, reservation)
+			return recoveryReservation{}, "", err
+		}
 	}
 	return reservation, admission, nil
 }
@@ -107,8 +108,8 @@ func (s *Service) rollbackRecoveryReservationLocked(key string, reservation reco
 	if current == nil || current.id != reservation.executionID {
 		return
 	}
-	if reservation.sourceAdded {
-		delete(current.sources, reservation.sourceID)
+	for _, source := range reservation.addedSources {
+		delete(current.sources, source)
 	}
 	if reservation.created && len(current.sources) == 0 {
 		delete(s.recoveryExecution, key)
@@ -563,7 +564,7 @@ func (s *Service) dispatchRecovery(ctx context.Context, origin orchestrator.Orig
 			dispatchErr = promptErr
 			return nil
 		}
-		dispatchErr = s.dispatchHarnessPrompt(ctx, message, base+"\n\n---\n\n"+prompt, s.recoveryEmitter(origin))
+		dispatchErr = s.dispatchHarnessPrompt(ctx, message, base+"\n\n---\n\n"+prompt, s.recoveryEmitter(origin), ids[1:]...)
 		return nil
 	})
 	if err != nil {
