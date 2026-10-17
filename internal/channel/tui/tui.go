@@ -43,14 +43,19 @@ type titleEvent struct{ title string }
 type runtimeEvent struct{ status core.RuntimeStatus }
 type durableWorkEvent struct{ counts core.DurableWorkCounts }
 type themeEvent struct{ theme theme.Theme }
-type taskNotificationEvent struct{ notification channel.Notification }
+type taskNotificationEvent struct {
+	conversation string
+	notification channel.Notification
+	closed       bool
+}
 type notificationPauseMsg struct{ sequence uint64 }
 type notificationAckMsg struct {
-	ids   []string
-	after int
-	err   error
+	conversation string
+	ids          []string
+	after        int
+	err          error
 }
-type notificationAckRetryMsg struct{}
+type notificationAckRetryMsg struct{ conversation string }
 type notificationBoundaryMsg struct {
 	sequence uint64
 	safe     bool
@@ -132,9 +137,10 @@ type Options struct {
 	ConnectionEvents   <-chan channel.ConnectionStatus
 	PairingEvents      <-chan channel.PairingEvent
 	NoticeEvents       <-chan channel.Notice
-	NotificationEvents <-chan channel.Notification
+	HistoryDirectory   string
+	HistoryOffset      int64
 	ConversationEvents <-chan core.Event
-	AckNotification    func(string, int) error
+	AckNotification    func(string, string, int) error
 	InitialConnections []channel.ConnectionStatus
 	TitleEvents        <-chan string
 	Themes             []theme.Theme
@@ -237,8 +243,10 @@ type model struct {
 	pairings                 <-chan channel.PairingEvent
 	notices                  <-chan channel.Notice
 	notifications            <-chan channel.Notification
+	historyDirectory         string
+	cancelNotifications      context.CancelFunc
 	conversationEvents       <-chan core.Event
-	ackNotification          func(string, int) error
+	ackNotification          func(string, string, int) error
 	titles                   <-chan string
 	runtimeEvents            <-chan core.RuntimeStatus
 	runtimeStatus            core.RuntimeStatus
@@ -481,7 +489,7 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 	}
 	initialTranscript := transcriptFromHistory(initialHistory)
 	m := model{
-		ctx: ctx, handler: handler, title: resolvedTitle, version: headerVersion(options.Version), input: input,
+		ctx: liveCtx, handler: handler, title: resolvedTitle, version: headerVersion(options.Version), input: input,
 		viewport: viewport.New(80, 20), events: make(chan core.Event, 256), composerRows: minComposerHeight,
 		logoSpinner:          newLogoSpinner(),
 		logoTick:             scheduleLogoTick,
@@ -498,7 +506,7 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 		connections:          options.ConnectionEvents,
 		pairings:             options.PairingEvents,
 		notices:              options.NoticeEvents,
-		notifications:        options.NotificationEvents,
+		historyDirectory:     options.HistoryDirectory,
 		conversationEvents:   options.ConversationEvents,
 		ackNotification:      options.AckNotification,
 		titles:               options.TitleEvents,
@@ -521,6 +529,7 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 		status:               "Ready", conversation: conversation, liveConversation: liveConversation,
 		initialHistoryScroll: len(initialTranscript) > 0,
 	}
+	m.watchConversationNotifications(options.HistoryOffset)
 	if options.InitialScreen != nil {
 		m.openScreen(*options.InitialScreen)
 	}
@@ -756,8 +765,8 @@ func (m model) waitEvent() tea.Cmd {
 			return pairingEvent{event: event}
 		case notice := <-m.notices:
 			return noticeEvent{notice: notice}
-		case notification := <-m.notifications:
-			return taskNotificationEvent{notification: notification}
+		case notification, ok := <-m.notifications:
+			return taskNotificationEvent{conversation: m.conversation, notification: notification, closed: !ok}
 		case event := <-m.conversationEvents:
 			return uiEvent{event: event, conversation: true}
 		case title := <-m.titles:
@@ -1181,6 +1190,10 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			commands = append(commands, func() tea.Msg { return uiEvent{event: event, replay: true} })
 		}
 	case taskNotificationEvent:
+		if value.closed || value.conversation != m.conversation {
+			commands = append(commands, m.waitEvent())
+			break
+		}
 		if value.notification.Recovery {
 			m.appendRecoveredResponse(value.notification)
 			m.refresh()
@@ -1213,11 +1226,12 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			commands = append(commands, m.beginNotificationAckAt(value.after))
 		}
 	case notificationAckMsg:
-		if !m.notificationAckBusy {
+		if value.conversation != m.conversation || !m.notificationAckBusy {
 			break
 		}
 		if value.err != nil {
-			commands = append(commands, tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return notificationAckRetryMsg{} }))
+			conversation := m.conversation
+			commands = append(commands, tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return notificationAckRetryMsg{conversation: conversation} }))
 			break
 		}
 		m.commitStreamingPrefix(value.after)
@@ -1234,7 +1248,7 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			commands = append(commands, notificationPause(m.deltaSequence))
 		}
 	case notificationAckRetryMsg:
-		if m.notificationAckBusy {
+		if value.conversation == m.conversation && m.notificationAckBusy {
 			commands = append(commands, m.ackPendingNotifications())
 		}
 	case bubblespinner.TickMsg:
@@ -1743,13 +1757,14 @@ func (m *model) ackPendingNotifications() tea.Cmd {
 	ids := append([]string(nil), m.notificationAckIDs...)
 	after := m.notificationAckAfter
 	ack := m.ackNotification
+	conversation := m.conversation
 	return func() tea.Msg {
 		for _, id := range ids {
-			if err := ack(id, after); err != nil {
-				return notificationAckMsg{ids: ids, after: after, err: err}
+			if err := ack(conversation, id, after); err != nil {
+				return notificationAckMsg{conversation: conversation, ids: ids, after: after, err: err}
 			}
 		}
-		return notificationAckMsg{ids: ids, after: after}
+		return notificationAckMsg{conversation: conversation, ids: ids, after: after}
 	}
 }
 
@@ -3546,16 +3561,41 @@ func trueColorBackgroundSGR(background lipgloss.TerminalColor) string {
 	return fmt.Sprintf("\x1b[48;2;%d;%d;%dm", red>>8, green>>8, blue>>8)
 }
 
+func (m *model) watchConversationNotifications(offset int64) {
+	if m.cancelNotifications != nil {
+		m.cancelNotifications()
+	}
+	m.notifications = nil
+	if m.historyDirectory != "" {
+		ctx, cancel := context.WithCancel(m.ctx)
+		m.cancelNotifications = cancel
+		path := history.New(m.historyDirectory).Path("tui", m.conversation)
+		m.notifications = watchTaskNotifications(ctx, path, offset)
+	}
+}
+
+func (m *model) selectConversation(conversation string, offset int64) {
+	m.conversation = conversation
+	if m.liveConversation != nil {
+		m.liveConversation.Set(conversation)
+	}
+	m.pendingNotifications = nil
+	m.notificationAckBusy = false
+	m.notificationAckIDs = nil
+	m.notificationAckAfter = 0
+	m.notificationBoundaryBusy = false
+	m.deltaSequence++
+	m.deferredUIEvents = nil
+	m.watchConversationNotifications(offset)
+}
+
 func (m *model) openScreen(screen core.Screen) {
 	m.clearSelections()
 	m.dialog = nil
 	if screen.ID == "welcome" {
 		if screen.Conversation != "" {
 			m.resetComposer()
-			m.conversation = screen.Conversation
-			if m.liveConversation != nil {
-				m.liveConversation.Set(screen.Conversation)
-			}
+			m.selectConversation(screen.Conversation, screen.HistoryOffset)
 			m.transcript = nil
 			m.initialHistoryScroll = false
 			m.resetResponse()
@@ -3580,10 +3620,7 @@ func (m *model) openScreen(screen core.Screen) {
 	}
 	if screen.ID == "chat" && screen.Conversation != "" {
 		m.resetComposer()
-		m.conversation = screen.Conversation
-		if m.liveConversation != nil {
-			m.liveConversation.Set(screen.Conversation)
-		}
+		m.selectConversation(screen.Conversation, screen.HistoryOffset)
 		m.welcome = nil
 		m.welcomeFocus = false
 		m.transcript = make([]transcriptEntry, 0, len(screen.Transcript))

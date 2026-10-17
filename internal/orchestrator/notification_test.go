@@ -47,8 +47,12 @@ func TestNotificationFrontMatterPreservesUnknownFieldsAndValidatesOrigin(t *test
 		t.Fatalf("local fallback policy = %#v, %v", policy, err)
 	}
 	doc.FrontMatter["notify"] = map[string]any{"enabled": true, "origin": "telegram/TG-7", "fallback_origin": "whatsapp/WA-1", "on": []any{"done"}}
+	if _, err := NotificationFromDocument(doc); err != nil {
+		t.Fatalf("explicit remote fallback rejected: %v", err)
+	}
+	doc.FrontMatter["notify"].(map[string]any)["fallback_origin"] = "whatsapp/WA-group-1"
 	if _, err := NotificationFromDocument(doc); err == nil {
-		t.Fatal("remote fallback accepted")
+		t.Fatal("group fallback accepted")
 	}
 }
 

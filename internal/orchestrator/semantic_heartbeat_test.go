@@ -134,7 +134,7 @@ Record findings with {{HEARTBEAT_ACTION_COMMAND}} and finish with exactly one au
 	if !strings.Contains(prompt, "Keep this workspace-specific inspection rule.") {
 		t.Fatalf("heartbeat sanitizer removed unrelated customization: %q", prompt)
 	}
-	for _, obsolete := range []string{"This audit is read-only", "primary runtime\u2014not this agent", "notify.origin", "HEARTBEAT_ACTION_COMMAND", "exactly one audit outcome", "Absence of an audit action"} {
+	for _, obsolete := range []string{"This audit is read-only", "primary runtime\u2014not this agent", "only to the affected workflow's authorized", "HEARTBEAT_ACTION_COMMAND", "exactly one audit outcome", "Absence of an audit action"} {
 		if strings.Contains(prompt, obsolete) {
 			t.Fatalf("heartbeat prompt retained obsolete rule %q: %q", obsolete, prompt)
 		}

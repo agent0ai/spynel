@@ -16,6 +16,8 @@
 
 - Own committed integration event replay and atomic bounded resynchronization snapshots. Cursors bind workspace/conversation, first history record and exact preceding record; invalid, cleared/replaced, corrupt, missing or excessive-lag cursors fail explicitly. Replay at most 256 raw records/4 MiB per read; snapshots pair the newest 100 visible entries under the existing 2 Mi-rune bound with the same append-lock cursor. A first subscription to an empty conversation appends only a private correlation baseline. Deltas/statuses are not durable subscription events, private ledgers stay hidden, notifications retain their existing outbox identity, and ordinary history retention/clear remains authoritative.
 
+- Notification delivery-state lookup recognizes committed assistant and pending-TUI entries by stable event ID. The application uses that existing ledger for local, remote and explicit-fallback retry suppression; normal context rendering retains notification timestamps/assistant semantics and hides send/failure bookkeeping.
+
 ## Child DOX Index
 
 No child DOX files.

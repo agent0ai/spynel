@@ -54,6 +54,7 @@ func TestMalformedSummaryDoesNotBlockNotificationAgentScheduling(t *testing.T) {
 	cfg.Root = directory
 	cfg.Path = filepath.Join(directory, ".spynel", "config.yaml")
 	manager := New(cfg, harness, extensions.Runner{})
+	manager.NotificationContext = func(Origin) (string, error) { return "", nil }
 	if err := manager.completeTransition(context.Background(), workflowRoute{Name: "tasks"}, Lease{ID: "lease", Phase: phaseTaskImplementation, ClaimAttempt: 1}, "done", path); err != nil {
 		t.Fatal(err)
 	}

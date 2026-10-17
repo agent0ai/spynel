@@ -269,7 +269,7 @@ func (s *Store) DeliveryState(channel, conversation, eventID string) (string, er
 				state = "sending"
 			case "notification_failed":
 				state = "failed"
-			case "assistant":
+			case "assistant", "notification_pending":
 				if entry.Sender == "Spy" {
 					state = "sent"
 				}

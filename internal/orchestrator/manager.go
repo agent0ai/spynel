@@ -65,6 +65,7 @@ type Manager struct {
 	JobEvent                 func(id int, event core.Event)
 	JobFinished              func(id int)
 	Cleanup                  func(context.Context, int) (string, error)
+	NotificationContext      func(Origin) (string, error)
 	notificationAgentTimeout time.Duration
 	runtimeConfigMu          sync.RWMutex
 	runtimeConfig            config.Config

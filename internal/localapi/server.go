@@ -310,9 +310,6 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 	events := make(chan core.Event, 64)
 	emit := func(event core.Event) {
 		event.RequestID = message.SourceMessageID
-		if message.Channel == "tui" && event.Screen != nil && event.Screen.Conversation != "" {
-			_ = s.Service.RegisterLiveTUI(message.InstanceID, event.Screen.Conversation, time.Now().UTC())
-		}
 		select {
 		case events <- event:
 		case <-ctx.Done():

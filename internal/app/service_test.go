@@ -222,7 +222,7 @@ func TestTaskCommandDelegatesCreationPolicyToCommunicationAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	prompts := harness.prompts["chat:cli:deploy"]
-	if len(prompts) != 1 || !strings.Contains(prompts[0], "explicitly invoked `/task`") || !strings.Contains(prompts[0], "ship it") || !strings.Contains(prompts[0], "origin `cli/deploy`") || !strings.Contains(prompts[0], "review_required") || !strings.Contains(prompts[0], "cancelled") {
+	if len(prompts) != 1 || !strings.Contains(prompts[0], "explicitly invoked `/task`") || !strings.Contains(prompts[0], "ship it") || !strings.Contains(prompts[0], `origin: "cli/deploy", on: [done, failed, waiting, cancelled]`) || !strings.Contains(prompts[0], "review_required") || !strings.Contains(prompts[0], "cancelled") {
 		t.Fatalf("task creation prompt = %#v", prompts)
 	}
 }
@@ -249,7 +249,7 @@ func TestCreationPromptsRetainFrameworkEvidenceGroundedHonestyWithCustomChatProm
 			t.Fatal(err)
 		}
 		prompt := harness.prompts["chat:cli:"+test.conversation][0]
-		if !strings.Contains(prompt, "preserved custom chat prompt") || strings.Count(prompt, instructions.EpistemicTrustGuidance) != 1 || !strings.Contains(prompt, "explicitly invoked `/"+test.kind+"`") {
+		if !strings.Contains(prompt, "preserved custom chat prompt") || strings.Count(prompt, instructions.EpistemicTrustGuidance) != 1 || !strings.Contains(prompt, "explicitly invoked `/"+test.kind+"`") || !strings.Contains(prompt, "notify.on: [done, failed, waiting, cancelled]") {
 			t.Errorf("/%s prompt omitted custom content, creation directive, or exact-once trust contract:\n%s", test.kind, prompt)
 		}
 	}
@@ -4070,9 +4070,20 @@ func TestNewCommandCreatesDistinctTUIConversationAndPreservesPriorHistory(t *tes
 	if _, err := service.History.Append("tui", "prior", history.Entry{Role: "assistant", Content: "keep this"}); err != nil {
 		t.Fatal(err)
 	}
-	var response core.Event
-	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "prior", Text: "/new"}, func(event core.Event) { response = event }); err != nil {
+	if err := service.RegisterLiveTUI("client", "prior", time.Now().UTC()); err != nil {
 		t.Fatal(err)
+	}
+	var response core.Event
+	if err := service.Handle(context.Background(), core.Message{Channel: "tui", InstanceID: "client", Conversation: "prior", Text: "/new"}, func(event core.Event) {
+		response = event
+		if event.Screen != nil && service.liveTUIConversation("client", time.Now().UTC()) != event.Screen.Conversation {
+			t.Error("new screen exposed before its owner-side selection")
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !service.liveTUIConversations(time.Now().UTC())["prior"] {
+		t.Fatal("new selection lost prior conversation cleanup protection")
 	}
 	if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != "welcome" || !strings.HasPrefix(response.Screen.Conversation, "new-") || response.Screen.Conversation == "prior" {
 		t.Fatalf("new conversation response = %#v", response)
@@ -4090,6 +4101,38 @@ func TestNewCommandCreatesDistinctTUIConversationAndPreservesPriorHistory(t *tes
 	}
 	if !strings.Contains(response.Text, "available in the TUI") {
 		t.Fatalf("remote /new response = %#v", response)
+	}
+}
+
+func TestNewCommandPreservesSelectionOnAdmissionFailure(t *testing.T) {
+	for _, mode := range []string{"missing-instance", "invalid-instance", "history-failure"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Root = t.TempDir()
+			service := New(cfg, newServiceHarness())
+			t.Cleanup(service.Runtime.Close)
+			if err := service.RegisterLiveTUI("client", "prior", time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+			instanceID := "client"
+			switch mode {
+			case "missing-instance":
+				instanceID = ""
+			case "invalid-instance":
+				instanceID = "cli\nent"
+			case "history-failure":
+				path := filepath.Join(t.TempDir(), "file")
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				service.History = history.New(path)
+			}
+			emitted := false
+			err := service.handleCommand(context.Background(), core.Message{Channel: "tui", InstanceID: instanceID, Conversation: "prior", Text: "/new"}, func(core.Event) { emitted = true })
+			if err == nil || emitted || service.liveTUIConversation("client", time.Now().UTC()) != "prior" {
+				t.Fatalf("failed selection err=%v emitted=%t", err, emitted)
+			}
+		})
 	}
 }
 
