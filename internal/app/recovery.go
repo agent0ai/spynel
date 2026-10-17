@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -284,127 +285,168 @@ func (s *Service) scanRecovery(ctx context.Context, trigger string) RecoveryStat
 		s.publishRecoveryStatus(result)
 		return result
 	}
-	conversations, err := s.History.List(recoveryConversationMax + 1)
+	conversations, more, err := s.History.RecoveryConversations(s.recoveryAfter, recoveryConversationMax)
 	if err != nil {
 		result.FailedClosed++
 		s.recoveryDecision(&result, 0, 0, "conversation_list_unreadable", 1)
 		s.publishRecoveryStatus(result)
 		return result
 	}
-	if len(conversations) > recoveryConversationMax {
-		conversations = conversations[:recoveryConversationMax]
-		result.Truncated = true
-		s.recoveryDecision(&result, 0, 0, "conversation_limit", 1)
+	if len(conversations) == 0 && s.recoveryAfter != "" {
+		s.recoveryAfter = ""
+		conversations, more, err = s.History.RecoveryConversations("", recoveryConversationMax)
+		if err != nil {
+			result.FailedClosed++
+			s.recoveryDecision(&result, 0, 0, "conversation_list_unreadable", 1)
+			s.publishRecoveryStatus(result)
+			return result
+		}
 	}
 	cutoff := result.ScannedAt.Add(-recoveryWindow)
-	durableSources, durableErr := s.durableRecoverySources()
-	if durableErr != nil {
-		result.FailedClosed++
-		s.recoveryDecision(&result, 0, 0, "source_index_unreadable", 1)
-		s.publishRecoveryStatus(result)
-		return result
-	}
 	for slot, conversation := range conversations {
-		if ctx.Err() != nil || result.Dispatched >= recoveryDispatchMax || result.Entries >= recoveryTotalEntryMax {
+		if ctx.Err() != nil || result.Dispatched >= recoveryDispatchMax {
 			result.Truncated = true
 			s.recoveryDecision(&result, slot+1, 0, "scan_budget_or_cancelled", 1)
 			break
 		}
-		if conversation.UpdatedAt.Before(cutoff) {
-			s.recoveryDecision(&result, slot+1, 0, "outside_window", 1)
-			continue
-		}
+		s.recoveryAfter = conversation.Path
 		result.Conversations++
-		snapshot, readErr := s.History.RecoveryWindow(conversation.Channel, conversation.Conversation, cutoff, recoveryTotalEntryMax-result.Entries)
-		if readErr != nil {
-			result.Truncated = result.Truncated || errors.Is(readErr, history.ErrRecoveryEntryBound) || errors.Is(readErr, history.ErrRecoveryByteBound)
-			result.FailedClosed++
-			s.recoveryDecision(&result, slot+1, 0, recoveryReadReason(readErr), 1)
-			continue
-		}
-		result.Entries += snapshot.Records
-		candidates := s.classifyRecoveryEntries(snapshot, s.recoveryActivation, cutoff, &result, slot+1)
-		if len(candidates) > 0 {
-			filtered := candidates[:0]
-			for _, candidate := range candidates {
-				if durableSources[candidate.entry.SourceMessageID] {
-					result.Excluded++
-					s.recoveryDecision(&result, slot+1, 0, "linked_work", 1)
-					continue
-				}
-				filtered = append(filtered, candidate)
+		for after := 0; ; {
+			snapshot, readErr := s.History.RecoveryPage(conversation.Channel, conversation.Conversation, cutoff, after, recoveryTotalEntryMax)
+			if readErr != nil {
+				result.FailedClosed++
+				s.recoveryDecision(&result, slot+1, 0, recoveryReadReason(readErr), 1)
+				break
 			}
-			candidates = filtered
-		}
-		if len(candidates) == 0 {
-			continue
-		}
-		origin := orchestrator.Origin{Channel: conversation.Channel, Conversation: conversation.Conversation}
-		reason := ""
-		switch {
-		case strings.Contains(conversation.Conversation, "-group-"):
-			reason = "group"
-		case s.validateOrigin(origin) != nil:
-			reason = "unauthorized"
-		case s.conversationInFlight(sessionKey(core.Message{Channel: conversation.Channel, Conversation: conversation.Conversation})):
-			reason = "active_or_queued"
-		}
-		if reason != "" {
-			result.FailedClosed += len(candidates)
-			s.recoveryDecision(&result, slot+1, 0, reason, len(candidates))
-			continue
-		}
-		result.Eligible += len(candidates)
-		if s.dispatchRecovery(ctx, origin, candidates) {
-			result.Dispatched++
-			s.recoveryDecision(&result, slot+1, 0, "recovery_admitted", len(candidates))
-		} else {
-			result.FailedClosed++
-			s.recoveryDecision(&result, slot+1, 0, "dispatch_not_admitted", len(candidates))
+			result.Entries += snapshot.Records
+			candidates := s.classifyRecoveryEntries(snapshot, s.recoveryActivation, cutoff, &result, slot+1)
+			ids := make([]string, 0, len(candidates))
+			for _, candidate := range candidates {
+				ids = append(ids, candidate.entry.SourceMessageID)
+			}
+			durableSources, durableErr := s.durableRecoverySources(ids)
+			if durableErr != nil {
+				result.FailedClosed++
+				s.recoveryDecision(&result, slot+1, 0, "source_index_unreadable", 1)
+				break
+			}
+			if len(candidates) > 0 {
+				filtered := candidates[:0]
+				for _, candidate := range candidates {
+					if durableSources[candidate.entry.SourceMessageID] {
+						result.Excluded++
+						s.recoveryDecision(&result, slot+1, 0, "linked_work", 1)
+						continue
+					}
+					filtered = append(filtered, candidate)
+				}
+				candidates = filtered
+			}
+			if len(candidates) == 0 {
+				if ctx.Err() != nil || !snapshot.More {
+					break
+				}
+				after = snapshot.Next
+				continue
+			}
+			origin := orchestrator.Origin{Channel: conversation.Channel, Conversation: conversation.Conversation}
+			reason := ""
+			switch {
+			case strings.Contains(conversation.Conversation, "-group-"):
+				reason = "group"
+			case s.validateOrigin(origin) != nil:
+				reason = "unauthorized"
+			case s.conversationInFlight(sessionKey(core.Message{Channel: conversation.Channel, Conversation: conversation.Conversation})):
+				reason = "active_or_queued"
+			}
+			if reason != "" {
+				result.FailedClosed += len(candidates)
+				s.recoveryDecision(&result, slot+1, 0, reason, len(candidates))
+				break
+			}
+			if len(candidates) > 20 {
+				candidates = candidates[:20]
+				s.recoveryDecision(&result, slot+1, 0, "candidate_batch_deferred", 1)
+			}
+			result.Eligible += len(candidates)
+			if s.dispatchRecovery(ctx, origin, candidates) {
+				result.Dispatched++
+				s.recoveryDecision(&result, slot+1, 0, "recovery_admitted", len(candidates))
+			} else {
+				result.FailedClosed++
+				s.recoveryDecision(&result, slot+1, 0, "dispatch_not_admitted", len(candidates))
+			}
+			break // One ordinary provider admission per conversation per scan.
 		}
 	}
+	if more {
+		result.Truncated = true
+		s.recoveryDecision(&result, 0, 0, "conversation_batch_deferred", 1)
+	} else if result.Dispatched < recoveryDispatchMax && ctx.Err() == nil {
+		s.recoveryAfter = ""
+	}
+
 	s.publishRecoveryStatus(result)
+	if result.Truncated && ctx.Err() == nil {
+		s.triggerRecoveryScan("batch_continuation")
+	}
 	return result
 }
 
-func (s *Service) durableRecoverySources() (map[string]bool, error) {
-	const documentMax = 2000
+func (s *Service) durableRecoverySources(requested []string) (map[string]bool, error) {
 	result := map[string]bool{}
-	documents := 0
+	if len(requested) == 0 {
+		return result, nil
+	}
+	wanted := map[string]bool{}
+	for _, id := range requested {
+		wanted[id] = true
+	}
 	for _, directory := range s.Orchestrator.WorkflowDirectories() {
-		entries, err := os.ReadDir(directory)
-		if os.IsNotExist(err) {
-			continue
-		}
+		err := func() error {
+			folder, err := os.Open(directory)
+			if os.IsNotExist(err) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			defer folder.Close()
+			for {
+				entries, err := folder.ReadDir(100)
+				if err != nil && err != io.EOF {
+					return err
+				}
+				for _, entry := range entries {
+					if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" || entry.Type()&os.ModeSymlink != 0 || entry.Name() == "AGENTS.md" {
+						continue
+					}
+					document, err := orchestrator.ReadDocumentMetadata(filepath.Join(directory, entry.Name()))
+					if err != nil {
+						return err
+					}
+					switch values := document.FrontMatter["source_message_ids"].(type) {
+					case []string:
+						for _, value := range values {
+							if wanted[value] {
+								result[value] = true
+							}
+						}
+					case []any:
+						for _, raw := range values {
+							if value, ok := raw.(string); ok && wanted[value] {
+								result[value] = true
+							}
+						}
+					}
+				}
+				if err == io.EOF {
+					return nil
+				}
+			}
+		}()
 		if err != nil {
 			return nil, err
-		}
-		for _, entry := range entries {
-			if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" || entry.Type()&os.ModeSymlink != 0 {
-				continue
-			}
-			documents++
-			if documents > documentMax {
-				return nil, errors.New("durable source-link index exceeds recovery bound")
-			}
-			document, err := orchestrator.ReadDocument(filepath.Join(directory, entry.Name()))
-			if err != nil {
-				return nil, err
-			}
-			switch values := document.FrontMatter["source_message_ids"].(type) {
-			case []string:
-				for _, value := range values {
-					if value != "" {
-						result[value] = true
-					}
-				}
-			case []any:
-				for _, raw := range values {
-					if value, ok := raw.(string); ok && value != "" {
-						result[value] = true
-					}
-				}
-			}
 		}
 	}
 	return result, nil
@@ -474,7 +516,7 @@ func (s *Service) dispatchRecovery(ctx context.Context, origin orchestrator.Orig
 		if !s.Settings.Snapshot().Orchestrator.RetriggerUnrespondedMessages || s.conversationInFlight(sessionKey(core.Message{Channel: origin.Channel, Conversation: origin.Conversation})) {
 			return nil
 		}
-		durableSources, indexErr := s.durableRecoverySources()
+		durableSources, indexErr := s.durableRecoverySources(ids)
 		if indexErr != nil {
 			return indexErr
 		}
@@ -498,10 +540,17 @@ func (s *Service) dispatchRecovery(ctx context.Context, origin orchestrator.Orig
 		ids = ids[:0]
 		var bodies strings.Builder
 		ambiguous := false
+		fmt.Fprintf(&bodies, "Full authoritative history JSONL: %q. Read each complete source message there before acting when its body is marked as an excerpt.\n", s.History.Path(origin.Channel, origin.Conversation))
 		for index, entry := range reserved {
 			ids = append(ids, entry.SourceMessageID)
 			ambiguous = ambiguous || entry.Admission != ""
-			fmt.Fprintf(&bodies, "\n<stalled_message index=\"%d\" source_message_id=\"%s\">\n%s\n</stalled_message>\n", index+1, entry.SourceMessageID, entry.Content)
+			body := entry.Content
+			budget := (48 * 1024) / len(reserved)
+			excerpt := entry.IsContentExcerpt() || len(body) > budget
+			if len(body) > budget {
+				body = strings.ToValidUTF8(body[:budget], "")
+			}
+			fmt.Fprintf(&bodies, "\n<stalled_message index=\"%d\" source_message_id=\"%s\" excerpt=\"%t\">\n%s\n</stalled_message>\n", index+1, entry.SourceMessageID, excerpt, body)
 		}
 		mode := "No provider admission was recorded, but you must still validate relevance against all later conversation and durable work before acting."
 		if ambiguous {
@@ -593,10 +642,8 @@ func (s *Service) recoveryFailure(origin orchestrator.Origin, _ error) {
 
 func recoveryReadReason(err error) string {
 	switch {
-	case errors.Is(err, history.ErrRecoveryEntryBound):
-		return "recent_entry_limit"
 	case errors.Is(err, history.ErrRecoveryByteBound):
-		return "history_entry_size_or_recent_byte_limit"
+		return "correlation_metadata_limit"
 	case errors.Is(err, history.ErrRecoveryCorrupt):
 		return "corrupt_history"
 	default:

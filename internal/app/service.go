@@ -100,6 +100,7 @@ type Service struct {
 	recoveryExecution      map[string]*recoveryExecution
 	recoveryIntake         map[string]int
 	recoveryStatus         RecoveryStatus
+	recoveryAfter          string
 	recoveryOwnershipFence func(func() error) (bool, error)
 }
 

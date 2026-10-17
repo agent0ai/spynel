@@ -1590,7 +1590,16 @@ func (m *Manager) relatedTasksForGoal(file string) string {
 		lines = append(lines, "- ["+task.Status+"] "+task.Path)
 	}
 	sort.Strings(lines)
-	return strings.Join(lines, "\n")
+	context := strings.Join(lines, "\n")
+	const contextBytes = 32 * 1024
+	if len(context) > contextBytes {
+		tail := context[len(context)-contextBytes:]
+		if end := strings.IndexByte(tail, '\n'); end >= 0 {
+			tail = tail[end+1:]
+		}
+		return fmt.Sprintf("- Earlier linked-task paths omitted from prompt context only. Inspect the complete current round in the authoritative goal %q and task folders %q before deciding the outcome.\n%s", file, m.Config.StatePath("tasks"), tail)
+	}
+	return context
 }
 
 func (m *Manager) Wait() { m.jobs.Wait() }

@@ -1,9 +1,11 @@
 package orchestrator
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +45,36 @@ func ReadDocument(path string) (Document, error) {
 		return Document{}, err
 	}
 	return ParseDocument(data)
+}
+
+// ReadDocumentMetadata streams only the bounded YAML header, independently of
+// a document's accumulated progress/body size.
+func ReadDocumentMetadata(path string) (Document, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return Document{}, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(io.LimitReader(file, (1<<20)+1))
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	var header strings.Builder
+	for scanner.Scan() {
+		line := strings.TrimSuffix(scanner.Text(), "\r")
+		if header.Len() == 0 && line != "---" {
+			return Document{}, errors.New("markdown document must begin with YAML front matter")
+		}
+		if header.Len()+len(line)+1 > 1<<20 {
+			return Document{}, errors.New("workflow metadata exceeds read limit")
+		}
+		header.WriteString(line + "\n")
+		if line == "---" && header.Len() > 4 {
+			return ParseDocument([]byte(header.String()))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return Document{}, err
+	}
+	return Document{}, errors.New("markdown front matter is not terminated within read limit")
 }
 
 func ParseDocument(data []byte) (Document, error) {

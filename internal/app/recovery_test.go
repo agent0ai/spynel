@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,6 +55,14 @@ func TestRecoveryFreshPrimaryDeliversOnceAfterLongOldHistory(t *testing.T) {
 		if _, err := previous.History.Append("telegram", "TG-7", history.Entry{At: old, Role: "assistant", Content: "old context"}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	for i := 0; i < recoveryTotalEntryMax+1; i++ {
+		if _, err := previous.History.Append("telegram", "TG-7", history.Entry{Role: "assistant", Content: "recent context"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := previous.History.Append("telegram", "TG-7", history.Entry{At: old, Role: "assistant", Content: strings.Repeat("large output ", 500000)}); err != nil {
+		t.Fatal(err)
 	}
 	message := core.Message{Channel: "telegram", Conversation: "TG-7", SourceMessageID: "telegram:7:interrupted", Text: "check whether this report is still needed"}
 	if err := previous.Handle(context.Background(), message, nil); err != nil {
@@ -113,6 +122,9 @@ func TestRecoveryFreshPrimaryDeliversOnceAfterLongOldHistory(t *testing.T) {
 		t.Fatal("repeated scans duplicated work or replies")
 	}
 	snapshot, err := service.History.RecoveryWindow(message.Channel, message.Conversation, time.Now().UTC().Add(-recoveryWindow), recoveryTotalEntryMax)
+	for err == nil && snapshot.More && snapshot.Covered[message.SourceMessageID] == "" {
+		snapshot, err = service.History.RecoveryPage(message.Channel, message.Conversation, time.Now().UTC().Add(-recoveryWindow), snapshot.Next, recoveryTotalEntryMax)
+	}
 	if err != nil || snapshot.Covered[message.SourceMessageID] != "terminal_coverage" || !snapshot.Admitted[message.SourceMessageID] {
 		t.Fatalf("terminal correlation missing: %#v, %v", snapshot, err)
 	}
@@ -190,7 +202,7 @@ func TestRecoveryLeavesOlderUncoveredRequestEligibleAfterExcludedCommand(t *test
 	}
 }
 
-func TestRecoveryFailsClosedWhenConversationExceedsBound(t *testing.T) {
+func TestRecoveryProcessesConversationBeyondRecentRecordBudget(t *testing.T) {
 	service, target, _ := newRecoveryTestService(t)
 	now := time.Now().UTC()
 	if _, err := service.History.Append("cli", "overflow", history.Entry{At: now, AcceptedAt: now, Role: "user", Content: "must not recover from a partial history", SourceMessageID: "local:overflow"}); err != nil {
@@ -202,8 +214,8 @@ func TestRecoveryFailsClosedWhenConversationExceedsBound(t *testing.T) {
 		}
 	}
 	result := service.scanRecovery(context.Background(), "periodic")
-	if result.Dispatched != 0 || result.FailedClosed == 0 || !result.Truncated || len(target.prompts) != 0 {
-		t.Fatalf("overflow recovery did not fail closed: result=%#v prompts=%#v", result, target.prompts)
+	if result.Dispatched != 1 || result.FailedClosed != 0 || len(target.prompts) != 1 {
+		t.Fatalf("recent history budget prevented recovery: result=%#v prompts=%#v", result, target.prompts)
 	}
 }
 
@@ -297,7 +309,7 @@ func TestRecoveryStatusOwnsReasonSnapshot(t *testing.T) {
 }
 
 func TestRecoveryHistoryFailureDiagnostics(t *testing.T) {
-	for _, kind := range []string{"corrupt_history", "recent_entry_limit"} {
+	for _, kind := range []string{"corrupt_history"} {
 		t.Run(kind, func(t *testing.T) {
 			service, target, _ := newRecoveryTestService(t)
 			now := time.Now().UTC()
@@ -805,5 +817,78 @@ func TestConsolidatedTerminalCoversRapidFollowupSources(t *testing.T) {
 	}
 	if !covered["local:first"] || !covered["local:second"] {
 		t.Fatalf("consolidated terminal coverage = %#v", covered)
+	}
+}
+
+func TestRecoveryEventuallyProcessesConversationAndCandidateBatches(t *testing.T) {
+	service, target, _ := newRecoveryTestService(t)
+	now := time.Now().UTC()
+	for i := 0; i < recoveryConversationMax+5; i++ {
+		name := fmt.Sprintf("batch-%03d", i)
+		if _, err := service.History.Append("cli", name, history.Entry{At: now, AcceptedAt: now, Role: "user", SourceMessageID: name, Content: "request"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 41; i++ {
+		if _, err := service.History.Append("cli", "many", history.Entry{At: now, AcceptedAt: now, Role: "user", SourceMessageID: fmt.Sprintf("source-%d", i), Content: strings.Repeat("large request ", 4000)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for scan := 0; scan < 15; scan++ {
+		result := service.scanRecovery(context.Background(), "periodic")
+		if result.Dispatched > recoveryDispatchMax || result.FailedClosed != 0 {
+			t.Fatalf("unsafe batch scan: %#v", result)
+		}
+		if result.Truncated {
+			select {
+			case <-service.recoveryTrigger:
+			default:
+				t.Fatal("deferred conversation batch did not schedule continuation")
+			}
+		}
+	}
+	if len(target.prompts) != recoveryConversationMax+6 {
+		t.Fatalf("conversation starvation: dispatched %d", len(target.prompts))
+	}
+	for key, prompts := range target.prompts {
+		want := 1
+		if key == "chat:cli:many" {
+			want = 3
+		}
+		if len(prompts) != want {
+			t.Fatalf("duplicate or missing work in %s: %d", key, len(prompts))
+		}
+		for _, prompt := range prompts {
+			if len(prompt) > 128*1024 || key == "chat:cli:many" && (!strings.Contains(prompt, `excerpt="true"`) || !strings.Contains(prompt, "Read each complete source message")) {
+				t.Fatalf("unbounded or unexplained excerpt: %d bytes", len(prompt))
+			}
+		}
+	}
+}
+
+func TestRecoverySourceIndexBeyondDocumentBudgetAndLargeProgress(t *testing.T) {
+	service, target, cfg := newRecoveryTestService(t)
+	for i := 0; i < 2001; i++ {
+		text := fmt.Sprintf("---\nid: doc-%d\nsource_message_ids: [source-%d]\n---\n", i, i)
+		if i == 2000 {
+			text += strings.Repeat("progress\n", 1<<18)
+		}
+		if err := os.WriteFile(filepath.Join(cfg.StatePath("tasks", "done"), fmt.Sprintf("%04d.md", i)), []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	for _, id := range []string{"source-2000", "unlinked"} {
+		if _, err := service.History.Append("cli", "linked", history.Entry{At: now, AcceptedAt: now, Role: "user", SourceMessageID: id, Content: "request"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result := service.scanRecovery(context.Background(), "periodic")
+	if result.Dispatched != 1 || result.Reasons["linked_work"] != 1 || result.FailedClosed != 0 {
+		t.Fatalf("source index discarded workflow: %#v", result)
+	}
+	prompt := target.prompts["chat:cli:linked"][0]
+	if strings.Contains(prompt, `source_message_id="source-2000"`) || !strings.Contains(prompt, `source_message_id="unlinked"`) {
+		t.Fatal("linked-work suppression changed past document budget")
 	}
 }

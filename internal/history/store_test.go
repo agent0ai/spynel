@@ -81,7 +81,7 @@ func TestRecoveryWindowAndReservationIgnoreOldHistoryButKeepExactCoverage(t *tes
 }
 
 func TestRecoveryWindowAndReservationFailClosed(t *testing.T) {
-	for _, kind := range []string{"corruption", "entries", "bytes", "oversized_old_entry"} {
+	for _, kind := range []string{"corruption", "oversized_correlation"} {
 		t.Run(kind, func(t *testing.T) {
 			store := New(t.TempDir())
 			now := time.Now().UTC()
@@ -89,16 +89,16 @@ func TestRecoveryWindowAndReservationFailClosed(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := ErrRecoveryEntryBound
+			want := ErrRecoveryCorrupt
 			switch kind {
-			case "corruption", "oversized_old_entry":
+			case "corruption", "oversized_correlation":
 				file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
 				if err != nil {
 					t.Fatal(err)
 				}
 				data := "{invalid}\n"
 				want = ErrRecoveryCorrupt
-				if kind == "oversized_old_entry" {
+				if kind == "oversized_correlation" {
 					data = strings.Repeat("x", maxHistoryEntryBytes+1) + "\n"
 					want = ErrRecoveryByteBound
 				}
@@ -106,19 +106,6 @@ func TestRecoveryWindowAndReservationFailClosed(t *testing.T) {
 				closeErr := file.Close()
 				if err != nil || closeErr != nil {
 					t.Fatalf("write fixture: %v, %v", err, closeErr)
-				}
-			case "entries":
-				for i := 0; i < 4; i++ {
-					if _, err := store.Append("cli", "bounded", Entry{At: now, Role: "assistant"}); err != nil {
-						t.Fatal(err)
-					}
-				}
-			case "bytes":
-				want = ErrRecoveryByteBound
-				for i := 0; i < 3; i++ {
-					if _, err := store.Append("cli", "bounded", Entry{At: now, Role: "assistant", Content: strings.Repeat("x", 3*1024*1024)}); err != nil {
-						t.Fatal(err)
-					}
 				}
 			}
 			before, err := os.Stat(path)

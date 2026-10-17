@@ -183,7 +183,7 @@ func (s *Store) appendLocked(channel, conversation string, entry Entry) (string,
 func (s *Store) ReserveRetrigger(channel, conversation string, requested []string, activation, cutoff time.Time, max int) ([]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	snapshot, err := s.recoveryWindowLocked(channel, conversation, cutoff, max)
+	snapshot, err := s.recoveryWindowLocked(channel, conversation, cutoff, 0, max, requested)
 	if err != nil {
 		return nil, err
 	}
@@ -253,12 +253,17 @@ func (s *Store) DeliveryState(channel, conversation, eventID string) (string, er
 		return "", err
 	}
 	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
+	reader := bufio.NewReaderSize(file, historyReadChunk)
 	state := ""
-	for scanner.Scan() {
-		var entry Entry
-		if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.EventID == eventID {
+	for {
+		entry, _, err := readCorrelationEntry(reader)
+		if err == io.EOF {
+			return state, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if entry.EventID == eventID {
 			switch entry.Role {
 			case "notification_sending":
 				state = "sending"
@@ -271,7 +276,6 @@ func (s *Store) DeliveryState(channel, conversation, eventID string) (string, er
 			}
 		}
 	}
-	return state, scanner.Err()
 }
 
 func (s *Store) Recent(channel, conversation string, characterLimit int) (string, string, error) {
@@ -430,11 +434,39 @@ func readRecentEntriesThroughFile(file *os.File, messageLimit, characterLimit in
 		block = append(block, carry...)
 		parts := bytes.Split(block, []byte{'\n'})
 		carry = append(carry[:0], parts[0]...)
-		if len(carry) > maxHistoryEntryBytes {
-			return nil, fmt.Errorf("history entry exceeds %d bytes", maxHistoryEntryBytes)
-		}
 		for index := len(parts) - 1; index >= 1 && !stopped; index-- {
 			consume(parts[index])
+		}
+		if len(carry) > maxHistoryEntryBytes && !stopped {
+			// Locate the oversized record without retaining its growing body.
+			end := position + int64(len(carry))
+			carry = nil
+			for position > 0 {
+				length := min(position, int64(historyReadChunk))
+				position -= length
+				chunk := make([]byte, length)
+				if _, err := file.ReadAt(chunk, position); err != nil {
+					return nil, err
+				}
+				if newline := bytes.LastIndexByte(chunk, '\n'); newline >= 0 {
+					position += int64(newline + 1)
+					break
+				}
+			}
+			reader := bufio.NewReader(io.NewSectionReader(file, position, end-position))
+			entry, _, err := readCorrelationEntry(reader)
+			if err == nil {
+				if entry.IsContentExcerpt() {
+					entry.Content += "\n[Body excerpt; inspect the full history file for complete text.]"
+				}
+				raw, marshalErr := json.Marshal(entry)
+				if marshalErr != nil {
+					return nil, marshalErr
+				}
+				consume(raw)
+			} else if !errors.Is(err, ErrRecoveryCorrupt) && !errors.Is(err, ErrRecoveryByteBound) {
+				return nil, err
+			}
 		}
 	}
 	if position == 0 && !stopped {
@@ -614,26 +646,21 @@ func (s *Store) HasUserSourceID(channel, conversation, sourceID string) (bool, e
 		return false, err
 	}
 	defer file.Close()
-	// ponytail: linear scan; add a durable source-ID index if admission gets slow.
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, historyReadChunk), maxHistoryEntryBytes)
+	// shortcut: linear validation, add an index if admission latency requires it.
+	reader := bufio.NewReaderSize(file, historyReadChunk)
 	found := false
-	for scanner.Scan() {
-		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
-			continue
+	for {
+		entry, _, err := readCorrelationEntry(reader)
+		if err == io.EOF {
+			return found, nil
 		}
-		var entry Entry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			return false, errors.New("conversation history contains corrupt correlation data")
+		if err != nil {
+			return false, err
 		}
 		if entry.Role == "user" && entry.SourceMessageID == sourceID {
 			found = true
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return false, err
-	}
-	return found, nil
 }
 
 // RecoveryEntries strictly reads at most max append-only entries. Recovery
@@ -673,32 +700,44 @@ func (s *Store) RecoveryEntries(channel, conversation string, max int) ([]Entry,
 }
 
 var (
-	ErrRecoveryEntryBound = errors.New("recovery recent-window entry bound exceeded")
-	ErrRecoveryByteBound  = errors.New("recovery recent-window byte bound exceeded")
-	ErrRecoveryCorrupt    = errors.New("conversation history contains corrupt correlation data")
+	ErrRecoveryByteBound = errors.New("conversation correlation metadata exceeds byte bound")
+	ErrRecoveryCorrupt   = errors.New("conversation history contains corrupt correlation data")
 )
 
 const maxRecoveryWindowBytes = 8 * 1024 * 1024
 
 // RecoverySnapshot retains recent user bodies and only their exact correlation.
-// Records counts all recent records, including replies and private ledger facts.
+// Records counts recent records in this page, including replies and ledgers.
 type RecoverySnapshot struct {
 	Entries  []Entry
 	Covered  map[string]string
 	Admitted map[string]bool
 	Records  int
+	Next     int
+	More     bool
 }
 
-// RecoveryWindow strictly streams all retained history. Old bodies do not count
-// against the recent-window bounds, but corruption anywhere still fails closed.
+// RecoveryWindow returns the first bounded page of recent history. Callers
+// continue with RecoveryPage while More is true; corruption fails closed.
 func (s *Store) RecoveryWindow(channel, conversation string, cutoff time.Time, max int) (RecoverySnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.recoveryWindowLocked(channel, conversation, cutoff, max)
+	return s.recoveryWindowLocked(channel, conversation, cutoff, 0, max, nil)
 }
 
-func (s *Store) recoveryWindowLocked(channel, conversation string, cutoff time.Time, max int) (RecoverySnapshot, error) {
+// RecoveryPage returns a bounded page, after a validated record position. Each
+// page validates the entire file and resolves exact coverage before returning.
+func (s *Store) RecoveryPage(channel, conversation string, cutoff time.Time, after, max int) (RecoverySnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recoveryWindowLocked(channel, conversation, cutoff, after, max, nil)
+}
+
+func (s *Store) recoveryWindowLocked(channel, conversation string, cutoff time.Time, after, max int, requested []string) (RecoverySnapshot, error) {
 	result := RecoverySnapshot{Covered: map[string]string{}, Admitted: map[string]bool{}}
+	if max <= 0 || after < 0 {
+		return result, errors.New("invalid recovery page bounds")
+	}
 	file, err := os.Open(s.Path(channel, conversation))
 	if os.IsNotExist(err) {
 		return result, nil
@@ -710,54 +749,63 @@ func (s *Store) recoveryWindowLocked(channel, conversation string, cutoff time.T
 	// Two passes keep correlation exact even with out-of-order timestamps while
 	// retaining no lifetime-sized source index or old message bodies.
 	scan := func(visit func(Entry, int) error) error {
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, historyReadChunk), maxHistoryEntryBytes)
-		for scanner.Scan() {
-			raw := scanner.Bytes()
-			if len(bytes.TrimSpace(raw)) == 0 {
-				continue
+		reader := bufio.NewReaderSize(file, historyReadChunk)
+		for {
+			entry, size, err := readCorrelationEntry(reader)
+			if err == io.EOF {
+				return nil
 			}
-			var entry Entry
-			if json.Unmarshal(raw, &entry) != nil {
-				return ErrRecoveryCorrupt
+			if err != nil {
+				return err
 			}
-			if err := visit(entry, len(raw)); err != nil {
+			if err := visit(entry, size); err != nil {
 				return err
 			}
 		}
-		if err := scanner.Err(); err != nil {
-			if errors.Is(err, bufio.ErrTooLong) {
-				return ErrRecoveryByteBound
-			}
-			return err
-		}
-		return nil
 	}
-	retainedBytes := 0
+	retainedBytes, position := 0, 0
+	wanted := map[string]bool{}
+	for _, id := range requested {
+		wanted[id] = true
+	}
 	err = scan(func(entry Entry, size int) error {
-		if !entry.At.Before(cutoff) {
-			result.Records++
-			retainedBytes += size
-			if max <= 0 || result.Records > max {
-				return ErrRecoveryEntryBound
-			}
-			if retainedBytes > maxRecoveryWindowBytes {
-				return ErrRecoveryByteBound
-			}
-		}
+		position++
 		if entry.RecoveryBaseline {
 			result.Entries = nil
+		}
+		if requested != nil {
+			if entry.Role == "user" && !entry.At.Before(cutoff) && wanted[entry.SourceMessageID] {
+				for i, previous := range result.Entries {
+					if previous.SourceMessageID == entry.SourceMessageID {
+						result.Entries[i] = entry
+						return nil
+					}
+				}
+				result.Entries = append(result.Entries, entry)
+			}
 			return nil
 		}
-		if entry.Role == "user" && !entry.At.Before(cutoff) {
-			result.Entries = append(result.Entries, entry)
+		if position <= after || result.More {
+			return nil
 		}
+		if !entry.At.Before(cutoff) {
+			if result.Records >= max || result.Records > 0 && retainedBytes+size > maxRecoveryWindowBytes {
+				result.More = true
+				return nil
+			}
+			result.Records++
+			retainedBytes += size
+			if entry.Role == "user" {
+				result.Entries = append(result.Entries, entry)
+			}
+		}
+		result.Next = position
 		return nil
 	})
 	if err != nil {
 		return RecoverySnapshot{}, err
 	}
-	wanted := map[string]bool{}
+	clear(wanted)
 	for _, entry := range result.Entries {
 		wanted[entry.SourceMessageID] = true
 	}
@@ -848,6 +896,59 @@ func (s *Store) List(limit int) ([]Conversation, error) {
 		}
 	}
 	return newestConversations(conversations, limit), nil
+}
+
+// RecoveryConversations pages stable lexical keys instead of repeatedly taking
+// the newest conversations. Directory reads and retained metadata stay bounded.
+func (s *Store) RecoveryConversations(after string, limit int) ([]Conversation, bool, error) {
+	channels, err := os.ReadDir(s.root)
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var result []Conversation
+	for _, channel := range channels {
+		if !channel.IsDir() {
+			continue
+		}
+		directory, err := os.Open(filepath.Join(s.root, channel.Name()))
+		if err != nil {
+			return nil, false, err
+		}
+		for {
+			entries, readErr := directory.ReadDir(100)
+			if readErr != nil && readErr != io.EOF {
+				directory.Close()
+				return nil, false, readErr
+			}
+			for _, entry := range entries {
+				if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || filepath.Ext(entry.Name()) != ".jsonl" {
+					continue
+				}
+				path := filepath.Join(s.root, channel.Name(), entry.Name())
+				if path <= after {
+					continue
+				}
+				result = append(result, Conversation{Channel: channel.Name(), Conversation: strings.TrimSuffix(entry.Name(), ".jsonl"), Path: path})
+				if len(result) > 2*(limit+1) {
+					sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+					result = result[:limit+1]
+				}
+			}
+			if readErr == io.EOF {
+				break
+			}
+		}
+		directory.Close()
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	more := len(result) > limit
+	if more {
+		result = result[:limit]
+	}
+	return result, more, nil
 }
 
 // ListUserActivity returns the newest accepted user activity per conversation.

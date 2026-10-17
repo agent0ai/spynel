@@ -40,6 +40,8 @@
 
 - `/update` applies the owning npm or GitHub installation update and requests coordinated restart of all its instances; `/update check` is read-only. Validate and publish complete script bundles through `updater` before the process update request, and leave npm replacement to its stopped-process launcher. Pass the validated updater result through the owner shutdown request so npm can skip unnecessary replacement when current. Errors remain visible without discarding the prior installation. Keep slash catalog/help aligned.
 
+- Recovery advances lexical conversation batches across scans, processes complete history pages until it finds eligible work, and admits at most 20 sources per conversation turn and 20 turns per pass. Deferred conversation/dispatch batches schedule a coalesced continuation, and remaining durable sources stay eligible for later passes. Bound body excerpts to 48 KiB and require full-source inspection through the authoritative history path when text is omitted. Source-link scans retain only candidate matches, read directory batches and bounded YAML metadata, and never use a lifetime document-count cutoff.
+
 ## Child DOX Index
 
 No child DOX files.

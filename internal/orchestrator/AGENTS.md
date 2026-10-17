@@ -18,6 +18,8 @@
 - Serialize terminal-task retention with goal scanning. Keep every settled task linked to any nonterminal goal in the live status folders until that goal reaches a terminal outcome; an incomplete nonterminal-goal index must fail safe by protecting goal-linked tasks.
 - Own exactly two fixed workflows under `.spynel/tasks` and `.spynel/goals`, with fixed prompt paths, transitions, and 30-minute/task and two-hour/goal stale thresholds. Do not persist route definitions in configuration, leases, or goal front matter. Task/goal creation prompts, scans, recovery, retention, status, and linked rounds share these canonical folders. Apply scanner interval changes by synchronously resetting the production timer and fence already-selected stale timer generations through the scan lock.
 
+- Metadata-only consumers use bounded YAML-header reads without loading accumulated progress. Goal handoff context retains a 32 KiB tail of linked-task paths with explicit full-cohort inspection guidance; eligibility and review still inspect the complete current round.
+
 ## Child DOX Index
 
 No child DOX files.
