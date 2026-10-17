@@ -325,6 +325,7 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 	encoder := json.NewEncoder(response)
 	awaitTerminal := false
 	handlerDone := false
+	terminalSeen := false
 	writeEvent := func(event core.Event) bool {
 		// Service.Handle returns after starting a harness turn. Remember that
 		// synchronous start/delta event instead of polling IsActive: providers
@@ -343,6 +344,10 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 		return true
 	}
 	for {
+		// Commands may publish control requests after emitting their reply.
+		if handlerDone && terminalSeen {
+			return
+		}
 		if handlerDone && !awaitTerminal {
 			select {
 			case event := <-events:
@@ -379,8 +384,11 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 				return
 			}
 		case event := <-events:
-			if !writeEvent(event) || event.Done && !event.Continues {
+			if !writeEvent(event) {
 				return
+			}
+			if event.Done && !event.Continues {
+				terminalSeen = true
 			}
 		case <-ctx.Done():
 			return
