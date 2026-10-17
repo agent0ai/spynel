@@ -4,12 +4,46 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
 )
+
+const providerWriteTimeout = 5 * time.Second
+
+type providerInput struct{ *os.File }
+
+func providerStdin(command *exec.Cmd) (io.WriteCloser, error) {
+	input, err := command.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	file, ok := input.(*os.File)
+	if !ok {
+		_ = input.Close()
+		return nil, errors.New("provider input requires a deadline-capable pipe")
+	}
+	return &providerInput{file}, nil
+}
+
+func (input *providerInput) Write(data []byte) (int, error) {
+	if err := input.SetWriteDeadline(time.Now().Add(providerWriteTimeout)); err != nil {
+		_ = input.Close()
+		return 0, err
+	}
+	n, err := input.File.Write(data)
+	if n != len(data) && err == nil {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		// A partial protocol frame cannot safely be followed by another request.
+		_ = input.Close()
+	}
+	return n, err
+}
 
 var errProcessOwnershipBusy = errors.New("a previous Spynel or provider process still holds harness ownership; reconnecting automatically")
 

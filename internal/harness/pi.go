@@ -565,7 +565,7 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 		cancel()
 		return nil, err
 	}
-	stdin, err := command.StdinPipe()
+	stdin, err := providerStdin(command)
 	if err != nil {
 		cancel()
 		return nil, err

@@ -624,6 +624,15 @@ func runCodexFixture(mode string) int {
 						write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": threadID, "turnId": turnID, "delta": "."}})
 					}
 				}()
+				if release := os.Getenv("SPYNEL_TEST_CODEX_PAUSE_INPUT"); release != "" {
+					appendFixtureLog(map[string]any{"kind": "input-paused", "pid": os.Getpid()})
+					for {
+						if _, err := os.Stat(release); err == nil {
+							break
+						}
+						time.Sleep(10 * time.Millisecond)
+					}
+				}
 			}
 			if mode == "codex-terminal-changed-status" {
 				write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": threadID, "turn": map[string]any{"id": turnID, "status": "done"}}})

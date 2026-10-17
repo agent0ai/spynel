@@ -411,7 +411,7 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 	var stdin io.WriteCloser
 	if streamingInput {
 		var err error
-		stdin, err = cmd.StdinPipe()
+		stdin, err = providerStdin(cmd)
 		if err != nil {
 			cancel()
 			return "", false, err

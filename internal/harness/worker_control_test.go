@@ -9,12 +9,90 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/updater"
 )
+
+func TestWorkerBlockedProviderInputReleasesOwnership(t *testing.T) {
+	release := filepath.Join(t.TempDir(), "release-input")
+	t.Setenv("SPYNEL_TEST_CODEX_PAUSE_INPUT", release)
+	f := newWorkerFixture(t, "codex", "codex-worker")
+	t.Cleanup(func() {
+		if err := os.WriteFile(release, nil, 0600); err != nil {
+			t.Error(err)
+		}
+	})
+	work := &WorkerWorkflow{WorkID: "synthetic", OwnerID: "synthetic-owner", ClaimAttempt: 1}
+	send := WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/blocked-input", Prompt: "original", Workflow: work}
+	first := f.mustCall(t, send).Executions[0]
+	// The provider keeps publishing useful progress but stops consuming stdin.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		paused := false
+		for _, record := range readFixtureRecords(t, f.log) {
+			paused = paused || record.Kind == "input-paused"
+		}
+		if paused {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("provider did not pause its input")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	control := WorkerRequest{Action: "control", Sequence: 1, Key: send.Key, Prompt: strings.Repeat("x", 192*1024), Workflow: work, Control: &WorkerControl{ID: "synthetic-blocked-input"}}
+	f.client.Timeout = 8 * time.Second
+	started := time.Now()
+	reply, status := f.call(control)
+	if status != http.StatusOK || reply.Error == "" || time.Since(started) > 7*time.Second {
+		t.Errorf("provider input did not return a bounded error: status=%d error=%q elapsed=%s", status, reply.Error, time.Since(started))
+	}
+	f.client.Timeout = time.Second
+	inspection, status := f.call(WorkerRequest{Action: "inspect"})
+	if status != http.StatusOK || inspection.Error != "" {
+		t.Fatalf("blocked provider input retained the worker/election fence: status=%d error=%q", status, inspection.Error)
+	}
+	retained := inspection.Executions[0]
+	if retained.Done || retained.Cancelled || retained.ThreadID != first.ThreadID || retained.LastCursor <= first.LastCursor {
+		t.Fatal("blocked input replaced or ended the ongoing provider execution")
+	}
+	if _, renewed, err := f.owner.Renew(f.term); err != nil || !renewed {
+		t.Fatal("blocked provider input prevented renewal:", renewed, err)
+	}
+	f.replaceOwner(t)
+	if err := updater.VerifyProcess(f.info.Process); err != nil {
+		t.Fatal("native worker identity changed:", err)
+	}
+	if duplicate := f.mustCall(t, control); duplicate.Control == nil || !duplicate.Control.Duplicate {
+		t.Fatal("ambiguous partial delivery lost control deduplication")
+	}
+	if reply, status := f.call(WorkerRequest{Action: "interrupt", Key: send.Key}); status != http.StatusOK || reply.Error == "" || reply.Interrupted {
+		t.Fatalf("closed provider input invented successful interruption: status=%d reply=%+v", status, reply)
+	}
+	if f.mustCall(t, WorkerRequest{Action: "inspect"}).Executions[0].Cancelled {
+		t.Fatal("rejected interruption left accepted cancellation intent")
+	}
+	starts, effects := 0, 0
+	for _, record := range readFixtureRecords(t, f.log) {
+		if record.Method == "turn/start" {
+			starts++
+		}
+		if record.Kind == "effect" {
+			effects++
+		}
+		if record.Method == "turn/steer" {
+			t.Fatal("provider parsed an incomplete blocked control frame")
+		}
+	}
+	if starts != 1 || effects != 1 {
+		t.Fatalf("blocked input duplicated work: starts=%d effects=%d", starts, effects)
+	}
+	t.Logf("blocked stdin released ownership without replacing worker PID=%d start=%s generation=%s; same execution, progress, renewal, takeover and ambiguous retry deduplication passed", f.info.PID, f.info.Process.StartTime, f.info.Process.Generation)
+}
 
 func TestWorkerControlTimeoutPreservesExecutionAndReleasesOwnership(t *testing.T) {
 	t.Setenv("SPYNEL_TEST_CODEX_STALL_CONTROL", "1")

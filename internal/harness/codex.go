@@ -260,7 +260,7 @@ func (c *Codex) Start(parent context.Context) error {
 		c.mu.Unlock()
 		return err
 	}
-	stdin, err := c.cmd.StdinPipe()
+	stdin, err := providerStdin(c.cmd)
 	if err != nil {
 		c.mu.Unlock()
 		return err

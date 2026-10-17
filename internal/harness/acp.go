@@ -165,7 +165,7 @@ func (a *ACP) Start(parent context.Context) error {
 		a.mu.Unlock()
 		return err
 	}
-	stdin, err := command.StdinPipe()
+	stdin, err := providerStdin(command)
 	if err != nil {
 		a.cancel()
 		a.ctx = nil
