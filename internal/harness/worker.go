@@ -274,7 +274,11 @@ func (h *workerHost) serve(w http.ResponseWriter, r *http.Request) {
 		reply = h.apply(request)
 		return nil
 	})
-	if err != nil || !ran {
+	if err != nil {
+		http.Error(w, "worker ownership or journal unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !ran {
 		http.Error(w, "worker controller ownership unavailable", http.StatusForbidden)
 		return
 	}
@@ -398,8 +402,7 @@ func (h *workerHost) capture(execution *workerExecution, event core.Event) {
 	}
 	if err != nil {
 		// Unrecorded events cannot become successful delivery or a new turn.
-		h.failure = errors.New("worker event journal unavailable")
-		h.stopOnce.Do(func() { close(h.stop) })
+		h.failJournalLocked()
 		return
 	}
 	execution.offsets = append(execution.offsets, execution.bytes)
@@ -429,14 +432,21 @@ func (h *workerHost) events(request WorkerRequest) WorkerReply {
 		}
 		data := make([]byte, end-start)
 		if _, err := execution.file.ReadAt(data, start); err != nil {
+			h.failJournalLocked()
 			return WorkerReply{Error: "read worker journal failed"}
 		}
 		var event WorkerEvent
 		if err := json.Unmarshal(data, &event); err != nil || event.Cursor != uint64(index+1) {
+			h.failJournalLocked()
 			return WorkerReply{Error: "invalid worker journal record"}
 		}
 		reply.Events = append(reply.Events, event)
 		bytes += end - start
 	}
 	return reply
+}
+
+func (h *workerHost) failJournalLocked() {
+	h.failure = errors.New("worker event journal unavailable")
+	h.stopOnce.Do(func() { close(h.stop) })
 }

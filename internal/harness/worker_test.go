@@ -397,6 +397,35 @@ func TestWorkerJournalFailsClosedOnStorageFailureAndCapacity(t *testing.T) {
 	}
 }
 
+func TestWorkerStopsOnUnreadableOrCorruptReplay(t *testing.T) {
+	for _, failure := range []string{"unreadable", "corrupt"} {
+		t.Run(failure, func(t *testing.T) {
+			file, err := os.CreateTemp(t.TempDir(), "journal-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			execution := &workerExecution{file: file}
+			host := &workerHost{stop: make(chan struct{}), executions: map[uint64]*workerExecution{1: execution}}
+			host.capture(execution, core.Event{Kind: core.EventDelta, Text: "synthetic"})
+			if failure == "unreadable" {
+				_ = file.Close()
+			} else if _, err := file.WriteAt([]byte("!"), 0); err != nil {
+				t.Fatal(err)
+			}
+			page := host.events(WorkerRequest{Sequence: 1})
+			if page.Error == "" || len(page.Events) > 0 || host.failure == nil {
+				t.Fatal("unrecoverable replay was presented as a successful event page")
+			}
+			select {
+			case <-host.stop:
+			default:
+				t.Fatal("worker could keep making effects with unreadable replay")
+			}
+		})
+	}
+}
+
 func TestWorkerRejectsOversizedAndTrailingRequests(t *testing.T) {
 	fixture := newWorkerFixture(t, "codex", "codex-interrupt")
 	for _, body := range []string{strings.Repeat(" ", workerRequestBytes+1), "{} {}", `{"unknown":true}`} {
