@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,6 +186,9 @@ func TestTaskNotificationWorkflowUsesFreshThreadAndReachesNextChat(t *testing.T)
 				t.Fatal(err)
 			}
 			name := filepath.Base(path)
+			moved, release := make(chan struct{}), make(chan struct{})
+			releaseDispatch := sync.OnceFunc(func() { close(release) })
+			t.Cleanup(releaseDispatch)
 			calls := 0
 			h.action = func(ctx context.Context, key, prompt string) error {
 				if strings.HasPrefix(key, "orchestrator:notification:") {
@@ -209,17 +213,30 @@ func TestTaskNotificationWorkflowUsesFreshThreadAndReachesNextChat(t *testing.T)
 				if err := orchestrator.WriteDocument(working, doc); err != nil {
 					return err
 				}
-				return os.Rename(working, cfg.StatePath("tasks", outcome, name))
+				if err := os.Rename(working, cfg.StatePath("tasks", outcome, name)); err != nil {
+					return err
+				}
+				if outcome == "failed" {
+					close(moved)
+					<-release
+					return errors.New("late provider admission failure")
+				}
+				return nil
 			}
 			if err := s.Orchestrator.ScanOnce(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			s.Orchestrator.Wait()
+			if outcome == "failed" {
+				<-moved
+			} else {
+				s.Orchestrator.Wait()
+			}
 			_, _ = s.History.Append("tui", "original", history.Entry{Role: "assistant", Sender: "Spy", Content: "prior notification", EventID: "prior"})
 			_, _ = s.History.Append("tui", "original", history.Entry{Role: "user", Content: "later correction"})
 			if err := s.Orchestrator.ScanOnce(context.Background()); err != nil {
 				t.Fatal(err)
 			}
+			releaseDispatch()
 			s.Orchestrator.Wait()
 			if err := s.Orchestrator.ScanOnce(context.Background()); err != nil {
 				t.Fatal(err)

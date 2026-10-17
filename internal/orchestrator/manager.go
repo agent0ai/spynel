@@ -595,15 +595,17 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 		}
 		if phase == phaseTaskImplementation && m.runtimeSnapshot().Extensions.Enabled {
 			output, hookErr := m.Hooks.Run(ctx, "task.claimed", map[string]any{"route": route.Name, "phase": phase, "file": target, "id": documentID})
-			if hookErr != nil {
-				m.recordError(lease, hookErr)
-				continue
-			}
-			if output.Cancel {
+			if hookErr != nil || output.Cancel {
 				lease.State = "hook_cancelled"
 				lease.LastError = output.Message
+				if hookErr != nil {
+					lease.State = "error"
+					lease.LastError = hookErr.Error()
+					lease.HeartbeatAt = time.Now().UTC()
+					m.log(fmt.Sprintf("dispatch %s: %v", lease.File, hookErr))
+				}
 				if err := m.saveLease(lease); err != nil {
-					m.log("save hook-cancelled lease: " + err.Error())
+					m.log("save task.claimed hook state: " + err.Error())
 				}
 				continue
 			}
@@ -707,10 +709,13 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			// its terminal status cannot fence the resumed job. The archive
 			// preserves this workflow dispatch's public number and history.
 			m.finishRuntimeJob(lease.ID)
-			lease.State = "recovering"
-			lease.LastError = ""
-			lease.HeartbeatAt = time.Now().UTC()
-			if err := m.saveLease(lease); err != nil {
+			var err error
+			lease, err = m.updateLease(lease, func(current *Lease) {
+				current.State = "recovering"
+				current.LastError = ""
+				current.HeartbeatAt = time.Now().UTC()
+			})
+			if err != nil {
 				m.recordError(lease, err)
 				return
 			}
@@ -766,27 +771,28 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			// the durable lease still existing. A fast agent can move its task,
 			// then a concurrent recovery scan can remove the obsolete lease
 			// before the provider emits its final event.
-			current, err := m.loadLease(lease.ID)
+			current, err := m.updateLease(lease, func(current *Lease) {
+				current.HeartbeatAt = time.Now().UTC()
+				if event.ThreadID != "" {
+					current.ThreadID = event.ThreadID
+				}
+				if event.Kind == core.EventError {
+					current.LastError = event.Text
+				}
+				if terminal {
+					current.State = "awaiting_transition"
+				} else if current.State == "recovering" && event.Execution != nil && event.Execution.State == "running" {
+					current.State = "processing"
+				}
+			})
 			if err != nil {
+				if !os.IsNotExist(err) {
+					m.log("save lease event state: " + err.Error())
+				}
 				if terminal {
 					finish()
 				}
 				return
-			}
-			current.HeartbeatAt = time.Now().UTC()
-			if event.ThreadID != "" {
-				current.ThreadID = event.ThreadID
-			}
-			if event.Kind == core.EventError {
-				current.LastError = event.Text
-			}
-			if terminal {
-				current.State = "awaiting_transition"
-			} else if current.State == "recovering" && event.Execution != nil && event.Execution.State == "running" {
-				current.State = "processing"
-			}
-			if err := m.saveLease(current); err != nil {
-				m.log("save lease event state: " + err.Error())
 			}
 			if jobID > 0 && m.JobUpdated != nil {
 				m.JobUpdated(jobID, current)
@@ -811,23 +817,21 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			m.recordError(lease, err)
 			return
 		}
-		current, loadErr := m.loadLease(lease.ID)
-		if os.IsNotExist(loadErr) {
-			return
-		}
-		if loadErr == nil {
-			lease = current
-		}
-		lease.ThreadID = threadID
-		lease.HeartbeatAt = time.Now().UTC()
-		if recovery {
-			lease.RecoveryCount++
-			if lease.State == "recovering" {
-				lease.State = "processing"
+		lease, err = m.updateLease(lease, func(current *Lease) {
+			current.ThreadID = threadID
+			current.HeartbeatAt = time.Now().UTC()
+			if recovery {
+				current.RecoveryCount++
+				if current.State == "recovering" {
+					current.State = "processing"
+				}
 			}
-		}
-		if err := m.saveLease(lease); err != nil {
-			m.log("save lease dispatch state: " + err.Error())
+		})
+		if err != nil {
+			if !os.IsNotExist(err) {
+				m.log("save lease dispatch state: " + err.Error())
+			}
+			return
 		}
 		if jobID > 0 && m.JobUpdated != nil {
 			m.JobUpdated(jobID, lease)
@@ -1723,6 +1727,22 @@ func (m *Manager) saveLease(lease Lease) error {
 	return fsx.AtomicWriteFile(m.leasePath(lease.ID), append(data, '\n'), 0o600)
 }
 
+// updateLease orders asynchronous updates with scan-owned retirement and claims.
+// A retired or replaced execution must never be recreated by a late writer.
+func (m *Manager) updateLease(expected Lease, update func(*Lease)) (Lease, error) {
+	m.scanMu.Lock()
+	defer m.scanMu.Unlock()
+	current, err := m.loadLease(expected.ID)
+	if err != nil {
+		return expected, err
+	}
+	if current.OwnerID != expected.OwnerID || current.SessionKey != expected.SessionKey {
+		return expected, errors.New("lease execution changed before update")
+	}
+	update(&current)
+	return current, m.saveLease(current)
+}
+
 func (m *Manager) loadLease(id string) (Lease, error) {
 	data, err := os.ReadFile(m.leasePath(id))
 	if err != nil {
@@ -1779,6 +1799,8 @@ func (m *Manager) LeaseForSession(sessionKey string) (Lease, bool) {
 // by this manager. A successful gate returns the lease to processing; the
 // provider's subsequent events remain responsible for heartbeat activity.
 func (m *Manager) PrepareControlContinuation(expected Lease, expectedDocumentID string) bool {
+	m.scanMu.Lock()
+	defer m.scanMu.Unlock()
 	if !m.ControlStillValid(expected, expectedDocumentID) || !m.Harness.IsActive(expected.SessionKey) {
 		return false
 	}
@@ -1889,10 +1911,12 @@ func (m *Manager) isControlCancelled(leaseID string) bool {
 }
 
 func (m *Manager) recordError(lease Lease, err error) {
-	lease.LastError = err.Error()
-	lease.State = "error"
-	lease.HeartbeatAt = time.Now().UTC()
-	if saveErr := m.saveLease(lease); saveErr != nil {
+	_, saveErr := m.updateLease(lease, func(current *Lease) {
+		current.LastError = err.Error()
+		current.State = "error"
+		current.HeartbeatAt = time.Now().UTC()
+	})
+	if saveErr != nil && !os.IsNotExist(saveErr) {
 		m.log("save failed lease: " + saveErr.Error())
 	}
 	m.log(fmt.Sprintf("dispatch %s: %v", lease.File, err))
