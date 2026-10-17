@@ -575,3 +575,148 @@ func TestWorkerConcurrentLaunchAndConfirmedDeadReplacement(t *testing.T) {
 		t.Fatal("explicit shutdown retained worker credentials")
 	}
 }
+
+func TestWorkerConfigurationSurvivesNativeControllerReplacement(t *testing.T) {
+	for _, scenario := range []struct{ name, mode string }{{"codex", "codex-worker"}, {"claude-code", "claude-interrupt"}, {"pi", "pi-interrupt"}, {"acp", "acp-interrupt"}} {
+		t.Run(scenario.name, func(t *testing.T) {
+			fixture := newWorkerFixture(t, scenario.name, scenario.mode)
+			client, err := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			send := WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/settings", Prompt: "synthetic retained work"}
+			first := workerClientCall(t, client, send).Executions[0]
+			if first.Done || first.Error != "" {
+				t.Fatalf("no retained provider turn: %+v", first)
+			}
+			next := fixture.config
+			next.Model = "model-a"
+			if scenario.name != "acp" {
+				next.Effort = "turbo"
+			}
+			request := WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: client.Info().ConfigDigest}
+			lockPath, _ := ProcessOwnershipPath(fixture.config.Cwd)
+			recordPath, _ := workerRecordPath(lockPath)
+			originalRecord, err := os.ReadFile(recordPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reply := workerClientCall(t, client, request)
+			if reply.ConfigDigest != workerConfigDigest(next) {
+				t.Fatal("configuration reply differs from requested runtime")
+			}
+			if workerClientCall(t, client, WorkerRequest{Action: "inspect"}).Executions[0].Done {
+				t.Fatal("configuration ended the active turn")
+			}
+			if stale, err := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term); err == nil {
+				stale.Close()
+				t.Fatal("discovery accepted stale settings")
+			}
+			committedRecord, err := os.ReadFile(recordPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := fsx.AtomicWriteFile(recordPath, originalRecord, 0600); err != nil {
+				t.Fatal(err)
+			}
+			stale, staleErr := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term)
+			if stale != nil {
+				stale.Close()
+			}
+			if err := fsx.AtomicWriteFile(recordPath, committedRecord, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if staleErr == nil {
+				t.Fatal("discovery trusted a record snapshot after authenticated settings changed")
+			}
+			// An exact retry after a lost reply has no new admission or provider start.
+			workerClientCall(t, client, request)
+			fixture.replaceOwner(t)
+			rejected := next
+			rejected.Model = "obsolete"
+			if _, err := client.Call(t.Context(), WorkerRequest{Action: "configure", Config: &rejected, ExpectedConfig: reply.ConfigDigest}); err == nil {
+				t.Fatal("obsolete controller changed worker settings")
+			}
+			successor, err := OpenWorker(t.Context(), next, fixture.owner.ID(), fixture.term)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer successor.Close()
+			oldInfo, newInfo := client.Info(), successor.Info()
+			oldInfo.ConfigDigest = newInfo.ConfigDigest
+			if oldInfo != newInfo {
+				t.Fatal("settings commit replaced the actual worker")
+			}
+			inspection := workerClientCall(t, successor, WorkerRequest{Action: "inspect"})
+			if inspection.ConfigDigest != reply.ConfigDigest || inspection.NextSequence != 2 || len(inspection.Executions) != 1 || inspection.Executions[0].ThreadID != first.ThreadID || inspection.Executions[0].Done {
+				t.Fatal("settings attachment lost work or dispatched again")
+			}
+			changed := next
+			changed.Sandbox = "workspace-write"
+			if _, err := successor.Call(t.Context(), WorkerRequest{Action: "configure", Config: &changed, ExpectedConfig: reply.ConfigDigest}); err == nil {
+				t.Fatal("structural settings replaced a retained provider")
+			}
+			for sequence := uint64(1); sequence <= 2; sequence++ {
+				if !workerClientCall(t, successor, WorkerRequest{Action: "interrupt", Key: send.Key}).Interrupted {
+					t.Fatal("successor could not interrupt")
+				}
+				deadline := time.Now().Add(5 * time.Second)
+				for {
+					current := workerClientCall(t, successor, WorkerRequest{Action: "inspect"}).Executions[0]
+					if current.Done {
+						workerClientCall(t, successor, WorkerRequest{Action: "commit", Sequence: sequence, After: current.LastCursor})
+						workerClientCall(t, successor, WorkerRequest{Action: "ack", Sequence: sequence, After: current.LastCursor})
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("provider did not release")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				if sequence == 1 {
+					send.Sequence = 2
+					if current := workerClientCall(t, successor, send).Executions[0]; current.Error != "" || current.Done {
+						t.Fatalf("next dispatch: %+v", current)
+					}
+				}
+			}
+			delivered := false
+			for _, record := range readFixtureRecords(t, fixture.log) {
+				var params map[string]any
+				if len(record.Params) > 0 {
+					if err := json.Unmarshal(record.Params, &params); err != nil {
+						t.Fatal(err)
+					}
+				}
+				switch scenario.name {
+				case "codex":
+					if record.Method == "turn/start" && params["model"] == next.Model && params["effort"] == next.Effort {
+						delivered = true
+					}
+				case "claude-code", "pi":
+					if record.Kind == "invocation" && containsArgument(record.Args, next.Model) && containsArgument(record.Args, next.Effort) {
+						delivered = true
+					}
+				case "acp":
+					if record.Method == "session/set_config_option" && params["value"] == next.Model {
+						delivered = true
+					}
+				}
+			}
+			if !delivered {
+				t.Fatal("committed settings did not reach the next native provider dispatch")
+			}
+			workerClientCall(t, successor, WorkerRequest{Action: "configure", Config: &changed, ExpectedConfig: reply.ConfigDigest})
+			reconfigured, err := OpenWorker(t.Context(), changed, fixture.owner.ID(), fixture.term)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reconfigured.Close()
+			if reconfigured.Info().Process != newInfo.Process {
+				t.Fatal("idle harness replacement changed worker identity")
+			}
+			t.Logf("retained native worker pid=%d start=%s generation=%s", newInfo.PID, newInfo.Process.StartTime, newInfo.Process.Generation)
+		})
+	}
+}

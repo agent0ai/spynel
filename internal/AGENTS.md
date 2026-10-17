@@ -138,6 +138,8 @@
 
 - Private workflow controls now reach the retained worker and reuse Supervisor queueing, retry deduplication and one guarded continuation. Native coordination preserves its existing emitter. The worker fences queued preparation, exact-claim reservation and delivery under the admitting controller term; a refused continuation releases the original terminal without another provider turn. Accepted interruption is checkpointed before provider control and retained as a cancelled lease before worker retirement, so replacement controllers do not automatically recover it. Normal application selection and the broader release/lifecycle gates remain unfinished.
 
+- Private worker runtime configuration now reuses the Supervisor inference fence and idle replacement, publishing its current digest for authenticated reconnect. Retained delivery fences structural replacement; publication errors restore the prior runtime or stop the worker. Canonical application settings save/reload and production selection remain unconnected; this runtime operation alone is not an atomic canonical-settings transaction.
+
 ## Child DOX Index
 
 Direct child DOX files:

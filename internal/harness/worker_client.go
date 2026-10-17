@@ -73,14 +73,18 @@ func OpenWorker(ctx context.Context, cfg HarnessConfig, instanceID, termToken st
 			}
 			return nil, errors.New("worker native identity unavailable")
 		}
-		// shortcut: startup settings must match exactly, replace when worker-owned live commits are connected.
 		if record.Info.EnvironmentID != election.EnvironmentID() || record.Info.WorkspaceID != filepath.Base(lockPath) || record.Info.ConfigDigest != workerConfigDigest(cfg) {
 			return nil, errors.New("worker environment, workspace or configuration changed")
 		}
 		client := newWorkerClient(record, instanceID, termToken, election)
-		if _, err := client.Call(ctx, WorkerRequest{Action: "inspect"}); err != nil {
+		inspection, err := client.Call(ctx, WorkerRequest{Action: "inspect"})
+		if err != nil {
 			client.Close()
 			return nil, err
+		}
+		if inspection.ConfigDigest != record.Info.ConfigDigest {
+			client.Close()
+			return nil, errors.New("worker configuration changed during discovery")
 		}
 		return client, nil
 	}

@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	WorkerProtocol      = 6
+	WorkerProtocol      = 7
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -60,19 +60,21 @@ type WorkerInfo struct {
 // Sequence is a strictly increasing admission number, not a provider turn.
 // A repeated or retired sequence can never call Send again.
 type WorkerRequest struct {
-	WorkerID   string
-	InstanceID string
-	TermToken  string
-	Action     string
-	Sequence   uint64
-	Key        string
-	Prompt     string
-	Message    string
-	After      uint64
-	Expected   uint64
-	Workflow   *WorkerWorkflow
-	Agent      *WorkerAgent
-	Control    *WorkerControl
+	WorkerID       string
+	InstanceID     string
+	TermToken      string
+	Action         string
+	Sequence       uint64
+	Key            string
+	Prompt         string
+	Message        string
+	After          uint64
+	Expected       uint64
+	Workflow       *WorkerWorkflow
+	Agent          *WorkerAgent
+	Control        *WorkerControl
+	Config         *HarnessConfig
+	ExpectedConfig [32]byte
 }
 
 type WorkerControl struct {
@@ -146,6 +148,7 @@ type WorkerReply struct {
 	Interrupted  bool
 	Session      *WorkerSession
 	Control      *ControlResult
+	ConfigDigest [32]byte
 }
 
 type workerExecution struct {
@@ -165,6 +168,7 @@ type workerHost struct {
 	info       WorkerInfo
 	token      string
 	directory  string
+	recordPath string
 	stop       chan struct{}
 	stopOnce   sync.Once
 	operations sync.Mutex
@@ -268,7 +272,7 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 		return errors.New("worker startup ownership unavailable")
 	}
 	host = &workerHost{
-		supervisor: supervisor, election: election, info: info, token: bootstrap.Token, directory: directory,
+		supervisor: supervisor, election: election, info: info, token: bootstrap.Token, directory: directory, recordPath: recordPath,
 		stop: make(chan struct{}), lastSeen: time.Now(), next: 1, executions: map[uint64]*workerExecution{},
 		workflow: workflow,
 	}
@@ -371,7 +375,7 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 	case "inspect":
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		reply := WorkerReply{NextSequence: h.next}
+		reply := WorkerReply{NextSequence: h.next, ConfigDigest: h.info.ConfigDigest}
 		for _, execution := range h.executions {
 			reply.Executions = append(reply.Executions, execution.WorkerExecution)
 		}
@@ -381,6 +385,8 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 		return h.send(request)
 	case "control":
 		return h.control(request)
+	case "configure":
+		return h.configure(request)
 	case "events":
 		return h.events(request)
 	case "commit":
