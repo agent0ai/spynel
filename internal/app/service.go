@@ -826,6 +826,9 @@ func (s *Service) conversationConsumer(message core.Message, jobID int, downstre
 		// A queued request can be cancelled while the shared provider turn is
 		// still active. Persist and deliver its result without settling that turn.
 		requestOnly := terminal && s.Harness.IsActive(key)
+		if terminal && !requestOnly {
+			s.beginConversationSettlement(key)
+		}
 		if event.Kind == core.EventDelta {
 			s.streamMu.Lock()
 			s.streamText[key] += event.Text

@@ -120,7 +120,15 @@ func (s *Service) rollbackRecoveryReservationLocked(key string, reservation reco
 	}
 }
 
-// Persist the reply and exact source coverage together before releasing the
+func (s *Service) beginConversationSettlement(key string) {
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	if current := s.recoveryExecution[key]; current != nil {
+		current.settling = true
+	}
+}
+
+// Persist the reply and frozen source coverage together before releasing the
 // in-memory execution; a failed write must leave both available for retry.
 func (s *Service) appendConversationResult(message core.Message, entry history.Entry, receipt string, settle bool) error {
 	key := sessionKey(message)
@@ -128,7 +136,6 @@ func (s *Service) appendConversationResult(message core.Message, entry history.E
 	defer s.recoveryMu.Unlock()
 	current := s.recoveryExecution[key]
 	if settle && current != nil {
-		current.settling = true
 		entry.ExecutionID = current.id
 		entry.Covers = make([]string, 0, len(current.sources))
 		for source := range current.sources {
