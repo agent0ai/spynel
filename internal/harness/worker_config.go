@@ -8,7 +8,7 @@ import (
 )
 
 // configure runs under the worker operation and exact-election fences. This
-// commits runtime settings only; canonical application saves remain separate.
+// commits runtime settings and any supplied canonical save before dispatch resumes.
 func (h *workerHost) configure(request WorkerRequest) WorkerReply {
 	if request.Config == nil {
 		return WorkerReply{Error: "worker configuration is required"}
@@ -22,10 +22,40 @@ func (h *workerHost) configure(request WorkerRequest) WorkerReply {
 	if !ValidReasoningEffort(next.Effort) {
 		return WorkerReply{Error: "invalid worker reasoning effort"}
 	}
-	digest := workerConfigDigest(next)
+	var commit, restore func() error
+	if request.Settings != nil {
+		if h.settings == nil {
+			return WorkerReply{Error: "canonical worker settings are unavailable"}
+		}
+		var err error
+		commit, restore, err = h.settings(previous.Cwd, previous, next, *request.Settings)
+		if err != nil || commit == nil || restore == nil {
+			return WorkerReply{Error: "canonical worker settings are invalid or changed"}
+		}
+	}
+	digest := ConfigDigest(next)
+	publish := func() error {
+		var err error
+		if commit != nil {
+			err = commit()
+		}
+		if err == nil {
+			err = h.publishConfiguration(digest)
+		}
+		if err != nil && restore != nil {
+			if rollback := restore(); rollback != nil {
+				h.mu.Lock()
+				h.failure = errors.New("canonical worker settings could not be restored")
+				h.stopOnce.Do(func() { close(h.stop) })
+				h.mu.Unlock()
+				err = errors.Join(err, rollback)
+			}
+		}
+		return err
+	}
 	available, _ := h.supervisor.Available()
 	if digest == h.info.ConfigDigest && available {
-		if err := h.publishConfiguration(digest); err != nil {
+		if err := publish(); err != nil {
 			return WorkerReply{Error: err.Error()}
 		}
 		return WorkerReply{ConfigDigest: digest}
@@ -36,10 +66,10 @@ func (h *workerHost) configure(request WorkerRequest) WorkerReply {
 	inferenceOnly := next
 	inferenceOnly.Model, inferenceOnly.Effort, inferenceOnly.LegacyEffort, inferenceOnly.ServiceMode = previous.Model, previous.Effort, previous.LegacyEffort, previous.ServiceMode
 	var err error
-	if workerConfigDigest(inferenceOnly) == h.info.ConfigDigest && available {
+	if ConfigDigest(inferenceOnly) == h.info.ConfigDigest && available {
 		err = h.supervisor.CommitInference(InferenceSelection{
 			Model: next.Model, Effort: next.Effort, LegacyEffort: next.LegacyEffort, ServiceMode: next.ServiceMode,
-		}, func() error { return h.publishConfiguration(digest) })
+		}, publish)
 	} else {
 		h.mu.Lock()
 		retained := len(h.executions) > 0
@@ -48,7 +78,7 @@ func (h *workerHost) configure(request WorkerRequest) WorkerReply {
 			return WorkerReply{Error: "consume and retire worker executions before replacing their harness"}
 		}
 		if err = h.supervisor.Reconfigure(next); err == nil {
-			if err = h.publishConfiguration(digest); err != nil {
+			if err = publish(); err != nil {
 				if rollback := h.supervisor.Reconfigure(previous); rollback != nil {
 					h.mu.Lock()
 					h.failure = errors.New("worker configuration could not be restored")

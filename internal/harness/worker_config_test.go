@@ -36,7 +36,7 @@ func newWorkerConfigurationHost(t *testing.T) (*workerHost, *inferenceSupervisor
 	if err != nil {
 		t.Fatal(err)
 	}
-	info := WorkerInfo{Protocol: WorkerProtocol, ID: strings.Repeat("a", 32), PID: os.Getpid(), Socket: filepath.Join(cfg.Cwd, "control.sock"), ConfigDigest: workerConfigDigest(cfg), Process: updater.ProcessRegistration{PID: os.Getpid(), HarnessWorker: true, Generation: strings.Repeat("b", 32), StartTime: "synthetic", Executable: executable}}
+	info := WorkerInfo{Protocol: WorkerProtocol, ID: strings.Repeat("a", 32), PID: os.Getpid(), Socket: filepath.Join(cfg.Cwd, "control.sock"), ConfigDigest: ConfigDigest(cfg), Process: updater.ProcessRegistration{PID: os.Getpid(), HarnessWorker: true, Generation: strings.Repeat("b", 32), StartTime: "synthetic", Executable: executable}}
 	host := &workerHost{supervisor: supervisor, info: info, token: strings.Repeat("c", 32), recordPath: filepath.Join(cfg.Cwd, "worker.json"), stop: make(chan struct{}), executions: map[uint64]*workerExecution{}}
 	data, _ := json.Marshal(workerRecord{Info: info, Token: host.token})
 	if err := fsx.AtomicWriteFile(host.recordPath, data, 0600); err != nil {
@@ -57,9 +57,9 @@ func TestWorkerConfigurationOrdersQueuedInferenceAndPublication(t *testing.T) {
 	next.Model = "new"
 	next.Effort = "xhigh"
 	next.ServiceMode = "priority"
-	request := WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: workerConfigDigest(previous)}
+	request := WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: ConfigDigest(previous)}
 	reply := host.apply(request)
-	if reply.Error != "" || reply.ConfigDigest != workerConfigDigest(next) || target.closed || !host.supervisor.IsActive("chat") {
+	if reply.Error != "" || reply.ConfigDigest != ConfigDigest(next) || target.closed || !host.supervisor.IsActive("chat") {
 		t.Fatalf("active configuration commit: %+v", reply)
 	}
 	record, err := readWorkerRecord(host.recordPath)
@@ -71,7 +71,7 @@ func TestWorkerConfigurationOrdersQueuedInferenceAndPublication(t *testing.T) {
 	}
 	conflict := next
 	conflict.Model = "obsolete"
-	if host.apply(WorkerRequest{Action: "configure", Config: &conflict, ExpectedConfig: workerConfigDigest(previous)}).Error == "" {
+	if host.apply(WorkerRequest{Action: "configure", Config: &conflict, ExpectedConfig: ConfigDigest(previous)}).Error == "" {
 		t.Fatal("stale settings overwrote committed inference")
 	}
 	target.finish("chat")
@@ -101,11 +101,11 @@ func TestWorkerConfigurationPublicationFailureKeepsInference(t *testing.T) {
 	if err := os.Mkdir(host.recordPath, 0700); err != nil {
 		t.Fatal(err)
 	}
-	request := WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: workerConfigDigest(previous)}
+	request := WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: ConfigDigest(previous)}
 	if host.apply(request).Error == "" {
 		t.Fatal("failed publication reported a commit")
 	}
-	if host.info.ConfigDigest != workerConfigDigest(previous) || !reflect.DeepEqual(host.supervisor.HarnessConfig(), previous) {
+	if host.info.ConfigDigest != ConfigDigest(previous) || !reflect.DeepEqual(host.supervisor.HarnessConfig(), previous) {
 		t.Fatal("failed publication changed runtime inference")
 	}
 	if host.apply(WorkerRequest{Action: "configure", Config: &previous}).Error == "" {
@@ -127,7 +127,7 @@ func TestWorkerConfigurationReplacementRetainsDeliveryAndFailureState(t *testing
 	previous := host.supervisor.HarnessConfig()
 	next := previous
 	next.Name = "replacement"
-	request := WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: workerConfigDigest(previous)}
+	request := WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: ConfigDigest(previous)}
 	host.executions[1] = &workerExecution{WorkerExecution: WorkerExecution{Sequence: 1, Done: true, LastCursor: 1}}
 	if host.apply(request).Error == "" || target.closed {
 		t.Fatal("replacement discarded retained terminal delivery")
@@ -135,23 +135,23 @@ func TestWorkerConfigurationReplacementRetainsDeliveryAndFailureState(t *testing
 	delete(host.executions, 1)
 	broken := previous
 	broken.Name = "broken"
-	if host.apply(WorkerRequest{Action: "configure", Config: &broken, ExpectedConfig: workerConfigDigest(previous)}).Error == "" {
+	if host.apply(WorkerRequest{Action: "configure", Config: &broken, ExpectedConfig: ConfigDigest(previous)}).Error == "" {
 		t.Fatal("failed provider start was accepted")
 	}
-	if host.info.ConfigDigest != workerConfigDigest(previous) || host.supervisor.HarnessConfig().Name != previous.Name {
+	if host.info.ConfigDigest != ConfigDigest(previous) || host.supervisor.HarnessConfig().Name != previous.Name {
 		t.Fatal("failed replacement changed saved selection")
 	}
 	if available, _ := host.supervisor.Available(); available {
 		t.Fatal("failed replacement claimed availability")
 	}
 	// An explicit retry of the saved choice must restart it, not return a no-op success.
-	if reply := host.apply(WorkerRequest{Action: "configure", Config: &previous, ExpectedConfig: workerConfigDigest(previous)}); reply.Error != "" {
+	if reply := host.apply(WorkerRequest{Action: "configure", Config: &previous, ExpectedConfig: ConfigDigest(previous)}); reply.Error != "" {
 		t.Fatalf("saved selection could not recover: %+v", reply)
 	}
 	if available, _ := host.supervisor.Available(); !available {
 		t.Fatal("retry left provider unavailable")
 	}
-	if reply := host.apply(request); reply.Error != "" || reply.ConfigDigest != workerConfigDigest(next) {
+	if reply := host.apply(request); reply.Error != "" || reply.ConfigDigest != ConfigDigest(next) {
 		t.Fatalf("idle replacement: %+v", reply)
 	}
 }
@@ -162,14 +162,14 @@ func TestWorkerConfigurationRejectsChangedIdentityAndInvalidInput(t *testing.T) 
 	for _, mutate := range []func(*HarnessConfig){func(c *HarnessConfig) { c.Cwd += "/other" }, func(c *HarnessConfig) { c.Version = "other" }, func(c *HarnessConfig) { c.Effort = "bad effort" }} {
 		next := previous
 		mutate(&next)
-		if host.apply(WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: workerConfigDigest(previous)}).Error == "" {
+		if host.apply(WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: ConfigDigest(previous)}).Error == "" {
 			t.Fatal("invalid runtime configuration accepted")
 		}
 	}
 	if host.apply(WorkerRequest{Action: "configure"}).Error == "" {
 		t.Fatal("missing settings accepted")
 	}
-	if host.info.ConfigDigest != workerConfigDigest(previous) {
+	if host.info.ConfigDigest != ConfigDigest(previous) {
 		t.Fatal("rejected input mutated configuration")
 	}
 }
@@ -193,10 +193,10 @@ func TestWorkerConfigurationRestoresIdleRuntimeOnPublicationFailure(t *testing.T
 			if err := os.Mkdir(host.recordPath, 0700); err != nil {
 				t.Fatal(err)
 			}
-			if host.apply(WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: workerConfigDigest(previous)}).Error == "" {
+			if host.apply(WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: ConfigDigest(previous)}).Error == "" {
 				t.Fatal("failed publication accepted")
 			}
-			if host.info.ConfigDigest != workerConfigDigest(previous) {
+			if host.info.ConfigDigest != ConfigDigest(previous) {
 				t.Fatal("failed publication changed discoverable selection")
 			}
 			if rollbackFails {
@@ -207,6 +207,56 @@ func TestWorkerConfigurationRestoresIdleRuntimeOnPublicationFailure(t *testing.T
 				}
 			} else if host.supervisor.HarnessConfig().Name != previous.Name {
 				t.Fatal("failed publication left the replacement selected")
+			}
+		})
+	}
+}
+
+func TestWorkerConfigurationCanonicalCommitFenceAndFailure(t *testing.T) {
+	for _, stage := range []string{"success", "save", "publication", "restore"} {
+		t.Run(stage, func(t *testing.T) {
+			host, target := newWorkerConfigurationHost(t)
+			previous := host.supervisor.HarnessConfig()
+			next := previous
+			next.Model = "new"
+			saved := "old"
+			initialSelection := target.selection
+			host.settings = func(_ string, current, desired HarnessConfig, _ WorkerSettings) (func() error, func() error, error) {
+				return func() error {
+						// CommitInference holds the dispatch snapshot fence here.
+						if target.selection != initialSelection {
+							t.Error("runtime changed before canonical persistence")
+						}
+						if stage == "save" {
+							return errors.New("synthetic save failure")
+						}
+						saved = "new"
+						if stage == "publication" || stage == "restore" {
+							_ = os.Remove(host.recordPath)
+						}
+						return nil
+					}, func() error {
+						if stage == "restore" {
+							return errors.New("synthetic restoration failure")
+						}
+						saved = "old"
+						return nil
+					}, nil
+			}
+			reply := host.apply(WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: ConfigDigest(previous), Settings: &WorkerSettings{}})
+			if stage == "success" {
+				if reply.Error != "" || saved != "new" || host.supervisor.HarnessConfig().Model != "new" {
+					t.Fatal("canonical/runtime commit did not finish", reply.Error)
+				}
+			} else if reply.Error == "" || host.supervisor.HarnessConfig().Model != "old" || stage != "restore" && saved != "old" {
+				t.Fatal("failed canonical commit changed runtime or saved settings", reply.Error)
+			}
+			if stage == "restore" {
+				select {
+				case <-host.stop:
+				default:
+					t.Fatal("unrestored settings kept admitting provider work")
+				}
 			}
 		})
 	}

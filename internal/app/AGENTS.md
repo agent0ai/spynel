@@ -57,6 +57,8 @@
 
 - Job message/ping/kill route through the orchestrator execution owner, including a privately bound surviving worker. Local harness controls retain their existing callbacks; worker controls validate the exact durable claim and reserve inside the worker. Preserve operator authorization, local acknowledgements, cancellation reservation and runtime cleanup behavior. This does not enable normal worker-backed conversation dispatch.
 
+- When the Manager has a bound worker, every settings surface uses worker-owned canonical save/reload and dispatch publication rather than a controller callback. Validate model/service capabilities through that worker, fence expected canonical/runtime snapshots, reconcile a lost reply by authenticated inspection without resending, then publish only the confirmed canonical snapshot under exact ownership. Failures preserve settings or report an unconfirmed commit; do not rollback native autostart after an unconfirmed remote commit. Native registration remains an external controller-owned side effect requiring explicit inspection after uncertainty, not a crash-atomic worker transaction. This private binding does not enable normal application composition or conversation adoption.
+
 ## Child DOX Index
 
 No child DOX files.

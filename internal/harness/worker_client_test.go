@@ -603,7 +603,7 @@ func TestWorkerConfigurationSurvivesNativeControllerReplacement(t *testing.T) {
 				t.Fatal(err)
 			}
 			reply := workerClientCall(t, client, request)
-			if reply.ConfigDigest != workerConfigDigest(next) {
+			if reply.ConfigDigest != ConfigDigest(next) {
 				t.Fatal("configuration reply differs from requested runtime")
 			}
 			if workerClientCall(t, client, WorkerRequest{Action: "inspect"}).Executions[0].Done {

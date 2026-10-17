@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -256,7 +257,7 @@ func TestWorkerAgentManagerRestoresHeartbeatJobAndFixedDelay(t *testing.T) {
 
 // Drop exactly the Send reply at a private Unix proxy. The accepted case
 // forwards first; the rejected case proves no provider admission happened.
-func dropWorkerAgentSendReply(t *testing.T, socket string, accepted bool) func() {
+func dropWorkerReply(t *testing.T, socket, action string, accepted, inspectionUnavailable bool) func() {
 	t.Helper()
 	target := socket + ".target"
 	if err := os.Rename(socket, target); err != nil {
@@ -272,6 +273,7 @@ func dropWorkerAgentSendReply(t *testing.T, socket string, accepted bool) func()
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", target)
 	}}
+	var applied atomic.Bool
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -281,7 +283,7 @@ func dropWorkerAgentSendReply(t *testing.T, socket string, accepted bool) func()
 		if json.Unmarshal(body, &request) != nil {
 			return
 		}
-		if request.Action == "send" && !accepted {
+		if request.Action == action && !accepted || request.Action == "inspect" && inspectionUnavailable && applied.Load() {
 			connection, _, _ := w.(http.Hijacker).Hijack()
 			_ = connection.Close()
 			return
@@ -294,8 +296,9 @@ func dropWorkerAgentSendReply(t *testing.T, socket string, accepted bool) func()
 			return
 		}
 		defer response.Body.Close()
-		if request.Action == "send" {
+		if request.Action == action {
 			_, _ = io.Copy(io.Discard, response.Body)
+			applied.Store(true)
 			connection, _, _ := w.(http.Hijacker).Hijack()
 			_ = connection.Close()
 			return
@@ -330,7 +333,7 @@ func TestWorkerAgentAmbiguousSendReconcilesSameJob(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newWorkerAgentFixture(t)
 			f.client.Close()
-			restore := dropWorkerAgentSendReply(t, f.client.Info().Socket, accepted)
+			restore := dropWorkerReply(t, f.client.Info().Socket, "send", accepted, false)
 			f.start(t)
 			f.trigger(t, true)
 			waitWorkerAgent(t, func() bool {

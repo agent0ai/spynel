@@ -73,7 +73,7 @@ func OpenWorker(ctx context.Context, cfg HarnessConfig, instanceID, termToken st
 			}
 			return nil, errors.New("worker native identity unavailable")
 		}
-		if record.Info.EnvironmentID != election.EnvironmentID() || record.Info.WorkspaceID != filepath.Base(lockPath) || record.Info.ConfigDigest != workerConfigDigest(cfg) {
+		if record.Info.EnvironmentID != election.EnvironmentID() || record.Info.WorkspaceID != filepath.Base(lockPath) || record.Info.ConfigDigest != ConfigDigest(cfg) {
 			return nil, errors.New("worker environment, workspace or configuration changed")
 		}
 		client := newWorkerClient(record, instanceID, termToken, election)
@@ -163,6 +163,12 @@ func (c *WorkerClient) Info() WorkerInfo { return c.record.Info }
 
 // Close detaches only. Destructive shutdown is an explicit fenced operation.
 func (c *WorkerClient) Close() { c.client.CloseIdleConnections() }
+
+// Models reads the owning adapter's capabilities without admitting work.
+func (c *WorkerClient) Models(ctx context.Context) ([]Model, error) {
+	reply, err := c.Call(ctx, WorkerRequest{Action: "models"})
+	return reply.Models, err
+}
 
 // RunOwned fences a short local mutation against worker death and controller
 // replacement. The callback must not call worker RPCs or reacquire this fence.
@@ -299,7 +305,8 @@ func (c *WorkerClient) Call(ctx context.Context, request WorkerRequest) (WorkerR
 	return reply, nil
 }
 
-func workerConfigDigest(cfg HarnessConfig) [32]byte {
+// ConfigDigest binds the wire-visible runtime selection, excluding process-owned writers.
+func ConfigDigest(cfg HarnessConfig) [32]byte {
 	data, _ := json.Marshal(cfg)
 	return sha256.Sum256(data)
 }

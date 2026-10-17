@@ -17,6 +17,8 @@
 
 - Orchestrator workflows belong to `internal/orchestrator`; configuration contains no route definitions, paths, transitions, prompt selection, or stale thresholds.
 
+- Own canonical worker-settings validation/persistence and canonical-to-runtime harness selection. Private encoded YAML is bounded and may contain credentials; never log it. Match the expected canonical digest or an exact applied retry, reject unsafe paths and runtime mismatch, recheck raw bytes before saving, reload before confirmation and restore original bytes only if the saved target still matches. Store reload publishes only the expected canonical bytes without another save; exact election ownership is supplied by the worker/application, not by a process-local store mutex.
+
 ## Child DOX Index
 
 No child DOX files.

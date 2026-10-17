@@ -1,7 +1,9 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -18,6 +20,8 @@ import (
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/theme"
 )
+
+var errWorkerSettingsUnconfirmed = errors.New("worker settings commit unconfirmed; inspect canonical and native settings before retrying")
 
 func (s *Service) Screen(id string) (core.Screen, error) {
 	switch strings.ToLower(strings.TrimSpace(id)) {
@@ -783,8 +787,8 @@ func (s *Service) modelCommand(ctx context.Context, message core.Message, remain
 		emit(core.Event{Kind: core.EventScreen, Screen: screen, Local: true})
 		return nil
 	}
-	provider, ok := s.Harness.(harness.ModelProvider)
-	if !ok {
+	provider := s.modelProvider()
+	if provider == nil {
 		return s.localReply(message, "The active harness does not provide a model catalog. Set an exact model with `/model <name>`.", emit)
 	}
 	models, err := provider.Models(ctx)
@@ -856,7 +860,7 @@ func (s *Service) modelPropertyCommand(ctx context.Context, message core.Message
 
 func (s *Service) modelScreen(ctx context.Context) (*core.Screen, error) {
 	var models []harness.Model
-	if provider, ok := s.Harness.(harness.ModelProvider); ok {
+	if provider := s.modelProvider(); provider != nil {
 		checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		models, _ = provider.Models(checkCtx)
@@ -1065,9 +1069,17 @@ func (s *Service) selectionScreenAction(ctx context.Context, screenID, action st
 	return selectionSavedScreen(selected, "", ""), true, nil
 }
 
+func (s *Service) modelProvider() harness.ModelProvider {
+	if s.Orchestrator.Worker != nil {
+		return s.Orchestrator.Worker
+	}
+	provider, _ := s.Harness.(harness.ModelProvider)
+	return provider
+}
+
 func (s *Service) catalogModel(ctx context.Context, id string) (*harness.Model, error) {
-	provider, ok := s.Harness.(harness.ModelProvider)
-	if !ok {
+	provider := s.modelProvider()
+	if provider == nil {
 		return nil, errors.New("the active harness does not provide a model catalog")
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -1229,12 +1241,12 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 			return nil, fmt.Errorf("autostart registration unverified: %s", boundAndRedactLogText(err.Error()))
 		}
 	}
-	if harnessChanged {
+	if harnessChanged && s.Orchestrator.Worker == nil {
 		if err := s.reconfigureHarness(next); err != nil {
 			return nil, err
 		}
 	}
-	if unchanged && !startupRequested {
+	if unchanged && !startupRequested && s.Orchestrator.Worker == nil {
 		if themeChanged {
 			s.publishTheme(selectedTheme)
 		}
@@ -1249,6 +1261,11 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 			}
 			startupSynced = true
 		}
+		if s.Orchestrator.Worker != nil {
+			var updateErr error
+			reloaded, updateErr = s.commitWorkerSettings(previous, next)
+			return updateErr
+		}
 		var updateErr error
 		reloaded, updateErr = s.Settings.Update(func(current *config.Config) error {
 			*current = next
@@ -1256,17 +1273,17 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		})
 		return updateErr
 	}
-	if inferenceChanged && canCommitInference && !harnessChanged {
+	if inferenceChanged && canCommitInference && !harnessChanged && s.Orchestrator.Worker == nil {
 		err = inferenceCommitter.CommitInference(harness.InferenceSelection{Model: next.Harness.Model, Effort: next.Harness.ReasoningEffort, LegacyEffort: next.Harness.UsesLegacyReasoningEffort(), ServiceMode: next.Harness.ServiceMode}, update)
 	} else {
 		err = update()
 	}
 	if err != nil {
 		var rollback error
-		if harnessChanged {
+		if harnessChanged && s.Orchestrator.Worker == nil {
 			rollback = wrapRollback("harness", s.reconfigureHarness(previous))
 		}
-		if startupSynced {
+		if startupSynced && !errors.Is(err, errWorkerSettingsUnconfirmed) {
 			if restoreErr := s.Startup.Sync(previous, previousStartup); restoreErr != nil {
 				rollback = errors.Join(rollback, fmt.Errorf("rollback autostart: %s", boundAndRedactLogText(restoreErr.Error())))
 			}
@@ -1330,7 +1347,7 @@ func (s *Service) validateInferenceSettings(ctx context.Context, previous config
 	var model *harness.Model
 	needCatalog := modelChanged && (!explicitEffort && selected.Effort != "" || !explicitService && selected.ServiceMode != "") || explicitService && selected.ServiceMode != ""
 	if previous.Harness.Name == next.Harness.Name && needCatalog {
-		if provider, ok := s.Harness.(harness.ModelProvider); ok {
+		if provider := s.modelProvider(); provider != nil {
 			checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			models, err := provider.Models(checkCtx)
 			cancel()
@@ -1510,23 +1527,8 @@ func (s *Service) reconfigureHarness(cfg config.Config) error {
 	if !ok {
 		return nil
 	}
-	runtimeConfig := runtimeHarness.HarnessConfig()
-	runtimeConfig.Name = cfg.Harness.Name
-	runtimeConfig.Cwd = cfg.Root
-	runtimeConfig.Model = cfg.Harness.Model
-	runtimeConfig.Effort = cfg.Harness.ReasoningEffort
-	runtimeConfig.LegacyEffort = cfg.Harness.UsesLegacyReasoningEffort()
-	runtimeConfig.ServiceMode = cfg.Harness.ServiceMode
-	runtimeConfig.ApprovalPolicy = "never"
-	runtimeConfig.Sandbox = cfg.Harness.Sandbox
-	runtimeConfig.Network = false
-	runtimeConfig.SessionsFile = cfg.HarnessSessionsPath(cfg.Harness.Name)
-	runtimeConfig.Args = cfg.HarnessArgs()
-	command, err := harness.ResolveConfiguredCommand(cfg.Harness.Name, cfg.Harness.ACPCommand, nil)
+	runtimeConfig, err := cfg.RuntimeHarness(runtimeHarness.HarnessConfig())
 	if err != nil {
-		if definition, ok := harness.Lookup(cfg.Harness.Name); ok {
-			runtimeConfig.Command = definition.Command
-		}
 		if unavailable, ok := s.Harness.(interface {
 			ConfigureUnavailable(harness.HarnessConfig, error) error
 		}); ok {
@@ -1534,8 +1536,59 @@ func (s *Service) reconfigureHarness(cfg config.Config) error {
 		}
 		return err
 	}
-	runtimeConfig.Command = command
 	return runtimeHarness.Reconfigure(runtimeConfig)
+}
+
+// The worker owns save/reload and runtime publication through its dispatch
+// fence. A lost reply is reconciled by inspection, never another admission.
+func (s *Service) commitWorkerSettings(previous, next config.Config) (config.Config, error) {
+	worker := s.Orchestrator.Worker
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	current, err := worker.Call(ctx, harness.WorkerRequest{Action: "inspect"})
+	if err != nil || current.Config == nil {
+		return previous, errors.New("worker settings inspection unavailable")
+	}
+	runtimeConfig, err := next.RuntimeHarness(*current.Config)
+	if err != nil {
+		return previous, err
+	}
+	before, err := previous.Encode()
+	if err != nil {
+		return previous, err
+	}
+	encoded, err := next.Encode()
+	if err != nil {
+		return previous, err
+	}
+	reply, err := worker.Call(ctx, harness.WorkerRequest{Action: "configure", Config: &runtimeConfig, ExpectedConfig: current.ConfigDigest,
+		Settings: &harness.WorkerSettings{Expected: sha256.Sum256(before), YAML: encoded}})
+	if err != nil {
+		// A request may have committed even when its response was lost.
+		inspection, inspectErr := worker.Call(ctx, harness.WorkerRequest{Action: "inspect"})
+		saved, loadErr := config.Load(next.Path)
+		actual, encodeErr := saved.Encode()
+		if inspectErr != nil || loadErr != nil || encodeErr != nil || !bytes.Equal(actual, encoded) || inspection.ConfigDigest != harness.ConfigDigest(runtimeConfig) {
+			if inspectErr == nil && loadErr == nil && encodeErr == nil && bytes.Equal(actual, before) && inspection.ConfigDigest == current.ConfigDigest {
+				return previous, err
+			}
+			return previous, fmt.Errorf("%w: %v", errWorkerSettingsUnconfirmed, err)
+		}
+		reply = inspection
+	}
+	if reply.ConfigDigest != harness.ConfigDigest(runtimeConfig) {
+		return previous, fmt.Errorf("%w: runtime digest changed before publication", errWorkerSettingsUnconfirmed)
+	}
+	var reloaded config.Config
+	err = worker.RunOwned(ctx, func() error {
+		var reloadErr error
+		reloaded, reloadErr = s.Settings.Reload(encoded)
+		return reloadErr
+	})
+	if err != nil {
+		return previous, fmt.Errorf("%w: application publication failed", errWorkerSettingsUnconfirmed)
+	}
+	return reloaded, err
 }
 
 func (s *Service) resolveHarnessCommand(name string) (string, error) {

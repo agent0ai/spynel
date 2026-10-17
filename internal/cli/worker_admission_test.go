@@ -40,6 +40,7 @@ func runWorkerAdmissionProvider() int {
 		var request struct {
 			ID     int
 			Method string
+			Params json.RawMessage
 		}
 		if json.Unmarshal(scanner.Bytes(), &request) != nil {
 			return 1
@@ -50,6 +51,8 @@ func runWorkerAdmissionProvider() int {
 		result := map[string]any{}
 		switch request.Method {
 		case "initialize", "turn/interrupt":
+		case "model/list":
+			result["data"] = []any{map[string]any{"id": "model-a", "model": "model-a", "isDefault": true, "supportedReasoningEfforts": []any{map[string]string{"reasoningEffort": "high"}}, "serviceTiers": []any{map[string]string{"id": "priority", "name": "Priority"}}}}
 		case "turn/steer":
 			result["turnId"] = "synthetic-turn"
 		case "thread/start", "thread/resume":
@@ -68,6 +71,9 @@ func runWorkerAdmissionProvider() int {
 			}
 		}
 		if request.Method == "turn/start" {
+			if _, err := file.WriteString("selection:" + string(request.Params) + "\n"); err != nil {
+				return 1
+			}
 			starts++
 			if prefix := os.Getenv("SPYNEL_TEST_WORKER_COMPLETIONS"); prefix != "" {
 				go func(path string) {

@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	WorkerProtocol      = 7
+	WorkerProtocol      = 8
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -75,7 +75,18 @@ type WorkerRequest struct {
 	Control        *WorkerControl
 	Config         *HarnessConfig
 	ExpectedConfig [32]byte
+	Settings       *WorkerSettings
 }
+
+// WorkerSettings carries canonical YAML privately; it must never enter logs.
+type WorkerSettings struct {
+	Expected [32]byte
+	YAML     []byte
+}
+
+// WorkerSettingsAction prepares canonical persistence and restoration. Both
+// callbacks run under the worker's configuration/dispatch fence, without RPCs.
+type WorkerSettingsAction func(root string, current, next HarnessConfig, settings WorkerSettings) (commit, restore func() error, err error)
 
 type WorkerControl struct {
 	ID                 string
@@ -149,6 +160,8 @@ type WorkerReply struct {
 	Session      *WorkerSession
 	Control      *ControlResult
 	ConfigDigest [32]byte
+	Config       *HarnessConfig
+	Models       []Model
 }
 
 type workerExecution struct {
@@ -179,12 +192,13 @@ type workerHost struct {
 	bytes      int64
 	failure    error
 	workflow   WorkerWorkflowAction
+	settings   WorkerSettingsAction
 }
 
 // RunWorker is a private same-binary entry point. Losing its bootstrap pipe,
 // HTTP clients or elected controller does not cancel its provider context.
 // Explicit shutdown, signal, journal failure or bounded detachment still do.
-func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *Registry, workflow WorkerWorkflowAction) (runErr error) {
+func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *Registry, workflow WorkerWorkflowAction, settings WorkerSettingsAction) (runErr error) {
 	var bootstrap WorkerBootstrap
 	data, err := io.ReadAll(io.LimitReader(input, workerRequestBytes+1))
 	if err != nil || len(data) > workerRequestBytes {
@@ -238,7 +252,7 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	info := WorkerInfo{
 		Protocol: WorkerProtocol, ID: id, Socket: filepath.Join(directory, "control.sock"), PID: os.Getpid(),
 		EnvironmentID: election.EnvironmentID(), WorkspaceID: filepath.Base(lockPath),
-		ConfigDigest: workerConfigDigest(bootstrap.Harness), Process: native,
+		ConfigDigest: ConfigDigest(bootstrap.Harness), Process: native,
 	}
 	listener, err := net.Listen("unix", info.Socket)
 	if err != nil {
@@ -274,7 +288,7 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	host = &workerHost{
 		supervisor: supervisor, election: election, info: info, token: bootstrap.Token, directory: directory, recordPath: recordPath,
 		stop: make(chan struct{}), lastSeen: time.Now(), next: 1, executions: map[uint64]*workerExecution{},
-		workflow: workflow,
+		workflow: workflow, settings: settings,
 	}
 	if err := publishWorkerRecord(recordPath, workerRecord{Info: info, Token: bootstrap.Token}); err != nil {
 		return err
@@ -373,9 +387,10 @@ func (h *workerHost) serve(w http.ResponseWriter, r *http.Request) {
 func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 	switch request.Action {
 	case "inspect":
+		cfg := h.supervisor.HarnessConfig()
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		reply := WorkerReply{NextSequence: h.next, ConfigDigest: h.info.ConfigDigest}
+		reply := WorkerReply{NextSequence: h.next, ConfigDigest: h.info.ConfigDigest, Config: &cfg}
 		for _, execution := range h.executions {
 			reply.Executions = append(reply.Executions, execution.WorkerExecution)
 		}
@@ -387,6 +402,14 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 		return h.control(request)
 	case "configure":
 		return h.configure(request)
+	case "models":
+		ctx, cancel := context.WithTimeout(h.supervisor.ctx, 10*time.Second)
+		defer cancel()
+		models, err := h.supervisor.Models(ctx)
+		if err != nil {
+			return WorkerReply{Error: err.Error()}
+		}
+		return WorkerReply{Models: models}
 	case "events":
 		return h.events(request)
 	case "commit":

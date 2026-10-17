@@ -55,7 +55,7 @@ func Run(args []string, version string) (runErr error) {
 		defer unregister()
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 		defer cancel()
-		return harness.RunWorker(ctx, os.Stdin, os.Stdout, harness.NewBuiltinRegistry(), orchestrator.ApplyWorkerWorkflow)
+		return harness.RunWorker(ctx, os.Stdin, os.Stdout, harness.NewBuiltinRegistry(), orchestrator.ApplyWorkerWorkflow, config.PrepareWorkerSettings)
 	}
 	if len(args) > 0 && args[0] == "__provider" {
 		unregister, err := updater.Detect(version).RegisterProviderGuardian()

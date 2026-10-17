@@ -67,7 +67,7 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			os.Exit(1)
 		}
-		if err := RunWorker(context.Background(), os.Stdin, os.Stdout, NewBuiltinRegistry(), reserveWorkerFixture); err != nil {
+		if err := RunWorker(context.Background(), os.Stdin, os.Stdout, NewBuiltinRegistry(), reserveWorkerFixture, nil); err != nil {
 			unregister()
 			_, _ = fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)

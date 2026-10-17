@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -657,25 +658,9 @@ func Save(cfg Config) error {
 	if cfg.Path == "" {
 		return errors.New("configuration path is empty")
 	}
-	if err := cfg.Validate(); err != nil {
-		return err
-	}
-	data, err := yaml.Marshal(cfg)
+	data, err := cfg.Encode()
 	if err != nil {
-		return fmt.Errorf("encode %s: %w", cfg.Path, err)
-	}
-	if cfg.Harness.reasoningEffortOmitted {
-		var document yaml.Node
-		if err := yaml.Unmarshal(data, &document); err != nil {
-			return fmt.Errorf("encode %s: %w", cfg.Path, err)
-		}
-		if len(document.Content) > 0 {
-			removeMappingKey(mappingValue(document.Content[0], "harness"), "reasoning_effort")
-		}
-		data, err = yaml.Marshal(&document)
-		if err != nil {
-			return fmt.Errorf("encode %s: %w", cfg.Path, err)
-		}
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o700); err != nil {
 		return fmt.Errorf("prepare %s: %w", cfg.Path, err)
@@ -684,6 +669,32 @@ func Save(cfg Config) error {
 		return fmt.Errorf("save %s: %w", cfg.Path, err)
 	}
 	return nil
+}
+
+// Encode returns validated canonical YAML, preserving omitted legacy effort.
+// Its contents can contain credentials and must never be logged.
+func (cfg Config) Encode() ([]byte, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("encode %s: %w", cfg.Path, err)
+	}
+	if cfg.Harness.reasoningEffortOmitted {
+		var document yaml.Node
+		if err := yaml.Unmarshal(data, &document); err != nil {
+			return nil, fmt.Errorf("encode %s: %w", cfg.Path, err)
+		}
+		if len(document.Content) > 0 {
+			removeMappingKey(mappingValue(document.Content[0], "harness"), "reasoning_effort")
+		}
+		data, err = yaml.Marshal(&document)
+		if err != nil {
+			return nil, fmt.Errorf("encode %s: %w", cfg.Path, err)
+		}
+	}
+	return data, nil
 }
 
 // Store serializes validated configuration changes and publishes the newest
@@ -735,3 +746,23 @@ func (s *Store) publishLocked(next Config) {
 }
 
 func (s *Store) Updates() <-chan Config { return s.updates }
+
+// Reload publishes a canonical file saved by the elected worker; it never saves
+// a controller snapshot over that worker's committed transaction.
+func (s *Store) Reload(expected []byte) (Config, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next, err := Load(s.current.Path)
+	if err != nil {
+		return s.current, err
+	}
+	encoded, err := next.Encode()
+	if err != nil || !bytes.Equal(encoded, expected) {
+		return s.current, errors.New("canonical configuration changed before publication")
+	}
+	s.current = next
+	s.publishLocked(next)
+	return next, nil
+}
