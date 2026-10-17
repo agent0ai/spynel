@@ -311,3 +311,118 @@ func workerWorkflowManagerFixture(t *testing.T, movedEarly bool) {
 		t.Fatal("settled worker stream was not retired", err)
 	}
 }
+
+func TestWorkerWorkflowScheduledScanRecoversAfterEndpointOutage(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Orchestrator.IntervalSec = 1
+	cfg.Orchestrator.SemanticHeartbeatMinutes = 0
+	owner, err := instance.New(cfg.StatePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	term, _ := owner.NewToken()
+	if _, ok, err := owner.TryAcquire("127.0.0.1:10001", term); err != nil || !ok {
+		t.Fatal("owner acquisition failed", err)
+	}
+	executable, _ := os.Executable()
+	t.Setenv("SPYNEL_TEST_WORKER_PROVIDER", "1")
+	t.Setenv("SPYNEL_TEST_WORKER_EVIDENCE", filepath.Join(root, "synthetic-provider-methods"))
+	harnessConfig := harness.HarnessConfig{Name: "codex", Command: executable, Cwd: root, Sandbox: "read-only", ApprovalPolicy: "never", SessionsFile: filepath.Join(root, "sessions.json")}
+	client, err := harness.OpenWorker(t.Context(), harnessConfig, owner.ID(), term)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := client.Info()
+	t.Logf("native outage worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
+	service := app.New(cfg, harness.NewSupervisor(harness.NewBuiltinRegistry(), harnessConfig))
+	service.Orchestrator.Worker = client
+	ctx, cancel := context.WithCancel(t.Context())
+	runDone := make(chan error, 1)
+	failedScan := make(chan struct{}, 1)
+	failedCount := 0
+	service.Orchestrator.Log = func(message string) {
+		if strings.HasPrefix(message, "orchestrator scan:") {
+			failedCount++
+			if failedCount >= 2 {
+				select {
+				case failedScan <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}
+	socket := identity.Socket
+	if err := os.Rename(socket, socket+".unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+	restored := false
+	t.Cleanup(func() {
+		if !restored {
+			_ = os.Rename(socket+".unavailable", socket)
+		}
+		cancel()
+		<-runDone
+		service.Orchestrator.Wait()
+		_ = service.Close()
+		if _, err := client.Call(context.Background(), harness.WorkerRequest{Action: "shutdown"}); err != nil {
+			t.Error(err)
+		}
+		client.Close()
+		_ = owner.Release(term)
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			if _, err := os.Stat(filepath.Dir(socket)); os.IsNotExist(err) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Error("worker endpoint/journal cleanup timed out")
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	go func() { runDone <- service.Orchestrator.Run(ctx) }()
+	select {
+	case <-failedScan:
+	case <-time.After(5 * time.Second):
+		t.Fatal("scheduled scan did not observe endpoint outage")
+	}
+	if err := os.Rename(socket+".unavailable", socket); err != nil {
+		t.Fatal(err)
+	}
+	restored = true
+	if _, err := client.Call(t.Context(), harness.WorkerRequest{Action: "inspect"}); err != nil {
+		t.Fatal("worker did not recover", err)
+	}
+	if updater.VerifyProcess(identity.Process) != nil {
+		t.Fatal("worker identity changed")
+	}
+	path, err := orchestrator.Create(cfg, "tasks", "synthetic scheduled outage recovery", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	working := cfg.StatePath("tasks", "working", filepath.Base(path))
+	deadline := time.Now().Add(3500 * time.Millisecond)
+	for {
+		if _, err := os.Stat(working); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("healthy same-identity worker recovered, but no later scheduled scan claimed queued work across three scan intervals")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

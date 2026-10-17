@@ -374,6 +374,17 @@ func (m *Manager) resetScanTimer(acceptedAt time.Time) {
 }
 
 func (m *Manager) scanScheduled(ctx context.Context, generation uint64) error {
+	defer func() {
+		m.scanMu.Lock()
+		defer m.scanMu.Unlock()
+		m.scanTimerMu.Lock()
+		current := m.scanTimerGeneration
+		m.scanTimerMu.Unlock()
+		// Rearm failed attempts without replacing a newer configuration deadline.
+		if current == generation {
+			m.resetScanTimer(time.Now())
+		}
+	}()
 	return m.runScan(ctx, &generation)
 }
 
@@ -454,7 +465,6 @@ func (m *Manager) runScan(ctx context.Context, generation *uint64) error {
 			if current != *generation {
 				return nil
 			}
-			defer m.resetScanTimer(time.Now())
 		}
 		if err := m.attachWorkerWorkflows(ctx, retained); err != nil {
 			return err

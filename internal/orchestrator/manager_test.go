@@ -15,6 +15,7 @@ import (
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
 
@@ -368,6 +369,64 @@ func TestLiveScanIntervalResetsRunningSchedulerFromAcceptedChange(t *testing.T) 
 	}
 	if got := manager.scanInterval(); got != 2*time.Second {
 		t.Fatalf("live scan interval = %s", got)
+	}
+}
+
+func TestScheduledScanRearmsAfterFailure(t *testing.T) {
+	for _, failure := range []string{"inspection", "scan"} {
+		t.Run(failure, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Root = filepath.Join(t.TempDir(), "blocked")
+			if err := os.WriteFile(cfg.Root, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+			if failure == "inspection" {
+				manager.Worker = &harness.WorkerClient{}
+			}
+			timer := manager.startScanTimer()
+			defer manager.stopScanTimer(timer)
+			generation := manager.scanTimerGeneration
+			timer.Reset(0)
+			<-timer.C
+			before := time.Now()
+			if err := manager.scanScheduled(t.Context(), generation); err == nil {
+				t.Fatal("scan unexpectedly succeeded")
+			}
+			if manager.scanTimerGeneration != generation+1 || manager.scanTimer == timer || manager.scanNext.Before(before.Add(manager.scanInterval())) {
+				t.Fatal("failed scheduled scan did not rearm its spent timer")
+			}
+		})
+	}
+}
+
+func TestScheduledScanFailurePreservesConcurrentConfigurationDeadline(t *testing.T) {
+	cfg := config.Default()
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+	manager.Worker = &harness.WorkerClient{}
+	timer := manager.startScanTimer()
+	defer manager.stopScanTimer(timer)
+	generation := manager.scanTimerGeneration
+	timer.Reset(0)
+	<-timer.C
+	manager.workerAdmissionMu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- manager.scanScheduled(t.Context(), generation) }()
+	cfg.Orchestrator.IntervalSec += 60
+	manager.ApplyRuntimeConfig(cfg)
+	acceptedTimer, acceptedNext := manager.scanTimer, manager.scanNext
+	acceptedGeneration := manager.scanTimerGeneration
+	manager.workerAdmissionMu.Unlock()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("inspection unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed scan did not release scheduler ownership")
+	}
+	if manager.scanTimer != acceptedTimer || manager.scanNext != acceptedNext || manager.scanTimerGeneration != acceptedGeneration {
+		t.Fatal("obsolete scan overwrote the newly accepted timer")
 	}
 }
 
