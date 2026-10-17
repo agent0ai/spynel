@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,7 +16,7 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
-	"github.com/agent0ai/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/updater"
 )
@@ -24,12 +25,6 @@ const (
 	fixtureModeEnv = "SPYNEL_HARNESS_FIXTURE_MODE"
 	fixtureLogEnv  = "SPYNEL_HARNESS_FIXTURE_LOG"
 )
-
-type workerConsumerReceipt struct {
-	WorkerID string
-	Sequence uint64
-	Event    WorkerEvent
-}
 
 type fixtureRecord struct {
 	PID        int             `json:"pid"`
@@ -98,6 +93,11 @@ func runWorkerControllerFixture() error {
 		return err
 	}
 	defer client.Close()
+	store := history.New(filepath.Join(cfg.Cwd, "consumer-history"))
+	sink := func(delivery WorkerDelivery) error {
+		_, err := store.AppendOnce("cli", "owned", delivery.ReceiptID(), history.Entry{Role: "assistant", Content: delivery.Event.Text, Terminal: delivery.Event.Done})
+		return err
+	}
 	if _, err := client.Call(context.Background(), WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/controller", Prompt: "synthetic useful work"}); err != nil {
 		return err
 	}
@@ -108,12 +108,13 @@ func runWorkerControllerFixture() error {
 			return err
 		}
 		if len(page.Events) > 0 {
-			// This synthetic durable sink stands in for a consumer effect.
-			data, err := json.Marshal(workerConsumerReceipt{WorkerID: client.Info().ID, Sequence: 1, Event: page.Events[0]})
-			if err != nil {
-				return err
-			}
-			if err := fsx.AtomicWriteFile(filepath.Join(cfg.Cwd, "synthetic-consumer.json"), data, 0600); err != nil {
+			ran, err := owner.RunForOwner(owner.ID(), term, func() error {
+				return sink(WorkerDelivery{WorkerID: client.Info().ID, Sequence: 1, WorkerEvent: page.Events[0]})
+			})
+			if err != nil || !ran {
+				if err == nil {
+					err = errors.New("controller fixture lost effect ownership")
+				}
 				return err
 			}
 			if _, err := client.Call(context.Background(), WorkerRequest{Action: "commit", Sequence: 1, After: page.Events[0].Cursor}); err != nil {
@@ -123,6 +124,26 @@ func runWorkerControllerFixture() error {
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("controller fixture did not consume an event")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Leave a real history effect durable in the effect-before-commit window.
+	interrupted := errors.New("synthetic controller interrupted before cursor commit")
+	for {
+		_, err := client.Consume(context.Background(), 1, func(delivery WorkerDelivery) error {
+			if err := sink(delivery); err != nil {
+				return err
+			}
+			return interrupted
+		})
+		if errors.Is(err, interrupted) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return errors.New("controller fixture did not reach uncommitted effect")
 		}
 		time.Sleep(time.Millisecond)
 	}

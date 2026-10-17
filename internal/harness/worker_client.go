@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -32,6 +33,7 @@ type WorkerClient struct {
 	instanceID string
 	termToken  string
 	client     *http.Client
+	election   *instance.Election
 }
 
 // OpenWorker discovers a live worker before considering a new launch. Unknown
@@ -75,7 +77,7 @@ func OpenWorker(ctx context.Context, cfg HarnessConfig, instanceID, termToken st
 		if record.Info.EnvironmentID != election.EnvironmentID() || record.Info.WorkspaceID != filepath.Base(lockPath) || record.Info.ConfigDigest != workerConfigDigest(cfg) {
 			return nil, errors.New("worker environment, workspace or configuration changed")
 		}
-		client := newWorkerClient(record, instanceID, termToken)
+		client := newWorkerClient(record, instanceID, termToken, election)
 		if _, err := client.Call(ctx, WorkerRequest{Action: "inspect"}); err != nil {
 			client.Close()
 			return nil, err
@@ -140,8 +142,8 @@ func OpenWorker(ctx context.Context, cfg HarnessConfig, instanceID, termToken st
 	}
 }
 
-func newWorkerClient(record workerRecord, instanceID, termToken string) *WorkerClient {
-	return &WorkerClient{record: record, instanceID: instanceID, termToken: termToken, client: &http.Client{
+func newWorkerClient(record workerRecord, instanceID, termToken string, election *instance.Election) *WorkerClient {
+	return &WorkerClient{record: record, instanceID: instanceID, termToken: termToken, election: election, client: &http.Client{
 		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			if err := validateWorkerSocket(record.Info.Socket); err != nil {
 				return nil, err
@@ -157,6 +159,87 @@ func (c *WorkerClient) Info() WorkerInfo { return c.record.Info }
 
 // Close detaches only. Destructive shutdown is an explicit fenced operation.
 func (c *WorkerClient) Close() { c.client.CloseIdleConnections() }
+
+// WorkerDelivery supplies the private stable identity for downstream receipts.
+type WorkerDelivery struct {
+	WorkerID string
+	Sequence uint64
+	WorkerEvent
+}
+
+func (d WorkerDelivery) ReceiptID() string {
+	return d.WorkerID + ":" + strconv.FormatUint(d.Sequence, 10) + ":" + strconv.FormatUint(d.Cursor, 10)
+}
+
+// Consume applies one bounded page after the durable committed prefix. Each
+// callback runs under the exact election term and must durably deduplicate its
+// effects by ReceiptID before returning nil. It must not call worker RPCs or
+// reacquire election ownership. A failed callback/commit leaves replay safe
+// only through those receipts; arbitrary external effects are not exactly-once.
+func (c *WorkerClient) Consume(ctx context.Context, sequence uint64, consume func(WorkerDelivery) error) (WorkerExecution, error) {
+	if sequence == 0 || consume == nil || c.election == nil {
+		return WorkerExecution{}, errors.New("invalid worker consumer")
+	}
+	inspection, err := c.Call(ctx, WorkerRequest{Action: "inspect"})
+	if err != nil {
+		return WorkerExecution{}, err
+	}
+	var execution WorkerExecution
+	for _, current := range inspection.Executions {
+		if current.Sequence == sequence {
+			execution = current
+			break
+		}
+	}
+	if execution.Sequence == 0 {
+		return execution, errors.New("unknown or retired worker execution")
+	}
+	page, err := c.Call(ctx, WorkerRequest{Action: "events", Sequence: sequence, After: execution.CommittedCursor})
+	if err != nil {
+		return execution, err
+	}
+	if len(page.Executions) != 1 || page.Executions[0].Sequence != sequence {
+		return execution, errors.New("invalid worker consumer page")
+	}
+	execution = page.Executions[0]
+	after := execution.CommittedCursor
+	for _, event := range page.Events {
+		if event.Cursor <= after {
+			continue
+		}
+		if event.Cursor != after+1 {
+			return execution, errors.New("worker consumer event gap")
+		}
+		ran, err := c.election.RunForOwner(c.instanceID, c.termToken, func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := updater.VerifyProcess(c.record.Info.Process); err != nil {
+				return err
+			}
+			return consume(WorkerDelivery{WorkerID: c.record.Info.ID, Sequence: sequence, WorkerEvent: event})
+		})
+		if err != nil {
+			return execution, err
+		}
+		if !ran {
+			return execution, errors.New("worker consumer ownership unavailable")
+		}
+		after = event.Cursor
+	}
+	if after == execution.CommittedCursor {
+		return execution, nil
+	}
+	// RPC acquires the same mutation lock in the worker, after callbacks release it.
+	reply, err := c.Call(ctx, WorkerRequest{Action: "commit", Sequence: sequence, Expected: execution.CommittedCursor, After: after})
+	if err != nil {
+		return execution, err
+	}
+	if len(reply.Executions) != 1 || reply.Executions[0].Sequence != sequence || reply.Executions[0].CommittedCursor != after {
+		return execution, errors.New("invalid worker consumer commit")
+	}
+	return reply.Executions[0], nil
+}
 
 func (c *WorkerClient) Call(ctx context.Context, request WorkerRequest) (WorkerReply, error) {
 	if err := updater.VerifyProcess(c.record.Info.Process); err != nil {

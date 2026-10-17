@@ -31,6 +31,8 @@ type Entry struct {
 	ReplyTo          string    `json:"reply_to,omitempty"`
 	Content          string    `json:"content"`
 	EventID          string    `json:"event_id,omitempty"`
+	ReceiptID        string    `json:"receipt_id,omitempty"`
+	ReceiptHash      string    `json:"receipt_hash,omitempty"`
 	AfterChars       int       `json:"after_chars,omitempty"`
 	Terminal         bool      `json:"terminal,omitempty"`
 	FinalText        *string   `json:"final_text,omitempty"`

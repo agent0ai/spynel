@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,9 +18,147 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/fsx"
+	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/updater"
 )
+
+type workerTransportHook func(*http.Request) (*http.Response, error)
+
+func (hook workerTransportHook) RoundTrip(request *http.Request) (*http.Response, error) {
+	return hook(request)
+}
+
+func TestWorkerConsumerDurableReceiptAndOwnership(t *testing.T) {
+	for _, scenario := range []struct{ name, mode string }{
+		{"codex", "codex-worker"}, {"claude-code", "claude-interrupt"}, {"pi", "pi-interrupt"}, {"acp", "acp-interrupt"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			fixture := newWorkerFixture(t, scenario.name, scenario.mode)
+			client, err := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			workerClientCall(t, client, WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/receipt", Prompt: "synthetic receipt"})
+			workerClientCall(t, client, WorkerRequest{Action: "interrupt", Key: "synthetic/receipt"})
+			deadline := time.Now().Add(5 * time.Second)
+			for !workerClientCall(t, client, WorkerRequest{Action: "inspect"}).Executions[0].Done {
+				if time.Now().After(deadline) {
+					t.Fatal("fixture did not finish")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			root := t.TempDir()
+			store := history.New(root)
+			appended := 0
+			sink := func(delivery WorkerDelivery) error {
+				inserted, err := store.AppendOnce("cli", "owned", delivery.ReceiptID(), history.Entry{
+					Role: "assistant", Content: delivery.Event.Text, Terminal: delivery.Event.Done,
+				})
+				if inserted {
+					appended++
+				}
+				return err
+			}
+			failed := errors.New("synthetic failure after durable effect before prefix commit")
+			if state, err := client.Consume(t.Context(), 1, func(delivery WorkerDelivery) error {
+				if err := sink(delivery); err != nil {
+					return err
+				}
+				return failed
+			}); !errors.Is(err, failed) || state.CommittedCursor != 0 || appended != 1 {
+				t.Fatalf("failed effect/commit boundary: state=%+v added=%d err=%v", state, appended, err)
+			}
+			fixture.replaceOwner(t)
+			calls := 0
+			if _, err := client.Consume(t.Context(), 1, func(WorkerDelivery) error { calls++; return nil }); err == nil || calls != 0 {
+				t.Fatal("obsolete consumer applied effects")
+			}
+			replacement, err := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer replacement.Close()
+			store = history.New(root)
+			state, err := replacement.Consume(t.Context(), 1, sink)
+			if err != nil || state.CommittedCursor != state.LastCursor || appended != int(state.LastCursor) {
+				t.Fatalf("replacement replay repeated/lost effect: state=%+v added=%d err=%v", state, appended, err)
+			}
+			if _, err := replacement.Consume(t.Context(), 1, func(WorkerDelivery) error { calls++; return nil }); err != nil || calls != 0 {
+				t.Fatal("committed prefix was applied again")
+			}
+			workerClientCall(t, replacement, WorkerRequest{Action: "ack", Sequence: 1, After: state.CommittedCursor})
+			if _, err := replacement.Consume(t.Context(), 1, sink); err == nil {
+				t.Fatal("retired delivery was silently consumed")
+			}
+
+		})
+	}
+}
+func TestWorkerConsumerFencesTakeoverAfterReadAndLostCommitReply(t *testing.T) {
+	for _, takeover := range []bool{true, false} {
+		name := "lost-commit-reply"
+		if takeover {
+			name = "takeover-after-read"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newWorkerFixture(t, "codex", "codex-lifecycle")
+			client, err := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			workerClientCall(t, client, WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/race", Prompt: "synthetic race"})
+			deadline := time.Now().Add(5 * time.Second)
+			for !workerClientCall(t, client, WorkerRequest{Action: "inspect"}).Executions[0].Done {
+				if time.Now().After(deadline) {
+					t.Fatal("fixture did not finish")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			transport := client.client.Transport
+			client.client.Transport = workerTransportHook(func(request *http.Request) (*http.Response, error) {
+				body, _ := request.GetBody()
+				var operation WorkerRequest
+				_ = json.NewDecoder(body).Decode(&operation)
+				_ = body.Close()
+				response, err := transport.RoundTrip(request)
+				if err != nil {
+					return response, err
+				}
+				if takeover && operation.Action == "events" {
+					fixture.replaceOwner(t)
+				}
+				if !takeover && operation.Action == "commit" {
+					_, _ = io.Copy(io.Discard, response.Body)
+					_ = response.Body.Close()
+					return nil, errors.New("synthetic lost commit reply")
+				}
+				return response, nil
+			})
+			calls := 0
+			if _, err := client.Consume(t.Context(), 1, func(WorkerDelivery) error { calls++; return nil }); err == nil {
+				t.Fatal("injected failure was hidden")
+			}
+			client.client.Transport = transport
+			if takeover {
+				if calls != 0 {
+					t.Fatal("consumer applied effects after takeover won")
+				}
+			} else {
+				if calls == 0 {
+					t.Fatal("consumer did not reach the commit boundary")
+				}
+				before := calls
+				state, err := client.Consume(t.Context(), 1, func(WorkerDelivery) error { calls++; return nil })
+				if err != nil || calls != before || state.CommittedCursor != state.LastCursor {
+					t.Fatal("lost commit reply caused effects to repeat")
+				}
+			}
+		})
+	}
+}
 
 func workerClientCall(t *testing.T, client *WorkerClient, request WorkerRequest) WorkerReply {
 	t.Helper()
@@ -251,7 +391,7 @@ func TestWorkerLaunchSurvivesActualControllerExit(t *testing.T) {
 			if client.Info() != original {
 				t.Fatal("controller exit replaced the actual worker")
 			}
-			obsolete := newWorkerClient(client.record, prior.InstanceID, prior.Token)
+			obsolete := newWorkerClient(client.record, prior.InstanceID, prior.Token, owner)
 			defer obsolete.Close()
 			if _, err := obsolete.Call(t.Context(), WorkerRequest{Action: "interrupt", Key: "synthetic/controller"}); err == nil {
 				t.Fatal("old controller could interrupt after takeover")
@@ -260,13 +400,10 @@ func TestWorkerLaunchSurvivesActualControllerExit(t *testing.T) {
 			if inspect.NextSequence != 2 || len(inspect.Executions) != 1 || inspect.Executions[0].Done || inspect.Executions[0].CommittedCursor != 1 {
 				t.Fatal("controller restart duplicated or lost execution")
 			}
-			data, err := os.ReadFile(filepath.Join(root, "synthetic-consumer.json"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			var receipt workerConsumerReceipt
-			if err := json.Unmarshal(data, &receipt); err != nil || receipt.WorkerID != original.ID || receipt.Sequence != 1 || receipt.Event.Cursor != 1 {
-				t.Fatal("controller committed before its synthetic effect was durable")
+			store := history.New(filepath.Join(root, "consumer-history"))
+			entries, _, err := store.RecentEntries("cli", "owned", 10, 100000)
+			if err != nil || len(entries) != 2 || entries[0].ReceiptID != (WorkerDelivery{WorkerID: original.ID, Sequence: 1, WorkerEvent: WorkerEvent{Cursor: 1}}).ReceiptID() || entries[1].ReceiptID != (WorkerDelivery{WorkerID: original.ID, Sequence: 1, WorkerEvent: WorkerEvent{Cursor: 2}}).ReceiptID() {
+				t.Fatal("controller lost its committed or not-yet-committed history effect")
 			}
 			after := inspect.Executions[0].CommittedCursor
 			deadline = time.Now().Add(5 * time.Second)
@@ -311,16 +448,25 @@ func TestWorkerLaunchSurvivesActualControllerExit(t *testing.T) {
 			}
 			deadline = time.Now().Add(5 * time.Second)
 			terminal := false
+			applied := uint64(1)
 			for {
-				page = workerClientCall(t, client, WorkerRequest{Action: "events", Sequence: 1, After: after})
-				for _, event := range page.Events {
-					if event.Cursor != after+1 {
+				state, err := client.Consume(t.Context(), 1, func(delivery WorkerDelivery) error {
+					if delivery.Cursor != applied+1 {
 						t.Fatal("terminal replay repeated or lost events")
 					}
-					after = event.Cursor
-					terminal = terminal || event.Event.Done && !event.Event.Continues
+					applied = delivery.Cursor
+					terminal = terminal || delivery.Event.Done && !delivery.Event.Continues
+					if delivery.Cursor == 2 || delivery.Event.Done {
+						_, err := store.AppendOnce("cli", "owned", delivery.ReceiptID(), history.Entry{Role: "assistant", Content: delivery.Event.Text, Terminal: delivery.Event.Done})
+						return err
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
 				}
-				if terminal {
+				after = state.CommittedCursor
+				if terminal && state.Done && after == state.LastCursor {
 					break
 				}
 				if time.Now().After(deadline) {
@@ -328,7 +474,10 @@ func TestWorkerLaunchSurvivesActualControllerExit(t *testing.T) {
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
-			workerClientCall(t, client, WorkerRequest{Action: "commit", Sequence: 1, Expected: 1, After: after})
+			entries, _, err = store.RecentEntries("cli", "owned", 10, 100000)
+			if err != nil || len(entries) != 3 || !entries[2].Terminal {
+				t.Fatal("controller replacement repeated a history effect or lost terminal history")
+			}
 			workerClientCall(t, client, WorkerRequest{Action: "ack", Sequence: 1, After: after})
 			client.Close()
 			reattached, err := OpenWorker(t.Context(), cfg, owner.ID(), term)
@@ -344,7 +493,7 @@ func TestWorkerLaunchSurvivesActualControllerExit(t *testing.T) {
 			if _, err := os.Lstat(filepath.Dir(original.Socket)); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("worker did not remove its private endpoint/journals")
 			}
-			t.Logf("actual controller exit retained worker pid=%d start=%s generation=%s; one provider admission/effect, ordered progress and replacement cancellation", original.PID, original.Process.StartTime, original.Process.Generation)
+			t.Logf("actual controller exit retained worker pid=%d start=%s generation=%s; one provider admission/effect, committed and uncommitted history receipts, ordered progress and replacement cancellation", original.PID, original.Process.StartTime, original.Process.Generation)
 		})
 	}
 }
