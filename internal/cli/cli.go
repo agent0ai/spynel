@@ -1132,8 +1132,13 @@ func runMessageWithOutput(ctx context.Context, handler channel.Handler, conversa
 
 	var streamed strings.Builder
 	handlerDone := false
+	terminalSeen := false
 	awaitTerminal := false
 	for {
+		// Commands may publish control requests after emitting their reply.
+		if handlerDone && terminalSeen {
+			return nil
+		}
 		if handlerDone && !awaitTerminal {
 			// Framework hooks may intentionally cancel a message without a
 			// visible reply. Drain an event already emitted before Handle
@@ -1168,8 +1173,10 @@ func runMessageWithOutput(ctx context.Context, handler channel.Handler, conversa
 			if !event.Done {
 				awaitTerminal = true
 			}
-			if done, err := writeCLIEvent(output, &streamed, event, options); done || err != nil {
+			if done, err := writeCLIEvent(output, &streamed, event, options); err != nil {
 				return err
+			} else if done {
+				terminalSeen = true
 			}
 		case <-ctx.Done():
 			return ctx.Err()

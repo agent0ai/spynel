@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1417,6 +1418,38 @@ func TestRunMessageCompletesWhenFollowUpReleasesItsEmitter(t *testing.T) {
 	}
 	if err := runMessageWithHandler(context.Background(), handler, "follow-up", "message"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRunMessageWaitsForHandlerAfterTerminalReply(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	rendered := make(chan struct{}, 1)
+	defer close(rendered)
+	want := errors.New("handler failed after acknowledgement")
+	handler := func(ctx context.Context, _ core.Message, emit core.Emit) error {
+		emit(core.Event{Kind: core.EventFinal, Text: "acknowledged", Done: true})
+		select {
+		case <-rendered:
+			return want
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- runMessageWithOutput(ctx, handler, "completion", "message", messageRunOptions{Output: writer})
+	}()
+	ack := make([]byte, len("acknowledged\n"))
+	if _, err := io.ReadFull(reader, ack); err != nil {
+		t.Fatal(err)
+	}
+	rendered <- struct{}{}
+	if err := <-result; !errors.Is(err, want) {
+		t.Fatalf("handler completion = %v, want %v", err, want)
 	}
 }
 
