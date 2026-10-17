@@ -25,6 +25,7 @@
 - Shared readiness is 40 seconds (30-second election expiry plus ten seconds startup), cancellable and still environment/lease fenced. This resolves prompt primary replacement without caller retries or lease deletion.
 
 - Explicit fallback association may name a private Telegram/WhatsApp route established by the operator as the same operator; current authorization is checked independently at admission and delivery. No recipient is inferred from global activity. Existing request/response fields and queue-admission semantics are unchanged.
+- Forward the authenticated caller instance for `/new`; the application owns selection registration before exposing its screen, as it does for resume actions. Do not duplicate outgoing-screen registration or ignore its errors in the transport.
 
 ## Child DOX Index
 

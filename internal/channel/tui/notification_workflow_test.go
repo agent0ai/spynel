@@ -61,6 +61,66 @@ func awaitNotificationMessage(t *testing.T, command tea.Cmd) tea.Msg {
 	}
 }
 
+type notificationSelectionRouter struct{ calls int }
+
+func (r *notificationSelectionRouter) Deliver(context.Context, string, string, string, string, []core.OutboundAttachment) error {
+	r.calls++
+	return nil
+}
+
+func TestNewScreenPublishesSelectionBeforeNotificationFallback(t *testing.T) {
+	service, _ := notificationWorkflowService(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := service.Settings.Update(func(next *config.Config) error {
+		next.Channels.Telegram.AllowedUsers = []string{"7"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, origin := range [][2]string{{"tui", "original"}, {"telegram", "TG-7"}} {
+		if _, err := service.History.Ensure(origin[0], origin[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	router := &notificationSelectionRouter{}
+	service.DeliveryControl = router
+	if err := service.RegisterLiveTUI("client", "original", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	m := notificationTestModel()
+	m.ctx, m.conversation = ctx, "original"
+	m.liveConversation = &liveConversationTracker{conversation: "original"}
+	m.historyDirectory = service.Config.StatePath("history")
+	var screen *core.Screen
+	if err := service.Handle(ctx, core.Message{Channel: "tui", InstanceID: "client", Conversation: "original", Text: "/new"}, func(event core.Event) {
+		if event.Screen != nil {
+			screen = event.Screen
+			m.openScreen(*screen)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if screen == nil || m.conversation == "original" || m.liveConversation.Get() != m.conversation {
+		t.Fatal("screen did not switch")
+	}
+	// The owner must already see the switch, before any periodic renewal.
+	if _, err := service.NotifyWithFallback(ctx, "tui/original", "telegram/TG-7", "result after switch"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Orchestrator.Outbox.Process(ctx); err != nil {
+		t.Fatal(err)
+	}
+	remote, _, err := service.History.RecentEntries("telegram", "TG-7", 20, 12000)
+	if err != nil || router.calls != 1 || len(remote) != 1 || remote[0].Content != "result after switch" {
+		t.Fatalf("fallback sends=%d remote=%#v err=%v", router.calls, remote, err)
+	}
+	local, _, err := service.History.RecentEntries("tui", "original", 20, 12000)
+	if err != nil || len(local) != 1 || local[0].Content != "/new" {
+		t.Fatalf("unseen notification committed to original: %#v err=%v", local, err)
+	}
+}
+
 func TestNotificationWorkflowSwitchAndResumeKeepDisplayHistoryAndNextChatTogether(t *testing.T) {
 	for _, mode := range []string{"new", "resume"} {
 		t.Run(mode, func(t *testing.T) {
@@ -86,7 +146,7 @@ func TestNotificationWorkflowSwitchAndResumeKeepDisplayHistoryAndNextChatTogethe
 			oldStream := m.notifications
 			var screen *core.Screen
 			if mode == "new" {
-				err = service.Handle(ctx, core.Message{Channel: "tui", Conversation: "original", Text: "/new"}, func(event core.Event) {
+				err = service.Handle(ctx, core.Message{Channel: "tui", InstanceID: "fixture", Conversation: "original", Text: "/new"}, func(event core.Event) {
 					if event.Screen != nil {
 						screen = event.Screen
 					}

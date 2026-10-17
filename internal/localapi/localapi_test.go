@@ -281,6 +281,34 @@ func TestResumeScreenActionRegistersBranchThroughOwner(t *testing.T) {
 	}
 }
 
+func TestNewCommandSelectsThreadBeforeExposingScreenThroughOwner(t *testing.T) {
+	election, server, _, cancel, done := startTestServer(t, t.TempDir())
+	defer func() { cancel(); <-done; lease, _ := election.Current(); _ = election.Release(lease.Token) }()
+	client := NewClient(election)
+	ctx := context.Background()
+	if _, err := server.Service.History.Ensure("cli", "fallback"); err != nil {
+		t.Fatal(err)
+	}
+	var screen *core.Screen
+	if err := client.Handle(ctx, core.Message{Channel: "tui", Conversation: "original", Text: "/new"}, func(event core.Event) {
+		if event.Screen != nil {
+			screen = event.Screen
+			if _, err := client.NotifyWithFallback(ctx, "tui/original", "cli/fallback", "result after switch"); err != nil {
+				t.Error(err)
+			}
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if screen == nil || screen.Conversation == "original" {
+		t.Fatal("new screen did not cross the API")
+	}
+	entries, _, err := server.Service.History.RecentEntries("cli", "fallback", 20, 12000)
+	if err != nil || len(entries) != 1 || entries[0].Content != "result after switch" {
+		t.Fatalf("post-screen fallback=%#v err=%v", entries, err)
+	}
+}
+
 func TestServerRejectsMissingToken(t *testing.T) {
 	state := t.TempDir()
 	election, _, _, cancel, done := startTestServer(t, state)

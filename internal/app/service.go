@@ -963,12 +963,21 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		if message.Channel != "tui" {
 			return s.localReply(message, "Starting a separate conversation with /new is available in the TUI; this channel keeps its stable conversation identity.", emit)
 		}
+		if err := validateLiveTUIIdentity(message.InstanceID, message.Conversation); err != nil {
+			return fmt.Errorf("register new TUI conversation: %w", err)
+		}
 		id, err := shortid.New()
 		if err != nil {
 			return fmt.Errorf("allocate new conversation: %w", err)
 		}
 		conversation := "new-" + id
-		if _, err := s.History.Ensure("tui", conversation); err != nil {
+		s.liveTUIMu.Lock()
+		_, err = s.History.Ensure("tui", conversation)
+		if err == nil {
+			s.registerLiveTUILocked(message.InstanceID, conversation, time.Now().UTC())
+		}
+		s.liveTUIMu.Unlock()
+		if err != nil {
 			return fmt.Errorf("create new conversation: %w", err)
 		}
 		screen := s.WelcomeScreen()
