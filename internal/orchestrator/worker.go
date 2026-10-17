@@ -69,7 +69,7 @@ func (m *Manager) attachWorkerWorkflows(ctx context.Context, executions []harnes
 	return nil
 }
 
-func (m *Manager) runWorkerWorkflow(ctx context.Context, route workflowRoute, lease Lease, prompt string, execution *harness.WorkerExecution, jobID int, consume func(core.Event, *harness.WorkerDelivery) error) {
+func (m *Manager) runWorkerWorkflow(ctx context.Context, route workflowRoute, lease Lease, prompt string, execution *harness.WorkerExecution, jobID int, consume func(core.Event, *harness.WorkerDelivery) error) (retired bool) {
 	if jobID <= 0 || m.JobDelivery == nil {
 		m.recordDispatchError(ctx, lease, errors.New("durable worker job admission and delivery are required"))
 		return
@@ -153,7 +153,7 @@ func (m *Manager) runWorkerWorkflow(ctx context.Context, route workflowRoute, le
 			if current.Error != "" || !m.leaseExists(lease.ID) {
 				m.finishRuntimeJob(lease.ID)
 			}
-			return
+			return true
 		}
 		select {
 		case <-ctx.Done():
@@ -168,7 +168,13 @@ func (m *Manager) recordDispatchError(ctx context.Context, lease Lease, err erro
 		m.recordError(lease, err)
 		return
 	}
-	_ = m.Worker.RunOwned(ctx, func() error { m.recordError(lease, err); return nil })
+	_ = m.Worker.RunOwned(ctx, func() error {
+		m.recordError(lease, err)
+		if id := m.runtimeJob(lease.ID); id > 0 && m.JobExecutionUpdated != nil {
+			m.JobExecutionUpdated(id, core.ExecutionStatus{State: "degraded", Detail: "Worker delivery requires reconciliation"})
+		}
+		return nil
+	})
 }
 
 // ReserveWorkerTurn runs inside the worker's exact-election admission fence;

@@ -715,12 +715,15 @@ func (m *Manager) dispatchExecution(ctx context.Context, route workflowRoute, le
 	m.jobs.Add(1)
 	go func() {
 		defer m.jobs.Done()
+		rescan := m.Worker == nil
 		defer func() {
 			m.setInflight(lease.ID, false)
 			// Harness completion is the event that makes agent-authored durable
 			// transitions observable. Wake the manager immediately instead of
 			// waiting for the periodic recovery scan.
-			m.requestScan()
+			if rescan {
+				m.requestScan()
+			}
 		}()
 		if !m.acquireCapacity(ctx) {
 			return
@@ -875,7 +878,7 @@ func (m *Manager) dispatchExecution(ctx context.Context, route workflowRoute, le
 		}
 		emit := func(event core.Event) { _ = consume(event, nil) }
 		if m.Worker != nil {
-			m.runWorkerWorkflow(ctx, route, lease, prompt, attached, jobID, consume)
+			rescan = m.runWorkerWorkflow(ctx, route, lease, prompt, attached, jobID, consume)
 			return
 		}
 		firstAssignedAt, providerIterations, err = ReserveProviderTurn(lease.File, time.Now().UTC())

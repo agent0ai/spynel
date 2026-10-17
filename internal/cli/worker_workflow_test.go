@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,6 +47,8 @@ func workerWorkflowManagerFixture(t *testing.T, movedEarly bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Orchestrator.IntervalSec = 60
+	cfg.Orchestrator.SemanticHeartbeatMinutes = 0
 	owner, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)
@@ -112,20 +115,18 @@ func workerWorkflowManagerFixture(t *testing.T, movedEarly bool) {
 	}
 	delivered := make(chan harness.WorkerDelivery, 1)
 	var failOnce sync.Once
+	var failedDeliveries atomic.Int32
 	service.Orchestrator.JobDelivery = func(id int, delivery harness.WorkerDelivery) error {
 		if err := service.Runtime.RecordJobDelivery(id, delivery); err != nil {
 			return err
 		}
-		fail := false
-		failOnce.Do(func() { fail = true; delivered <- delivery })
-		if fail {
-			return errors.New("synthetic controller loss after archive sync before cursor commit")
-		}
-		return nil
+		failOnce.Do(func() { delivered <- delivery })
+		failedDeliveries.Add(1)
+		return errors.New("synthetic controller loss after archive sync before cursor commit")
 	}
-	if err := service.Orchestrator.ScanOnce(ctx); err != nil {
-		t.Fatal(err)
-	}
+	firstRunDone := make(chan error, 1)
+	firstManager := service.Orchestrator
+	go func() { firstRunDone <- firstManager.Run(ctx) }()
 	var effect harness.WorkerDelivery
 	select {
 	case effect = <-delivered:
@@ -134,6 +135,10 @@ func workerWorkflowManagerFixture(t *testing.T, movedEarly bool) {
 		t.Fatalf("workflow did not reach durable job consumer: worker=%+v jobs=%+v logs=%+v", reply, service.Runtime.Jobs(), service.Runtime.Logs())
 	}
 	service.Orchestrator.Wait()
+	time.Sleep(100 * time.Millisecond)
+	if failedDeliveries.Load() != 1 {
+		t.Fatal("failed worker delivery caused immediate no-progress scan churn")
+	}
 	jobs := service.Runtime.Jobs()
 	if len(jobs) != 1 {
 		t.Fatalf("jobs=%d", len(jobs))
@@ -149,6 +154,11 @@ func workerWorkflowManagerFixture(t *testing.T, movedEarly bool) {
 		moveTask()
 	}
 	cancel()
+	select {
+	case <-firstRunDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first manager did not detach")
+	}
 	if err := service.Close(); err != nil {
 		t.Fatal(err)
 	}
