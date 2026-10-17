@@ -2,11 +2,13 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +17,170 @@ import (
 	"github.com/agent0ai/spynel/internal/extensions"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
+
+type leaseLifecycleHarness struct {
+	*fakeHarness
+	send func(context.Context, string, string, core.Emit) (string, bool, error)
+}
+
+func (h *leaseLifecycleHarness) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
+	return h.send(ctx, key, prompt, emit)
+}
+
+func TestLateDispatchErrorDoesNotRepeatReconciledNotification(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Extensions.Enabled = false
+	task, err := CreateWithOptions(cfg, "tasks", "late dispatch failure", "", CreateOptions{Notify: true, Origin: "cli/original", Outcomes: []string{"failed"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, release := make(chan struct{}), make(chan struct{})
+	releaseDispatch := sync.OnceFunc(func() { close(release) })
+	var notifications atomic.Int32
+	h := &leaseLifecycleHarness{fakeHarness: newFakeRecipient()}
+	h.send = func(_ context.Context, key, _ string, emit core.Emit) (string, bool, error) {
+		if strings.HasPrefix(key, "orchestrator:notification:") {
+			notifications.Add(1)
+			emit(core.Event{Kind: core.EventFinal, Done: true})
+			return "notification-thread", false, nil
+		}
+		name := filepath.Base(task)
+		if err := moveDocument(cfg.StatePath("tasks", "working", name), cfg.StatePath("tasks", "failed", name), "failed", time.Now().UTC()); err != nil {
+			t.Error(err)
+		}
+		close(moved)
+		<-release
+		return "", false, errors.New("provider admission failed after durable transition")
+	}
+	manager := New(cfg, h, extensions.Runner{})
+	manager.NotificationContext = func(Origin) (string, error) { return "latest original conversation", nil }
+	t.Cleanup(func() { manager.Wait() })
+	t.Cleanup(releaseDispatch)
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-moved
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	leases, err := manager.loadLeases()
+	if err != nil || len(leases) != 0 {
+		t.Fatalf("transition did not retire lease: %#v, %v", leases, err)
+	}
+	// Finish the failed admission only after reconciliation has retired it.
+	releaseDispatch()
+	manager.Wait()
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	leases, err = manager.loadLeases()
+	if err != nil || len(leases) != 0 || notifications.Load() != 1 {
+		t.Fatalf("late admission recreated transition: leases=%#v err=%v notifications=%d", leases, err, notifications.Load())
+	}
+}
+
+func TestProviderEventUsesTransitionScanBoundary(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(cfg, "tasks", "event versus retirement", ""); err != nil {
+		t.Fatal(err)
+	}
+	emitter := make(chan core.Emit, 1)
+	release := make(chan struct{})
+	h := &leaseLifecycleHarness{fakeHarness: newFakeRecipient()}
+	h.send = func(_ context.Context, _, _ string, emit core.Emit) (string, bool, error) {
+		emitter <- emit
+		<-release
+		return "thread", false, nil
+	}
+	manager := New(cfg, h, extensions.Runner{})
+	manager.JobStarted = func(Lease, string, time.Time, int, int) (int, error) { return 1, nil }
+	eventSeen := make(chan struct{})
+	manager.JobEvent = func(int, core.Event) { close(eventSeen) }
+	t.Cleanup(func() { manager.Wait() })
+	t.Cleanup(func() { close(release) })
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	emit := <-emitter
+	manager.scanMu.Lock()
+	finished := make(chan struct{})
+	go func() {
+		emit(core.Event{Kind: core.EventFinal, ThreadID: "thread", Done: true})
+		close(finished)
+	}()
+	<-eventSeen
+	mutatedDuringScan := false
+	select {
+	case <-finished:
+		mutatedDuringScan = true
+	case <-time.After(25 * time.Millisecond):
+	}
+	manager.scanMu.Unlock()
+	<-finished
+	if mutatedDuringScan {
+		t.Fatal("provider lease read/write bypassed the transition scan boundary")
+	}
+}
+
+func TestLeaseUpdatePreservesCurrentStateAndRejectsRetiredOrReplacedExecution(t *testing.T) {
+	cfg := config.Default()
+	cfg.Root = t.TempDir()
+	manager := New(cfg, newFakeRecipient(), extensions.Runner{})
+	expected := Lease{ID: "lease", OwnerID: "owner", SessionKey: "attempt-1", State: "processing"}
+	current := expected
+	current.TerminalHooksCompleted = map[string]bool{"completed-hook": true}
+	if err := manager.saveLease(current); err != nil {
+		t.Fatal(err)
+	}
+	update := func(lease *Lease) { lease.ThreadID = "thread" }
+	got, err := manager.updateLease(expected, update)
+	if err != nil || !got.TerminalHooksCompleted["completed-hook"] || got.ThreadID != "thread" {
+		t.Fatalf("update lost current state: %#v, %v", got, err)
+	}
+	for _, change := range []func(*Lease){
+		func(lease *Lease) { lease.OwnerID = "replacement-owner" },
+		func(lease *Lease) { lease.SessionKey = "attempt-2" },
+	} {
+		current = expected
+		change(&current)
+		if err := manager.saveLease(current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.updateLease(expected, update); err == nil {
+			t.Fatal("updated a replacement execution")
+		}
+		if got, err := manager.loadLease(expected.ID); err != nil || !reflect.DeepEqual(got, current) {
+			t.Fatalf("replacement changed: %#v, %v", got, err)
+		}
+	}
+	if err := os.WriteFile(manager.leasePath(expected.ID), []byte("unreadable JSON"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.updateLease(expected, update); err == nil {
+		t.Fatal("overwrote unreadable current state")
+	}
+	if err := os.Remove(manager.leasePath(expected.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.updateLease(expected, update); !os.IsNotExist(err) || manager.leaseExists(expected.ID) {
+		t.Fatalf("recreated retired execution: %v", err)
+	}
+}
 
 type fakeHarness struct {
 	mu         sync.Mutex
