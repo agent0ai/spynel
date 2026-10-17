@@ -110,6 +110,7 @@ func TestUnknownEnvironmentReadinessIsBoundedAndRedacted(t *testing.T) {
 
 type apiHarness struct {
 	mu      sync.Mutex
+	workers sync.WaitGroup
 	active  map[string]bool
 	threads map[string]string
 	keys    []string
@@ -130,8 +131,10 @@ func (h *apiHarness) Send(_ context.Context, key, _ string, emit core.Emit) (str
 		h.threads[key] = thread
 	}
 	h.active[key] = true
+	h.workers.Add(1)
 	h.mu.Unlock()
 	go func() {
+		defer h.workers.Done()
 		time.Sleep(5 * time.Millisecond)
 		h.mu.Lock()
 		delete(h.active, key)
@@ -158,7 +161,26 @@ func (h *apiHarness) IsActive(key string) bool {
 	defer h.mu.Unlock()
 	return h.active[key]
 }
-func (h *apiHarness) Close() error { return nil }
+func (h *apiHarness) Close() error { h.workers.Wait(); return nil }
+
+func TestAPIHarnessCloseJoinsTerminalCallback(t *testing.T) {
+	target := newAPIHarness()
+	emitting, release, closed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	if _, _, err := target.Send(context.Background(), "fixture", "", func(core.Event) {
+		close(emitting)
+		<-release
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-emitting
+	go func() { _ = target.Close(); close(closed) }()
+	defer func() { close(release); <-closed }()
+	select {
+	case <-closed:
+		t.Fatal("fixture closed while its terminal callback was still writing")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
 
 func TestClientStreamsIndependentTUIConversationsThroughOwner(t *testing.T) {
 	state := t.TempDir()
@@ -487,6 +509,7 @@ func startTestServer(t *testing.T, state string) (*instance.Election, *Server, *
 	}
 	target := newAPIHarness()
 	service := app.New(cfg, target)
+	t.Cleanup(func() { _ = service.Close() })
 	service.Updates = &updater.Manager{CurrentVersion: "primary-version"}
 	election, err := instance.New(cfg.StatePath())
 	if err != nil {
