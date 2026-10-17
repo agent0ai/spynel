@@ -261,3 +261,54 @@ func TestSemanticHeartbeatPromptUsesHeartbeatPrefixAndInstructions(t *testing.T)
 		t.Fatalf("heartbeat prefix/instructions missing: %q", prompt)
 	}
 }
+
+func TestScheduledHeartbeatSelectsCustomPromptAndRepairsStaleInspectionRule(t *testing.T) {
+	target := &heartbeatHarness{asyncRelease: make(chan struct{})}
+	manager := newHeartbeatManager(t, target)
+	const legacy = "Keep the custom workspace inspection rule.\n\nInspect only bounded, relevant evidence and body-free state for notification triage. Never read question/message bodies, recipient or native message identifiers, secrets, full conversation histories, unrelated repositories, or unbounded logs."
+	if err := os.WriteFile(manager.Config.StatePath("prompts", "heartbeat.md"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ticks := make(chan time.Time, 1)
+	manager.heartbeatTicks = ticks
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); manager.runSemanticHeartbeat(ctx) }()
+	defer func() { cancel(); <-done; manager.jobs.Wait() }()
+	ticks <- time.Now()
+	deadline := time.After(5 * time.Second)
+	var prompt string
+	for prompt == "" {
+		target.mu.Lock()
+		prompt = target.prompt
+		target.mu.Unlock()
+		select {
+		case <-deadline:
+			t.Fatal("scheduled heartbeat did not reach provider")
+		default:
+		}
+		if prompt == "" {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	for _, obsolete := range []string{"Never read question/message bodies", "body-free state for notification triage"} {
+		if strings.Contains(prompt, obsolete) {
+			t.Errorf("scheduled prompt retains %q", obsolete)
+		}
+	}
+	for _, want := range []string{
+		"Keep the custom workspace inspection rule.", "Inspect only bounded, relevant evidence and bounded original-thread evidence for notification triage.",
+		"privately", "first prerequisite question", "freshness", "existing authorization", "independent work",
+		"failed or absent attempt", "relevant answer", "unrelated later message", "exact enabled notify.origin",
+		"explicitly owner-established same-operator route", "queue acceptance from send and receipt",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("scheduled custom prompt omitted %q", want)
+		}
+	}
+	data, err := os.ReadFile(manager.Config.StatePath("prompts", "heartbeat.md"))
+	if err != nil || string(data) != legacy {
+		t.Fatal("rendering rewrote the workspace override")
+	}
+	close(target.asyncRelease)
+}
