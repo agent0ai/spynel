@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -57,7 +58,7 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 			select {
 			case err := <-term.apiError:
 				term.service.Runtime.LogEvent("error", "localapi", "stopped", "Workspace API stopped: "+errorText(err))
-				stopErr := term.stop()
+				stopErr := term.stopFor("", "local_api_exit")
 				term = nil
 				return stopErr
 			default:
@@ -65,16 +66,23 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 			if now.Before(nextHeartbeat) {
 				return nil
 			}
+			if delay := now.Sub(nextHeartbeat); delay >= instance.HeartbeatInterval {
+				term.service.Runtime.LogEvent("warn", "instance", "renewal_late", fmt.Sprintf("Primary renewal scheduling delay_ms=%d", delay.Milliseconds()))
+			}
 			_, owned, err := election.Renew(term.token)
 			if err != nil {
 				term.service.Runtime.LogEvent("error", "instance", "lease_renew_failed", "Renew primary lease: "+err.Error())
 			}
 			if err != nil || !owned {
-				stopErr := term.stop()
+				reason := "ownership_changed"
+				if err != nil {
+					reason = "renewal_failed"
+				}
+				stopErr := term.stopFor("", reason)
 				term = nil
 				return stopErr
 			}
-			nextHeartbeat = now.Add(instance.HeartbeatInterval)
+			nextHeartbeat = time.Now().Add(instance.HeartbeatInterval)
 			return nil
 		}
 
@@ -173,6 +181,9 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 		}
 	}()
 	service.Runtime.LogEvent("info", "config", "reloaded", "Configuration loaded for primary startup")
+	election.SetObserver(func(observation instance.Observation) {
+		logElectionObservation(service.Runtime, election.ID(), observation)
+	})
 	service.SetRecoveryOwnershipFence(func(action func() error) (bool, error) {
 		return election.RunWhileOwner(token, action)
 	})
@@ -254,19 +265,20 @@ func runPrimaryOrchestrator(ctx context.Context, service *app.Service) error {
 }
 
 func (term *primaryTerm) stop() error {
-	return term.stopFor("")
+	return term.stopFor("", "controller_shutdown")
 }
 
 func (term *primaryTerm) handoff(targetID string) error {
-	return term.stopFor(targetID)
+	return term.stopFor(targetID, "explicit_handoff")
 }
 
-func (term *primaryTerm) stopFor(targetID string) error {
+func (term *primaryTerm) stopFor(targetID, reason string) error {
 	var stopErr error
 	stopped := false
 	term.stopOnce.Do(func() {
 		defer term.service.Runtime.Close()
 		stopped = true
+		term.service.Runtime.LogEvent("info", "instance", "primary_stopping", "Primary stopping: instance="+term.election.ID()+" reason="+reason)
 		term.service.SetPrimaryInstanceID("")
 		term.cancel()
 		_ = term.listener.Close()
@@ -301,6 +313,19 @@ func (term *primaryTerm) stopFor(targetID string) error {
 		return errOwnershipLost
 	}
 	return stopErr
+}
+
+func logElectionObservation(runtime *app.Runtime, id string, observation instance.Observation) {
+	if observation.Reason == "" {
+		if observation.LockWait < instance.HeartbeatInterval && observation.LockHeld < instance.HeartbeatInterval {
+			return
+		}
+		runtime.LogEvent("warn", "instance", "election_lock_delay", fmt.Sprintf("instance=%s operation=%s wait_ms=%d held_ms=%d", id, observation.Operation, observation.LockWait.Milliseconds(), observation.LockHeld.Milliseconds()))
+		return
+	}
+	if observation.Reason != "renewed" {
+		runtime.LogEvent("warn", "instance", "lease_renewal", fmt.Sprintf("instance=%s reason=%s lease_age_ms=%d", id, observation.Reason, observation.LeaseAge.Milliseconds()))
+	}
 }
 
 func errorText(err error) string {

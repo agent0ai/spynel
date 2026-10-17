@@ -2,12 +2,31 @@ package cli
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/app"
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/instance"
 )
+
+func TestElectionDiagnosticsSeparateDelayAndOwnershipWithoutLeaseSecrets(t *testing.T) {
+	runtime := app.NewRuntime()
+	defer runtime.Close()
+	logElectionObservation(runtime, "synthetic-instance", instance.Observation{Operation: "renew", Reason: "renewed"})
+	logElectionObservation(runtime, "synthetic-instance", instance.Observation{Operation: "renew", LockWait: time.Millisecond})
+	if len(runtime.Logs()) != 0 {
+		t.Fatal("routine renewals generated diagnostic noise")
+	}
+	logElectionObservation(runtime, "synthetic-instance", instance.Observation{Operation: "owner_action", LockHeld: 31 * time.Second})
+	logElectionObservation(runtime, "synthetic-instance", instance.Observation{Operation: "renew", Reason: "renewed_unchanged_stale_term", LeaseAge: 35 * time.Second})
+	logElectionObservation(runtime, "synthetic-instance", instance.Observation{Operation: "renew", Reason: "different_term", LeaseAge: time.Second})
+	logs := runtime.Logs()
+	if len(logs) != 3 || logs[0].Event != "election_lock_delay" || !strings.Contains(logs[0].Text, "operation=owner_action") || !strings.Contains(logs[0].Text, "held_ms=31000") || logs[1].Event != "lease_renewal" || !strings.Contains(logs[1].Text, "reason=renewed_unchanged_stale_term") || !strings.Contains(logs[2].Text, "reason=different_term") {
+		t.Fatalf("ownership diagnostics = %#v", logs)
+	}
+}
 
 func TestPublishTUIStateChangesCarriesLatestDurableCounts(t *testing.T) {
 	events := tuiStateEvents{durableWork: make(chan core.DurableWorkCounts, 1)}
