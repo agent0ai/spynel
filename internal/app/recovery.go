@@ -28,8 +28,9 @@ const (
 )
 
 type recoveryExecution struct {
-	id      string
-	sources map[string]struct{}
+	id       string
+	sources  map[string]struct{}
+	settling bool
 }
 
 type recoveryReservation struct {
@@ -59,6 +60,9 @@ func (s *Service) reserveRecoveryExecution(message core.Message, additionalSourc
 	defer s.recoveryMu.Unlock()
 	key := sessionKey(message)
 	current := s.recoveryExecution[key]
+	if current != nil && current.settling {
+		return recoveryReservation{}, "", errors.New("the previous conversation result is still awaiting durable settlement")
+	}
 	reservation := recoveryReservation{}
 	admission := "new"
 	if provider, ok := s.Harness.(interface{ ConversationAdmission(string) string }); ok {
@@ -116,25 +120,33 @@ func (s *Service) rollbackRecoveryReservationLocked(key string, reservation reco
 	}
 }
 
-func (s *Service) finishRecoveryExecution(message core.Message, outcome string) {
+// Persist the reply and exact source coverage together before releasing the
+// in-memory execution; a failed write must leave both available for retry.
+func (s *Service) appendConversationResult(message core.Message, entry history.Entry, receipt string, settle bool) error {
 	key := sessionKey(message)
 	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
 	current := s.recoveryExecution[key]
-	delete(s.recoveryExecution, key)
-	s.recoveryMu.Unlock()
-	if current == nil {
-		return
+	if settle && current != nil {
+		current.settling = true
+		entry.ExecutionID = current.id
+		entry.Covers = make([]string, 0, len(current.sources))
+		for source := range current.sources {
+			entry.Covers = append(entry.Covers, source)
+		}
+		sort.Strings(entry.Covers)
+		entry.Outcome = "terminal_assistant"
+		if entry.Role == "error" {
+			entry.Outcome = "terminal_error"
+		}
 	}
-	covers := make([]string, 0, len(current.sources))
-	for source := range current.sources {
-		covers = append(covers, source)
+	if _, err := s.History.AppendOnce(message.Channel, message.Conversation, receipt, entry); err != nil {
+		return err
 	}
-	sort.Strings(covers)
-	if _, err := s.History.Append(message.Channel, message.Conversation, history.Entry{
-		Role: "correlation", ExecutionID: current.id, Covers: covers, Outcome: outcome,
-	}); err != nil {
-		s.Runtime.LogEvent("error", "recovery", "terminal_correlation_failed", "Terminal conversation correlation could not be persisted")
+	if settle {
+		delete(s.recoveryExecution, key)
 	}
+	return nil
 }
 
 func (s *Service) recoveryCancellationSnapshot(key string) *recoveryExecution {

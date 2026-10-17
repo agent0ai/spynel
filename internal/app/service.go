@@ -793,35 +793,39 @@ func (s *Service) chatPrompt(message core.Message) (string, error) {
 }
 
 func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit) core.Emit {
+	consume := s.conversationConsumer(message, jobID, downstream)
+	return func(event core.Event) {
+		if err := consume(event); err != nil {
+			s.Runtime.LogEvent("error", "history", "conversation_settlement_failed", fmt.Sprintf("Persist conversation result failed (%T)", err))
+			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobDegraded), Detail: "Conversation result could not be saved"})
+			if downstream != nil {
+				downstream(core.Event{Kind: core.EventError, Text: "Conversation result could not be saved; execution settlement remains pending", Done: true})
+			}
+		}
+	}
+}
+
+// shortcut: receipt/activity identity is emitter-local, bind it to worker admission before cross-controller replay.
+func (s *Service) conversationConsumer(message core.Message, jobID int, downstream core.Emit) func(core.Event) error {
+	consumerID, setupErr := shortid.New()
 	var terminalMu sync.Mutex
 	terminalDelivered := false
-	return func(event core.Event) {
-		terminal := event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError)
-		if terminal {
-			terminalMu.Lock()
-			if terminalDelivered {
-				terminalMu.Unlock()
-				return
-			}
-			terminalDelivered = true
-			terminalMu.Unlock()
+	var cursor uint64
+	process := func(event core.Event) (core.Event, bool, bool, error) {
+		terminalMu.Lock()
+		defer terminalMu.Unlock()
+		if setupErr != nil {
+			return event, false, false, setupErr
 		}
+		if terminalDelivered {
+			return event, false, false, nil
+		}
+		terminal := event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError)
+		receipt := fmt.Sprintf("conversation:%s:%d", consumerID, cursor+1)
 		key := sessionKey(message)
 		// A queued request can be cancelled while the shared provider turn is
 		// still active. Persist and deliver its result without settling that turn.
 		requestOnly := terminal && s.Harness.IsActive(key)
-		if event.Execution != nil {
-			s.Runtime.UpdateJob(jobID, *event.Execution)
-		} else if event.Kind == core.EventDelta {
-			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobRunning)})
-		}
-		if terminal && !requestOnly {
-			state := JobFinishing
-			if event.Kind == core.EventError {
-				state = JobError
-			}
-			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(state), Detail: map[bool]string{true: event.Text, false: ""}[event.Kind == core.EventError]})
-		}
 		if event.Kind == core.EventDelta {
 			s.streamMu.Lock()
 			s.streamText[key] += event.Text
@@ -832,7 +836,6 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 			if !requestOnly {
 				s.streamMu.Lock()
 				streamed = s.streamText[key]
-				delete(s.streamText, key)
 				s.streamMu.Unlock()
 			}
 			text := event.Text
@@ -843,7 +846,7 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 			}
 			if s.Config.Extensions.Enabled {
 				output, err := s.Hooks.Run(context.Background(), "harness.after", map[string]any{
-					"session_key": sessionKey(message), "text": hookText, "kind": event.Kind,
+					"session_key": sessionKey(message), "text": hookText, "kind": event.Kind, "event_id": receipt,
 				})
 				if err != nil {
 					event.Kind = core.EventError
@@ -897,8 +900,8 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 				historyText = strings.TrimSpace(historyText + "\n\n[Sent " + attachment.Kind + " " + attachment.Name + "]")
 			}
 			if event.Kind == core.EventError && streamed != "" {
-				if _, err := s.History.Append(message.Channel, message.Conversation, history.Entry{At: time.Now().UTC(), Role: "assistant", Content: streamed}); err != nil {
-					s.Runtime.LogEvent("error", "history", "partial_append_failed", fmt.Sprintf("Persist partial history failed (%T)", err))
+				if _, err := s.History.AppendOnce(message.Channel, message.Conversation, receipt+":partial", history.Entry{Role: "assistant", Content: streamed}); err != nil {
+					return event, false, requestOnly, fmt.Errorf("save partial conversation result: %w", err)
 				}
 			}
 			entry := history.Entry{At: time.Now().UTC(), Role: map[bool]string{true: "error", false: "assistant"}[event.Kind == core.EventError], Content: historyText, Terminal: true, SourceMessageID: message.SourceMessageID, FinalText: event.FinalText, Continues: event.Continues}
@@ -906,13 +909,38 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 				entry.Sender = "Spy"
 				entry.Recovery = true
 			}
-			if _, err := s.History.Append(message.Channel, message.Conversation, entry); err != nil {
-				s.Runtime.LogEvent("error", "history", "terminal_append_failed", fmt.Sprintf("Persist terminal history failed (%T)", err))
+			if err := s.appendConversationResult(message, entry, receipt+":result", !event.Continues && !requestOnly); err != nil {
+				return event, false, requestOnly, fmt.Errorf("save terminal conversation result: %w", err)
 			}
-			if !event.Continues && !requestOnly {
-				s.finishRecoveryExecution(message, map[bool]string{true: "terminal_error", false: "terminal_assistant"}[event.Kind == core.EventError])
+			if !requestOnly {
+				s.streamMu.Lock()
+				delete(s.streamText, key)
+				s.streamMu.Unlock()
 			}
 		}
+		if event.Execution != nil {
+			s.Runtime.UpdateJob(jobID, *event.Execution)
+		} else if event.Kind == core.EventDelta {
+			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobRunning)})
+		}
+		if terminal && !requestOnly {
+			state := JobFinishing
+			if event.Kind == core.EventError {
+				state = JobError
+			}
+			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(state), Detail: map[bool]string{true: event.Text, false: ""}[event.Kind == core.EventError]})
+		}
+		cursor++
+		terminalDelivered = terminal
+		return event, true, requestOnly, nil
+	}
+	return func(event core.Event) error {
+		event, deliver, requestOnly, err := process(event)
+		if err != nil || !deliver {
+			return err
+		}
+		terminal := event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError)
+
 		// Capture after extension and outbound-media processing so validated
 		// attachment paths and objects never enter the archive.
 		s.Runtime.RecordJobEvent(jobID, event)
@@ -927,6 +955,7 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 			s.Runtime.LogEvent(level, "harness", "turn_"+outcome, "Harness turn "+outcome)
 			s.Runtime.EndJob(jobID)
 		}
+		return nil
 	}
 }
 
