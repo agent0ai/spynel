@@ -23,6 +23,11 @@ const (
 var errCleanupAlreadyRunning = errors.New("cleanup is already running")
 var errCleanupLeaseReestablishing = errors.New("live TUI protection is re-establishing after primary startup; retry shortly")
 
+type liveTUILease struct {
+	selected      string
+	conversations map[string]time.Time
+}
+
 type cleanupResult struct {
 	RemovedConversations int
 	RemovedJobArchives   int
@@ -183,10 +188,10 @@ func validateLiveTUIIdentity(instanceID, conversation string) error {
 func (s *Service) registerLiveTUILocked(instanceID, conversation string, now time.Time) {
 	instanceID = strings.TrimSpace(instanceID)
 	conversation = strings.TrimSpace(conversation)
-	conversations := s.liveTUI[instanceID]
+	lease := s.liveTUI[instanceID]
+	conversations := lease.conversations
 	if conversations == nil {
 		conversations = map[string]time.Time{}
-		s.liveTUI[instanceID] = conversations
 	}
 	for name, expires := range conversations {
 		if !expires.After(now) {
@@ -194,6 +199,7 @@ func (s *Service) registerLiveTUILocked(instanceID, conversation string, now tim
 		}
 	}
 	conversations[conversation] = now.Add(liveTUILeaseDuration)
+	s.liveTUI[instanceID] = liveTUILease{selected: conversation, conversations: conversations}
 }
 
 // UnregisterLiveTUI releases all conversation leases owned by a cleanly
@@ -207,14 +213,22 @@ func (s *Service) UnregisterLiveTUI(instanceID string) {
 func (s *Service) liveTUIConversation(instanceID string, now time.Time) string {
 	s.liveTUIMu.Lock()
 	defer s.liveTUIMu.Unlock()
-	var selected string
-	var selectedExpiry time.Time
-	for conversation, expires := range s.liveTUI[strings.TrimSpace(instanceID)] {
-		if expires.After(now) && (expires.After(selectedExpiry) || expires.Equal(selectedExpiry) && conversation < selected) {
-			selected, selectedExpiry = conversation, expires
+	lease := s.liveTUI[strings.TrimSpace(instanceID)]
+	if lease.conversations[lease.selected].After(now) {
+		return lease.selected
+	}
+	return ""
+}
+
+func (s *Service) hasLiveTUIPresentation(conversation string, now time.Time) bool {
+	s.liveTUIMu.Lock()
+	defer s.liveTUIMu.Unlock()
+	for _, lease := range s.liveTUI {
+		if lease.selected == conversation && lease.conversations[conversation].After(now) {
+			return true
 		}
 	}
-	return selected
+	return false
 }
 
 func (s *Service) liveTUIConversations(now time.Time) map[string]bool {
@@ -228,7 +242,8 @@ func (s *Service) liveTUIConversations(now time.Time) map[string]bool {
 // history deletion so registration and retention have one admission order.
 func (s *Service) liveTUIConversationsLocked(now time.Time) map[string]bool {
 	protected := map[string]bool{}
-	for instanceID, conversations := range s.liveTUI {
+	for instanceID, lease := range s.liveTUI {
+		conversations := lease.conversations
 		for conversation, expires := range conversations {
 			if expires.After(now) {
 				protected[conversation] = true

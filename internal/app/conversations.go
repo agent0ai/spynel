@@ -143,7 +143,7 @@ func (s *Service) screenAction(ctx context.Context, instanceID, screenID, action
 			}
 			s.registerLiveTUILocked(instanceID, branch, time.Now().UTC())
 		}
-		entries, _, err := s.History.RecentEntries("tui", branch, resumeDisplayMessages, resumeDisplayCharacter)
+		entries, _, offset, err := s.History.RecentEntriesSnapshot("tui", branch, resumeDisplayMessages, resumeDisplayCharacter)
 		if err != nil {
 			return nil, err
 		}
@@ -156,7 +156,7 @@ func (s *Service) screenAction(ctx context.Context, instanceID, screenID, action
 			}
 			transcript = append(transcript, core.ChatEntry{Role: role, Text: entry.Content})
 		}
-		screen := core.Screen{ID: "chat", Conversation: branch, Transcript: transcript, Subtitle: fmt.Sprintf("Branched from %s/%s at %s", channelName, conversation, time.Now().Format(time.RFC3339))}
+		screen := core.Screen{ID: "chat", Conversation: branch, Transcript: transcript, HistoryOffset: offset, Subtitle: fmt.Sprintf("Branched from %s/%s at %s", channelName, conversation, time.Now().Format(time.RFC3339))}
 		return &screen, nil
 	}
 	if screenID == "resume" && strings.HasPrefix(action, "delete:") {

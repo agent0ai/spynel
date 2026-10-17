@@ -15,6 +15,8 @@
 
 - Local response events may carry the client-owned request ID solely for correlation on authenticated message/protocol surfaces; it remains excluded from public status/job and operational-log projections.
 
+- A conversation-changing screen carries its transcript snapshot byte offset in `HistoryOffset` so the TUI follows only later durable entries without losing the handoff window or replaying restored messages.
+
 ## Child DOX Index
 
 No child DOX files.

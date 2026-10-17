@@ -184,3 +184,64 @@ func TestFallbackRevocationAndUnknownOrAliasedOriginsFailClosed(t *testing.T) {
 		t.Fatal("revoked fallback was sent")
 	}
 }
+
+func TestSwitchedTUIFallbackRequiresAnActuallySelectedOriginal(t *testing.T) {
+	for _, mode := range []string{"fallback", "another-client", "no-fallback"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(config.PathForRoot(root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Channels.Telegram.AllowedUsers = []string{"7"}
+			s := New(cfg, newServiceHarness())
+			t.Cleanup(func() { _ = s.Close() })
+			router := &fallibleNotificationRouter{}
+			s.DeliveryControl = router
+			for _, origin := range []orchestrator.Origin{{Channel: "tui", Conversation: "original"}, {Channel: "tui", Conversation: "selected"}, {Channel: "telegram", Conversation: "TG-7"}} {
+				if _, err := s.History.Ensure(origin.Channel, origin.Conversation); err != nil {
+					t.Fatal(err)
+				}
+			}
+			now := time.Now().UTC()
+			for _, selected := range []string{"original", "selected"} {
+				if err := s.RegisterLiveTUI("client", selected, now); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !s.liveTUIConversations(now)["original"] {
+				t.Fatal("switch lost cleanup protection")
+			}
+			if mode == "another-client" {
+				if err := s.RegisterLiveTUI("other-client", "original", now); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fallback := "telegram/TG-7"
+			if mode == "no-fallback" {
+				fallback = ""
+			}
+			if _, err := s.NotifyWithFallback(context.Background(), "tui/original", fallback, "controlled update"); err != nil {
+				t.Fatal(err)
+			}
+			local, _, err := s.History.RecentEntries("tui", "original", 20, 12000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			remote, _, err := s.History.RecentEntries("telegram", "TG-7", 20, 12000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "fallback" {
+				if router.calls != 1 || len(remote) != 1 || len(local) != 0 {
+					t.Fatalf("fallback calls=%d local=%d remote=%d", router.calls, len(local), len(remote))
+				}
+			} else if router.calls != 0 || len(local) != 1 || len(remote) != 0 {
+				t.Fatalf("saved/live original calls=%d local=%d remote=%d", router.calls, len(local), len(remote))
+			}
+		})
+	}
+}

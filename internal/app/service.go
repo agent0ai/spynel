@@ -79,7 +79,7 @@ type Service struct {
 	admissionMu            sync.Mutex
 	admissions             map[string]bool
 	liveTUIMu              sync.Mutex
-	liveTUI                map[string]map[string]time.Time
+	liveTUI                map[string]liveTUILease
 	chatActivityMu         sync.Mutex
 	chatActivity           map[int]map[*chatActivityEmitter]struct{}
 	cleanupHistoryStep     func(string)
@@ -145,7 +145,7 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 		updateRequests:        make(chan updater.Result, 1),
 		primaryRequests:       make(chan string, 1),
 		streamText:            map[string]string{},
-		liveTUI:               map[string]map[string]time.Time{},
+		liveTUI:               map[string]liveTUILease{},
 		chatActivity:          map[int]map[*chatActivityEmitter]struct{}{},
 		telegramIdentity:      telegram.NewIdentityStore(cfg.StatePath("runtime", "telegram-identities.json")),
 		readJobDocument:       readBoundedJobDocument,
@@ -199,7 +199,7 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	manager.NotificationContext = service.notificationContext
 	manager.Outbox.FallbackAllowed = func(_ context.Context, origin orchestrator.Origin) error { return service.validateOrigin(origin) }
 	manager.Outbox.PrimaryAvailable = func(_ context.Context, origin orchestrator.Origin) error {
-		if origin.Channel == "tui" && !service.liveTUIConversations(time.Now().UTC())[origin.Conversation] {
+		if origin.Channel == "tui" && !service.hasLiveTUIPresentation(origin.Conversation, time.Now().UTC()) {
 			return errors.New("original TUI conversation has no live presentation")
 		}
 		return nil

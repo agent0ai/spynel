@@ -284,17 +284,23 @@ func TestAutomaticCleanupProtectsEveryLeasedIdleTUIConversation(t *testing.T) {
 }
 
 func TestLiveTUIConversationSwitchRetainsTransitionLeaseAndUnregisters(t *testing.T) {
-	service := &Service{liveTUI: map[string]map[string]time.Time{}}
+	service := &Service{liveTUI: map[string]liveTUILease{}}
 	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
 	if err := service.RegisterLiveTUI("client", "before", now); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.RegisterLiveTUI("client", "after", now.Add(time.Second)); err != nil {
+	if err := service.RegisterLiveTUI("client", "after", now); err != nil {
 		t.Fatal(err)
 	}
 	protected := service.liveTUIConversations(now.Add(2 * time.Second))
 	if !protected["before"] || !protected["after"] {
 		t.Fatalf("transition leases = %#v", protected)
+	}
+	if got := service.liveTUIConversation("client", now); got != "after" {
+		t.Fatalf("selected conversation after equal-clock switch = %q", got)
+	}
+	if service.hasLiveTUIPresentation("before", now) || !service.hasLiveTUIPresentation("after", now) || service.hasLiveTUIPresentation("after", now.Add(liveTUILeaseDuration)) {
+		t.Fatal("presentation used transition protection or an expired lease")
 	}
 	service.UnregisterLiveTUI("client")
 	if protected := service.liveTUIConversations(now.Add(2 * time.Second)); len(protected) != 0 {

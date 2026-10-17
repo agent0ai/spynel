@@ -124,6 +124,7 @@ type Screen struct {
 	ExitOnAction   bool
 	Conversation   string
 	Transcript     []ChatEntry
+	HistoryOffset  int64
 }
 
 // ScreenHint describes one context-sensitive TUI footer binding. Screens own

@@ -836,7 +836,7 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			defer cancel()
 			_ = client.UnregisterLiveTUI(cleanupCtx)
 		}()
-		initialHistory, historyPath, historyOffset, err := histories.RecentEntriesSnapshot("tui", conversation, initialTUIHistoryMessages, initialTUIHistoryChars)
+		initialHistory, _, historyOffset, err := histories.RecentEntriesSnapshot("tui", conversation, initialTUIHistoryMessages, initialTUIHistoryChars)
 		if err != nil {
 			return serverResult(fmt.Errorf("load TUI history: %w", err))
 		}
@@ -849,7 +849,6 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			return serverResult(fmt.Errorf("load initial TUI screen: %w", err))
 		}
 		stateEvents := startTUIStatePolling(ctx, client, shared, cfg.StatePath("themes"), conversation)
-		notificationEvents := watchTaskNotifications(ctx, historyPath, historyOffset)
 		updateManager := updater.Detect(version)
 		if updateManager.InstallRoot != "" {
 			updateManager.PeriodicChecks = standaloneChecksEligible(restartArgs, interactiveTerminal())
@@ -885,9 +884,12 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			ConnectionEvents:   stateEvents.connections,
 			PairingEvents:      stateEvents.pairings,
 			NoticeEvents:       stateEvents.notices,
-			NotificationEvents: notificationEvents,
+			HistoryOffset:      historyOffset,
+			HistoryDirectory:   cfg.StatePath("history"),
 			ConversationEvents: stateEvents.activity,
-			AckNotification:    func(id string, after int) error { return client.AckNotification(ctx, "tui/"+conversation, id, after) },
+			AckNotification: func(selected, id string, after int) error {
+				return client.AckNotification(ctx, "tui/"+selected, id, after)
+			},
 			InitialConnections: shared.Connections,
 			RuntimeEvents:      stateEvents.runtime,
 			InitialRuntime:     shared.Runtime,

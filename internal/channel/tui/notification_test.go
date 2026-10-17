@@ -18,7 +18,7 @@ func notificationTestModel() model {
 
 func TestNotificationSplitsStreamOnlyAtIdleBoundary(t *testing.T) {
 	m := notificationTestModel()
-	m.ackNotification = func(string, int) error { return nil }
+	m.ackNotification = func(string, string, int) error { return nil }
 	m.working = true
 	m.streaming = "Hello "
 	m.responseText = "Hello "
@@ -46,7 +46,7 @@ func TestNotificationSplitsStreamOnlyAtIdleBoundary(t *testing.T) {
 
 func TestNotificationReconsidersLaterSafePause(t *testing.T) {
 	m := notificationTestModel()
-	m.ackNotification = func(string, int) error { return nil }
+	m.ackNotification = func(string, string, int) error { return nil }
 	m.working = true
 	m.streaming = "hel"
 	m.responseText = "hel"
@@ -94,7 +94,7 @@ func TestSafeNotificationBoundaryDoesNotSplitMarkdownTokens(t *testing.T) {
 
 func TestNotificationWaitsForAcknowledgementAndDefersTerminal(t *testing.T) {
 	m := notificationTestModel()
-	m.ackNotification = func(string, int) error { return nil }
+	m.ackNotification = func(string, string, int) error { return nil }
 	m.working = true
 	m.streaming = "Hello "
 	m.responseText = "Hello "
@@ -129,7 +129,7 @@ func TestNotificationWaitsForAcknowledgementAndDefersTerminal(t *testing.T) {
 
 func TestNotificationAcknowledgementPreservesDeltasReceivedInFlight(t *testing.T) {
 	m := notificationTestModel()
-	m.ackNotification = func(string, int) error { return nil }
+	m.ackNotification = func(string, string, int) error { return nil }
 	m.working = true
 	m.streaming = "Hello "
 	m.responseText = "Hello "
