@@ -393,6 +393,9 @@ func (m *Manager) semanticHeartbeatPrompt(executionID string, now time.Time) (st
 // remain on disk during upgrades, so compatibility belongs at render time and
 // must not replace unrelated workspace content.
 func sanitizeHeartbeatTemplate(template string) string {
+	// Retired stock wording blocked the bounded evidence needed to repair missed alerts.
+	template = strings.ReplaceAll(template, "body-free state for notification triage", "bounded original-thread evidence for notification triage")
+	template = strings.ReplaceAll(template, "Never read question/message bodies, recipient or native message identifiers, secrets, full conversation histories, unrelated repositories, or unbounded logs.", "Inspect exact task routing metadata privately and only necessary bounded original-thread question/reply evidence; never expose identities or transcripts or read secrets, full conversation histories, unrelated repositories, or unbounded logs.")
 	forbidden := []string{
 		"This audit is read-only",
 		"primary runtime\u2014not this agent\u2014owns due reminder selection",
