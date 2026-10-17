@@ -638,6 +638,9 @@ func runCodexFixture(mode string) int {
 				}()
 			}
 		case "turn/steer":
+			if os.Getenv("SPYNEL_TEST_CODEX_STALL_CONTROL") != "" {
+				continue
+			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{"turnId": "turn_test"}})
 		case "turn/interrupt":
 			write(map[string]any{"id": message.ID, "result": map[string]any{}})

@@ -10,9 +10,60 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/updater"
 )
+
+func TestWorkerControlTimeoutPreservesExecutionAndReleasesOwnership(t *testing.T) {
+	t.Setenv("SPYNEL_TEST_CODEX_STALL_CONTROL", "1")
+	f := newWorkerFixture(t, "codex", "codex-worker")
+	work := &WorkerWorkflow{WorkID: "synthetic", OwnerID: "synthetic-owner", ClaimAttempt: 1}
+	send := WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/control", Prompt: "original", Workflow: work}
+	first := f.mustCall(t, send).Executions[0]
+	control := WorkerRequest{Action: "control", Sequence: 1, Key: send.Key, Prompt: "synthetic guidance", Workflow: work, Control: &WorkerControl{ID: "synthetic-stalled-control"}}
+	f.client.Timeout = 8 * time.Second
+	started := time.Now()
+	reply, status := f.call(control)
+	if status != http.StatusOK || reply.Error != context.DeadlineExceeded.Error() || time.Since(started) > 7*time.Second {
+		t.Fatalf("control acknowledgement was not bounded: status=%d reply=%+v elapsed=%s", status, reply, time.Since(started))
+	}
+	if _, renewed, err := f.owner.Renew(f.term); err != nil || !renewed {
+		t.Fatal("control timeout retained the election fence:", renewed, err)
+	}
+	f.client.Timeout = time.Second
+	retained := f.mustCall(t, WorkerRequest{Action: "inspect"}).Executions[0]
+	if retained.Done || retained.Cancelled || retained.ThreadID != first.ThreadID || retained.Sequence != first.Sequence {
+		t.Fatal("control timeout ended or replaced the retained execution")
+	}
+	f.replaceOwner(t)
+	if err := updater.VerifyProcess(f.info.Process); err != nil {
+		t.Fatal("native worker identity changed:", err)
+	}
+	if duplicate := f.mustCall(t, control); duplicate.Control == nil || !duplicate.Control.Duplicate {
+		t.Fatal("ambiguous control retry was not deduplicated")
+	}
+	starts, steers, effects := 0, 0, 0
+	for _, record := range readFixtureRecords(t, f.log) {
+		if record.Method == "turn/start" {
+			starts++
+		}
+		if record.Method == "turn/steer" {
+			steers++
+		}
+		if record.Kind == "effect" {
+			effects++
+		}
+	}
+	if starts != 1 || steers != 1 || effects != 1 {
+		t.Fatalf("timeout/retry duplicated provider work: starts=%d steers=%d effects=%d", starts, steers, effects)
+	}
+	if !f.mustCall(t, WorkerRequest{Action: "interrupt", Key: send.Key}).Interrupted {
+		t.Fatal("successor could not interrupt after unacknowledged control")
+	}
+	t.Logf("permanently unacknowledged steer retained worker PID=%d start=%s generation=%s; renewal, takeover, deduplication and successor interruption passed", f.info.PID, f.info.Process.StartTime, f.info.Process.Generation)
+}
 
 func TestWorkerControlsRetainAdapterAndCancellation(t *testing.T) {
 	for _, scenario := range []struct{ name, mode string }{

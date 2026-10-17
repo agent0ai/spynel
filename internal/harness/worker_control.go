@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // control is called inside the request's election fence; only later queued
@@ -39,7 +40,10 @@ func (h *workerHost) control(request WorkerRequest) WorkerReply {
 	if !apply("validate") {
 		return WorkerReply{Error: "worker control workflow ownership changed"}
 	}
-	result, err := h.supervisor.SendControl(h.supervisor.ctx, request.Key, ControlRequest{
+	// Bound the acknowledgement wait without cancelling the retained provider turn.
+	ctx, cancel := context.WithTimeout(h.supervisor.ctx, 5*time.Second)
+	defer cancel()
+	result, err := h.supervisor.SendControl(ctx, request.Key, ControlRequest{
 		ID: request.Control.ID, Prompt: request.Prompt, ContinuationPrompt: request.Control.ContinuationPrompt,
 		Validate: func() bool { return apply("validate") }, PrepareContinuation: func() bool { return apply("continue") },
 		ReserveProviderTurn: func() bool { return apply("reserve-control") },

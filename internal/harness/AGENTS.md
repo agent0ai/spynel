@@ -38,6 +38,8 @@
 
 - Private workflow controls bind the retained sequence and exact stable claim, validating its current manager owner before admission. Keep initial delivery under the request election fence, and queued preparation/reservation/delivery under that same admitting term through RunContinuation; acquire worker-operation/election locks before the supervisor session lock. Never reacquire the election fence inside callbacks. Reuse the bounded Supervisor queue, deduplication and single continuation. A refused continuation releases the original provider terminal; an error after actual admission must not fabricate release. Sync each new reservation before delivery. Sync accepted cancellation intent before interruption; restore only a rejected serialized attempt, and fail closed on checkpoint failure. Retain the flag through attachment and terminal consumption.
 
+- Native worker control acknowledgement waits have a five-second server-owned context, independent of the retained execution and queued continuation lifetime. Timeout releases the operation/election fence, preserves ambiguous-delivery deduplication and never cancels or redispatches the provider turn.
+
 ## Child DOX Index
 
 No child DOX files.
