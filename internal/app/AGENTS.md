@@ -53,6 +53,8 @@
 
 - RecordJobDelivery is the fallible worker event boundary. Sync one bounded redacted archive snapshot and its private worker/sequence/cursor receipt together, including empty or truncated events; rollback in-memory output/prefix on write failure. Use the exact lease work ID for job identity even when the agent has already moved its document; reject a conflicting readable document ID. Reopening the same workflow archive retains its receipt and public identity; Runtime.Close releases its ownership lock without inventing provider completion. An authenticated immutable worker journal may replay an earlier prefix; reject gaps and changed last events, and require a later durable provider reservation before a different execution starts a new prefix in the same archive. Receipts remain absent from public summaries/output and never influence workflow decisions. Normal CLI composition does not yet select worker-backed application dispatch.
 
+- Ordinary worker heartbeat/notification jobs use their independent admission WorkID and original start time for archive restoration; a referenced task file supplies no replacement task identity or parent linkage. The private Manager uses the same fallible archive delivery boundary as workflows. Normal production dispatch remains controller-owned.
+
 ## Child DOX Index
 
 No child DOX files.

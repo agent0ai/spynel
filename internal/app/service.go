@@ -165,7 +165,7 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 			kind = "markdown"
 		}
 		workID, parentID := lease.WorkID, ""
-		if lease.File != "" {
+		if lease.File != "" && kind != "heartbeat" && kind != "notification" {
 			if document, err := orchestrator.ReadDocument(lease.File); err == nil {
 				if value, ok := document.FrontMatter["id"].(string); ok {
 					if workID != "" && workID != value {

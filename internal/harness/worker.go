@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,7 +25,7 @@ import (
 )
 
 const (
-	WorkerProtocol      = 4
+	WorkerProtocol      = 5
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -70,6 +71,17 @@ type WorkerRequest struct {
 	After      uint64
 	Expected   uint64
 	Workflow   *WorkerWorkflow
+	Agent      *WorkerAgent
+}
+
+// WorkerAgent retains an ordinary background turn, not a task transition or
+// notification result. Its original deadline belongs to the worker lifetime.
+type WorkerAgent struct {
+	ID        string
+	Kind      string
+	File      string
+	StartedAt time.Time
+	Deadline  time.Time
 }
 
 // WorkerWorkflow identifies the exact claimed work whose provider admission
@@ -109,6 +121,7 @@ type WorkerExecution struct {
 	CommittedCursor uint64
 	Workflow        *WorkerWorkflow
 	Reservation     *WorkerReservation
+	Agent           *WorkerAgent
 }
 
 type WorkerSession struct {
@@ -128,11 +141,13 @@ type WorkerReply struct {
 
 type workerExecution struct {
 	WorkerExecution
-	file           *os.File
-	offsets        []int64
-	bytes          int64
-	digest         [32]byte
-	admissionBytes int64
+	file                *os.File
+	offsets             []int64
+	bytes               int64
+	digest              [32]byte
+	admissionBytes      int64
+	deadlineInterrupted bool
+	cancel              context.CancelFunc
 }
 
 type workerHost struct {
@@ -281,6 +296,7 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 		case err := <-served:
 			return err
 		case <-ticker.C:
+			host.expireAgents()
 			host.mu.Lock()
 			expired := time.Since(host.lastSeen) >= workerDetachedGrace
 			host.mu.Unlock()
@@ -427,7 +443,8 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 	data, _ := json.Marshal(struct {
 		Key, Prompt, Message string
 		Workflow             *WorkerWorkflow
-	}{request.Key, request.Prompt, request.Message, request.Workflow})
+		Agent                *WorkerAgent
+	}{request.Key, request.Prompt, request.Message, request.Workflow, request.Agent})
 	digest := sha256.Sum256(data)
 	h.mu.Lock()
 	if execution := h.executions[request.Sequence]; execution != nil {
@@ -443,7 +460,24 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		h.mu.Unlock()
 		return WorkerReply{Error: "invalid or retired worker admission"}
 	}
+	if agent := request.Agent; agent != nil {
+		if request.Workflow != nil || len(agent.ID) < 8 || len(agent.ID) > 128 ||
+			(agent.Kind != "heartbeat" && agent.Kind != "notification") ||
+			agent.StartedAt.IsZero() || !agent.Deadline.After(time.Now()) ||
+			agent.StartedAt.After(time.Now().Add(time.Minute)) ||
+			!agent.Deadline.After(agent.StartedAt) || agent.Deadline.Sub(agent.StartedAt) > 24*time.Hour ||
+			(agent.Kind == "heartbeat" && request.Key != "orchestrator:semantic-heartbeat") ||
+			(agent.Kind == "notification" && !strings.HasPrefix(request.Key, "orchestrator:notification:")) {
+			h.mu.Unlock()
+			return WorkerReply{Error: "invalid worker agent admission"}
+		}
+	}
 	for _, retained := range h.executions {
+		if (retained.Agent != nil || request.Agent != nil) && retained.Key == request.Key ||
+			retained.Agent != nil && request.Agent != nil && retained.Agent.ID == request.Agent.ID {
+			h.mu.Unlock()
+			return WorkerReply{Error: "agent admission already retained; inspect and attach before any new dispatch"}
+		}
 		if retained.Workflow != nil && (retained.Key == request.Key || request.Workflow != nil &&
 			retained.Workflow.LeaseID == request.Workflow.LeaseID && retained.Workflow.ClaimAttempt == request.Workflow.ClaimAttempt) {
 			h.mu.Unlock()
@@ -459,7 +493,7 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		h.mu.Unlock()
 		return WorkerReply{Error: "create worker journal failed"}
 	}
-	execution := &workerExecution{WorkerExecution: WorkerExecution{Sequence: request.Sequence, Key: request.Key, Workflow: request.Workflow}, file: file, digest: digest}
+	execution := &workerExecution{WorkerExecution: WorkerExecution{Sequence: request.Sequence, Key: request.Key, Workflow: request.Workflow, Agent: request.Agent}, file: file, digest: digest}
 	h.executions[request.Sequence] = execution
 	h.next++
 	if err := file.Sync(); err != nil || h.saveAdmissionLocked(execution) != nil {
@@ -494,13 +528,20 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		h.mu.Unlock()
 	}
 	// The worker lifetime, not a controller request, owns every admitted turn.
-	threadID, steered, err := h.supervisor.SendConversation(h.supervisor.ctx, request.Key, request.Prompt, request.Message, func(event core.Event) {
+	turnCtx := h.supervisor.ctx
+	if request.Agent != nil {
+		turnCtx, execution.cancel = context.WithDeadline(turnCtx, request.Agent.Deadline)
+	}
+	threadID, steered, err := h.supervisor.SendConversation(turnCtx, request.Key, request.Prompt, request.Message, func(event core.Event) {
 		h.capture(execution, event)
 	})
 	h.mu.Lock()
 	execution.ThreadID, execution.Steered = threadID, steered
 	if err != nil {
 		execution.Error, execution.Done = err.Error(), true
+		if execution.cancel != nil {
+			execution.cancel()
+		}
 	}
 	if err := h.saveAdmissionLocked(execution); err != nil {
 		h.failJournalLocked()
@@ -510,6 +551,39 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 	reply := WorkerReply{Executions: []WorkerExecution{execution.WorkerExecution}}
 	h.mu.Unlock()
 	return reply
+}
+
+func (h *workerHost) expireAgents() {
+	h.operations.Lock()
+	defer h.operations.Unlock()
+	h.mu.Lock()
+	var expired []*workerExecution
+	for _, execution := range h.executions {
+		if execution.Agent != nil && !execution.Done && !execution.deadlineInterrupted && !time.Now().Before(execution.Agent.Deadline) {
+			execution.deadlineInterrupted = true
+			execution.Error = context.DeadlineExceeded.Error()
+			if h.saveAdmissionLocked(execution) != nil {
+				h.failJournalLocked()
+				break
+			}
+			expired = append(expired, execution)
+		}
+	}
+	h.mu.Unlock()
+	for _, execution := range expired {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := h.supervisor.Interrupt(ctx, execution.Key)
+		cancel()
+		detail := "Background agent deadline exceeded; provider release pending"
+		if err != nil {
+			detail = "Background agent deadline exceeded; interruption failed"
+		}
+		event := core.Event{Kind: core.EventStatus, Text: detail, Execution: &core.ExecutionStatus{State: "degraded", Detail: detail}}
+		if !h.supervisor.IsActive(execution.Key) {
+			event.Kind, event.Done, event.Execution.State = core.EventError, true, "error"
+		}
+		h.capture(execution, event)
+	}
 }
 
 func (h *workerHost) saveAdmissionLocked(execution *workerExecution) error {
@@ -564,6 +638,12 @@ func (h *workerHost) capture(execution *workerExecution, event core.Event) {
 	h.bytes += int64(len(data))
 	if event.Done && !event.Continues {
 		execution.Done = true
+		if execution.Agent != nil && !time.Now().Before(execution.Agent.Deadline) {
+			execution.Error = context.DeadlineExceeded.Error()
+		}
+		if execution.cancel != nil {
+			execution.cancel()
+		}
 	}
 }
 

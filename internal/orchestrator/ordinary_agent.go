@@ -19,6 +19,9 @@ type ordinaryAgentResult struct {
 // dispatch through the first authoritative terminal event. Harness Send is an
 // admission boundary for asynchronous adapters such as Codex, not completion.
 func (m *Manager) runOrdinaryAgentTurn(parent context.Context, lease Lease, description, prompt string, timeout time.Duration, providerIterations int) ordinaryAgentResult {
+	if m.Worker != nil {
+		return m.runWorkerAgent(parent, lease, prompt, timeout)
+	}
 	jobID := 0
 	if m.JobStarted != nil {
 		var err error

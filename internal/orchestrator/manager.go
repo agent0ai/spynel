@@ -469,6 +469,7 @@ func (m *Manager) runScan(ctx context.Context, generation *uint64) error {
 		if err := m.attachWorkerWorkflows(ctx, retained); err != nil {
 			return err
 		}
+		m.attachWorkerAgents(ctx, retained)
 		return m.scanOnce(ctx)
 	}
 	if m.Worker != nil {

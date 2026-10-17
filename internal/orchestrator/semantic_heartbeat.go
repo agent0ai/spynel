@@ -300,7 +300,7 @@ func (m *Manager) runSemanticHeartbeatOnceForTerm(parent context.Context, term u
 	providerOwnsFence = true
 	go func() {
 		result := m.runOrdinaryAgentTurn(parent, lease, "semantic workflow heartbeat", message, timeout, 0)
-		if !result.providerSent || !m.Harness.IsActive(semanticHeartbeatSession) {
+		if !result.providerSent || !m.ordinaryAgentActive(parent, semanticHeartbeatSession) {
 			releaseProvider()
 			resultReady <- result
 			return
@@ -308,7 +308,7 @@ func (m *Manager) runSemanticHeartbeatOnceForTerm(parent context.Context, term u
 		resultReady <- result
 		// Timeout or cancellation ends the ordinary job. Cadence remains
 		// fenced until an adapter that ignored interruption actually releases.
-		for result.providerSent && m.Harness.IsActive(semanticHeartbeatSession) {
+		for result.providerSent && m.ordinaryAgentActive(parent, semanticHeartbeatSession) {
 			select {
 			case <-parent.Done():
 				releaseProvider()
@@ -332,11 +332,29 @@ func (m *Manager) runSemanticHeartbeatOnceForTerm(parent context.Context, term u
 
 func (m *Manager) semanticHeartbeatProviderInFlight() bool {
 	m.heartbeatProviderMu.Lock()
-	defer m.heartbeatProviderMu.Unlock()
-	return m.heartbeatProviderActive.Load()
+	active := m.heartbeatProviderActive.Load()
+	m.heartbeatProviderMu.Unlock()
+	if active || m.Worker == nil {
+		return active
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	return m.ordinaryAgentActive(ctx, semanticHeartbeatSession)
 }
 
 func (m *Manager) waitForSemanticHeartbeatProviderRelease(ctx context.Context) (time.Time, bool) {
+	if m.Worker != nil {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for m.semanticHeartbeatProviderInFlight() {
+			select {
+			case <-ctx.Done():
+				return time.Time{}, false
+			case <-ticker.C:
+			}
+		}
+		return m.semanticHeartbeatNow(), true
+	}
 	m.heartbeatProviderMu.Lock()
 	done := m.heartbeatProviderDone
 	releasedAt := m.heartbeatProviderReleasedAt
