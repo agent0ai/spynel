@@ -72,7 +72,7 @@ func TestReserveWorkerTurnExactClaim(t *testing.T) {
 }
 
 func TestReserveWorkerTurnRejectsChangedOrUnsafeClaim(t *testing.T) {
-	for _, scenario := range []string{"wrong-key", "wrong-route", "wrong-path", "wrong-claim", "changed-owner", "changed-attempt", "terminal-lease", "changed-document", "moved-document", "corrupt-lease", "symlink"} {
+	for _, scenario := range []string{"wrong-key", "wrong-route", "wrong-path", "wrong-claim", "changed-owner", "changed-work-id", "changed-attempt", "terminal-lease", "changed-document", "moved-document", "corrupt-lease", "symlink"} {
 		t.Run(scenario, func(t *testing.T) {
 			root, key, work, manager := workerWorkflowFixture(t, "tasks", phaseTaskImplementation)
 			original := work.File
@@ -95,6 +95,8 @@ func TestReserveWorkerTurnRejectsChangedOrUnsafeClaim(t *testing.T) {
 				work.ClaimID += "changed"
 			case "changed-owner":
 				lease.OwnerID += "changed"
+			case "changed-work-id":
+				lease.WorkID = "changed"
 			case "changed-attempt":
 				lease.ClaimAttempt++
 			case "terminal-lease":

@@ -160,6 +160,27 @@ func (c *WorkerClient) Info() WorkerInfo { return c.record.Info }
 // Close detaches only. Destructive shutdown is an explicit fenced operation.
 func (c *WorkerClient) Close() { c.client.CloseIdleConnections() }
 
+// RunOwned fences a short local mutation against worker death and controller
+// replacement. The callback must not call worker RPCs or reacquire this fence.
+func (c *WorkerClient) RunOwned(ctx context.Context, action func() error) error {
+	if c.election == nil || action == nil {
+		return errors.New("invalid worker ownership callback")
+	}
+	ran, err := c.election.RunForOwner(c.instanceID, c.termToken, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := updater.VerifyProcess(c.record.Info.Process); err != nil {
+			return err
+		}
+		return action()
+	})
+	if err == nil && !ran {
+		err = errors.New("worker consumer ownership unavailable")
+	}
+	return err
+}
+
 // WorkerDelivery supplies the private stable identity for downstream receipts.
 type WorkerDelivery struct {
 	WorkerID string
@@ -210,20 +231,11 @@ func (c *WorkerClient) Consume(ctx context.Context, sequence uint64, consume fun
 		if event.Cursor != after+1 {
 			return execution, errors.New("worker consumer event gap")
 		}
-		ran, err := c.election.RunForOwner(c.instanceID, c.termToken, func() error {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if err := updater.VerifyProcess(c.record.Info.Process); err != nil {
-				return err
-			}
+		err := c.RunOwned(ctx, func() error {
 			return consume(WorkerDelivery{WorkerID: c.record.Info.ID, Sequence: sequence, WorkerEvent: event})
 		})
 		if err != nil {
 			return execution, err
-		}
-		if !ran {
-			return execution, errors.New("worker consumer ownership unavailable")
 		}
 		after = event.Cursor
 	}

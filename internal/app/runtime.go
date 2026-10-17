@@ -911,6 +911,12 @@ func (r *Runtime) ClearLogsResult() (int, error) {
 // Close marks a clean boundary and flushes the current session file.
 func (r *Runtime) Close() {
 	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		archive := r.archive
+		r.mu.Unlock()
+		if archive != nil {
+			archive.close()
+		}
 		r.writerMu.Lock()
 		partial := append([]byte(nil), r.partial...)
 		partials := r.partials

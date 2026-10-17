@@ -137,6 +137,44 @@ func TestProviderEventUsesTransitionScanBoundary(t *testing.T) {
 	}
 }
 
+func TestWorkflowJobAdmissionFailureDoesNotReserveProviderTurn(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := Create(cfg, "tasks", "failed job admission", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newFakeRecipient()
+	manager := New(cfg, h, extensions.Runner{})
+	manager.JobStarted = func(lease Lease, _ string, _ time.Time, iterations, _ int) (int, error) {
+		document, err := ReadDocument(lease.File)
+		if err != nil {
+			t.Error(err)
+		}
+		if iterations != 0 || numberValue(document.FrontMatter["provider_iterations"]) != 0 {
+			t.Error("reserved before job admission")
+		}
+		return 0, errors.New("synthetic job archive failure")
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.Wait()
+	document, err := ReadDocument(cfg.StatePath("tasks", "working", filepath.Base(path)))
+	if err != nil || numberValue(document.FrontMatter["provider_iterations"]) != 0 {
+		t.Fatalf("failed admission inflated provider count: %v", err)
+	}
+	if len(h.prompts) != 0 {
+		t.Fatal("failed job admission reached provider")
+	}
+}
+
 func TestLeaseUpdatePreservesCurrentStateAndRejectsRetiredOrReplacedExecution(t *testing.T) {
 	cfg := config.Default()
 	cfg.Root = t.TempDir()

@@ -164,10 +164,13 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 		if kind == "" {
 			kind = "markdown"
 		}
-		workID, parentID := "", ""
+		workID, parentID := lease.WorkID, ""
 		if lease.File != "" {
 			if document, err := orchestrator.ReadDocument(lease.File); err == nil {
 				if value, ok := document.FrontMatter["id"].(string); ok {
+					if workID != "" && workID != value {
+						return 0, errors.New("workflow job identity changed")
+					}
 					workID = value
 				}
 				if value, ok := document.FrontMatter["goal_id"].(string); ok {
@@ -194,6 +197,7 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	}
 	manager.JobExecutionUpdated = func(id int, status core.ExecutionStatus) { runtime.UpdateJob(id, status) }
 	manager.JobEvent = runtime.RecordJobEvent
+	manager.JobDelivery = runtime.RecordJobDelivery
 	manager.JobFinished = runtime.EndJob
 	manager.SetNotificationDelivery(service.deliverNotification)
 	manager.NotificationContext = service.notificationContext
