@@ -529,6 +529,47 @@ func TestReusedPIDStartTimeRejectsSignal(t *testing.T) {
 	}
 }
 
+func TestVerifyProcessIsReadOnlyAndFenced(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	fixture := lifecycleFixture(t, t.TempDir())
+	record, err := ProcessRecord(fixture.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyProcess(record); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*ProcessRegistration){
+		func(r *ProcessRegistration) { r.StartTime += "changed" },
+		func(r *ProcessRegistration) { r.Executable += ".wrong" },
+		func(r *ProcessRegistration) { r.Generation = "00000000000000000000000000000000" },
+	} {
+		changed := record
+		mutate(&changed)
+		if err := VerifyProcess(changed); err == nil || errors.Is(err, syscall.ESRCH) {
+			t.Fatal("changed live identity accepted or classified dead")
+		}
+	}
+	if current, err := ProcessRecord(record.PID); err != nil || current.Generation != record.Generation || VerifyProcess(record) != nil {
+		t.Fatal("read-only verification disturbed the live process")
+	}
+	if err := fixture.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !errors.Is(VerifyProcess(record), syscall.ESRCH) {
+		if time.Now().After(deadline) {
+			t.Fatal("confirmed exit was not classified dead")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = fixture.Wait()
+	if err := VerifyProcess(record); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("reaped process was not classified dead: %v", err)
+	}
+}
+
 func TestStaleRegistrationStartTimeIsNotAdopted(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())

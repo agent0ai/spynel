@@ -31,6 +31,7 @@ type workerFixture struct {
 	command *exec.Cmd
 	log     string
 	state   string
+	config  HarnessConfig
 }
 
 func newWorkerFixture(t *testing.T, name, mode string) *workerFixture {
@@ -66,7 +67,7 @@ func newWorkerFixture(t *testing.T, name, mode string) *workerFixture {
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
-	fixture := &workerFixture{token: token, owner: owner, term: term, command: command, log: log, state: state}
+	fixture := &workerFixture{token: token, owner: owner, term: term, command: command, log: log, state: state, config: bootstrap.Harness}
 	fixture.client = &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", fixture.info.Socket)
 	}}, Timeout: 5 * time.Second}

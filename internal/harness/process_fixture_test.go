@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/updater"
 )
 
@@ -35,6 +36,13 @@ type fixtureRecord struct {
 }
 
 func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == "__worker-controller" {
+		if err := runWorkerControllerFixture(); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) == 2 && os.Args[1] == "__worker" {
 		unregister, err := updater.Detect("fixture").RegisterHarnessWorker()
 		if err != nil {
@@ -58,6 +66,42 @@ func TestMain(m *testing.M) {
 		os.Exit(runHarnessFixture(mode))
 	}
 	os.Exit(m.Run())
+}
+
+func runWorkerControllerFixture() error {
+	var cfg HarnessConfig
+	decoder := json.NewDecoder(os.Stdin)
+	if err := decoder.Decode(&cfg); err != nil {
+		return err
+	}
+	owner, err := instance.New(filepath.Join(cfg.Cwd, ".spynel"))
+	if err != nil {
+		return err
+	}
+	term, err := owner.NewToken()
+	if err != nil {
+		return err
+	}
+	if _, acquired, err := owner.TryAcquire("127.0.0.1:10001", term); err != nil || !acquired {
+		return fmt.Errorf("controller fixture did not acquire ownership")
+	}
+	defer owner.Release(term)
+	client, err := OpenWorker(context.Background(), cfg, owner.ID(), term)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	if _, err := client.Call(context.Background(), WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/controller", Prompt: "synthetic useful work"}); err != nil {
+		return err
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(client.Info()); err != nil {
+		return err
+	}
+	_, err = io.Copy(io.Discard, decoder.Buffered())
+	if err == nil {
+		_, err = io.Copy(io.Discard, os.Stdin)
+	}
+	return err
 }
 
 func TestManualInferenceReachesProvidersWithoutCatalogDiscovery(t *testing.T) {
@@ -503,7 +547,7 @@ func runCodexFixture(mode string) int {
 			if mode == "codex-worker" {
 				appendFixtureLog(map[string]any{"kind": "effect", "pid": os.Getpid()})
 				go func() {
-					for tick := 0; tick < 100; tick++ {
+					for tick := 0; tick < 3000; tick++ {
 						time.Sleep(20 * time.Millisecond)
 						write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": threadID, "turnId": turnID, "delta": "."}})
 					}

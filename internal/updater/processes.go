@@ -359,30 +359,45 @@ func signalRegisteredProcess(record ProcessRegistration, signal os.Signal) error
 		return err
 	}
 	defer process.Release()
-	path, err := installationProcessPath(record.PID)
-	if err != nil {
+	if err := VerifyProcess(record); err != nil {
 		return err
 	}
-	if !processMatches(record, path) {
-		return errors.New("Spynel process identity changed before signal delivery")
+	return process.Signal(signal)
+}
+
+// VerifyProcess checks the same native identity used before signalling without
+// sending a signal. Only a confirmed dead/zombie process returns ESRCH.
+func VerifyProcess(record ProcessRegistration) error {
+	if record.PID <= 1 {
+		return errors.New("invalid Spynel process identity")
 	}
 	alive, start, err := inspectProcess(record.PID)
 	if err != nil {
+		if (errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH)) && !processAlive(record.PID) {
+			return syscall.ESRCH
+		}
 		return err
 	}
 	if !alive {
 		return syscall.ESRCH
 	}
+	path, err := installationProcessPath(record.PID)
+	if err != nil {
+		return err
+	}
+	if !processMatches(record, path) {
+		return errors.New("Spynel process identity changed")
+	}
 	if record.start != "" && record.start != start || record.StartTime != "" && record.StartTime != start {
-		return errors.New("Spynel process start time changed before signal delivery")
+		return errors.New("Spynel process start time changed")
 	}
 	if record.Generation != "" {
 		current, err := ProcessRecord(record.PID)
 		if err != nil || current.Generation != record.Generation {
-			return errors.New("Spynel generation changed before signal delivery")
+			return errors.New("Spynel generation changed")
 		}
 	}
-	return process.Signal(signal)
+	return nil
 }
 
 // KillAll stops verified Spynel processes, including older releases and

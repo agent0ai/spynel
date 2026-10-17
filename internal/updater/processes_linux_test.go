@@ -2,6 +2,7 @@ package updater
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"golang.org/x/sys/unix"
 	"os"
@@ -71,6 +72,13 @@ func TestUnreadableLiveRegistrationBlocksCoordination(t *testing.T) {
 	}
 	if !processAlive(command.Process.Pid) {
 		t.Fatal("unreadable live child classified dead")
+	}
+	record, err := ProcessRecord(command.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyProcess(record); err == nil || errors.Is(err, syscall.ESRCH) {
+		t.Fatal("unreadable live process was verified or classified dead")
 	}
 	manager := &Manager{InstallRoot: root}
 	if err := manager.CheckRestartable(); err == nil || !strings.Contains(err.Error(), "cannot verify executable") {

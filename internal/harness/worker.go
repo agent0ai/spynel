@@ -19,10 +19,11 @@ import (
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/instance"
+	"github.com/agent0ai/spynel/internal/updater"
 )
 
 const (
-	WorkerProtocol      = 1
+	WorkerProtocol      = 2
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -44,10 +45,14 @@ type WorkerBootstrap struct {
 }
 
 type WorkerInfo struct {
-	Protocol int
-	ID       string
-	Socket   string
-	PID      int
+	Protocol      int
+	ID            string
+	Socket        string
+	PID           int
+	EnvironmentID string
+	WorkspaceID   string
+	ConfigDigest  [32]byte
+	Process       updater.ProcessRegistration
 }
 
 // Sequence is a strictly increasing admission number, not a provider turn.
@@ -140,14 +145,16 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	if err != nil {
 		return err
 	}
-	for _, directory := range []string{filepath.Dir(filepath.Dir(lockPath)), filepath.Dir(lockPath)} {
-		if err := os.MkdirAll(directory, 0700); err != nil {
-			return err
-		}
-		info, err := os.Lstat(directory)
-		if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-			return errors.New("worker directory must be private and not a symlink")
-		}
+	recordPath, err := workerRecordPath(lockPath)
+	if err != nil {
+		return err
+	}
+	native, err := updater.ProcessRecord(os.Getpid())
+	if err != nil || !native.HarnessWorker {
+		return errors.New("worker native registration unavailable")
+	}
+	if err := updater.VerifyProcess(native); err != nil {
+		return errors.New("worker native identity unavailable")
 	}
 	// Unix socket names have a small platform limit; workspace/config paths do not.
 	directory, err := os.MkdirTemp("", "spynel-worker-")
@@ -163,7 +170,11 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	if err != nil {
 		return err
 	}
-	info := WorkerInfo{Protocol: WorkerProtocol, ID: id, Socket: filepath.Join(directory, "control.sock"), PID: os.Getpid()}
+	info := WorkerInfo{
+		Protocol: WorkerProtocol, ID: id, Socket: filepath.Join(directory, "control.sock"), PID: os.Getpid(),
+		EnvironmentID: election.EnvironmentID(), WorkspaceID: filepath.Base(lockPath),
+		ConfigDigest: workerConfigDigest(bootstrap.Harness), Process: native,
+	}
 	listener, err := net.Listen("unix", info.Socket)
 	if err != nil {
 		return err
@@ -180,6 +191,9 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	defer func() {
 		cancel()
 		runErr = errors.Join(runErr, supervisor.Close())
+		if current, err := readWorkerRecord(recordPath); err == nil && current.Info.ID == info.ID {
+			runErr = errors.Join(runErr, os.Remove(recordPath))
+		}
 		if host != nil {
 			host.mu.Lock()
 			defer host.mu.Unlock()
@@ -195,6 +209,9 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	host = &workerHost{
 		supervisor: supervisor, election: election, info: info, token: bootstrap.Token, directory: directory,
 		stop: make(chan struct{}), lastSeen: time.Now(), next: 1, executions: map[uint64]*workerExecution{},
+	}
+	if err := publishWorkerRecord(recordPath, workerRecord{Info: info, Token: bootstrap.Token}); err != nil {
+		return err
 	}
 	server := &http.Server{
 		Handler: http.HandlerFunc(host.serve), ReadHeaderTimeout: 5 * time.Second,
