@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -233,6 +234,7 @@ func TestWorkerRetainsFullAdapterAcrossControllerTerms(t *testing.T) {
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
+			fixture.mustCall(t, WorkerRequest{Action: "commit", Sequence: 1, After: after})
 			fixture.mustCall(t, WorkerRequest{Action: "ack", Sequence: 1, After: after})
 			fixture.mustCall(t, WorkerRequest{Action: "ack", Sequence: 1, After: after})
 			if reply, _ := fixture.call(send); reply.Error == "" {
@@ -259,6 +261,202 @@ func TestWorkerRetainsFullAdapterAcrossControllerTerms(t *testing.T) {
 	}
 }
 
+func TestWorkerSessionInspectionAndResetAcrossControllerTerms(t *testing.T) {
+	for _, scenario := range []struct{ name, mode string }{
+		{"codex", "codex-worker"}, {"claude-code", "claude-interrupt"}, {"pi", "pi-interrupt"}, {"acp", "acp-interrupt"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			fixture := newWorkerFixture(t, scenario.name, scenario.mode)
+			key := "synthetic/session"
+			first := fixture.mustCall(t, WorkerRequest{Action: "send", Sequence: 1, Key: key, Prompt: "synthetic session inspection"}).Executions[0]
+			obsolete := WorkerRequest{WorkerID: fixture.info.ID, InstanceID: fixture.owner.ID(), TermToken: fixture.term, Key: key, Sequence: 1}
+			fixture.replaceOwner(t)
+			for _, action := range []string{"session", "reset", "commit"} {
+				obsolete.Action = action
+				if _, status := fixture.rawCall(obsolete, fixture.token); status != http.StatusForbidden {
+					t.Fatalf("obsolete controller could %s: %d", action, status)
+				}
+			}
+			session := fixture.mustCall(t, WorkerRequest{Action: "session", Key: key}).Session
+			if session == nil || !session.Active || session.ThreadID == "" || session.ThreadID != first.ThreadID || session.Admission == "new" {
+				t.Fatalf("replacement lost live session state: %#v", session)
+			}
+			if reply, _ := fixture.call(WorkerRequest{Action: "reset", Key: key}); reply.Error == "" {
+				t.Fatal("reset discarded a live execution")
+			}
+			fixture.mustCall(t, WorkerRequest{Action: "interrupt", Key: key})
+			var after uint64
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				page := fixture.mustCall(t, WorkerRequest{Action: "events", Sequence: 1, After: after})
+				for _, event := range page.Events {
+					if event.Cursor != after+1 {
+						t.Fatal("session cancellation replay skipped a cursor")
+					}
+					after = event.Cursor
+				}
+				if page.Executions[0].Done && after == page.Executions[0].LastCursor {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("original session did not finish cancellation")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if reply, _ := fixture.call(WorkerRequest{Action: "reset", Key: key}); reply.Error == "" {
+				t.Fatal("reset discarded an unconsumed terminal execution")
+			}
+			fixture.mustCall(t, WorkerRequest{Action: "commit", Sequence: 1, After: after})
+			fixture.mustCall(t, WorkerRequest{Action: "ack", Sequence: 1, After: after})
+			if session := fixture.mustCall(t, WorkerRequest{Action: "reset", Key: key}).Session; session == nil || session.Active || session.ThreadID != "" || session.Admission != "new" {
+				t.Fatalf("settled idle session did not reset: %#v", session)
+			}
+			for _, action := range []string{"session", "reset"} {
+				for _, key := range []string{"", strings.Repeat("x", 4097)} {
+					if reply, _ := fixture.call(WorkerRequest{Action: action, Key: key}); reply.Error == "" {
+						t.Fatal("invalid session key accepted")
+					}
+				}
+			}
+			if state := fixture.mustCall(t, WorkerRequest{Action: "inspect"}); state.NextSequence != 2 || len(state.Executions) != 0 {
+				t.Fatal("session inspection/reset admitted provider work")
+			}
+		})
+	}
+}
+
+func TestWorkerCommittedCursorSurvivesControllerTerms(t *testing.T) {
+	fixture := newWorkerFixture(t, "codex", "codex-lifecycle")
+	fixture.mustCall(t, WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/cursor", Prompt: "synthetic committed consumption"})
+	var page WorkerReply
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		page = fixture.mustCall(t, WorkerRequest{Action: "events", Sequence: 1})
+		if page.Executions[0].Done && uint64(len(page.Events)) == page.Executions[0].LastCursor {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("provider did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	last := page.Executions[0].LastCursor
+	if last < 2 || page.Executions[0].CommittedCursor != 0 {
+		t.Fatal("reading events advanced their committed cursor")
+	}
+	if reply, _ := fixture.call(WorkerRequest{Action: "ack", Sequence: 1, After: last}); reply.Error == "" {
+		t.Fatal("uncommitted terminal stream was retired")
+	}
+	commit := WorkerRequest{Action: "commit", Sequence: 1, After: 1}
+	if got := fixture.mustCall(t, commit).Executions[0].CommittedCursor; got != 1 {
+		t.Fatalf("committed cursor = %d", got)
+	}
+	path := filepath.Join(filepath.Dir(fixture.info.Socket), "1.jsonl.cursor")
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatal("committed cursor was not stored privately")
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "1\n" {
+		t.Fatal("committed cursor was not persisted before acknowledgement")
+	}
+	fixture.replaceOwner(t)
+	state := fixture.mustCall(t, WorkerRequest{Action: "inspect"}).Executions[0]
+	if state.CommittedCursor != 1 || state.LastCursor != last || !state.Done {
+		t.Fatalf("replacement lost the committed prefix: %#v", state)
+	}
+	fixture.mustCall(t, commit) // A lost commit reply is safe to reconcile/repeat.
+	for _, invalid := range []WorkerRequest{
+		{Action: "commit", Sequence: 1, After: 0},
+		{Action: "commit", Sequence: 1, After: last},
+		{Action: "commit", Sequence: 1, Expected: 1, After: last + 1},
+		{Action: "commit", Sequence: 1, Expected: last + 1, After: last},
+		{Action: "commit", Sequence: 2, After: 1},
+	} {
+		if reply, _ := fixture.call(invalid); reply.Error == "" {
+			t.Fatalf("invalid commit accepted: %#v", invalid)
+		}
+	}
+	remaining := fixture.mustCall(t, WorkerRequest{Action: "events", Sequence: 1, After: state.CommittedCursor})
+	if remaining.Events[0].Cursor != 2 || remaining.Events[len(remaining.Events)-1].Cursor != last {
+		t.Fatal("replacement lost the unsettled suffix")
+	}
+	fixture.mustCall(t, WorkerRequest{Action: "commit", Sequence: 1, Expected: 1, After: last})
+	if data, err := os.ReadFile(path); err != nil || string(data) != strconv.FormatUint(last, 10)+"\n" {
+		t.Fatal("terminal cursor was not persisted")
+	}
+	fixture.mustCall(t, WorkerRequest{Action: "ack", Sequence: 1, After: last})
+	fixture.mustCall(t, WorkerRequest{Action: "ack", Sequence: 1, After: last})
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("retired execution left its cursor file")
+	}
+	if reply, _ := fixture.call(commit); reply.Error == "" {
+		t.Fatal("retired cursor could be committed")
+	}
+}
+
+func TestWorkerCursorCommitStorageFailureStopsHost(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "journal-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	execution := &workerExecution{file: file}
+	host := &workerHost{stop: make(chan struct{}), executions: map[uint64]*workerExecution{1: execution}}
+	host.capture(execution, core.Event{Kind: core.EventFinal, Text: "synthetic", Done: true})
+	if err := os.Mkdir(file.Name()+".cursor", 0700); err != nil {
+		t.Fatal(err)
+	}
+	if reply := host.commit(WorkerRequest{Sequence: 1, After: 1}); reply.Error == "" || execution.CommittedCursor != 0 || host.failure == nil {
+		t.Fatal("failed cursor persistence was acknowledged")
+	}
+	select {
+	case <-host.stop:
+	default:
+		t.Fatal("failed cursor persistence allowed further provider work")
+	}
+}
+
+func TestWorkerCursorRetirementFailureStopsHost(t *testing.T) {
+	for _, failure := range []string{"journal", "cursor"} {
+		t.Run(failure, func(t *testing.T) {
+			file, err := os.CreateTemp(t.TempDir(), "journal-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			execution := &workerExecution{file: file}
+			host := &workerHost{stop: make(chan struct{}), executions: map[uint64]*workerExecution{1: execution}}
+			host.capture(execution, core.Event{Kind: core.EventFinal, Text: "synthetic", Done: true})
+			if reply := host.commit(WorkerRequest{Sequence: 1, After: 1}); reply.Error != "" {
+				t.Fatal(reply.Error)
+			}
+			if failure == "journal" {
+				if err := os.Rename(file.Name(), file.Name()+".moved"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				path := file.Name() + ".cursor"
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "block-removal"), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if reply := host.apply(WorkerRequest{Action: "ack", Sequence: 1, After: 1}); reply.Error == "" || host.failure == nil {
+				t.Fatal("failed retirement was acknowledged or left the host available")
+			}
+			select {
+			case <-host.stop:
+			default:
+				t.Fatal("failed retirement allowed further provider work")
+			}
+		})
+	}
+}
+
 func TestWorkerReplaysCompletionAfterDetachedDelivery(t *testing.T) {
 	fixture := newWorkerFixture(t, "codex", "codex-lifecycle")
 	fixture.mustCall(t, WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/completion", Prompt: "synthetic terminal delivery"})
@@ -279,6 +477,7 @@ func TestWorkerReplaysCompletionAfterDetachedDelivery(t *testing.T) {
 	if replay := fixture.mustCall(t, WorkerRequest{Action: "events", Sequence: 1, After: last.Cursor}); len(replay.Events) != 0 {
 		t.Fatal("reconnection replayed already consumed events")
 	}
+	fixture.mustCall(t, WorkerRequest{Action: "commit", Sequence: 1, After: last.Cursor})
 	fixture.mustCall(t, WorkerRequest{Action: "ack", Sequence: 1, After: last.Cursor})
 }
 
@@ -319,6 +518,7 @@ func TestWorkerRetainsQueuedFollowUpAndNativeEmitterHandoff(t *testing.T) {
 					}
 					time.Sleep(10 * time.Millisecond)
 				}
+				fixture.mustCall(t, WorkerRequest{Action: "commit", Sequence: sequence, After: after})
 				fixture.mustCall(t, WorkerRequest{Action: "ack", Sequence: sequence, After: after})
 			}
 			starts, steers := 0, 0

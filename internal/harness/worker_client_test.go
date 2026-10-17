@@ -257,10 +257,18 @@ func TestWorkerLaunchSurvivesActualControllerExit(t *testing.T) {
 				t.Fatal("old controller could interrupt after takeover")
 			}
 			inspect := workerClientCall(t, client, WorkerRequest{Action: "inspect"})
-			if inspect.NextSequence != 2 || len(inspect.Executions) != 1 || inspect.Executions[0].Done {
+			if inspect.NextSequence != 2 || len(inspect.Executions) != 1 || inspect.Executions[0].Done || inspect.Executions[0].CommittedCursor != 1 {
 				t.Fatal("controller restart duplicated or lost execution")
 			}
-			var after uint64
+			data, err := os.ReadFile(filepath.Join(root, "synthetic-consumer.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var receipt workerConsumerReceipt
+			if err := json.Unmarshal(data, &receipt); err != nil || receipt.WorkerID != original.ID || receipt.Sequence != 1 || receipt.Event.Cursor != 1 {
+				t.Fatal("controller committed before its synthetic effect was durable")
+			}
+			after := inspect.Executions[0].CommittedCursor
 			deadline = time.Now().Add(5 * time.Second)
 			for {
 				page := workerClientCall(t, client, WorkerRequest{Action: "events", Sequence: 1, After: after})
@@ -320,6 +328,7 @@ func TestWorkerLaunchSurvivesActualControllerExit(t *testing.T) {
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
+			workerClientCall(t, client, WorkerRequest{Action: "commit", Sequence: 1, Expected: 1, After: after})
 			workerClientCall(t, client, WorkerRequest{Action: "ack", Sequence: 1, After: after})
 			client.Close()
 			reattached, err := OpenWorker(t.Context(), cfg, owner.ID(), term)

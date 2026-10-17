@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/updater"
 )
@@ -23,6 +24,12 @@ const (
 	fixtureModeEnv = "SPYNEL_HARNESS_FIXTURE_MODE"
 	fixtureLogEnv  = "SPYNEL_HARNESS_FIXTURE_LOG"
 )
+
+type workerConsumerReceipt struct {
+	WorkerID string
+	Sequence uint64
+	Event    WorkerEvent
+}
 
 type fixtureRecord struct {
 	PID        int             `json:"pid"`
@@ -93,6 +100,31 @@ func runWorkerControllerFixture() error {
 	defer client.Close()
 	if _, err := client.Call(context.Background(), WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/controller", Prompt: "synthetic useful work"}); err != nil {
 		return err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		page, err := client.Call(context.Background(), WorkerRequest{Action: "events", Sequence: 1})
+		if err != nil {
+			return err
+		}
+		if len(page.Events) > 0 {
+			// This synthetic durable sink stands in for a consumer effect.
+			data, err := json.Marshal(workerConsumerReceipt{WorkerID: client.Info().ID, Sequence: 1, Event: page.Events[0]})
+			if err != nil {
+				return err
+			}
+			if err := fsx.AtomicWriteFile(filepath.Join(cfg.Cwd, "synthetic-consumer.json"), data, 0600); err != nil {
+				return err
+			}
+			if _, err := client.Call(context.Background(), WorkerRequest{Action: "commit", Sequence: 1, After: page.Events[0].Cursor}); err != nil {
+				return err
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("controller fixture did not consume an event")
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(client.Info()); err != nil {
 		return err

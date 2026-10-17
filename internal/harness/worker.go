@@ -18,12 +18,13 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/updater"
 )
 
 const (
-	WorkerProtocol      = 2
+	WorkerProtocol      = 3
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -67,6 +68,7 @@ type WorkerRequest struct {
 	Prompt     string
 	Message    string
 	After      uint64
+	Expected   uint64
 }
 
 type WorkerEvent struct {
@@ -75,12 +77,20 @@ type WorkerEvent struct {
 }
 
 type WorkerExecution struct {
-	Sequence uint64
-	Key      string
-	ThreadID string
-	Steered  bool
-	Done     bool
-	Error    string
+	Sequence        uint64
+	Key             string
+	ThreadID        string
+	Steered         bool
+	Done            bool
+	Error           string
+	LastCursor      uint64
+	CommittedCursor uint64
+}
+
+type WorkerSession struct {
+	ThreadID  string
+	Active    bool
+	Admission string
 }
 
 type WorkerReply struct {
@@ -89,6 +99,7 @@ type WorkerReply struct {
 	Executions   []WorkerExecution
 	Events       []WorkerEvent
 	Interrupted  bool
+	Session      *WorkerSession
 }
 
 type workerExecution struct {
@@ -318,6 +329,8 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 		return h.send(request)
 	case "events":
 		return h.events(request)
+	case "commit":
+		return h.commit(request)
 	case "ack":
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -328,11 +341,16 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 			}
 			return WorkerReply{Error: "unknown worker execution"}
 		}
-		if !execution.Done || request.After != uint64(len(execution.offsets)) {
-			return WorkerReply{Error: "worker execution is not fully consumed"}
+		if !execution.Done || request.After != execution.LastCursor || execution.CommittedCursor != execution.LastCursor {
+			return WorkerReply{Error: "worker execution is not fully committed"}
 		}
 		if err := os.Remove(execution.file.Name()); err != nil {
+			h.failJournalLocked()
 			return WorkerReply{Error: "retire worker journal failed"}
+		}
+		if err := os.Remove(execution.file.Name() + ".cursor"); err != nil && !os.IsNotExist(err) {
+			h.failJournalLocked()
+			return WorkerReply{Error: "retire worker cursor failed"}
 		}
 		_ = execution.file.Close()
 		h.bytes -= execution.bytes
@@ -344,6 +362,28 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 			return WorkerReply{Error: err.Error()}
 		}
 		return WorkerReply{Interrupted: interrupted}
+	case "session", "reset":
+		if request.Key == "" || len(request.Key) > 4096 {
+			return WorkerReply{Error: "invalid worker session key"}
+		}
+		if request.Action == "reset" {
+			h.mu.Lock()
+			retained := false
+			for _, execution := range h.executions {
+				retained = retained || execution.Key == request.Key
+			}
+			h.mu.Unlock()
+			if retained {
+				return WorkerReply{Error: "consume and retire worker executions before resetting their session"}
+			}
+			if err := h.supervisor.ResetSession(request.Key); err != nil {
+				return WorkerReply{Error: err.Error()}
+			}
+		}
+		return WorkerReply{Session: &WorkerSession{
+			ThreadID: h.supervisor.ThreadID(request.Key), Active: h.supervisor.IsActive(request.Key),
+			Admission: h.supervisor.ConversationAdmission(request.Key),
+		}}
 	case "shutdown":
 		h.stopOnce.Do(func() { close(h.stop) })
 		return WorkerReply{}
@@ -423,11 +463,35 @@ func (h *workerHost) capture(execution *workerExecution, event core.Event) {
 		return
 	}
 	execution.offsets = append(execution.offsets, execution.bytes)
+	execution.LastCursor = uint64(len(execution.offsets))
 	execution.bytes += int64(len(data))
 	h.bytes += int64(len(data))
 	if event.Done && !event.Continues {
 		execution.Done = true
 	}
+}
+
+// Commit only after downstream effects are durable and deduplicated by worker
+// ID, sequence and cursor. Reading a page alone never settles those effects.
+func (h *workerHost) commit(request WorkerRequest) WorkerReply {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	execution := h.executions[request.Sequence]
+	if execution == nil || request.Expected > request.After || request.After > execution.LastCursor {
+		return WorkerReply{Error: "unknown worker execution or commit cursor"}
+	}
+	if request.After == execution.CommittedCursor {
+		return WorkerReply{Executions: []WorkerExecution{execution.WorkerExecution}}
+	}
+	if request.Expected != execution.CommittedCursor || request.After < execution.CommittedCursor {
+		return WorkerReply{Error: "worker committed cursor changed"}
+	}
+	if err := fsx.AtomicWriteFile(execution.file.Name()+".cursor", []byte(strconv.FormatUint(request.After, 10)+"\n"), 0600); err != nil {
+		h.failJournalLocked()
+		return WorkerReply{Error: "commit worker cursor failed"}
+	}
+	execution.CommittedCursor = request.After
+	return WorkerReply{Executions: []WorkerExecution{execution.WorkerExecution}}
 }
 
 func (h *workerHost) events(request WorkerRequest) WorkerReply {
