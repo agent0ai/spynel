@@ -7,7 +7,6 @@ import (
 	"context"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -32,6 +31,7 @@ func TestServerRetainsHandledTerminationBoundary(t *testing.T) {
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
+	isolatePrimaryWorker(t, cfg, "synthetic-version")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, os.Args[0], "__server_fixture", cfg.Path)
@@ -40,7 +40,6 @@ func TestServerRetainsHandledTerminationBoundary(t *testing.T) {
 			command.Env = append(command.Env, value)
 		}
 	}
-	command.Env = append(command.Env, "XDG_CONFIG_HOME="+filepath.Join(root, "user-config"), "HOME="+filepath.Join(root, "user-home"))
 	var terminal bytes.Buffer
 	command.Stdout, command.Stderr = &terminal, &terminal
 	if err := command.Start(); err != nil {

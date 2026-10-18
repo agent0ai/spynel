@@ -187,6 +187,15 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 	service.SetRecoveryOwnershipFence(func(action func() error) (bool, error) {
 		return election.RunWhileOwner(token, action)
 	})
+	// Unavailable selections still need a discoverable worker for inspection
+	// and explicit settings recovery; availability is checked by Service.Start.
+	runtimeConfig, _ := cfg.RuntimeHarness(harness.HarnessConfig{Version: version})
+	service.Orchestrator.Worker, err = harness.OpenWorker(ctx, runtimeConfig, election.ID(), token)
+	if err != nil {
+		cancel()
+		_ = service.Close()
+		return nil, fmt.Errorf("bind primary harness worker: %w", err)
+	}
 	service.SetPrimaryInstanceID(election.ID())
 	if err := service.Start(ctx); err != nil {
 		service.Runtime.LogEvent("error", "harness", "unavailable", "Harness unavailable: "+err.Error())
@@ -289,16 +298,12 @@ func (term *primaryTerm) stopFor(targetID, reason string) error {
 	var stopErr error
 	stopped := false
 	term.stopOnce.Do(func() {
-		defer term.service.Runtime.Close()
+		defer func() { stopErr = errors.Join(stopErr, term.service.Close()) }()
 		stopped = true
 		term.service.Runtime.LogEvent("info", "instance", "primary_stopping", "Primary stopping: instance="+term.election.ID()+" reason="+reason)
 		term.service.SetPrimaryInstanceID("")
 		term.cancel()
 		_ = term.listener.Close()
-		if err := term.service.Harness.Close(); err != nil {
-			term.service.Runtime.LogEvent("error", "harness", "shutdown_failed", err.Error())
-			stopErr = err
-		}
 		<-term.apiDone
 		<-term.channelsDone
 		<-term.orchestratorDone

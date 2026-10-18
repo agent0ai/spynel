@@ -1566,6 +1566,7 @@ func TestOwnerElectionRunsOneServerAndHandsOffOnExit(t *testing.T) {
 	cfg.Channels.WhatsApp.Enabled = false
 	cfg.Orchestrator.Enabled = false
 	cfg.Extensions.Enabled = false
+	isolatePrimaryWorker(t, cfg, "test")
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -1657,6 +1658,7 @@ func TestOwnerElectionPromotesAfterObservedPrimaryBecomesStale(t *testing.T) {
 	cfg.Channels.WhatsApp.Enabled = false
 	cfg.Orchestrator.Enabled = false
 	cfg.Extensions.Enabled = false
+	isolatePrimaryWorker(t, cfg, "test")
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -1719,6 +1721,7 @@ func TestPrimaryCommandHandsOwnershipToRequestingTUI(t *testing.T) {
 	cfg.Channels.WhatsApp.Enabled = false
 	cfg.Orchestrator.Enabled = false
 	cfg.Extensions.Enabled = false
+	isolatePrimaryWorker(t, cfg, "test")
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}

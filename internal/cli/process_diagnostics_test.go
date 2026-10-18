@@ -69,6 +69,13 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if len(os.Args) == 3 && os.Args[1] == "__primary_worker_fixture" {
+		if err := Run([]string{"serve", "--automatic-startup", "--config", os.Args[2]}, "synthetic-version"); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) == 4 && os.Args[1] == "__diagnostic_fixture" {
 		d := newProcessDiagnostic(os.Args[2], "synthetic-version")
 		_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(filepath.Dir(d.Directory), "user-config"))
