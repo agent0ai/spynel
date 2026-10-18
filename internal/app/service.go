@@ -200,6 +200,7 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	manager.JobDelivery = runtime.RecordJobDelivery
 	manager.JobFinished = runtime.EndJob
 	manager.ConversationAttached = service.attachWorkerConversation
+	manager.ConversationStarted = service.startWorkerConversation
 	manager.ConversationDelivery = service.deliverWorkerConversation
 	manager.SetNotificationDelivery(service.deliverNotification)
 	manager.NotificationContext = service.notificationContext

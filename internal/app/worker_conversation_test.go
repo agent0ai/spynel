@@ -109,6 +109,9 @@ func TestWorkerConversationAutomaticRoutingChecksAuthorizationBeforeEffects(t *t
 			if _, err := s.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic"}); err != nil {
 				t.Fatal(err)
 			}
+			if _, err := s.startWorkerConversation(*c); err == nil || len(s.Runtime.Jobs()) != 0 {
+				t.Fatal("unavailable or unauthorized route admitted a provider job")
+			}
 			id, err := s.attachWorkerConversation(harness.WorkerExecution{Key: "chat:telegram:TG-7", Conversation: c, SourcesReserved: true})
 			if err != nil {
 				t.Fatal(err)
@@ -138,6 +141,9 @@ func TestWorkerConversationAttachmentRejectsConflictingJob(t *testing.T) {
 	}
 	if _, err := s.attachWorkerConversation(execution); err == nil {
 		t.Fatal("conflicting live job was reused")
+	}
+	if _, err := s.startWorkerConversation(*c); err == nil {
+		t.Fatal("conflicting live job admitted another execution")
 	}
 }
 

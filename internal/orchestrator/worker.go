@@ -18,11 +18,12 @@ import (
 // Scan already holds the snapshot/election fence. Consumers run outside it;
 // retirement shares the snapshot lock so a retired stream cannot reattach.
 func (m *Manager) attachWorkerConversations(ctx context.Context, executions []harness.WorkerExecution) {
+	m.reconcileConversationAdmissions(executions)
 	if m.ConversationAttached == nil || m.ConversationDelivery == nil || m.JobFinished == nil {
 		return
 	}
 	for _, execution := range executions {
-		if execution.Conversation == nil {
+		if execution.Conversation == nil || !execution.SourcesReserved {
 			continue
 		}
 		key := "worker-conversation:" + strconv.FormatUint(execution.Sequence, 10)
@@ -49,6 +50,9 @@ func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harne
 	if err := m.Worker.RunOwned(ctx, func() error {
 		var err error
 		jobID, err = m.ConversationAttached(execution)
+		if err == nil && jobID > 0 {
+			m.setRuntimeJob("worker-conversation:"+execution.Conversation.ExecutionID, jobID)
+		}
 		return err
 	}); err != nil {
 		return err
@@ -79,7 +83,7 @@ func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harne
 			}
 			m.workerAdmissionMu.Lock()
 			err := m.Worker.RunOwned(ctx, func() error {
-				m.JobFinished(jobID)
+				m.finishRuntimeJob("worker-conversation:" + current.Conversation.ExecutionID)
 				return nil
 			})
 			if err == nil {

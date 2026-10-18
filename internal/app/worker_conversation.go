@@ -12,18 +12,34 @@ import (
 	"github.com/agent0ai/spynel/internal/orchestrator"
 )
 
+// Called before worker source reservation, under the exact owner fence.
+func (s *Service) startWorkerConversation(c harness.WorkerConversation) (int, error) {
+	if c.Validate() != nil {
+		return 0, errors.New("invalid conversation admission")
+	}
+	if _, err := s.workerConversationRouter(c); err != nil {
+		return 0, err
+	}
+	return s.beginWorkerConversation(c)
+}
+
+func (s *Service) beginWorkerConversation(c harness.WorkerConversation) (int, error) {
+	key := "chat:" + c.Channel + ":" + c.Conversation
+	if job, ok := s.Runtime.JobForSession(key); ok && (job.Kind != "conversation" || job.WorkID != c.ExecutionID) {
+		return 0, errors.New("retained conversation conflicts with its live job")
+	}
+	return s.Runtime.TryBeginJobWithDetails(key, c.Channel, c.Conversation, "Retained conversation", JobDetails{
+		Kind: "conversation", WorkID: c.ExecutionID, Provider: s.Settings.Snapshot().Harness.Name,
+	})
+}
+
 // Called under the Manager's native/exact-owner fence; it must not use RPC.
 func (s *Service) attachWorkerConversation(execution harness.WorkerExecution) (int, error) {
 	c := execution.Conversation
 	if c.Validate() != nil || execution.Key != "chat:"+c.Channel+":"+c.Conversation || !execution.SourcesReserved || execution.Workflow != nil || execution.Agent != nil {
 		return 0, errors.New("invalid retained conversation admission")
 	}
-	if job, ok := s.Runtime.JobForSession(execution.Key); ok && (job.Kind != "conversation" || job.WorkID != c.ExecutionID) {
-		return 0, errors.New("retained conversation conflicts with its live job")
-	}
-	id, err := s.Runtime.TryBeginJobWithDetails(execution.Key, c.Channel, c.Conversation, "Retained conversation", JobDetails{
-		Kind: "conversation", WorkID: c.ExecutionID, Provider: s.Settings.Snapshot().Harness.Name,
-	})
+	id, err := s.beginWorkerConversation(*c)
 	if err == nil && c.Channel == "tui" && !execution.Done && !execution.Cancelled {
 		s.chatActivityMu.Lock()
 		if len(s.chatActivity[id]) == 0 {
@@ -43,23 +59,34 @@ func (s *Service) deliverWorkerConversation(ctx context.Context, jobID int, deli
 	if c.Validate() != nil {
 		return errors.New("invalid retained conversation delivery")
 	}
-	if c.Channel != "telegram" && c.Channel != "whatsapp" {
-		return s.ConsumeConversationDelivery(jobID, delivery, nil)
-	}
-	cfg := s.Settings.Snapshot()
-	if c.Channel == "telegram" && !cfg.Channels.Telegram.Enabled || c.Channel == "whatsapp" && !cfg.Channels.WhatsApp.Enabled {
-		return errors.New("retained conversation transport is disabled")
-	}
-	if err := s.validateOrigin(orchestrator.Origin{Channel: c.Channel, Conversation: c.Conversation}); err != nil {
+	router, err := s.workerConversationRouter(*c)
+	if err != nil {
 		return err
 	}
-	router, ok := s.conversationDelivery().(channel.ConversationEventRouter)
-	if !ok {
-		return errors.New("retained conversation response router unavailable")
+	if router == nil {
+		return s.ConsumeConversationDelivery(jobID, delivery, nil)
 	}
 	return s.ConsumeConversationDelivery(jobID, delivery, func(transformed harness.WorkerDelivery) error {
 		return router.DeliverEvent(ctx, c.Channel, c.Conversation, transformed.ReceiptID(), transformed.Event)
 	})
+}
+
+func (s *Service) workerConversationRouter(c harness.WorkerConversation) (channel.ConversationEventRouter, error) {
+	if c.Channel != "telegram" && c.Channel != "whatsapp" {
+		return nil, nil
+	}
+	cfg := s.Settings.Snapshot()
+	if c.Channel == "telegram" && !cfg.Channels.Telegram.Enabled || c.Channel == "whatsapp" && !cfg.Channels.WhatsApp.Enabled {
+		return nil, errors.New("retained conversation transport is disabled")
+	}
+	if err := s.validateOrigin(orchestrator.Origin{Channel: c.Channel, Conversation: c.Conversation}); err != nil {
+		return nil, err
+	}
+	router, ok := s.conversationDelivery().(channel.ConversationEventRouter)
+	if !ok {
+		return nil, errors.New("retained conversation response router unavailable")
+	}
+	return router, nil
 }
 
 // AdmitWorkerConversation runs inside the worker's existing owner fence.

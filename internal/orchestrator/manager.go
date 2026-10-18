@@ -68,6 +68,7 @@ type Manager struct {
 	JobDelivery              func(id int, delivery harness.WorkerDelivery) error
 	JobFinished              func(id int)
 	ConversationAttached     func(harness.WorkerExecution) (int, error)
+	ConversationStarted      func(harness.WorkerConversation) (int, error)
 	ConversationDelivery     func(context.Context, int, harness.WorkerDelivery) error
 	Cleanup                  func(context.Context, int) (string, error)
 	NotificationContext      func(Origin) (string, error)
