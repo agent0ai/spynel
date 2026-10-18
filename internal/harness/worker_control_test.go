@@ -143,6 +143,70 @@ func TestWorkerControlTimeoutPreservesExecutionAndReleasesOwnership(t *testing.T
 	t.Logf("permanently unacknowledged steer retained worker PID=%d start=%s generation=%s; renewal, takeover, deduplication and successor interruption passed", f.info.PID, f.info.Process.StartTime, f.info.Process.Generation)
 }
 
+func TestWorkerInterruptTimeoutRetainsIntentAndReleasesOwnership(t *testing.T) {
+	release := filepath.Join(t.TempDir(), "release-interrupt")
+	t.Setenv("SPYNEL_TEST_CODEX_DELAY_INTERRUPT", release)
+	f := newWorkerFixture(t, "codex", "codex-worker")
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0600) })
+	send := WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/interrupt-timeout", Prompt: "original"}
+	first := f.mustCall(t, send).Executions[0]
+	interrupt := WorkerRequest{Action: "interrupt", Key: send.Key, WorkerID: f.info.ID, InstanceID: f.owner.ID(), TermToken: f.term}
+	f.client.Timeout = 8 * time.Second
+	started := time.Now()
+	reply, status := f.call(interrupt)
+	if status != http.StatusOK || reply.Error != context.DeadlineExceeded.Error() || reply.Interrupted || time.Since(started) > 7*time.Second {
+		t.Fatalf("interrupt acknowledgement was not bounded and honest: status=%d reply=%+v elapsed=%s", status, reply, time.Since(started))
+	}
+	f.client.Timeout = time.Second
+	retained := f.mustCall(t, WorkerRequest{Action: "inspect"}).Executions[0]
+	if retained.Done || !retained.Cancelled || retained.ThreadID != first.ThreadID || retained.LastCursor <= first.LastCursor {
+		t.Fatal("uncertain interruption lost its intent or ongoing execution")
+	}
+	if _, renewed, err := f.owner.Renew(f.term); err != nil || !renewed {
+		t.Fatal("interrupt timeout retained the election fence:", renewed, err)
+	}
+	f.replaceOwner(t)
+	if err := updater.VerifyProcess(f.info.Process); err != nil {
+		t.Fatal("interrupt timeout replaced the native worker:", err)
+	}
+	if _, status := f.rawCall(interrupt, f.token); status != http.StatusForbidden {
+		t.Fatal("obsolete controller could interrupt")
+	}
+	if duplicate := f.mustCall(t, send).Executions[0]; !duplicate.Cancelled || duplicate.Sequence != first.Sequence || duplicate.Done {
+		t.Fatal("replacement lost the uncertain cancellation fence")
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		retained = f.mustCall(t, WorkerRequest{Action: "inspect"}).Executions[0]
+		if retained.Done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("late provider terminal did not settle")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !retained.Cancelled || retained.Sequence != first.Sequence || retained.ThreadID != first.ThreadID {
+		t.Fatal("late terminal lost cancellation intent")
+	}
+	starts, interrupts := 0, 0
+	for _, record := range readFixtureRecords(t, f.log) {
+		if record.Method == "turn/start" {
+			starts++
+		}
+		if record.Method == "turn/interrupt" {
+			interrupts++
+		}
+	}
+	if starts != 1 || interrupts != 1 {
+		t.Fatalf("timeout/attachment repeated provider work: starts=%d interrupts=%d", starts, interrupts)
+	}
+	t.Logf("interrupt timeout preserved intent and late terminal with worker pid=%d start=%s generation=%s; renewal, takeover and obsolete-controller refusal passed", f.info.PID, f.info.Process.StartTime, f.info.Process.Generation)
+}
+
 func TestWorkerControlsRetainAdapterAndCancellation(t *testing.T) {
 	for _, scenario := range []struct{ name, mode string }{
 		{"codex", "codex-worker"}, {"claude-code", "claude-interrupt"}, {"pi", "pi-interrupt"}, {"acp", "acp-interrupt"},

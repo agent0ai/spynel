@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,63 @@ import (
 	"github.com/agent0ai/spynel/internal/orchestrator"
 	"github.com/agent0ai/spynel/internal/updater"
 )
+
+func TestWorkerWorkflowInterruptTimeoutStaysCancelledAcrossReplacement(t *testing.T) {
+	release := filepath.Join(t.TempDir(), "release-interrupt")
+	t.Setenv("SPYNEL_TEST_WORKER_DELAY_INTERRUPT", release)
+	f := newWorkerAgentFixture(t)
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0600) })
+	if _, err := orchestrator.Create(f.cfg, "tasks", "synthetic delayed cancellation", ""); err != nil {
+		t.Fatal(err)
+	}
+	f.start(t)
+	waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 1 && len(f.service.Runtime.Jobs()) == 1 })
+	execution, job, identity := f.inspect(t)[0], f.service.Runtime.Jobs()[0], f.client.Info()
+	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	defer cancel()
+	started := time.Now()
+	var response string
+	err := f.service.Handle(ctx, core.Message{Channel: "cli", Conversation: "synthetic-operator", Text: fmt.Sprintf("/job kill %d", job.Number)}, func(e core.Event) { response += e.Text })
+	if err != nil || !strings.Contains(response, context.DeadlineExceeded.Error()) || strings.Contains(response, "Kill requested") || time.Since(started) > 7*time.Second {
+		t.Fatalf("uncertain job kill was not bounded and honest: response=%q err=%v elapsed=%s", response, err, time.Since(started))
+	}
+	retained := f.inspect(t)[0]
+	if retained.Done || !retained.Cancelled || retained.Sequence != execution.Sequence {
+		t.Fatal("unacknowledged cancellation released its live execution")
+	}
+	f.stop(t)
+	if err := f.owner.Release(f.term); err != nil {
+		t.Fatal(err)
+	}
+	f.open(t)
+	if f.client.Info().Process != identity.Process || updater.VerifyProcess(identity.Process) != nil {
+		t.Fatal("replacement changed worker identity")
+	}
+	f.start(t)
+	waitWorkerAgent(t, func() bool { return len(f.service.Runtime.Jobs()) == 1 })
+	current := f.service.Runtime.Jobs()[0]
+	if current.Number != job.Number || current.Generation != job.Generation || current.StableID != job.StableID || current.ProviderIterations != 1 {
+		t.Fatal("replacement lost original job identity/counters")
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 0 && len(f.service.Runtime.Jobs()) == 0 })
+	for scan := 0; scan < 2; scan++ {
+		if err := f.service.Orchestrator.ScanOnce(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.service.Orchestrator.Wait()
+	lease, ok := f.service.Orchestrator.LeaseForSession(execution.Key)
+	doc, err := orchestrator.ReadDocument(execution.Workflow.File)
+	methods, readErr := os.ReadFile(f.log)
+	if !ok || lease.State != "cancelled" || err != nil || doc.FrontMatter["provider_iterations"] != 1 ||
+		readErr != nil || strings.Count(string(methods), "turn/start\n") != 1 || strings.Count(string(methods), "turn/interrupt\n") != 1 || len(f.inspect(t)) != 0 {
+		t.Fatal("late interruption recovered cancelled work or repeated provider admission", lease.State, err, readErr)
+	}
+	t.Logf("job kill timeout and late terminal preserved same job/counters and cancelled lease across replacement; worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
+}
 
 func TestWorkerWorkflowControlsAcrossManagerReplacement(t *testing.T) {
 	for _, scenario := range []string{"successor-control", "obsolete-continuation", "cancelled"} {

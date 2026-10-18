@@ -663,6 +663,14 @@ func runCodexFixture(mode string) int {
 			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{"turnId": "turn_test"}})
 		case "turn/interrupt":
+			if release := os.Getenv("SPYNEL_TEST_CODEX_DELAY_INTERRUPT"); release != "" {
+				for {
+					if _, err := os.Stat(release); err == nil {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{}})
 			write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thr_stop", "turn": map[string]any{"id": "turn_stop", "status": "interrupted"}}})
 		case "model/list":

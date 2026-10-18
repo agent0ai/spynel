@@ -89,8 +89,11 @@ func (h *workerHost) interrupt(key string) WorkerReply {
 		}
 	}
 	h.mu.Unlock()
-	interrupted, err := h.supervisor.Interrupt(context.Background(), key)
-	if err != nil || !interrupted {
+	ctx, cancel := context.WithTimeout(h.supervisor.ctx, 5*time.Second)
+	defer cancel()
+	interrupted, err := h.supervisor.Interrupt(ctx, key)
+	// A timed-out acknowledgement cannot undo intent: a late terminal must not recover cancelled work.
+	if (err != nil || !interrupted) && ctx.Err() == nil {
 		h.mu.Lock()
 		for _, execution := range marked {
 			execution.Cancelled = false

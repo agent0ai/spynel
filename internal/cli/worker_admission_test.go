@@ -50,7 +50,16 @@ func runWorkerAdmissionProvider() int {
 		}
 		result := map[string]any{}
 		switch request.Method {
-		case "initialize", "turn/interrupt":
+		case "initialize":
+		case "turn/interrupt":
+			if release := os.Getenv("SPYNEL_TEST_WORKER_DELAY_INTERRUPT"); release != "" {
+				for {
+					if _, err := os.Stat(release); err == nil {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
 		case "model/list":
 			result["data"] = []any{map[string]any{"id": "model-a", "model": "model-a", "isDefault": true, "supportedReasoningEfforts": []any{map[string]string{"reasoningEffort": "high"}}, "serviceTiers": []any{map[string]string{"id": "priority", "name": "Priority"}}}}
 		case "turn/steer":
