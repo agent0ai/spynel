@@ -663,6 +663,9 @@ func runCodexFixture(mode string) int {
 			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{"turnId": "turn_test"}})
 		case "turn/interrupt":
+			if os.Getenv("SPYNEL_TEST_CODEX_DISCONNECT_INTERRUPT") == "1" {
+				return 0
+			}
 			if release := os.Getenv("SPYNEL_TEST_CODEX_DELAY_INTERRUPT"); release != "" {
 				for {
 					if _, err := os.Stat(release); err == nil {

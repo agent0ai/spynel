@@ -202,6 +202,7 @@ type ConversationSender interface {
 type Harness interface {
 	Start(context.Context) error
 	Send(context.Context, string, string, core.Emit) (threadID string, steered bool, err error)
+	// Errors leave interruption uncertain; false with nil error means no interruption was needed.
 	Interrupt(context.Context, string) (bool, error)
 	ResetSession(string) error
 	ThreadID(string) string

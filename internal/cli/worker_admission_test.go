@@ -52,6 +52,9 @@ func runWorkerAdmissionProvider() int {
 		switch request.Method {
 		case "initialize":
 		case "turn/interrupt":
+			if os.Getenv("SPYNEL_TEST_WORKER_DISCONNECT_INTERRUPT") == "1" {
+				return 0
+			}
 			if release := os.Getenv("SPYNEL_TEST_WORKER_DELAY_INTERRUPT"); release != "" {
 				for {
 					if _, err := os.Stat(release); err == nil {

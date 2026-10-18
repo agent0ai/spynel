@@ -73,7 +73,7 @@ func (h *workerHost) control(request WorkerRequest) WorkerReply {
 }
 
 // Persist intent before provider interruption, including synchronous terminal
-// callbacks. A rejected interrupt restores only this serialized attempt.
+// callbacks. Only a clean no-interruption result restores this attempt.
 func (h *workerHost) interrupt(key string) WorkerReply {
 	h.mu.Lock()
 	var marked []*workerExecution
@@ -92,8 +92,8 @@ func (h *workerHost) interrupt(key string) WorkerReply {
 	ctx, cancel := context.WithTimeout(h.supervisor.ctx, 5*time.Second)
 	defer cancel()
 	interrupted, err := h.supervisor.Interrupt(ctx, key)
-	// A timed-out acknowledgement cannot undo intent: a late terminal must not recover cancelled work.
-	if (err != nil || !interrupted) && ctx.Err() == nil {
+	// An error cannot prove rejection: a terminal may already follow an unacknowledged interrupt.
+	if err == nil && !interrupted && ctx.Err() == nil {
 		h.mu.Lock()
 		for _, execution := range marked {
 			execution.Cancelled = false

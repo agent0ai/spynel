@@ -74,6 +74,58 @@ func TestWorkerWorkflowInterruptTimeoutStaysCancelledAcrossReplacement(t *testin
 	t.Logf("job kill timeout and late terminal preserved same job/counters and cancelled lease across replacement; worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
 }
 
+func TestWorkerWorkflowInterruptTransportFailureStaysCancelledAcrossReplacement(t *testing.T) {
+	t.Setenv("SPYNEL_TEST_WORKER_DISCONNECT_INTERRUPT", "1")
+	f := newWorkerAgentFixture(t)
+	if _, err := orchestrator.Create(f.cfg, "tasks", "synthetic disconnected cancellation", ""); err != nil {
+		t.Fatal(err)
+	}
+	f.start(t)
+	waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 1 && len(f.service.Runtime.Jobs()) == 1 })
+	execution, job, identity := f.inspect(t)[0], f.service.Runtime.Jobs()[0], f.client.Info()
+	// Detach consumption so the terminal remains available for successor attachment.
+	f.cancel()
+	<-f.done
+	f.cancel = nil
+	f.service.Orchestrator.Wait()
+	started := time.Now()
+	var response string
+	err := f.service.Handle(t.Context(), core.Message{Channel: "cli", Conversation: "synthetic-operator", Text: fmt.Sprintf("/job kill %d", job.Number)}, func(e core.Event) { response += e.Text })
+	if err != nil || !strings.Contains(response, "Cannot kill job") || strings.Contains(response, "Kill requested") || time.Since(started) >= 5*time.Second {
+		t.Fatalf("disconnected job kill was not an honest pre-deadline error: response=%q err=%v", response, err)
+	}
+	retained := f.inspect(t)[0]
+	if !retained.Done || !retained.Cancelled || retained.Sequence != execution.Sequence {
+		t.Fatal("disconnected cancellation lost its terminal intent")
+	}
+	f.stop(t)
+	if err := f.owner.Release(f.term); err != nil {
+		t.Fatal(err)
+	}
+	f.open(t)
+	if f.client.Info().Process != identity.Process || updater.VerifyProcess(identity.Process) != nil {
+		t.Fatal("replacement changed worker identity")
+	}
+	f.start(t)
+	waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 0 && len(f.service.Runtime.Jobs()) == 0 })
+	for scan := 0; scan < 2; scan++ {
+		if err := f.service.Orchestrator.ScanOnce(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.service.Orchestrator.Wait()
+	lease, ok := f.service.Orchestrator.LeaseForSession(execution.Key)
+	doc, err := orchestrator.ReadDocument(execution.Workflow.File)
+	archived, _, archiveErr := f.service.Runtime.ArchivedJob(job.Number)
+	methods, readErr := os.ReadFile(f.log)
+	if !ok || lease.State != "cancelled" || err != nil || doc.FrontMatter["provider_iterations"] != 1 ||
+		archiveErr != nil || archived.ID != job.StableID || archived.Number != job.Number || archived.Generation != job.Generation ||
+		readErr != nil || strings.Count(string(methods), "turn/start\n") != 1 || strings.Count(string(methods), "turn/interrupt\n") != 1 {
+		t.Fatal("transport failure recovered cancelled work or changed its job/counters", lease.State, err, archiveErr, readErr)
+	}
+	t.Logf("disconnected job kill preserved same job/counters and cancelled lease across replacement; worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
+}
+
 func TestWorkerWorkflowControlsAcrossManagerReplacement(t *testing.T) {
 	for _, scenario := range []string{"successor-control", "obsolete-continuation", "cancelled"} {
 		t.Run(scenario, func(t *testing.T) {

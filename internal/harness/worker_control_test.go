@@ -5,7 +5,6 @@ package harness
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -73,8 +72,8 @@ func TestWorkerBlockedProviderInputReleasesOwnership(t *testing.T) {
 	if reply, status := f.call(WorkerRequest{Action: "interrupt", Key: send.Key}); status != http.StatusOK || reply.Error == "" || reply.Interrupted {
 		t.Fatalf("closed provider input invented successful interruption: status=%d reply=%+v", status, reply)
 	}
-	if f.mustCall(t, WorkerRequest{Action: "inspect"}).Executions[0].Cancelled {
-		t.Fatal("rejected interruption left accepted cancellation intent")
+	if !f.mustCall(t, WorkerRequest{Action: "inspect"}).Executions[0].Cancelled {
+		t.Fatal("failed interruption lost cancellation intent")
 	}
 	starts, effects := 0, 0
 	for _, record := range readFixtureRecords(t, f.log) {
@@ -250,11 +249,11 @@ func TestWorkerControlsRetainAdapterAndCancellation(t *testing.T) {
 	}
 }
 
-func TestWorkerCancellationPersistenceAndRejectedInterrupt(t *testing.T) {
-	for _, brokenStorage := range []bool{false, true} {
-		t.Run(fmt.Sprint(brokenStorage), func(t *testing.T) {
+func TestWorkerCancellationPersistenceAndFailedInterrupt(t *testing.T) {
+	for _, mode := range []string{"error", "inactive", "storage"} {
+		t.Run(mode, func(t *testing.T) {
 			root := t.TempDir()
-			target := &supervisorHarness{name: "synthetic", active: map[string]bool{}, emits: map[string]core.Emit{}, interruptErr: errors.New("synthetic refused interrupt")}
+			target := &supervisorHarness{name: "synthetic", active: map[string]bool{}, emits: map[string]core.Emit{}, interruptErr: errors.New("synthetic interrupt failure")}
 			supervisor := NewSupervisor(NewRegistry(), HarnessConfig{Cwd: root})
 			supervisor.current, supervisor.ctx = target, context.Background()
 			host := &workerHost{supervisor: supervisor, directory: root, next: 1, stop: make(chan struct{}), executions: map[uint64]*workerExecution{}}
@@ -262,7 +261,12 @@ func TestWorkerCancellationPersistenceAndRejectedInterrupt(t *testing.T) {
 				t.Fatal(reply.Error)
 			}
 			defer host.executions[1].file.Close()
-			if brokenStorage {
+			if mode == "inactive" {
+				target.interruptErr = nil
+				delete(target.active, "synthetic")
+				delete(supervisor.active, "synthetic")
+			}
+			if mode == "storage" {
 				path := filepath.Join(root, "1.jsonl.admission")
 				if err := os.Remove(path); err != nil {
 					t.Fatal(err)
@@ -271,12 +275,55 @@ func TestWorkerCancellationPersistenceAndRejectedInterrupt(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if reply := host.interrupt("synthetic"); reply.Error == "" || reply.Interrupted {
+			if reply := host.interrupt("synthetic"); (reply.Error != "") != (mode != "inactive") || reply.Interrupted {
 				t.Fatal("failed cancellation reported success")
 			}
-			if brokenStorage != (host.failure != nil) || !target.IsActive("synthetic") || !brokenStorage && host.executions[1].Cancelled {
+			if (mode == "storage") != (host.failure != nil) || target.IsActive("synthetic") != (mode != "inactive") || host.executions[1].Cancelled != (mode != "inactive") {
 				t.Fatal("failed cancellation lost its storage fence or changed the provider")
 			}
 		})
 	}
+}
+
+func TestWorkerInterruptTransportFailureRetainsIntent(t *testing.T) {
+	t.Setenv("SPYNEL_TEST_CODEX_DISCONNECT_INTERRUPT", "1")
+	f := newWorkerFixture(t, "codex", "codex-worker")
+	send := WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/interrupt-disconnect", Prompt: "original"}
+	first := f.mustCall(t, send).Executions[0]
+	interrupt := WorkerRequest{Action: "interrupt", Key: send.Key, WorkerID: f.info.ID, InstanceID: f.owner.ID(), TermToken: f.term}
+	started := time.Now()
+	reply, status := f.call(interrupt)
+	if status != http.StatusOK || reply.Error == "" || reply.Interrupted || time.Since(started) >= 5*time.Second {
+		t.Fatalf("disconnected interruption was not an honest pre-deadline error: status=%d reply=%+v", status, reply)
+	}
+	retained := f.mustCall(t, WorkerRequest{Action: "inspect"}).Executions[0]
+	if !retained.Done || !retained.Cancelled || retained.ThreadID != first.ThreadID || retained.Sequence != first.Sequence {
+		t.Fatal("transport failure undid cancellation intent after the provider terminal")
+	}
+	if _, renewed, err := f.owner.Renew(f.term); err != nil || !renewed {
+		t.Fatal("transport failure retained ownership:", renewed, err)
+	}
+	f.replaceOwner(t)
+	if err := updater.VerifyProcess(f.info.Process); err != nil {
+		t.Fatal("transport failure replaced worker identity:", err)
+	}
+	if _, status := f.rawCall(interrupt, f.token); status != http.StatusForbidden {
+		t.Fatal("obsolete controller could interrupt")
+	}
+	if replay := f.mustCall(t, send).Executions[0]; !replay.Cancelled || !replay.Done || replay.Sequence != first.Sequence {
+		t.Fatal("replacement lost the cancellation result")
+	}
+	starts, interrupts := 0, 0
+	for _, record := range readFixtureRecords(t, f.log) {
+		if record.Method == "turn/start" {
+			starts++
+		}
+		if record.Method == "turn/interrupt" {
+			interrupts++
+		}
+	}
+	if starts != 1 || interrupts != 1 {
+		t.Fatalf("disconnected interruption repeated provider work: starts=%d interrupts=%d", starts, interrupts)
+	}
+	t.Logf("transport failure preserved cancellation after terminal on worker pid=%d start=%s generation=%s", f.info.PID, f.info.Process.StartTime, f.info.Process.Generation)
 }
