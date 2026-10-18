@@ -374,15 +374,22 @@ func signalRegisteredProcess(record ProcessRegistration, signal os.Signal) error
 
 // VerifyProcess checks the same native identity used before signalling without
 // sending a signal. Only a confirmed dead/zombie process returns ESRCH.
-func VerifyProcess(record ProcessRegistration) error {
+func VerifyProcess(record ProcessRegistration) (err error) {
 	if record.PID <= 1 {
 		return errors.New("invalid Spynel process identity")
 	}
+	defer func() {
+		if err != nil {
+			// Graceful exit can race any of the identity/registration reads.
+			if !processAlive(record.PID) {
+				err = syscall.ESRCH
+			} else if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+				err = fmt.Errorf("cannot verify live Spynel process: %v", err)
+			}
+		}
+	}()
 	alive, start, err := inspectProcess(record.PID)
 	if err != nil {
-		if (errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH)) && !processAlive(record.PID) {
-			return syscall.ESRCH
-		}
 		return err
 	}
 	if !alive {
@@ -400,12 +407,20 @@ func VerifyProcess(record ProcessRegistration) error {
 	}
 	if record.Generation != "" {
 		current, err := ProcessRecord(record.PID)
-		if err != nil || current.Generation != record.Generation {
+		if errors.Is(err, os.ErrNotExist) {
+			return errProcessUnregistered
+		}
+		if err != nil {
+			return fmt.Errorf("cannot read Spynel process registration: %v", err)
+		}
+		if current.Generation != record.Generation {
 			return errors.New("Spynel generation changed")
 		}
 	}
 	return nil
 }
+
+var errProcessUnregistered = errors.New("Spynel process registration is missing")
 
 // KillAll stops verified Spynel processes, including older releases and
 // different installations. Normal termination retains provider cleanup.
@@ -428,8 +443,8 @@ func stopProcessRecords(ctx context.Context, records []ProcessRegistration) erro
 		if !record.Supervisor {
 			continue
 		}
-		if err := signalRegisteredProcess(record, terminationSignal()); !processGone(err) {
-			return err
+		if err := signalRegisteredProcess(record, terminationSignal()); !processGone(err) && !errors.Is(err, errProcessUnregistered) {
+			return fmt.Errorf("cannot stop Spynel process %d: %w", record.PID, err)
 		}
 		deadline := time.NewTimer(2 * time.Second)
 		for {
@@ -458,20 +473,21 @@ func stopProcessRecords(ctx context.Context, records []ProcessRegistration) erro
 		if record.Supervisor {
 			continue
 		}
-		if err := signalRegisteredProcess(record, terminationSignal()); !processGone(err) {
-			return err
+		if err := signalRegisteredProcess(record, terminationSignal()); !processGone(err) && !errors.Is(err, errProcessUnregistered) {
+			return fmt.Errorf("cannot stop Spynel process %d: %w", record.PID, err)
 		}
 	}
 	killAt := time.Now().Add(10 * time.Second)
 	deadline := killAt.Add(5 * time.Second)
 	for _, record := range records {
 		for {
-			if !processAlive(record.PID) {
+			err := VerifyProcess(record)
+			if errors.Is(err, syscall.ESRCH) {
 				break
 			}
-			path, err := installationProcessPath(record.PID)
-			if err == nil && !processMatches(record, path) {
-				break
+			// Unregistration never authorizes a signal or proves exit.
+			if err != nil && !errors.Is(err, errProcessUnregistered) {
+				return fmt.Errorf("cannot verify stopping Spynel process %d: %w", record.PID, err)
 			}
 			if time.Now().After(deadline) {
 				if err != nil {

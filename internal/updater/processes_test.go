@@ -83,10 +83,109 @@ func TestLifecycleProcessFixture(t *testing.T) {
 		}
 	}
 	if supervised {
+		if dependent := os.Getenv("SPYNEL_TEST_STOP_DEPENDENT"); dependent != "" {
+			pid, err := strconv.Atoi(dependent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				if _, err := ProcessRecord(pid); errors.Is(err, os.ErrNotExist) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("dependent did not unregister")
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
 		if err := SetExecutor(0, false, true); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if os.Getenv("SPYNEL_TEST_UNREGISTER_BEFORE_EXIT") == "1" {
+		closeRecord()
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func TestStopWaitsForUnregisteredDependentExit(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SPYNEL_TEST_UNREGISTER_BEFORE_EXIT", "1")
+	dependent := lifecycleFixture(t, t.TempDir())
+	t.Setenv("SPYNEL_TEST_UNREGISTER_BEFORE_EXIT", "0")
+	t.Setenv("SPYNEL_TEST_SUPERVISOR", "1")
+	t.Setenv("SPYNEL_TEST_STOP_DEPENDENT", strconv.Itoa(dependent.Process.Pid))
+	supervisor := lifecycleFixture(t, t.TempDir())
+	records, err := processRecords([]int{supervisor.Process.Pid, dependent.Process.Pid})
+	if err != nil || len(records) != 2 {
+		t.Fatalf("stop discovery = %v, %v", records, err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := stopProcessRecords(ctx, records); err != nil {
+		t.Fatal(err)
+	}
+	for _, record := range records {
+		if !errors.Is(VerifyProcess(record), syscall.ESRCH) {
+			t.Fatal("shutdown succeeded before confirmed native exit")
+		}
+	}
+}
+
+func TestUnregisteredLiveProcessIsNotDeadOrSignalled(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	fixture := lifecycleFixture(t, t.TempDir())
+	record, err := ProcessRecord(fixture.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, _ := processDirectory()
+	if err := os.Remove(filepath.Join(directory, strconv.Itoa(record.PID)+".json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyProcess(record); err == nil || processGone(err) {
+		t.Fatalf("missing live registration treated as verified/dead: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	if err := stopProcessRecords(ctx, []ProcessRegistration{record}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unregistered live stop = %v", err)
+	}
+	if !processAlive(record.PID) {
+		t.Fatal("unregistered live process was signalled")
+	}
+}
+
+func TestUnregisteredSupervisorCannotAuthorizeDependentStop(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	dependent := lifecycleFixture(t, t.TempDir())
+	t.Setenv("SPYNEL_TEST_SUPERVISOR", "1")
+	supervisor := lifecycleFixture(t, t.TempDir())
+	records, err := processRecords([]int{supervisor.Process.Pid, dependent.Process.Pid})
+	if err != nil || len(records) != 2 {
+		t.Fatalf("stop discovery = %v, %v", records, err)
+	}
+	directory, _ := processDirectory()
+	if err := os.Remove(filepath.Join(directory, strconv.Itoa(supervisor.Process.Pid)+".json")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	if err := stopProcessRecords(ctx, records); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unacknowledged supervisor stop = %v", err)
+	}
+	for _, record := range records {
+		if !processAlive(record.PID) {
+			t.Fatal("unacknowledged supervisor authorized a signal")
+		}
 	}
 }
 
