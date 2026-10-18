@@ -44,6 +44,26 @@ func (m *Manager) Interrupt(ctx context.Context, key string) (bool, error) {
 	if m.Worker == nil {
 		return false, errors.New("workflow worker control is unavailable")
 	}
-	reply, err := m.Worker.Call(ctx, harness.WorkerRequest{Action: "interrupt", Key: key})
-	return reply.Interrupted, err
+	m.workerAdmissionMu.Lock()
+	defer m.workerAdmissionMu.Unlock()
+	snapshot, err := m.Worker.Call(ctx, harness.WorkerRequest{Action: "inspect"})
+	if err != nil {
+		return false, err
+	}
+	for _, execution := range snapshot.Executions {
+		if execution.Key == key {
+			if m.Harness.IsActive(key) {
+				return false, errors.New("session has conflicting execution owners")
+			}
+			reply, err := m.Worker.Call(ctx, harness.WorkerRequest{Action: "interrupt", Key: key})
+			return reply.Interrupted, err
+		}
+	}
+	var stopped bool
+	err = m.Worker.RunOwned(ctx, func() error {
+		var err error
+		stopped, err = m.Harness.Interrupt(ctx, key)
+		return err
+	})
+	return stopped, err
 }

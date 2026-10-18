@@ -1177,7 +1177,11 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		if hasJob {
 			job, hasJob = s.Runtime.ReserveJobCancellation(job.ID)
 		}
-		stopped, err := s.Harness.Interrupt(ctx, key)
+		interrupt := s.Harness.Interrupt
+		if s.Orchestrator.Worker != nil {
+			interrupt = s.Orchestrator.Interrupt
+		}
+		stopped, err := interrupt(ctx, key)
 		if err != nil {
 			if hasJob {
 				s.Runtime.RestoreJobAfterFailedCancellation(job)
