@@ -279,6 +279,85 @@ func TestWorkerConversationNativeReservedRecoveryAndLostSendReply(t *testing.T) 
 	}
 }
 
+func TestWorkerConversationNativeSendFailureSettlesAfterReplacement(t *testing.T) {
+	for _, scenario := range []string{"normal", "lost-commit"} {
+		t.Run(scenario, func(t *testing.T) {
+			t.Setenv("SPYNEL_TEST_WORKER_REJECT_START", "1")
+			f := newWorkerAgentFixture(t)
+			c := &harness.WorkerConversation{Channel: "cli", Conversation: "send-failure", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
+			if _, err := f.service.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic", AcceptedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			key := "chat:cli:send-failure"
+			id, err := f.service.Runtime.TryBeginJobWithDetails(key, c.Channel, c.Conversation, "synthetic", app.JobDetails{Kind: "conversation", WorkID: c.ExecutionID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			original, _ := f.service.Runtime.Job(id)
+			identity := f.client.Info()
+			t.Logf("failed-send worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
+			request := harness.WorkerRequest{Action: "send", Sequence: 1, Key: key, Prompt: "synthetic", Conversation: c}
+			reply, err := f.client.Call(t.Context(), request)
+			if err != nil || len(reply.Executions) != 1 || !reply.Executions[0].SourcesReserved || !reply.Executions[0].Done || reply.Executions[0].Error == "" {
+				t.Fatal("provider refusal did not retain its failed admission", err)
+			}
+			page, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "events", Sequence: 1})
+			if err != nil || len(page.Events) == 0 || page.Events[len(page.Events)-1].Event.Kind != core.EventError || !page.Events[len(page.Events)-1].Event.Done {
+				t.Fatal("failed provider Send has no durable terminal event", err)
+			}
+			f.stop(t)
+			if err := f.owner.Release(f.term); err != nil {
+				t.Fatal(err)
+			}
+			f.open(t)
+			if f.client.Info().ID != identity.ID || f.client.Info().Process != identity.Process {
+				t.Fatal("failed admission attachment replaced the worker")
+			}
+			restored := make(chan app.Job, 1)
+			attach := f.service.Orchestrator.ConversationAttached
+			f.service.Orchestrator.ConversationAttached = func(execution harness.WorkerExecution) (int, error) {
+				id, err := attach(execution)
+				if err == nil {
+					job, _ := f.service.Runtime.Job(id)
+					select {
+					case restored <- job:
+					default:
+					}
+				}
+				return id, err
+			}
+			if scenario == "lost-commit" {
+				f.client.Close()
+				restore := dropWorkerReply(t, f.client.Info().Socket, "commit", true, false)
+				defer restore()
+			}
+			f.cfg.Orchestrator.IntervalSec = 1
+			f.service.Orchestrator.ApplyRuntimeConfig(f.cfg)
+			f.start(t)
+			waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 0 })
+			job := <-restored
+			if job.StableID != original.StableID || job.Number != original.Number || job.Generation != original.Generation || job.ProviderIterations != 1 {
+				t.Fatal("failed admission attachment changed its job or counters")
+			}
+			entries, _, err := f.service.History.Entries(c.Channel, c.Conversation)
+			terminals := 0
+			for _, entry := range entries {
+				if entry.Terminal {
+					terminals++
+					if entry.Role != "error" || entry.Outcome != "terminal_error" || entry.ExecutionID != c.ExecutionID || strings.Join(entry.Covers, ",") != "source" {
+						t.Fatal("failed admission lost exact terminal coverage")
+					}
+				}
+			}
+			window, windowErr := f.service.History.RecoveryWindow(c.Channel, c.Conversation, time.Time{}, 20)
+			methods, readErr := os.ReadFile(f.log)
+			if err != nil || windowErr != nil || readErr != nil || terminals != 1 || window.Covered["source"] != "terminal_coverage" || f.service.Runtime.Status().Jobs != 0 || strings.Count(string(methods), "turn/start\n") != 1 || strings.Contains(string(methods), "selection:") {
+				t.Fatal("failed admission did not settle once without a new provider attempt", err, windowErr, readErr)
+			}
+		})
+	}
+}
+
 func TestWorkerConversationScheduledAttachment(t *testing.T) {
 	for _, scenario := range []string{"normal", "lost-commit", "tui", "tui-lost-commit"} {
 		t.Run(scenario, func(t *testing.T) {

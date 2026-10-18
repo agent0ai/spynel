@@ -5,6 +5,7 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -18,6 +19,109 @@ import (
 type workerStorageHarness struct {
 	*supervisorHarness
 	afterSend func()
+}
+
+type workerSendErrorHarness struct {
+	*supervisorHarness
+	beforeReturn func(core.Emit)
+	sends        int
+}
+
+func (h *workerSendErrorHarness) SendWithModel(_ context.Context, _, _, _ string, emit core.Emit) (string, bool, error) {
+	h.sends++
+	h.beforeReturn(emit)
+	return "synthetic-thread", false, errors.New("synthetic provider admission refused")
+}
+
+func TestWorkerSendFailureHasOneDurableTerminal(t *testing.T) {
+	for _, role := range []string{"conversation", "workflow", "agent"} {
+		for _, mode := range []string{"return-only", "already-terminal", "journal-failure"} {
+			t.Run(role+"/"+mode, func(t *testing.T) {
+				root := t.TempDir()
+				target := &workerSendErrorHarness{supervisorHarness: &supervisorHarness{active: map[string]bool{}, emits: map[string]core.Emit{}}}
+				supervisor := NewSupervisor(NewRegistry(), HarnessConfig{Cwd: root})
+				supervisor.current, supervisor.ctx = target, context.Background()
+				host := &workerHost{supervisor: supervisor, directory: root, next: 1, executions: map[uint64]*workerExecution{}, stop: make(chan struct{})}
+				defer func() {
+					for _, execution := range host.executions {
+						_ = execution.file.Close()
+					}
+				}()
+				reservations := 0
+				host.conversation = func(string, string, WorkerConversation, string) error { reservations++; return nil }
+				host.workflow = func(string, string, WorkerWorkflow, string) (WorkerReservation, error) {
+					reservations++
+					return WorkerReservation{ProviderIterations: 1}, nil
+				}
+				request := WorkerRequest{Sequence: 1, Key: "synthetic", Prompt: "synthetic"}
+				switch role {
+				case "conversation":
+					request.Key = "chat:cli:synthetic"
+					request.Conversation = &WorkerConversation{Channel: "cli", Conversation: "synthetic", ExecutionID: "execution", SourceMessageID: "source", Sources: []string{"source"}}
+				case "workflow":
+					request.Workflow = &WorkerWorkflow{WorkID: "synthetic"}
+				case "agent":
+					request.Key = "orchestrator:semantic-heartbeat"
+					now := time.Now().UTC()
+					request.Agent = &WorkerAgent{ID: "synthetic-agent", Kind: "heartbeat", StartedAt: now, Deadline: now.Add(time.Minute)}
+				}
+				target.beforeReturn = func(emit core.Emit) {
+					emit(core.Event{Kind: core.EventDelta, Text: "useful output 界"})
+					if mode == "already-terminal" {
+						emit(core.Event{Kind: core.EventError, Text: "adapter terminal", Done: true})
+					}
+					if mode == "journal-failure" {
+						if err := host.executions[1].file.Close(); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				reply := host.send(request)
+				execution := host.executions[1]
+				if mode == "journal-failure" {
+					if reply.Error == "" || host.failure == nil || execution.Done || execution.LastCursor != 1 {
+						t.Fatal("unrecorded Send failure was acknowledged as completion")
+					}
+					select {
+					case <-host.stop:
+					default:
+						t.Fatal("failed terminal persistence did not stop the worker")
+					}
+					return
+				}
+				if reply.Error != "" || len(reply.Executions) != 1 || !execution.Done || execution.Error != "synthetic provider admission refused" || execution.LastCursor != 2 {
+					t.Fatal("failed provider Send has no single durable terminal")
+				}
+				page := host.events(WorkerRequest{Sequence: 1})
+				if page.Error != "" || len(page.Events) != 2 {
+					t.Fatal("failed dispatch journal cannot be replayed")
+				}
+				terminal := page.Events[1]
+				want := "synthetic provider admission refused"
+				if mode == "already-terminal" {
+					want = "adapter terminal"
+				}
+				if terminal.Event.Kind != core.EventError || !terminal.Event.Done || terminal.Event.Text != want || terminal.RequestOnly {
+					t.Fatal("failed Send changed or duplicated the terminal")
+				}
+				if role == "conversation" && (!execution.SourcesReserved || terminal.Streamed != "useful output 界" || !reflect.DeepEqual(terminal.Conversation, request.Conversation)) {
+					t.Fatal("failed Send lost reserved sources or useful output")
+				}
+				if retry := host.send(request); retry.Error != "" || target.sends != 1 || role != "agent" && reservations != 1 || execution.LastCursor != 2 {
+					t.Fatal("matching retry repeated dispatch, reservation or terminal capture")
+				}
+				if reply := host.apply(WorkerRequest{Action: "ack", Sequence: 1, After: 2}); reply.Error == "" {
+					t.Fatal("failed dispatch retired before downstream commit")
+				}
+				if reply := host.commit(WorkerRequest{Sequence: 1, Expected: 0, After: 2}); reply.Error != "" {
+					t.Fatal(reply.Error)
+				}
+				if reply := host.apply(WorkerRequest{Action: "ack", Sequence: 1, After: 2}); reply.Error != "" || len(host.executions) != 0 {
+					t.Fatal("committed failed dispatch did not retire", reply.Error)
+				}
+			})
+		}
+	}
 }
 
 func (h *workerStorageHarness) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {

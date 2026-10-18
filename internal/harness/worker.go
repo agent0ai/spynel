@@ -620,13 +620,17 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 	threadID, steered, err := h.supervisor.SendConversation(turnCtx, request.Key, request.Prompt, request.Message, func(event core.Event) {
 		h.capture(execution, event)
 	})
+	if err != nil {
+		h.capture(execution, core.Event{Kind: core.EventError, Text: err.Error(), ThreadID: threadID, Done: true})
+	}
 	h.mu.Lock()
+	if h.failure != nil {
+		h.mu.Unlock()
+		return WorkerReply{Error: "worker event journal unavailable"}
+	}
 	execution.ThreadID, execution.Steered = threadID, steered
 	if err != nil {
-		execution.Error, execution.Done = err.Error(), true
-		if execution.cancel != nil {
-			execution.cancel()
-		}
+		execution.Error = err.Error()
 	}
 	if err := h.saveAdmissionLocked(execution); err != nil {
 		h.failJournalLocked()

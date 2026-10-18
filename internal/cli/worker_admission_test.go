@@ -58,6 +58,12 @@ func runWorkerAdmissionProvider() int {
 		case "thread/start", "thread/resume":
 			result["thread"] = map[string]string{"id": "synthetic-thread"}
 		case "turn/start":
+			if os.Getenv("SPYNEL_TEST_WORKER_REJECT_START") == "1" {
+				if write(map[string]any{"id": request.ID, "error": map[string]any{"code": -32000, "message": "synthetic provider admission refused"}}) != nil {
+					return 1
+				}
+				continue
+			}
 			result["turn"] = map[string]string{"id": "synthetic-turn", "status": "inProgress"}
 		default:
 			continue

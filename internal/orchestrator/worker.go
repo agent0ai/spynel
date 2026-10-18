@@ -74,7 +74,7 @@ func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harne
 			return err
 		}
 		if current.Done && current.CommittedCursor == current.LastCursor {
-			if current.LastCursor == 0 || current.Error != "" {
+			if current.LastCursor == 0 {
 				return errors.New("retained conversation has no confirmed terminal delivery")
 			}
 			m.workerAdmissionMu.Lock()
