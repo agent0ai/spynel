@@ -89,9 +89,10 @@ type WorkerSettings struct {
 // callbacks run under the worker's configuration/dispatch fence, without RPCs.
 type WorkerSettingsAction func(root string, current, next HarnessConfig, settings WorkerSettings) (commit, restore func() error, err error)
 
-// WorkerConversationAction reserves sources inside the worker's existing
-// exact-election fence, without another ownership acquisition or worker RPC.
-type WorkerConversationAction func(root, key string, conversation WorkerConversation, receipt string) error
+// WorkerConversationAction reserves sources when sendErr is nil, or restores
+// the exact ordinary batch after SendNotAdmittedError. It runs inside the
+// worker's existing exact-election fence, without another acquisition or RPC.
+type WorkerConversationAction func(root, key string, conversation WorkerConversation, receipt string, sendErr error) error
 
 type WorkerControl struct {
 	ID                 string
@@ -575,7 +576,7 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 			err = errors.New("worker conversation reservation unavailable")
 		} else {
 			receipt := h.info.ID + ":" + strconv.FormatUint(request.Sequence, 10) + ":admission"
-			err = h.conversation(h.supervisor.HarnessConfig().Cwd, request.Key, *request.Conversation, receipt)
+			err = h.conversation(h.supervisor.HarnessConfig().Cwd, request.Key, *request.Conversation, receipt, nil)
 		}
 		h.mu.Lock()
 		execution.SourcesReserved = err == nil
@@ -636,6 +637,15 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 	})
 	var rejected *SendNotAdmittedError
 	if errors.As(err, &rejected) {
+		if request.Conversation != nil && !request.Conversation.Recovery {
+			receipt := h.info.ID + ":" + strconv.FormatUint(request.Sequence, 10) + ":admission"
+			if restoreErr := h.conversation(h.supervisor.HarnessConfig().Cwd, request.Key, *request.Conversation, receipt, err); restoreErr != nil {
+				h.mu.Lock()
+				h.failJournalLocked()
+				h.mu.Unlock()
+				return WorkerReply{Error: "restore worker conversation admission failed"}
+			}
+		}
 		h.capture(execution, core.Event{Kind: core.EventError, Text: err.Error(), ThreadID: threadID, Done: true})
 	} else if err != nil {
 		// A failed acknowledgement does not establish absence of provider effects.

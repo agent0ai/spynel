@@ -51,7 +51,12 @@ func TestWorkerUnknownSendRetainsExecutionUntilProviderTerminal(t *testing.T) {
 				}
 			})
 			reservations := 0
-			host.conversation = func(string, string, WorkerConversation, string) error { reservations++; return nil }
+			host.conversation = func(_, _ string, _ WorkerConversation, _ string, sendErr error) error {
+				if sendErr == nil {
+					reservations++
+				}
+				return nil
+			}
 			host.workflow = func(string, string, WorkerWorkflow, string) (WorkerReservation, error) {
 				reservations++
 				return WorkerReservation{ProviderIterations: 1}, nil
@@ -130,7 +135,12 @@ func TestWorkerSendFailureHasOneDurableTerminal(t *testing.T) {
 					}
 				}()
 				reservations := 0
-				host.conversation = func(string, string, WorkerConversation, string) error { reservations++; return nil }
+				host.conversation = func(_, _ string, _ WorkerConversation, _ string, sendErr error) error {
+					if sendErr == nil {
+						reservations++
+					}
+					return nil
+				}
 				host.workflow = func(string, string, WorkerWorkflow, string) (WorkerReservation, error) {
 					reservations++
 					return WorkerReservation{ProviderIterations: 1}, nil

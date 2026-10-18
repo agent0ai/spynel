@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -177,13 +178,23 @@ func (s *Service) workerConversationRouter(c harness.WorkerConversation) (channe
 	return router, nil
 }
 
-// AdmitWorkerConversation runs inside the worker's existing owner fence.
-// Recheck canonical remote authorization before reserving any source.
-func AdmitWorkerConversation(root, key string, conversation harness.WorkerConversation, receipt string) error {
+// ApplyWorkerConversation runs inside the worker's existing owner fence.
+// A nil sendErr reserves sources; explicit non-admission restores that batch.
+func ApplyWorkerConversation(root, key string, conversation harness.WorkerConversation, receipt string, sendErr error) error {
 	if conversation.Validate() != nil || key != "chat:"+conversation.Channel+":"+conversation.Conversation {
 		return errors.New("invalid worker conversation admission")
 	}
 	store := history.New(filepath.Join(root, ".spynel", "history"))
+	if sendErr != nil {
+		var rejected *harness.SendNotAdmittedError
+		if !errors.As(sendErr, &rejected) || conversation.Recovery {
+			return errors.New("conversation restoration requires proven ordinary non-admission")
+		}
+		if err := store.RestoreConversationAdmission(conversation.Channel, conversation.Conversation, conversation.ExecutionID, receipt, conversation.Sources); err != nil {
+			return fmt.Errorf("conversation admission restoration could not be saved (%T)", err)
+		}
+		return nil
+	}
 	var cfg config.Config
 	if conversation.Recovery || conversation.Channel == "telegram" || conversation.Channel == "whatsapp" {
 		var err error

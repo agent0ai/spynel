@@ -314,6 +314,10 @@ func TestWorkerConversationNativeSendFailureSettlesAfterReplacement(t *testing.T
 			if err != nil || len(reply.Executions) != 1 || !reply.Executions[0].SourcesReserved || !reply.Executions[0].Done || reply.Executions[0].Error == "" {
 				t.Fatal("provider refusal did not retain its failed admission", err)
 			}
+			unsettled, err := f.service.History.RecoveryWindow(c.Channel, c.Conversation, time.Time{}, 20)
+			if err != nil || unsettled.Admitted["source"] || unsettled.Covered["source"] != "" {
+				t.Fatal("proven provider rejection retained source admission before terminal settlement", err)
+			}
 			page, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "events", Sequence: 1})
 			if err != nil || len(page.Events) == 0 || page.Events[len(page.Events)-1].Event.Kind != core.EventError || !page.Events[len(page.Events)-1].Event.Done {
 				t.Fatal("failed provider Send has no durable terminal event", err)

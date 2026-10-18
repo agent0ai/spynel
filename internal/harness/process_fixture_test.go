@@ -68,7 +68,7 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 		// Protocol fixtures trust synthetic sources; native CLI tests exercise history admission.
-		if err := RunWorker(context.Background(), os.Stdin, os.Stdout, NewBuiltinRegistry(), reserveWorkerFixture, nil, func(string, string, WorkerConversation, string) error { return nil }); err != nil {
+		if err := RunWorker(context.Background(), os.Stdin, os.Stdout, NewBuiltinRegistry(), reserveWorkerFixture, nil, func(string, string, WorkerConversation, string, error) error { return nil }); err != nil {
 			unregister()
 			_, _ = fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)

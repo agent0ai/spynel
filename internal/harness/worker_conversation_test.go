@@ -150,7 +150,7 @@ func TestWorkerConversationReservationFailureNeverDispatches(t *testing.T) {
 			}()
 			calls := 0
 			if failure != "missing-owner" {
-				host.conversation = func(root, key string, conversation WorkerConversation, receipt string) error {
+				host.conversation = func(root, key string, conversation WorkerConversation, receipt string, sendErr error) error {
 					calls++
 					if failure == "refused" {
 						return os.ErrPermission

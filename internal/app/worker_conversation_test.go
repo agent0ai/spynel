@@ -55,7 +55,7 @@ func TestWorkerConversationRechecksRemoteAdmissionPolicy(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				err = AdmitWorkerConversation(cfg.Root, "chat:"+channel+":"+name, c, "worker:1:admission")
+				err = ApplyWorkerConversation(cfg.Root, "chat:"+channel+":"+name, c, "worker:1:admission", nil)
 				after, readErr := os.ReadFile(s.History.Path(channel, name))
 				if scenario == "valid" {
 					if err != nil || readErr != nil || string(before) == string(after) {
@@ -100,7 +100,7 @@ func TestWorkerRecoveryRechecksSourcePolicyBeforeReservation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = AdmitWorkerConversation(cfg.Root, "chat:cli:recover", c, "worker:1:admission")
+			err = ApplyWorkerConversation(cfg.Root, "chat:cli:recover", c, "worker:1:admission", nil)
 			after, readErr := os.ReadFile(s.History.Path(c.Channel, c.Conversation))
 			if scenario == "valid" {
 				if err != nil || readErr != nil || string(before) == string(after) {
