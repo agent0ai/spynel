@@ -137,7 +137,7 @@ func TestWorkerConversationRejectsInvalidDescriptorsBeforeAdmission(t *testing.T
 }
 
 func TestWorkerConversationReservationFailureNeverDispatches(t *testing.T) {
-	for _, failure := range []string{"missing-owner", "refused", "checkpoint"} {
+	for _, failure := range []string{"missing-owner", "refused", "checkpoint", "refusal-journal", "refusal-checkpoint"} {
 		t.Run(failure, func(t *testing.T) {
 			target := &supervisorHarness{name: "synthetic", active: map[string]bool{}, emits: map[string]core.Emit{}}
 			supervisor := NewSupervisor(NewRegistry(), HarnessConfig{Cwd: t.TempDir()})
@@ -155,11 +155,21 @@ func TestWorkerConversationReservationFailureNeverDispatches(t *testing.T) {
 					if failure == "refused" {
 						return os.ErrPermission
 					}
+					if failure == "refusal-journal" {
+						_ = host.executions[1].file.Close()
+						return os.ErrPermission
+					}
 					path := host.executions[1].file.Name() + ".admission"
 					if err := os.Remove(path); err != nil {
 						t.Fatal(err)
 					}
-					return os.Mkdir(path, 0700)
+					if err := os.Mkdir(path, 0700); err != nil {
+						return err
+					}
+					if failure == "refusal-checkpoint" {
+						return os.ErrPermission
+					}
+					return nil
 				}
 			}
 			metadata := &WorkerConversation{Channel: "cli", Conversation: "synthetic", ExecutionID: "execution", SourceMessageID: "source", Sources: []string{"source"}}
@@ -168,7 +178,7 @@ func TestWorkerConversationReservationFailureNeverDispatches(t *testing.T) {
 			if len(target.prompts[request.Key]) != 0 {
 				t.Fatal("failed source reservation dispatched provider work")
 			}
-			if failure == "checkpoint" {
+			if failure == "checkpoint" || failure == "refusal-journal" || failure == "refusal-checkpoint" {
 				if reply.Error == "" || host.failure == nil {
 					t.Fatal("failed reservation checkpoint did not stop the worker")
 				}
@@ -177,10 +187,48 @@ func TestWorkerConversationReservationFailureNeverDispatches(t *testing.T) {
 			if len(reply.Executions) != 1 || !reply.Executions[0].Done || reply.Executions[0].Error == "" || reply.Executions[0].SourcesReserved {
 				t.Fatal("refused source reservation was admitted")
 			}
+			if !reply.Executions[0].ConversationRefused() {
+				t.Fatal("refusal has no durable non-provider outcome")
+			}
+			page := host.events(WorkerRequest{Sequence: 1})
+			if len(page.Events) != 1 || page.Events[0].Event.Kind != core.EventStatus || !page.Events[0].Event.Done {
+				t.Fatal("refusal fabricated a provider terminal")
+			}
 			_ = host.send(request)
 			if calls > 1 || len(target.prompts[request.Key]) != 0 {
 				t.Fatal("matching retry repeated a refused reservation")
 			}
 		})
+	}
+}
+
+func TestWorkerConversationRefusalClassification(t *testing.T) {
+	c := &WorkerConversation{Channel: "cli", Conversation: "synthetic", ExecutionID: "execution", SourceMessageID: "source", Sources: []string{"source"}}
+	base := WorkerExecution{Sequence: 1, Key: "chat:cli:synthetic", Conversation: c, Done: true, Error: "refused", LastCursor: 1}
+	if !base.ConversationRefused() {
+		t.Fatal("journaled source refusal was not recognized")
+	}
+	for _, change := range []func(*WorkerExecution){
+		func(e *WorkerExecution) { e.SourcesReserved = true },
+		func(e *WorkerExecution) { e.Done = false },
+		func(e *WorkerExecution) { e.Error = "" },
+		func(e *WorkerExecution) { e.LastCursor = 0 },
+		func(e *WorkerExecution) { e.LastCursor = 2 },
+		func(e *WorkerExecution) { e.CommittedCursor = 2 },
+		func(e *WorkerExecution) { e.ThreadID = "provider-thread" },
+		func(e *WorkerExecution) { e.Steered = true },
+		func(e *WorkerExecution) { e.Cancelled = true },
+		func(e *WorkerExecution) { e.Workflow = &WorkerWorkflow{} },
+		func(e *WorkerExecution) { e.Agent = &WorkerAgent{} },
+		func(e *WorkerExecution) { e.Reservation = &WorkerReservation{} },
+		func(e *WorkerExecution) { e.Key = "chat:cli:other" },
+		func(e *WorkerExecution) { e.Conversation = nil },
+		func(e *WorkerExecution) { e.Sequence = 0 },
+	} {
+		value := base
+		change(&value)
+		if value.ConversationRefused() {
+			t.Fatalf("ambiguous or dispatched admission classified as a source refusal: %+v", value)
+		}
 	}
 }

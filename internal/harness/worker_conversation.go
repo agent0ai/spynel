@@ -12,6 +12,14 @@ import (
 var workerConversationIdentity = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 var workerConversationName = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9_.-]{0,118}[A-Za-z0-9-])?$`)
 
+// ConversationRefused identifies a journaled source refusal, never a provider result.
+func (e WorkerExecution) ConversationRefused() bool {
+	return e.Conversation.Validate() == nil && e.Key == "chat:"+e.Conversation.Channel+":"+e.Conversation.Conversation &&
+		e.Sequence > 0 && e.Workflow == nil && e.Agent == nil && e.Reservation == nil &&
+		!e.SourcesReserved && e.Done && e.Error != "" && e.ThreadID == "" && !e.Steered && !e.Cancelled &&
+		e.LastCursor == 1 && e.CommittedCursor <= e.LastCursor
+}
+
 // Validate owns the private descriptor schema shared by admission and replay.
 func (c *WorkerConversation) Validate() error {
 	if c == nil || !slices.Contains([]string{"cli", "tui", "telegram", "whatsapp"}, c.Channel) ||

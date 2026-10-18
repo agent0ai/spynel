@@ -72,8 +72,8 @@ func (m *Manager) AdmitConversation(ctx context.Context, conversation harness.Wo
 	return execution, err
 }
 
-// The caller holds the snapshot/election fence. Proven absent or refused
-// admissions end only their provisional job, without conversation effects.
+// The caller holds the snapshot/election fence. Proven absent admissions end
+// only their provisional job; journaled refusals settle through archive delivery.
 func (m *Manager) reconcileConversationAdmissions(executions []harness.WorkerExecution) {
 	retained := map[string]harness.WorkerExecution{}
 	for _, execution := range executions {
@@ -87,8 +87,7 @@ func (m *Manager) reconcileConversationAdmissions(executions []harness.WorkerExe
 		if !strings.HasPrefix(key, "worker-conversation:") {
 			continue
 		}
-		execution, exists := retained[key]
-		if !exists || execution.Done && !execution.SourcesReserved {
+		if _, exists := retained[key]; !exists {
 			absent[key] = id
 		}
 	}

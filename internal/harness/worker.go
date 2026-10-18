@@ -573,7 +573,14 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		h.mu.Lock()
 		execution.SourcesReserved = err == nil
 		if err != nil {
-			execution.Error, execution.Done = err.Error(), true
+			execution.Error = err.Error()
+			h.mu.Unlock()
+			h.capture(execution, core.Event{Kind: core.EventStatus, Text: "Conversation source reservation refused; provider was not dispatched", Done: true})
+			h.mu.Lock()
+			if h.failure != nil {
+				h.mu.Unlock()
+				return WorkerReply{Error: "persist worker source refusal failed"}
+			}
 		}
 		if saveErr := h.saveAdmissionLocked(execution); saveErr != nil {
 			h.failJournalLocked()

@@ -123,6 +123,8 @@ Update parent docs when parent-level structure, ownership, workflow, or child in
 
 - With a privately bound worker, the ordinary stalled-conversation scanner prepares its prompt without reserving sources, then uses Manager admission. The worker rechecks canonical recovery enablement, private-route authorization, source age/activation, exact coverage, eligible commands and durable workflow links under its existing election fence. One synced history receipt contains both the complete retrigger reservation and admission before Send; a stale or refused batch reserves nothing. Unknown Send is not counted as confirmed dispatch and creates no fabricated terminal failure; ordinary scheduled reconciliation owns attachment or proven absence. No worker RPC is enclosed by a controller election callback. Ordinary request streams/follow-ups, production selection and coordinated lifecycle remain unfinished.
 
+- The private worker journals conversation source refusals as completed non-provider statuses. The Manager restores the same job and syncs its ordinary archive receipt before commit/retirement, without conversation hooks, activity, history, routes or another Send. Ambiguous/empty admissions remain retained; reserved provider errors keep the normal conversation consumer. Production composition and the unified release gates remain unfinished.
+
 ## Child DOX Index
 
 Direct child DOX files:

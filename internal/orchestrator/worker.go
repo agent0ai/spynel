@@ -23,7 +23,7 @@ func (m *Manager) attachWorkerConversations(ctx context.Context, executions []ha
 		return
 	}
 	for _, execution := range executions {
-		if execution.Conversation == nil || !execution.SourcesReserved {
+		if execution.Conversation == nil || !execution.SourcesReserved && !execution.ConversationRefused() {
 			continue
 		}
 		key := "worker-conversation:" + strconv.FormatUint(execution.Sequence, 10)
@@ -46,6 +46,9 @@ func (m *Manager) attachWorkerConversations(ctx context.Context, executions []ha
 }
 
 func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harness.WorkerExecution) (resultErr error) {
+	if !execution.SourcesReserved && (!execution.ConversationRefused() || m.JobDelivery == nil) {
+		return errors.New("conversation source refusal archive unavailable or invalid")
+	}
 	var jobID int
 	if err := m.Worker.RunOwned(ctx, func() error {
 		var err error
@@ -72,6 +75,12 @@ func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harne
 	defer ticker.Stop()
 	for {
 		current, err := m.Worker.Consume(ctx, execution.Sequence, func(delivery harness.WorkerDelivery) error {
+			if !execution.SourcesReserved {
+				if delivery.Cursor != 1 || delivery.Event.Kind != core.EventStatus || !delivery.Event.Done || delivery.Event.Continues || delivery.RequestOnly || delivery.Streamed != "" {
+					return errors.New("invalid conversation source refusal event")
+				}
+				return m.JobDelivery(jobID, delivery)
+			}
 			return m.ConversationDelivery(ctx, jobID, delivery)
 		})
 		if err != nil {
@@ -83,6 +92,9 @@ func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harne
 			}
 			m.workerAdmissionMu.Lock()
 			err := m.Worker.RunOwned(ctx, func() error {
+				if current.ConversationRefused() && m.JobExecutionUpdated != nil {
+					m.JobExecutionUpdated(jobID, core.ExecutionStatus{State: "error", Detail: "Conversation source reservation refused; provider was not dispatched"})
+				}
 				m.finishRuntimeJob("worker-conversation:" + current.Conversation.ExecutionID)
 				return nil
 			})

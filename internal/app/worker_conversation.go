@@ -85,7 +85,7 @@ func (s *Service) beginWorkerConversation(c harness.WorkerConversation) (int, er
 // Called under the Manager's native/exact-owner fence; it must not use RPC.
 func (s *Service) attachWorkerConversation(execution harness.WorkerExecution) (int, error) {
 	c := execution.Conversation
-	if c.Validate() != nil || execution.Key != "chat:"+c.Channel+":"+c.Conversation || !execution.SourcesReserved || execution.Workflow != nil || execution.Agent != nil {
+	if c.Validate() != nil || execution.Key != "chat:"+c.Channel+":"+c.Conversation || !execution.SourcesReserved && !execution.ConversationRefused() || execution.Workflow != nil || execution.Agent != nil {
 		return 0, errors.New("invalid retained conversation admission")
 	}
 	id, err := s.beginWorkerConversation(*c)

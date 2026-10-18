@@ -73,9 +73,9 @@ func TestWorkerConversationManagerAdmission(t *testing.T) {
 			}
 			if scenario == "absent-send" || scenario == "source-refused" {
 				f.start(t)
-				waitWorkerAgent(t, func() bool { return len(f.service.Runtime.Jobs()) == 0 })
+				waitWorkerAgent(t, func() bool { return len(f.service.Runtime.Jobs()) == 0 && len(f.inspect(t)) == 0 })
 				retained := f.inspect(t)
-				if scenario == "source-refused" && (len(retained) != 1 || !retained[0].Done || retained[0].SourcesReserved || retained[0].LastCursor != 0) || scenario == "absent-send" && len(retained) != 0 {
+				if len(retained) != 0 {
 					t.Fatal("reconciliation lost its non-dispatched boundary")
 				}
 				data, err := os.ReadFile(f.log)
