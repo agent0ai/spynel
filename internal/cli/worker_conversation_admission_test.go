@@ -18,7 +18,7 @@ func TestWorkerConversationManagerAdmission(t *testing.T) {
 	for _, scenario := range []string{"normal", "concurrent", "lost-send", "absent-send", "source-refused", "job-failed", "provider-refused", "obsolete-owner"} {
 		t.Run(scenario, func(t *testing.T) {
 			if scenario == "provider-refused" {
-				t.Setenv("SPYNEL_TEST_WORKER_REJECT_START", "1")
+				t.Setenv("SPYNEL_TEST_WORKER_REJECT_THREAD", "1")
 			}
 			f := newWorkerAgentFixture(t)
 			c := harness.WorkerConversation{Channel: "cli", Conversation: "admission", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
@@ -125,7 +125,11 @@ func TestWorkerConversationManagerAdmission(t *testing.T) {
 			waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 0 && len(f.service.Runtime.Jobs()) == 0 })
 			window, err := f.service.History.RecoveryWindow(c.Channel, c.Conversation, time.Time{}, 20)
 			data, readErr := os.ReadFile(f.log)
-			if err != nil || readErr != nil || window.Covered["source"] != "terminal_coverage" || strings.Count(string(data), "turn/start\n") != 1 {
+			wantStarts := 1
+			if scenario == "provider-refused" {
+				wantStarts = 0
+			}
+			if err != nil || readErr != nil || window.Covered["source"] != "terminal_coverage" || strings.Count(string(data), "turn/start\n") != wantStarts {
 				t.Fatal("controller replacement lost coverage or redispatched", err, readErr)
 			}
 		})

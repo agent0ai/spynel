@@ -24,13 +24,92 @@ type workerStorageHarness struct {
 type workerSendErrorHarness struct {
 	*supervisorHarness
 	beforeReturn func(core.Emit)
+	returnErr    error
 	sends        int
 }
 
 func (h *workerSendErrorHarness) SendWithModel(_ context.Context, _, _, _ string, emit core.Emit) (string, bool, error) {
 	h.sends++
 	h.beforeReturn(emit)
+	if h.returnErr != nil {
+		return "synthetic-thread", false, h.returnErr
+	}
 	return "synthetic-thread", false, errors.New("synthetic provider admission refused")
+}
+
+func TestWorkerUnknownSendRetainsExecutionUntilProviderTerminal(t *testing.T) {
+	for _, role := range []string{"conversation", "workflow", "agent"} {
+		t.Run(role, func(t *testing.T) {
+			root := t.TempDir()
+			target := &workerSendErrorHarness{supervisorHarness: &supervisorHarness{active: map[string]bool{}, emits: map[string]core.Emit{}}}
+			supervisor := NewSupervisor(NewRegistry(), HarnessConfig{Cwd: root})
+			supervisor.current, supervisor.ctx = target, context.Background()
+			host := &workerHost{supervisor: supervisor, directory: root, next: 1, executions: map[uint64]*workerExecution{}, stop: make(chan struct{})}
+			t.Cleanup(func() {
+				for _, execution := range host.executions {
+					_ = execution.file.Close()
+				}
+			})
+			reservations := 0
+			host.conversation = func(string, string, WorkerConversation, string) error { reservations++; return nil }
+			host.workflow = func(string, string, WorkerWorkflow, string) (WorkerReservation, error) {
+				reservations++
+				return WorkerReservation{ProviderIterations: 1}, nil
+			}
+			request := WorkerRequest{Sequence: 1, Key: "synthetic", Prompt: "synthetic"}
+			switch role {
+			case "conversation":
+				request.Key = "chat:cli:synthetic"
+				request.Conversation = &WorkerConversation{Channel: "cli", Conversation: "synthetic", ExecutionID: "execution", SourceMessageID: "source", Sources: []string{"source"}}
+			case "workflow":
+				request.Workflow = &WorkerWorkflow{WorkID: "synthetic"}
+			case "agent":
+				request.Key = "orchestrator:semantic-heartbeat"
+				now := time.Now().UTC()
+				request.Agent = &WorkerAgent{ID: "synthetic-agent", Kind: "heartbeat", StartedAt: now, Deadline: now.Add(time.Minute)}
+			}
+			var provider core.Emit
+			target.beforeReturn = func(emit core.Emit) {
+				provider = emit
+				emit(core.Event{Kind: core.EventDelta, Text: "applied before acknowledgement"})
+			}
+			reply := host.send(request)
+			execution := host.executions[1]
+			if reply.Error == "" || execution.Done || execution.Error == "" {
+				t.Fatal("uncertain Send manufactured terminal completion")
+			}
+			page := host.events(WorkerRequest{Sequence: 1})
+			for _, event := range page.Events {
+				if event.Event.Done {
+					t.Fatal("uncertain Send journaled fabricated terminal coverage")
+				}
+			}
+			if retry := host.send(request); retry.Error == "" || target.sends != 1 || role != "agent" && reservations != 1 {
+				t.Fatal("uncertain retry confirmed or repeated provider admission")
+			}
+			if ack := host.apply(WorkerRequest{Action: "ack", Sequence: 1, After: execution.LastCursor}); ack.Error == "" {
+				t.Fatal("uncertain execution retired before a provider terminal")
+			}
+			provider(core.Event{Kind: core.EventFinal, Text: "actual provider result", Done: true})
+			if !execution.Done || execution.Error != "" {
+				t.Fatal("actual terminal did not resolve admission uncertainty")
+			}
+			page = host.events(WorkerRequest{Sequence: 1})
+			terminal := page.Events[len(page.Events)-1]
+			if terminal.Event.Kind != core.EventFinal || terminal.Event.Text != "actual provider result" || terminal.RequestOnly {
+				t.Fatal("actual provider terminal was lost or rewritten")
+			}
+			if role == "conversation" && (terminal.Streamed != "applied before acknowledgement" || !reflect.DeepEqual(terminal.Conversation, request.Conversation)) {
+				t.Fatal("late provider terminal lost retained output or exact sources")
+			}
+			if reply := host.commit(WorkerRequest{Sequence: 1, After: execution.LastCursor}); reply.Error != "" {
+				t.Fatal(reply.Error)
+			}
+			if reply := host.apply(WorkerRequest{Action: "ack", Sequence: 1, After: execution.LastCursor}); reply.Error != "" || len(host.executions) != 0 {
+				t.Fatal("actual committed terminal did not retire", reply.Error)
+			}
+		})
+	}
 }
 
 func TestWorkerSendFailureHasOneDurableTerminal(t *testing.T) {
@@ -39,6 +118,9 @@ func TestWorkerSendFailureHasOneDurableTerminal(t *testing.T) {
 			t.Run(role+"/"+mode, func(t *testing.T) {
 				root := t.TempDir()
 				target := &workerSendErrorHarness{supervisorHarness: &supervisorHarness{active: map[string]bool{}, emits: map[string]core.Emit{}}}
+				if mode != "already-terminal" {
+					target.returnErr = &SendNotAdmittedError{Err: errors.New("synthetic provider admission refused")}
+				}
 				supervisor := NewSupervisor(NewRegistry(), HarnessConfig{Cwd: root})
 				supervisor.current, supervisor.ctx = target, context.Background()
 				host := &workerHost{supervisor: supervisor, directory: root, next: 1, executions: map[uint64]*workerExecution{}, stop: make(chan struct{})}
@@ -66,8 +148,8 @@ func TestWorkerSendFailureHasOneDurableTerminal(t *testing.T) {
 					request.Agent = &WorkerAgent{ID: "synthetic-agent", Kind: "heartbeat", StartedAt: now, Deadline: now.Add(time.Minute)}
 				}
 				target.beforeReturn = func(emit core.Emit) {
-					emit(core.Event{Kind: core.EventDelta, Text: "useful output 界"})
 					if mode == "already-terminal" {
+						emit(core.Event{Kind: core.EventDelta, Text: "useful output 界"})
 						emit(core.Event{Kind: core.EventError, Text: "adapter terminal", Done: true})
 					}
 					if mode == "journal-failure" {
@@ -79,7 +161,7 @@ func TestWorkerSendFailureHasOneDurableTerminal(t *testing.T) {
 				reply := host.send(request)
 				execution := host.executions[1]
 				if mode == "journal-failure" {
-					if reply.Error == "" || host.failure == nil || execution.Done || execution.LastCursor != 1 {
+					if reply.Error == "" || host.failure == nil || execution.Done || execution.LastCursor != 0 {
 						t.Fatal("unrecorded Send failure was acknowledged as completion")
 					}
 					select {
@@ -89,14 +171,18 @@ func TestWorkerSendFailureHasOneDurableTerminal(t *testing.T) {
 					}
 					return
 				}
-				if reply.Error != "" || len(reply.Executions) != 1 || !execution.Done || execution.Error != "synthetic provider admission refused" || execution.LastCursor != 2 {
+				wantError, wantEvents, wantStream := "synthetic provider admission refused", uint64(1), ""
+				if mode == "already-terminal" {
+					wantError, wantEvents, wantStream = "", 2, "useful output 界"
+				}
+				if reply.Error != "" || len(reply.Executions) != 1 || !execution.Done || execution.Error != wantError || execution.LastCursor != wantEvents {
 					t.Fatal("failed provider Send has no single durable terminal")
 				}
 				page := host.events(WorkerRequest{Sequence: 1})
-				if page.Error != "" || len(page.Events) != 2 {
+				if page.Error != "" || uint64(len(page.Events)) != wantEvents {
 					t.Fatal("failed dispatch journal cannot be replayed")
 				}
-				terminal := page.Events[1]
+				terminal := page.Events[len(page.Events)-1]
 				want := "synthetic provider admission refused"
 				if mode == "already-terminal" {
 					want = "adapter terminal"
@@ -104,19 +190,19 @@ func TestWorkerSendFailureHasOneDurableTerminal(t *testing.T) {
 				if terminal.Event.Kind != core.EventError || !terminal.Event.Done || terminal.Event.Text != want || terminal.RequestOnly {
 					t.Fatal("failed Send changed or duplicated the terminal")
 				}
-				if role == "conversation" && (!execution.SourcesReserved || terminal.Streamed != "useful output 界" || !reflect.DeepEqual(terminal.Conversation, request.Conversation)) {
+				if role == "conversation" && (!execution.SourcesReserved || terminal.Streamed != wantStream || !reflect.DeepEqual(terminal.Conversation, request.Conversation)) {
 					t.Fatal("failed Send lost reserved sources or useful output")
 				}
-				if retry := host.send(request); retry.Error != "" || target.sends != 1 || role != "agent" && reservations != 1 || execution.LastCursor != 2 {
+				if retry := host.send(request); retry.Error != "" || target.sends != 1 || role != "agent" && reservations != 1 || execution.LastCursor != wantEvents {
 					t.Fatal("matching retry repeated dispatch, reservation or terminal capture")
 				}
-				if reply := host.apply(WorkerRequest{Action: "ack", Sequence: 1, After: 2}); reply.Error == "" {
+				if reply := host.apply(WorkerRequest{Action: "ack", Sequence: 1, After: wantEvents}); reply.Error == "" {
 					t.Fatal("failed dispatch retired before downstream commit")
 				}
-				if reply := host.commit(WorkerRequest{Sequence: 1, Expected: 0, After: 2}); reply.Error != "" {
+				if reply := host.commit(WorkerRequest{Sequence: 1, Expected: 0, After: wantEvents}); reply.Error != "" {
 					t.Fatal(reply.Error)
 				}
-				if reply := host.apply(WorkerRequest{Action: "ack", Sequence: 1, After: 2}); reply.Error != "" || len(host.executions) != 0 {
+				if reply := host.apply(WorkerRequest{Action: "ack", Sequence: 1, After: wantEvents}); reply.Error != "" || len(host.executions) != 0 {
 					t.Fatal("committed failed dispatch did not retire", reply.Error)
 				}
 			})

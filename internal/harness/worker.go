@@ -516,7 +516,7 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 			h.mu.Unlock()
 			return WorkerReply{Error: "worker admission payload changed"}
 		}
-		reply := WorkerReply{Executions: []WorkerExecution{execution.WorkerExecution}}
+		reply := workerSendReply(execution.WorkerExecution)
 		h.mu.Unlock()
 		return reply
 	}
@@ -634,8 +634,13 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 	threadID, steered, err := h.supervisor.SendConversation(turnCtx, request.Key, request.Prompt, request.Message, func(event core.Event) {
 		h.capture(execution, event)
 	})
-	if err != nil {
+	var rejected *SendNotAdmittedError
+	if errors.As(err, &rejected) {
 		h.capture(execution, core.Event{Kind: core.EventError, Text: err.Error(), ThreadID: threadID, Done: true})
+	} else if err != nil {
+		// A failed acknowledgement does not establish absence of provider effects.
+		h.capture(execution, core.Event{Kind: core.EventStatus, Text: "Provider admission requires reconciliation", ThreadID: threadID,
+			Execution: &core.ExecutionStatus{State: "degraded"}})
 	}
 	h.mu.Lock()
 	if h.failure != nil {
@@ -643,7 +648,7 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		return WorkerReply{Error: "worker event journal unavailable"}
 	}
 	execution.ThreadID, execution.Steered = threadID, steered
-	if err != nil {
+	if err != nil && (!execution.Done || rejected != nil) {
 		execution.Error = err.Error()
 	}
 	if err := h.saveAdmissionLocked(execution); err != nil {
@@ -651,8 +656,17 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		h.mu.Unlock()
 		return WorkerReply{Error: "persist worker dispatch result failed"}
 	}
-	reply := WorkerReply{Executions: []WorkerExecution{execution.WorkerExecution}}
+	reply := workerSendReply(execution.WorkerExecution)
 	h.mu.Unlock()
+	return reply
+}
+
+// Exact Send retries preserve uncertainty without another provider admission.
+func workerSendReply(execution WorkerExecution) WorkerReply {
+	reply := WorkerReply{Executions: []WorkerExecution{execution}}
+	if !execution.Done && execution.Error != "" {
+		reply.Error = "worker provider admission unconfirmed; execution retained"
+	}
 	return reply
 }
 
@@ -744,6 +758,10 @@ func (h *workerHost) capture(execution *workerExecution, event core.Event) {
 	h.bytes += int64(len(data))
 	if event.Done && !event.Continues {
 		execution.Done = true
+		// The provider's actual terminal resolves a previously uncertain Send.
+		if !execution.deadlineInterrupted && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+			execution.Error = ""
+		}
 		if execution.Agent != nil && !time.Now().Before(execution.Agent.Deadline) {
 			execution.Error = context.DeadlineExceeded.Error()
 		}

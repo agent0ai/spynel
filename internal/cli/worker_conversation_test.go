@@ -295,7 +295,7 @@ func TestWorkerConversationNativeAtomicRecoveryAndLostSendReply(t *testing.T) {
 func TestWorkerConversationNativeSendFailureSettlesAfterReplacement(t *testing.T) {
 	for _, scenario := range []string{"normal", "lost-commit"} {
 		t.Run(scenario, func(t *testing.T) {
-			t.Setenv("SPYNEL_TEST_WORKER_REJECT_START", "1")
+			t.Setenv("SPYNEL_TEST_WORKER_REJECT_THREAD", "1")
 			f := newWorkerAgentFixture(t)
 			c := &harness.WorkerConversation{Channel: "cli", Conversation: "send-failure", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
 			if _, err := f.service.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic", AcceptedAt: time.Now().UTC()}); err != nil {
@@ -364,7 +364,7 @@ func TestWorkerConversationNativeSendFailureSettlesAfterReplacement(t *testing.T
 			}
 			window, windowErr := f.service.History.RecoveryWindow(c.Channel, c.Conversation, time.Time{}, 20)
 			methods, readErr := os.ReadFile(f.log)
-			if err != nil || windowErr != nil || readErr != nil || terminals != 1 || window.Covered["source"] != "terminal_coverage" || f.service.Runtime.Status().Jobs != 0 || strings.Count(string(methods), "turn/start\n") != 1 || strings.Contains(string(methods), "selection:") {
+			if err != nil || windowErr != nil || readErr != nil || terminals != 1 || window.Covered["source"] != "terminal_coverage" || f.service.Runtime.Status().Jobs != 0 || strings.Count(string(methods), "turn/start\n") != 0 || strings.Contains(string(methods), "selection:") {
 				t.Fatal("failed admission did not settle once without a new provider attempt", err, windowErr, readErr)
 			}
 		})
