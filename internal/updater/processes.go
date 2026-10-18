@@ -20,8 +20,8 @@ import (
 	"github.com/agent0ai/spynel/internal/fsx"
 )
 
-// ProcessRegistration identifies a server/TUI or its diagnostic reader,
-// including other workspaces. It contains no workspace credentials.
+// ProcessRegistration identifies an application, client or helper, including
+// other workspaces. It contains no workspace credentials.
 type ProcessRegistration struct {
 	PID                  int    `json:"pid"`
 	Generation           string `json:"generation"`
@@ -33,6 +33,7 @@ type ProcessRegistration struct {
 	DiagnosticReader     bool   `json:"diagnostic_reader,omitempty"`
 	ProviderGuardian     bool   `json:"provider_guardian,omitempty"`
 	HarnessWorker        bool   `json:"harness_worker,omitempty"`
+	ApplicationClient    bool   `json:"application_client,omitempty"`
 	Supervisor           bool   `json:"supervisor,omitempty"`
 	SupervisorPID        int    `json:"supervisor_pid,omitempty"`
 	SupervisorGeneration string `json:"supervisor_generation,omitempty"`
@@ -83,6 +84,12 @@ func (m *Manager) RegisterProviderGuardian() (func(), error) {
 
 func (m *Manager) RegisterHarnessWorker() (func(), error) {
 	return m.registerProcess(ProcessRegistration{HarnessWorker: true})
+}
+
+// RegisterApplicationClient retains stop/uninstall visibility without making a
+// finite request or event subscription an application restart target.
+func (m *Manager) RegisterApplicationClient() (func(), error) {
+	return m.registerProcess(ProcessRegistration{ApplicationClient: true})
 }
 
 func (m *Manager) registerProcess(role ProcessRegistration) (func(), error) {
@@ -279,7 +286,7 @@ func (m *Manager) CheckRestartable() error {
 		return err
 	}
 	for _, record := range records {
-		if record.DiagnosticReader || record.ProviderGuardian || record.HarnessWorker {
+		if record.DiagnosticReader || record.ProviderGuardian || record.HarnessWorker || record.ApplicationClient {
 			continue
 		}
 		if record.SupervisorPID != 0 && (record.Installation == root || m.ownsProcessPath(root, record.Executable)) {

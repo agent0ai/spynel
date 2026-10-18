@@ -156,6 +156,16 @@ func run(args []string, version string) error {
 		return runBareInteractive(version)
 	}
 	switch args[0] {
+	case "send", "followup", "events", "notify", "command", "status", "run",
+		"jobs", "tasks", "goals", "job", "log", "logs", "stop", "new", "clear", "history",
+		"harness", "model", "effort", "speed", "telegram", "restart", "config", "whatsapp":
+		unregister, err := updater.Detect(version).RegisterApplicationClient()
+		if err != nil {
+			return err
+		}
+		defer unregister()
+	}
+	switch args[0] {
 	case "help", "--help", "-h":
 		fmt.Print(helpText)
 		return nil

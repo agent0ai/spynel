@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Isolated npm update: two workspaces, headless primary, secondary TUI and primary TUI."""
+"""Isolated npm update with a live worker, two workspaces and retained PTYs."""
+import datetime
 import fcntl
+import hashlib
 import http.server
 import json
 import os
@@ -45,6 +47,10 @@ def main():
         updated = "9.9.9"
         build_env = {**os.environ, "CGO_LDFLAGS_ALLOW": "^-Wl,-rpath,@loader_path/lib$"}
         subprocess.run([os.environ.get("SPYNEL_GO_BINARY", "go"), "build", "-trimpath", "-ldflags=-s -w -X main.version=" + updated, "-o", str(replacement / "npm" / "vendor" / "spynel"), "./cmd/spynel"], cwd=repo, env=build_env, check=True, timeout=180)
+        updated_image = replacement / "npm" / "vendor" / "spynel"
+        if len(sys.argv) > 2:
+            shutil.copy2(updated_image, Path(sys.argv[2]).resolve())
+        print(json.dumps({"event": "native_images", "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(), "updated_image_sha256": hashlib.sha256(updated_image.read_bytes()).hexdigest()}), flush=True)
         (replacement / "package.json").write_text(json.dumps({"name": "spynel", "version": updated}))
         (replacement / "npm" / "vendor" / ".installed.json").write_text(json.dumps({"version": updated}))
         tools = temp / "tools"
@@ -55,6 +61,9 @@ import json, os, pathlib, shutil, sys
 package = pathlib.Path(os.environ["INSTANCE_TEST_PACKAGE"])
 if sys.argv[1:] == ["root", "--global"]:
     print(package.parent)
+    sys.exit(0)
+if sys.argv[1:] == ["uninstall", "--global", "--prefix", str(package.parents[2]), "spynel"]:
+    shutil.rmtree(package)
     sys.exit(0)
 assert sys.argv[1] == "update", sys.argv
 with open(os.environ["INSTANCE_TEST_CALLS"], "a") as log:
@@ -67,18 +76,44 @@ shutil.rmtree(old)
         npm.chmod(0o700)
         harness = tools / "acp-fixture"
         harness.write_text(f'''#!{sys.executable}
-import json, sys
+import json, os, pathlib, sys, threading, time
+lock = threading.Lock()
+def emit(value):
+    with lock:
+        print(json.dumps(value), flush=True)
+def record(event):
+    with open(os.environ["INSTANCE_TEST_PROVIDER_EVENTS"], "a") as log:
+        log.write(json.dumps({{"event": event, "pid": os.getpid()}}) + "\\n")
+def finish(request):
+    deadline = time.monotonic() + 240
+    while not pathlib.Path(os.environ["INSTANCE_TEST_COMPLETE"]).exists():
+        if time.monotonic() >= deadline:
+            os._exit(2)
+        time.sleep(.05)
+    record("completed")
+    emit({{"jsonrpc": "2.0", "method": "session/update", "params": {{"sessionId": "synthetic-session", "update": {{"sessionUpdate": "agent_message_chunk", "content": {{"type": "text", "text": "synthetic installed worker result"}}}}}}}})
+    emit({{"jsonrpc": "2.0", "id": request["id"], "result": {{"stopReason": "end_turn"}}}})
+record("started")
 for line in sys.stdin:
     request = json.loads(line)
-    assert request["method"] == "initialize", "test must not dispatch inference"
-    print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": {{"protocolVersion": 1, "agentCapabilities": {{}}}}}}), flush=True)
+    method = request["method"]
+    if method == "initialize":
+        emit({{"jsonrpc": "2.0", "id": request["id"], "result": {{"protocolVersion": 1, "agentCapabilities": {{}}}}}})
+    elif method == "session/new":
+        emit({{"jsonrpc": "2.0", "id": request["id"], "result": {{"sessionId": "synthetic-session"}}}})
+    elif method == "session/prompt":
+        record("prompt")
+        threading.Thread(target=finish, args=(request,), daemon=True).start()
+    else:
+        raise AssertionError("unexpected provider operation: " + method)
 ''')
         harness.chmod(0o700)
         home = temp / "home"
         home.mkdir()
         env = {k: v for k, v in os.environ.items() if not k.startswith("SPYNEL_")}
-        env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"), XDG_RUNTIME_DIR=str(temp / "run"), TERM="xterm-256color", SPYNEL_SKIP_UPDATE_CHECK="1", PATH=str(tools) + os.pathsep + os.environ["PATH"], INSTANCE_TEST_PACKAGE=str(package), INSTANCE_TEST_REPLACEMENT=str(replacement), INSTANCE_TEST_CALLS=str(temp / "npm-calls"))
+        env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"), XDG_RUNTIME_DIR=str(temp / "run"), TERM="xterm-256color", SPYNEL_SKIP_UPDATE_CHECK="1", PATH=str(tools) + os.pathsep + os.environ["PATH"], INSTANCE_TEST_PACKAGE=str(package), INSTANCE_TEST_REPLACEMENT=str(replacement), INSTANCE_TEST_CALLS=str(temp / "npm-calls"), INSTANCE_TEST_PROVIDER_EVENTS=str(temp / "provider-events"), INSTANCE_TEST_COMPLETE=str(temp / "complete"))
         processes, terminals, logs = [], [], []
+        request = None
         registry = home / ("Library/Application Support" if sys.platform == "darwin" else ".config") / "spynel" / "processes"
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -97,16 +132,35 @@ for line in sys.stdin:
         env["SPYNEL_NPM_REGISTRY_URL"] = f"http://127.0.0.1:{server.server_port}/latest"
         launcher = [shutil.which("node"), str(package / "npm" / "bin" / "spynel.js")]
 
-        def records():
+        def records(workers=False):
             result = []
             for path in registry.glob("*.json"):
                 try:
                     record = json.loads(path.read_text())
-                    if not record.get("diagnostic_reader") and not record.get("provider_guardian") and not record.get("supervisor_pid"):
+                    if workers is None or (bool(record.get("harness_worker")) == workers and not record.get("diagnostic_reader") and not record.get("provider_guardian") and not record.get("application_client") and not record.get("supervisor_pid")):
                         result.append(record)
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
             return result
+
+        def evidence(event, **fields):
+            print(json.dumps({"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "event": event, **fields}), flush=True)
+
+        def provider_events():
+            path = Path(env["INSTANCE_TEST_PROVIDER_EVENTS"])
+            return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+        def worker_identity():
+            return {record["pid"]: record for record in records(workers=True)}
+
+        def native_start(pid):
+            result = subprocess.run(["ps", "-p", str(pid), "-o", "stat=", "-o", "lstart="], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+            assert not result.stderr, result.stderr
+            if result.returncode == 1 and not result.stdout.strip():
+                return None
+            assert result.returncode == 0, result.returncode
+            state, start = result.stdout.strip().split(maxsplit=1)
+            return None if state.startswith(("Z", "X")) else start
 
         def wait_for(predicate):
             deadline = time.monotonic() + 40
@@ -151,11 +205,27 @@ for line in sys.stdin:
                 processes.append(process)
                 wait_for(lambda: len(records()) == index + 1)
             wait_for(lambda: all(b"\x1b[?1049h" in output for _, output in terminals))
+            wait_for(lambda: len(worker_identity()) == 2)
+            workers_before = worker_identity()
+            evidence("workers_before_update", workers=list(workers_before.values()))
+            request_log = (temp / "request.log").open("w")
+            logs.append(request_log)
+            request = subprocess.Popen([*launcher, "send", "--conversation", "installation-continuity", "synthetic installation continuity request"], cwd=workspaces[0], env=env, stdin=subprocess.DEVNULL, stdout=request_log, stderr=request_log)
+            wait_for(lambda: len([e for e in provider_events() if e["event"] == "prompt"]) == 1)
+            active_provider = next(e["pid"] for e in provider_events() if e["event"] == "prompt")
+            provider_starts = [e for e in provider_events() if e["event"] == "started"]
+            provider_start = native_start(active_provider)
+            assert provider_start is not None, "admitted provider already exited"
+            evidence("provider_admitted", pid=active_provider, native_start=provider_start, starts=provider_starts)
             before = {record["pid"]: record["generation"] for record in records()}
             result = subprocess.run([*launcher, "update"], cwd=temp, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
             assert result.returncode == 0, result.stderr
             wait_for(lambda: len(records()) == 3 and all(record["ready"] and record["version"] == updated and before.get(record["pid"]) != record["generation"] for record in records()))
             assert set(before) == {record["pid"] for record in records()}, "restart lost logical instance PIDs or terminal attachment"
+            assert worker_identity() == workers_before, "npm image replacement replaced a surviving worker"
+            assert not any(e["event"] == "completed" for e in provider_events()), "provider ended during update"
+            assert native_start(active_provider) == provider_start, "update lost the native provider"
+            evidence("npm_image_replaced", applications=records(), workers=list(worker_identity().values()))
             wait_for(lambda: all(output.count(b"\x1b[?1049h") >= 2 for _, output in terminals))
             wait_for(lambda: all(updated.encode() in output for _, output in terminals))
             for fd, output in terminals:
@@ -166,6 +236,19 @@ for line in sys.stdin:
             os.write(terminals[0][0], b"/update\r")
             wait_for(lambda: len(records()) == 3 and all(record["ready"] and record["generation"] not in before for record in records()))
             assert (temp / "npm-calls").read_text() == "update\n", "current-version restart invoked npm replacement"
+            assert worker_identity() == workers_before, "current-version channel update replaced a surviving worker"
+            assert native_start(active_provider) == provider_start, "channel restart lost the native provider"
+            Path(env["INSTANCE_TEST_COMPLETE"]).touch()
+
+            def completed_history():
+                return [json.loads(line) for path in (workspaces[0] / ".spynel" / "history").rglob("*.jsonl") for line in path.read_text().splitlines(keepends=True) if line.endswith("\n") and line.strip()]
+
+            wait_for(lambda: sum(e.get("role") == "assistant" and e.get("content") == "synthetic installed worker result" for e in completed_history()) == 1)
+            prompts = [e for e in provider_events() if e["event"] == "prompt"]
+            completions = [e for e in provider_events() if e["event"] == "completed"]
+            assert prompts == [{"event": "prompt", "pid": active_provider}] and completions == [{"event": "completed", "pid": active_provider}], "update duplicated or replaced the active provider turn"
+            assert [e for e in provider_events() if e["event"] == "started"] == provider_starts, "update restarted a provider"
+            evidence("retained_turn_completed_once", provider_pid=active_provider, workers=list(worker_identity().values()))
             # A registered native process made legacy must block publication without a signal.
             record = records()[0]
             path = registry / (str(record["pid"]) + ".json")
@@ -233,8 +316,15 @@ assert sys.argv[1] == "check-restartable", sys.argv
             assert recovered.returncode == 0 and "Restarting" in recovered.stdout, recovered
             wait_for(lambda: any(record["installation"] == str(legacy) and record["ready"] and record["version"] == version and record["generation"] != before_recovery["generation"] for record in records()))
             assert legacy_calls.read_text() == "update\n", "already-current recovery invoked npm replacement"
-            print("Verified npm replacement, cross-workspace ready generations and PTYs, channel updates, exact v0.12.14 stale-launcher refusal, and fresh-launcher recovery with a subsequent /update.")
+            print("Verified npm image replacement and current-version channel update preserve native workers and one active ACP turn/result, cross-workspace ready generations and PTYs, exact v0.12.14 stale-launcher refusal, and fresh-launcher recovery.")
         finally:
+            cleanup_records = records(workers=None)
+            cleanup_providers = {e["pid"] for e in provider_events() if e["event"] == "started"}
+            evidence("cleanup_owned_identities", records=cleanup_records, provider_pids=sorted(cleanup_providers))
+            if request is not None:
+                if request.poll() is None:
+                    request.terminate()
+                request.wait(timeout=10)
             for process in processes:
                 if process.poll() is None:
                     process.terminate()
@@ -248,6 +338,22 @@ assert sys.argv[1] == "check-restartable", sys.argv
                 os.close(fd)
             for log in logs:
                 log.close()
+            # Controller exit deliberately detaches workers. Use the owning
+            # installation boundary, never a host-wide killall or PID sweep.
+            cleanup_errors = []
+            for root in (package, temp / "legacy" / "lib" / "node_modules" / "spynel"):
+                # The retained candidate also handles partially installed or
+                # synthetic legacy launchers and remains outside removed trees.
+                binary = replacement / "npm" / "vendor" / "spynel"
+                if root.exists():
+                    cleaned = subprocess.run([str(binary), "uninstall-bundles", "--root", str(temp / "absent-standalone"), "--npm-root", str(root)], env={**env, "INSTANCE_TEST_PACKAGE": str(root)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=40)
+                    if cleaned.returncode != 0:
+                        cleanup_errors.append(cleaned.stderr)
+            assert not cleanup_errors, cleanup_errors
+            assert not records(workers=True), "owned workers survived installation cleanup"
+            for pid in {record["pid"] for record in cleanup_records} | cleanup_providers:
+                assert native_start(pid) is None, "recorded fixture process survived uninstall: " + str(pid)
+            evidence("installation_owned_cleanup_passed")
             server.shutdown()
             server.server_close()
 

@@ -32,6 +32,8 @@
 
 - Represent native logical instances with supervisor and linked executor PID/generation roles in this registry, verified against actual parent/image relationships. Restart only the supervisor or a direct externally managed executor. A supervised restart succeeds only after the same supervisor PID publishes a new generation and a verified ready executor at the target version; absent children remain visible and cannot count as ready. Include lawful election expiry in the 60-second restart deadline. Stop/uninstall acknowledges parent suppression before child teardown, fences generations, and gives the parent time to reap before forced parent termination.
 
+- Register finite application CLI requests and event subscriptions as `application_client: true` at the public command boundary. They retain exact native start/generation/executable/installation identity for stop/uninstall, but never become application restart targets, readiness evidence or legacy-preflight blockers. Unknown/unregistered applications still refuse coordination; do not infer client roles from arguments.
+
 ## Child DOX Index
 
 No child DOX files.

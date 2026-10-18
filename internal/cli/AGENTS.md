@@ -54,6 +54,8 @@
 
 - Protocol 14 is the explicit worker compatibility boundary, including behavior and schema. Bump it whenever a successor cannot safely consume/control the previous worker. Its configuration digest binds that protocol and every serialized runtime setting except the native client version. A same-protocol controller with an otherwise exact selection may adopt across release versions without reconfiguration or another provider turn; native PID/start/executable/generation verification and authenticated exact-term inspection still apply. The retained worker keeps its native registration and original provider client version. Canonical settings derive from authenticated worker configuration, and direct attempts to change its workspace/version still refuse. Changed runtime settings and incompatible protocols fail closed; no automatic stop, replacement, admission retry or compatibility reader is added. This resolves version-only discovery compatibility, not complete coordinated update/stop/uninstall or final release qualification.
 
+- Register public application CLI requests and subscriptions through the updater as application clients for their entire command lifetime, including stdin preparation and explicit sockets. They remain visible to verified stop/uninstall without being restarted alongside servers/TUIs or blocking coordinated updates. Keep this at process dispatch so in-process application calls cannot overwrite a server registration. Offline docs/help/version and standalone installer/update ownership retain their existing boundaries.
+
 ## Child DOX Index
 
 No child DOX files.

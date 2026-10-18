@@ -29,6 +29,7 @@ func TestLifecycleProcessFixture(t *testing.T) {
 	diagnostic := os.Getenv("SPYNEL_TEST_DIAGNOSTIC_READER") == "1"
 	guardian := os.Getenv("SPYNEL_TEST_PROVIDER_GUARDIAN") == "1"
 	worker := os.Getenv("SPYNEL_TEST_HARNESS_WORKER") == "1"
+	client := os.Getenv("SPYNEL_TEST_APPLICATION_CLIENT") == "1"
 	supervised := os.Getenv("SPYNEL_TEST_SUPERVISOR") == "1"
 	var closeRecord func()
 	var err error
@@ -38,6 +39,8 @@ func TestLifecycleProcessFixture(t *testing.T) {
 		closeRecord, err = manager.RegisterProviderGuardian()
 	} else if worker {
 		closeRecord, err = manager.RegisterHarnessWorker()
+	} else if client {
+		closeRecord, err = manager.RegisterApplicationClient()
 	} else if supervised {
 		closeRecord, err = manager.RegisterSupervisor()
 	} else {
@@ -60,7 +63,7 @@ func TestLifecycleProcessFixture(t *testing.T) {
 		}
 		defer closeNewRecord()
 	}
-	if !diagnostic && !guardian && !worker && (version != "2.0.0" || os.Getenv("SPYNEL_TEST_NOT_READY") != "1") {
+	if !diagnostic && !guardian && !worker && !client && (version != "2.0.0" || os.Getenv("SPYNEL_TEST_NOT_READY") != "1") {
 		if err := MarkProcessReady(); err != nil {
 			t.Fatal(err)
 		}
@@ -69,7 +72,7 @@ func TestLifecycleProcessFixture(t *testing.T) {
 	signal.Notify(signals, RestartSignal(), syscall.SIGTERM)
 	fmt.Println("ready")
 	if <-signals == RestartSignal() {
-		if diagnostic || guardian || worker {
+		if diagnostic || guardian || worker || client {
 			t.Fatal("helper received an application restart")
 		}
 		closeRecord()
@@ -127,6 +130,9 @@ func TestDiagnosticReaderIsDiscoverableWithoutBecomingARestartTarget(t *testing.
 	t.Setenv("SPYNEL_TEST_PROVIDER_GUARDIAN", "0")
 	t.Setenv("SPYNEL_TEST_HARNESS_WORKER", "1")
 	worker := lifecycleFixture(t, root)
+	t.Setenv("SPYNEL_TEST_HARNESS_WORKER", "0")
+	t.Setenv("SPYNEL_TEST_APPLICATION_CLIENT", "1")
+	client := lifecycleFixture(t, root)
 	directory, _ := processDirectory()
 	path := filepath.Join(directory, strconv.Itoa(reader.Process.Pid)+".json")
 	before, err := readProcess(path)
@@ -142,6 +148,11 @@ func TestDiagnosticReaderIsDiscoverableWithoutBecomingARestartTarget(t *testing.
 	workerBefore, err := readProcess(workerPath)
 	if err != nil || !workerBefore.HarnessWorker || workerBefore.Ready || restartTarget(workerBefore) {
 		t.Fatalf("worker registration lost its role: %#v, %v", workerBefore, err)
+	}
+	clientPath := filepath.Join(directory, strconv.Itoa(client.Process.Pid)+".json")
+	clientBefore, err := readProcess(clientPath)
+	if err != nil || !clientBefore.ApplicationClient || clientBefore.Ready || restartTarget(clientBefore) {
+		t.Fatalf("client registration lost its role: %#v, %v", clientBefore, err)
 	}
 	manager := &Manager{InstallRoot: root, CurrentVersion: "1.0.0"}
 	if err := manager.CheckRestartable(); err != nil {
@@ -164,8 +175,12 @@ func TestDiagnosticReaderIsDiscoverableWithoutBecomingARestartTarget(t *testing.
 	if err != nil || workerAfter.Generation != workerBefore.Generation {
 		t.Fatal("worker was restarted as an application")
 	}
-	records, err := processRecords([]int{server.Process.Pid, reader.Process.Pid, guardian.Process.Pid, worker.Process.Pid})
-	if err != nil || len(records) != 4 {
+	clientAfter, err := readProcess(clientPath)
+	if err != nil || clientAfter != clientBefore {
+		t.Fatal("client was restarted as an application")
+	}
+	records, err := processRecords([]int{server.Process.Pid, reader.Process.Pid, guardian.Process.Pid, worker.Process.Pid, client.Process.Pid})
+	if err != nil || len(records) != 5 {
 		t.Fatalf("shutdown discovery lost the reader: %d %v", len(records), err)
 	}
 	if err := stopProcessRecords(ctx, records); err != nil {
