@@ -41,10 +41,15 @@ def assert_terminal_restored(master, original):
 def main():
     repo = Path(__file__).resolve().parent.parent
     if sys.platform == "linux":
-        # Adopt only this fixture's orphaned provider so cleanup can wait it.
+        # Adopt only this fixture's orphaned workers/helpers so cleanup can wait them.
         assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
-    with tempfile.TemporaryDirectory(prefix=".tmp-native-supervisor-", dir=repo) as temporary:
+    temporary = tempfile.mkdtemp(prefix=".tmp-native-supervisor-", dir=repo)
+    cleanup_confirmed = False
+    try:
         root = Path(temporary)
+        # Unix sockets need native permissions even on shared workspace mounts.
+        native_temporary = Path(tempfile.mkdtemp(prefix="spynel-supervisor-"))
+        cleanup_runtime = root / "cleanup-runtime"
         package = root / "prefix" / "lib" / "node_modules" / "spynel"
         vendor = package / "npm" / "vendor"
         vendor.mkdir(parents=True)
@@ -53,7 +58,38 @@ def main():
                 assert member.isfile() or member.isdir()
                 assert not Path(member.name).is_absolute() and ".." not in Path(member.name).parts
             archive.extractall(vendor)
+        shutil.copytree(vendor, cleanup_runtime)
+        cleanup_binary = cleanup_runtime / "spynel"
         binary = vendor / "spynel"
+        control_source = root / "native-crash.go"
+        control_source.write_text('''package main
+import (
+    "encoding/json"
+    "errors"
+    "fmt"
+    "os"
+    "syscall"
+    "github.com/agent0ai/spynel/internal/updater"
+)
+func main() {
+    var record updater.ProcessRegistration
+    err := json.NewDecoder(os.Stdin).Decode(&record)
+    if err == nil { err = updater.VerifyProcess(record) }
+    if len(os.Args) == 2 && os.Args[1] == "verify" {
+        if errors.Is(err, syscall.ESRCH) { os.Exit(3) }
+        if err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(1) }
+        return
+    }
+    if err == nil {
+        var process *os.Process
+        process, err = os.FindProcess(record.PID)
+        if err == nil { err = process.Signal(syscall.SIGKILL) }
+    }
+    if err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(1) }
+}
+''')
+        control = root / "native-crash"
+        subprocess.run([os.environ.get("SPYNEL_GO_BINARY", "go"), "build", "-o", str(control), str(control_source)], cwd=repo, check=True, timeout=120)
         version = subprocess.check_output([str(binary), "--version"], text=True).strip().split()[1]
         for name in ("bin/spynel.js", "platform.js", "update.js"):
             target = package / "npm" / name
@@ -64,7 +100,7 @@ def main():
         home = root / "home"
         home.mkdir()
         env = {k: v for k, v in os.environ.items() if not k.startswith("SPYNEL_")}
-        env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"), TERM="xterm-256color", SPYNEL_SKIP_UPDATE_CHECK="1")
+        env.update(TMPDIR=str(native_temporary), HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"), TERM="xterm-256color", SPYNEL_SKIP_UPDATE_CHECK="1")
         registry = home / ("Library/Application Support" if sys.platform == "darwin" else ".config") / "spynel" / "processes"
         processes, terminals, providers, adopted = [], [], [], []
 
@@ -76,6 +112,22 @@ def main():
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
             return result
+
+        def verified(record):
+            result = subprocess.run([str(control), "verify"], input=json.dumps(record), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert result.returncode in (0, 3), result.stderr
+            return result.returncode == 0
+
+        def application_records():
+            return [r for r in records() if not r.get("harness_worker") and not r.get("provider_guardian")]
+
+        def worker_records():
+            return {r["pid"]: r for r in records() if r.get("harness_worker")}
+
+        def crash(record):
+            # Native identity is independent of launcher update eligibility.
+            assert record in records(), "fixture native registration changed before crash"
+            subprocess.run([str(control)], input=json.dumps(record), env=env, text=True, check=True)
 
         def child():
             current = records()
@@ -128,7 +180,9 @@ def main():
             screens = 2 if args == [] else 1
             wait_for(lambda: child() is not None and output.count(b"\x1b[?1049h") >= screens)
             assert process.poll() is None
-            assert sum(not r.get("provider_guardian") for r in records()) == 2, "supervised capture spawned another reader/runtime"
+            current = application_records()
+            assert len(current) == 2 and not any(r.get("diagnostic_reader") for r in current), "supervised capture spawned another reader/runtime"
+            assert worker_records(), "ordinary startup did not bind its independent worker"
             if sys.platform == "linux" and len(processes) == 1:
                 parent = next(r for r in records() if r.get("supervisor"))
                 def memory(pid):
@@ -148,7 +202,7 @@ def main():
 
         def stopped(process, master, original, status=0):
             assert process.wait(timeout=15) == status
-            wait_for(lambda: not records(), 3)
+            wait_for(lambda: not application_records(), 3)
             # Check real kernel termios, not escape emission alone.
             assert_terminal_restored(master, original)
 
@@ -181,15 +235,18 @@ def main():
             uninitialized = directory / "uninitialized child"
             uninitialized.mkdir()
             process, master, output, original = launch(launchers[0], uninitialized, args=[])
-            old = child()["pid"]
-            os.kill(old, signal.SIGKILL)
+            old_record = child()
+            old = old_record["pid"]
+            retained_workers = worker_records()
+            crash(old_record)
             wait_for(lambda: b"bounded delay" in output, 5)
             assert_terminal_restored(master, original)
             try:
                 wait_for(lambda: child() is not None and child()["pid"] != old and output.count(b"\x1b[?1049h") >= 3)
             except AssertionError:
                 raise AssertionError((process.poll(), records(), bytes(output[-2500:])))
-            assert len(records()) == 2, "dead executor registration was not retired"
+            assert len(application_records()) == 2, "dead executor registration was not retired"
+            assert worker_records() == retained_workers, "executor recovery replaced an independent worker"
             assert not (uninitialized / ".spynel").exists(), "recovery repeated workspace initialization"
             if sys.platform == "linux":
                 current_pid = child()["pid"]
@@ -236,22 +293,20 @@ finally:
             if sys.platform == "linux":
                 os.waitpid(executor_pid, 0)
                 adopted.remove(executor_pid)
-            # Only the killed supervisor's inert record may remain.
-            for path in registry.glob("*.json"):
-                record = json.loads(path.read_text())
-                assert record["pid"] == supervisor_pid
-                path.unlink()
+            # Retained workers remain independent; remove only the waited supervisor.
+            assert all(r["pid"] == supervisor_pid for r in application_records())
+            (registry / (str(supervisor_pid) + ".json")).unlink()
             process.terminate()
             assert process.wait(timeout=3) == 0
 
             directory = workspace("external service")
             managed = subprocess.Popen([str(binary), "serve", "--automatic-startup"], cwd=directory, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             processes.append(managed)
-            wait_for(lambda: len(records()) == 2 and any(r.get("ready") for r in records()), 5)
-            assert all(not r.get("supervisor") for r in records()), "external service acquired a competing native supervisor"
+            wait_for(lambda: len(application_records()) == 2 and any(r.get("ready") for r in application_records()), 5)
+            assert all(not r.get("supervisor") for r in application_records()), "external service acquired a competing native supervisor"
             managed.terminate()
             assert managed.wait(timeout=12) == 0
-            wait_for(lambda: not records(), 3)
+            wait_for(lambda: not application_records(), 3)
 
             provider = root / "orphan-provider"
             provider.write_text(f'''#!{sys.executable}
@@ -269,27 +324,46 @@ while True:
 ''')
             provider.chmod(0o700)
             directory = workspace("orphan ownership", provider)
+            workers_before_provider = worker_records()
             process, master, output, original = launch(launchers[0], directory)
             wait_for(lambda: (root / "provider-starts").exists())
             providers.extend(int(pid) for pid in (root / "provider-starts").read_text().split())
-            old = child()["pid"]
-            guardian = next(r["pid"] for r in records() if r.get("provider_guardian"))
-            adopted.append(guardian)
-            os.kill(old, signal.SIGKILL)
+            old_record = child()
+            old = old_record["pid"]
+            retained_workers = worker_records()
+            guardian = next(r for r in records() if r.get("provider_guardian"))
+            crash(old_record)
             wait_for(lambda: b"bounded delay" in output, 5)
             assert_terminal_restored(master, original)
-            # Recovery waits out election ownership, then admits exactly one replacement.
-            wait_for(lambda: child() is not None and child()["pid"] != old and len((root / "provider-starts").read_text().split()) == 2)
+            wait_for(lambda: child() is not None and child()["pid"] != old)
+            assert worker_records() == retained_workers, "controller crash replaced a live worker"
+            assert guardian in records(), "controller crash stopped the provider guardian"
+            assert len((root / "provider-starts").read_text().split()) == 1, "controller crash restarted the provider"
+            os.kill(providers[-1], 0)
+
+            # Actual execution-owner death, rather than controller loss, owns reaping.
+            admitted = [r for pid, r in retained_workers.items() if pid not in workers_before_provider]
+            assert len(admitted) == 1, "provider fixture did not admit exactly one worker"
+            worker = admitted[0]
+            print(json.dumps({"event": "controller_worker_continuity", "worker": worker, "guardian": guardian, "provider_pid": providers[-1]}), flush=True)
+            adopted.extend([worker["pid"], guardian["pid"]])
+            crash(worker)
+            wait_for(lambda: len((root / "provider-starts").read_text().split()) == 2)
             prior = providers.pop()
             try:
                 os.kill(prior, 0)
                 raise AssertionError("successor admitted before prior provider was reaped")
             except ProcessLookupError:
                 pass
+            assert not verified(worker), "dead worker identity remained live"
             if sys.platform == "linux":
-                os.waitpid(guardian, 0)
-                adopted.remove(guardian)
+                for pid in [worker["pid"], guardian["pid"]]:
+                    os.waitpid(pid, 0)
+                    adopted.remove(pid)
             providers.append(int((root / "provider-starts").read_text().split()[-1]))
+            replacements = [r for pid, r in worker_records().items() if pid not in retained_workers]
+            assert len(replacements) == 1 and verified(replacements[0]), "worker death did not admit one verified replacement"
+            print(json.dumps({"event": "worker_crash_recovery", "old_worker": worker, "replacement_worker": replacements[0], "old_provider_reaped": True, "replacement_provider_pid": providers[-1]}), flush=True)
             assert process.poll() is None, "native supervisor did not recover"
             before = (root / "synthetic-effects").stat().st_size
             wait_for(lambda: (root / "synthetic-effects").stat().st_size > before, 3)
@@ -299,8 +373,8 @@ while True:
 
             failure = subprocess.run([str(binary), "serve", "--invalid-fixture-flag"], cwd=directory, env=env, capture_output=True, timeout=5)
             assert failure.returncode != 0 and b"bounded delay" not in failure.stderr
-            assert not records(), "startup failure left running instances"
-            print("Verified native/npm PTY quit and Ctrl+C, F6/resize, kernel terminal restoration, primary crash/takeover, guarded provider reaping and automatic replacement after owner loss.")
+            assert not application_records(), "startup failure left running application instances"
+            print("Verified native/npm PTY quit and Ctrl+C, F6/resize, kernel terminal restoration, primary crash/takeover, independent-worker/provider continuity and guarded replacement after actual worker death.")
         finally:
             for process in processes:
                 if process.poll() is None:
@@ -311,26 +385,40 @@ while True:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+            cleanup_records = records()
+            worker_paths = [path for path in (registry.parent / "harness").glob("*.lock.worker.json")]
+            endpoints = [Path(json.loads(path.read_text())["Info"]["Socket"]).parent for path in worker_paths]
+            removed = subprocess.run([str(cleanup_binary), "uninstall-bundles", "--root", str(root / "absent-standalone"), "--npm-root", str(package)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=45)
+            assert removed.returncode == 0, removed.stderr
+            wait_for(lambda: not any(verified(r) for r in records()), 5)
+            assert not any(verified(r) for r in cleanup_records), "recorded native process survived teardown"
+            assert not package.exists(), "fixture installation survived removal"
+            assert all(not p.exists() for p in worker_paths + endpoints), "owned worker state survived removal"
+            if sys.platform == "linux":
+                for pid in {r["pid"] for r in cleanup_records} | set(adopted):
+                    try:
+                        waited, _ = os.waitpid(pid, os.WNOHANG)
+                        assert waited == pid, "fixture child remained live after verified uninstall"
+                    except ChildProcessError:
+                        pass
             for pid in providers:
                 try:
-                    os.kill(pid, signal.SIGKILL)
+                    os.kill(pid, 0)
+                    raise AssertionError("fixture provider survived verified installation removal")
                 except ProcessLookupError:
                     pass
-                if sys.platform == "linux":
-                    try:
-                        os.waitpid(pid, 0)
-                    except ChildProcessError:
-                        pass
-            if sys.platform == "linux":
-                for pid in adopted:
-                    try:
-                        if os.waitpid(pid, os.WNOHANG) == (0, 0):
-                            os.kill(pid, signal.SIGKILL)
-                            os.waitpid(pid, 0)
-                    except ChildProcessError:
-                        pass
+            print(json.dumps({"event": "installation_cleanup", "records": cleanup_records, "provider_pids": providers, "worker_paths": [str(p) for p in worker_paths + endpoints], "all_captured_native_identities_dead": True}), flush=True)
+            cleanup_confirmed = True
             for master in terminals:
                 os.close(master)
+
+    finally:
+        if cleanup_confirmed:
+            shutil.rmtree(native_temporary)
+            shutil.rmtree(root)
+            print(json.dumps({"event": "fixture_cleanup_complete", "fixture_root": str(root), "native_temporary_root": str(native_temporary), "roots_absent": not root.exists() and not native_temporary.exists()}), flush=True)
+        else:
+            print("Retained unconfirmed fixture roots: " + str(root) + " " + str(native_temporary), file=sys.stderr)
 
 
 if __name__ == "__main__":
