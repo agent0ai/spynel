@@ -252,7 +252,20 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 }
 
 func runPrimaryOrchestrator(ctx context.Context, service *app.Service) error {
-	if availability, ok := service.Harness.(harness.Availability); ok {
+	if service.Orchestrator.Worker != nil {
+		ticker := time.NewTicker(instance.RetryInterval)
+		defer ticker.Stop()
+		for {
+			if ready, _, err := service.Orchestrator.Availability(ctx); err == nil && ready {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+			}
+		}
+	} else if availability, ok := service.Harness.(harness.Availability); ok {
 		if ready, _ := availability.Available(); !ready {
 			select {
 			case <-ctx.Done():

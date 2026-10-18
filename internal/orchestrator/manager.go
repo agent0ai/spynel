@@ -455,13 +455,26 @@ func (m *Manager) requestScan() {
 func (m *Manager) ScanOnce(ctx context.Context) error { return m.runScan(ctx, nil) }
 
 func (m *Manager) runScan(ctx context.Context, generation *uint64) error {
+	processOutbox, err := m.scanWorkflows(ctx, generation)
+	if err != nil || !processOutbox {
+		return err
+	}
+	// Delivery inspects before fencing its own effects, outside scan locks.
+	if err := m.Outbox.Process(ctx); err != nil {
+		m.log("notification delivery deferred: " + err.Error())
+	}
+	return nil
+}
+
+func (m *Manager) scanWorkflows(ctx context.Context, generation *uint64) (bool, error) {
 	var retained []harness.WorkerExecution
+	processOutbox := false
 	if m.Worker != nil {
 		m.workerAdmissionMu.Lock()
 		defer m.workerAdmissionMu.Unlock()
 		reply, err := m.Worker.Call(ctx, harness.WorkerRequest{Action: "inspect"})
 		if err != nil {
-			return err
+			return false, err
 		}
 		retained = reply.Executions
 	}
@@ -481,12 +494,17 @@ func (m *Manager) runScan(ctx context.Context, generation *uint64) error {
 		}
 		m.attachWorkerAgents(ctx, retained)
 		m.attachWorkerConversations(ctx, retained)
-		return m.scanOnce(ctx)
+		err := m.scanOnce(ctx)
+		processOutbox = err == nil && m.orchestratorEnabled.Load()
+		return err
 	}
+	var err error
 	if m.Worker != nil {
-		return m.Worker.RunOwned(ctx, scan)
+		err = m.Worker.RunOwned(ctx, scan)
+	} else {
+		err = scan()
 	}
-	return scan()
+	return processOutbox, err
 }
 
 func (m *Manager) scanOnce(ctx context.Context) error {
@@ -544,9 +562,6 @@ func (m *Manager) scanOnce(ctx context.Context) error {
 		if err := m.scanPhaseQueue(ctx, route, filepath.Join(base, "review"), filepath.Join(base, "reviewing"), phase); err != nil {
 			return err
 		}
-	}
-	if err := m.Outbox.Process(ctx); err != nil {
-		m.log("notification delivery deferred: " + err.Error())
 	}
 	return nil
 }

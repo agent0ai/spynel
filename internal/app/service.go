@@ -232,6 +232,9 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 func (s *Service) Close() error {
 	s.stopRecoveryScanner()
 	err := s.Harness.Close()
+	if s.Orchestrator.Worker != nil {
+		s.Orchestrator.Worker.Close()
+	}
 	s.stopAllChatActivity()
 	s.Runtime.Close()
 	return err
@@ -291,6 +294,29 @@ func validateOrigin(cfg config.Config, store *history.Store, identity *telegram.
 }
 
 func (s *Service) deliverNotification(ctx context.Context, origin orchestrator.Origin, eventID, text string) error {
+	active := false
+	if origin.Channel == "tui" {
+		state, err := s.History.DeliveryState(origin.Channel, origin.Conversation, eventID)
+		if err != nil {
+			return err
+		}
+		if state == "sent" {
+			return s.validateOrigin(origin)
+		}
+		session, err := s.Orchestrator.Session(ctx, sessionKey(core.Message{Channel: origin.Channel, Conversation: origin.Conversation}))
+		if err != nil {
+			return errors.New("notification session state unavailable")
+		}
+		active = session.Active
+	}
+	deliver := func() error { return s.deliverNotificationEffect(ctx, origin, eventID, text, active) }
+	if s.Orchestrator.Worker != nil {
+		return s.Orchestrator.Worker.RunOwned(ctx, deliver)
+	}
+	return deliver()
+}
+
+func (s *Service) deliverNotificationEffect(ctx context.Context, origin orchestrator.Origin, eventID, text string, active bool) error {
 	if err := s.validateOrigin(origin); err != nil {
 		return err
 	}
@@ -324,7 +350,7 @@ func (s *Service) deliverNotification(ctx context.Context, origin orchestrator.O
 		}
 	}
 	role := "assistant"
-	if origin.Channel == "tui" && s.Harness.IsActive(sessionKey(core.Message{Channel: origin.Channel, Conversation: origin.Conversation})) {
+	if origin.Channel == "tui" && active {
 		role = "notification_pending"
 	}
 	_, err = s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: role, Sender: "Spy", Content: text, EventID: eventID})
@@ -455,7 +481,16 @@ func remoteAuthorizedPrincipalCount(cfg config.Config) int {
 }
 
 func (s *Service) Start(ctx context.Context) error {
-	err := s.Harness.Start(ctx)
+	var err error
+	if s.Orchestrator.Worker == nil {
+		err = s.Harness.Start(ctx)
+	} else {
+		ready, detail, inspectErr := s.Orchestrator.Availability(ctx)
+		err = inspectErr
+		if err == nil && !ready {
+			err = fmt.Errorf("worker harness unavailable: %s", detail)
+		}
+	}
 	s.recoveryMu.Lock()
 	s.serviceStarted = true
 	s.recoveryMu.Unlock()
@@ -576,7 +611,7 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 		return ErrDuplicateMessage
 	}
 	if message.FollowupOnly {
-		session, err := s.Orchestrator.ConversationSession(ctx, sessionKey(message))
+		session, err := s.Orchestrator.Session(ctx, sessionKey(message))
 		if err != nil {
 			return fmt.Errorf("inspect active conversation: %w", err)
 		}
@@ -1567,8 +1602,15 @@ func (s *Service) jobCommand(ctx context.Context, message core.Message, remainde
 	if !stopped {
 		s.Runtime.RestoreJobAfterFailedCancellation(job)
 		s.Orchestrator.RestoreControlCancellation(cancellationLeaseID)
-		if s.Harness.IsActive(job.SessionKey) {
+		session, inspectErr := s.Orchestrator.Session(ctx, job.SessionKey)
+		if inspectErr != nil {
+			return s.localReply(message, fmt.Sprintf("Cannot confirm completion of job %d: session state unavailable.", id), emit)
+		}
+		if session.Active {
 			return s.localReply(message, fmt.Sprintf("Cannot kill job %d: the provider did not accept the interrupt request.", id), emit)
+		}
+		if session.Retained {
+			return s.localReply(message, fmt.Sprintf("Job %d provider is finished; delivery is still pending.", id), emit)
 		}
 		s.stopJobChatActivity(job.ID)
 		s.Runtime.EndJob(job.ID)
@@ -1868,11 +1910,18 @@ func (s *Service) Status(message core.Message) (StatusSnapshot, error) {
 	}
 	harnessState := "connected"
 	harnessDetail := ""
-	if availability, ok := s.Harness.(harness.Availability); ok {
-		if ready, detail := availability.Available(); !ready {
-			harnessState = "unavailable"
-			harnessDetail = detail
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ready, detail, err := s.Orchestrator.Availability(ctx)
+	if err != nil {
+		return StatusSnapshot{}, err
+	}
+	if !ready {
+		harnessState, harnessDetail = "unavailable", detail
+	}
+	session, err := s.Orchestrator.Session(ctx, sessionKey(message))
+	if err != nil {
+		return StatusSnapshot{}, errors.New("harness session state unavailable")
 	}
 	version := ""
 	if s.Updates != nil {
@@ -1884,7 +1933,7 @@ func (s *Service) Status(message core.Message) (StatusSnapshot, error) {
 		Connections: []channel.ConnectionStatus{s.connectionStatus("telegram"), s.connectionStatus("whatsapp")},
 		Runtime:     s.Runtime.Status(), Harness: cfg.Harness.Name, HarnessState: harnessState,
 		HarnessDetail: harnessDetail, Model: cfg.Harness.Model, ReasoningEffort: cfg.Harness.ReasoningEffort, ServiceMode: cfg.Harness.ServiceMode, Sandbox: cfg.Harness.Sandbox,
-		StartupEnabled: cfg.Startup.Enabled, TurnActive: s.Harness.IsActive(sessionKey(message)),
+		StartupEnabled: cfg.Startup.Enabled, TurnActive: session.Active,
 		OrchestratorLease: leases, OrchestratorRuns: dispatches,
 		TasksActive: work.TasksActive, TasksWaiting: work.TasksWaiting, GoalsActive: work.GoalsActive, WorkDiagnostics: work.CountDiagnostics,
 		HeartbeatState: work.HeartbeatState, NextHeartbeatAt: nextHeartbeatAt,

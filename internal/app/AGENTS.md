@@ -73,6 +73,8 @@
 
 - With a bound worker, strict follow-up intake reads authenticated session state through the Manager, and serialized Manager admission still requires a retained execution before selecting follow-up. Clear and resume-delete share one service reset/clear path: exclude pending/new same-conversation intake through the existing admission map, confirm the owning worker reset before clearing, and fence the history mutation under the same exact controller. Retained delivery, conflicting local ownership, unavailable inspection and lost reset replies refuse deletion. RPCs remain outside ownership callbacks. Production selection and coordinated lifecycle remain gated.
 
+- Bound service startup and status/configuration/onboarding readiness inspect the worker instead of starting or reading its inactive controller Supervisor; Close detaches the worker client and retains its independent lifetime. Shared status and job details read authenticated owning session state with bounded inspection; unknown state is explicit, never invented idle/connected status. A clean inactive interruption still cannot retire a job whose worker retains delivery. TUI notification interleave uses that same session inspection before the application effect fence, then revalidates origin/history and commits under exact native/controller ownership. Inspection failure preserves the outbox retry without a delivered history entry; an existing delivered receipt remains authoritative. Scheduled outbox processing runs outside workflow scan locks. Production selection and version-changing update coordination remain unfinished.
+
 ## Child DOX Index
 
 No child DOX files.

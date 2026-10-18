@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	WorkerProtocol      = 12
+	WorkerProtocol      = 13
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -181,6 +181,12 @@ type WorkerSession struct {
 	ThreadID  string
 	Active    bool
 	Admission string
+	Retained  bool
+}
+
+type WorkerAvailability struct {
+	Available bool
+	Detail    string
 }
 
 type WorkerReply struct {
@@ -194,6 +200,7 @@ type WorkerReply struct {
 	ConfigDigest [32]byte
 	Config       *HarnessConfig
 	Models       []Model
+	Availability *WorkerAvailability
 }
 
 type workerExecution struct {
@@ -438,9 +445,10 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 	switch request.Action {
 	case "inspect":
 		cfg := h.supervisor.HarnessConfig()
+		available, detail := h.supervisor.Available()
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		reply := WorkerReply{NextSequence: h.next, ConfigDigest: h.info.ConfigDigest, Config: &cfg}
+		reply := WorkerReply{NextSequence: h.next, ConfigDigest: h.info.ConfigDigest, Config: &cfg, Availability: &WorkerAvailability{Available: available, Detail: detail}}
 		for _, execution := range h.executions {
 			reply.Executions = append(reply.Executions, execution.WorkerExecution)
 		}
@@ -501,13 +509,13 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 		if request.Key == "" || len(request.Key) > 4096 {
 			return WorkerReply{Error: "invalid worker session key"}
 		}
+		h.mu.Lock()
+		retained := false
+		for _, execution := range h.executions {
+			retained = retained || execution.Key == request.Key
+		}
+		h.mu.Unlock()
 		if request.Action == "reset" {
-			h.mu.Lock()
-			retained := false
-			for _, execution := range h.executions {
-				retained = retained || execution.Key == request.Key
-			}
-			h.mu.Unlock()
 			if retained {
 				return WorkerReply{Error: "consume and retire worker executions before resetting their session"}
 			}
@@ -517,7 +525,7 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 		}
 		return WorkerReply{Session: &WorkerSession{
 			ThreadID: h.supervisor.ThreadID(request.Key), Active: h.supervisor.IsActive(request.Key),
-			Admission: h.supervisor.ConversationAdmission(request.Key),
+			Admission: h.supervisor.ConversationAdmission(request.Key), Retained: retained,
 		}}
 	case "shutdown":
 		h.stopOnce.Do(func() { close(h.stop) })

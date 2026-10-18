@@ -104,10 +104,8 @@ func (s *Service) welcomeText(channelName string) string {
 		if s.connectionStatus("whatsapp").State != channel.ConnectionConnected {
 			lines = append(lines, "- type `/whatsapp` to connect WhatsApp")
 		}
-		if availability, ok := s.Harness.(harness.Availability); ok {
-			if ready, detail := availability.Available(); !ready {
-				lines = append(lines, "", "**Heads up:** The configured coding harness is unavailable: "+detail, "Use `/harness` to select or repair it before sending an objective.")
-			}
+		if ready, detail := s.harnessAvailability(); !ready {
+			lines = append(lines, "", "**Heads up:** The configured coding harness is unavailable: "+detail, "Use `/harness` to select or repair it before sending an objective.")
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -764,15 +762,23 @@ func (s *Service) HarnessScreen(required bool) core.Screen {
 		} else {
 			screen.Status = "No coding harness was detected. Choose one to see setup guidance."
 		}
-	} else if availability, ok := s.Harness.(harness.Availability); ok {
-		if ready, detail := availability.Available(); !ready {
-			screen.Status = "Selected but unavailable"
-			if strings.TrimSpace(detail) != "" {
-				screen.Status += ": " + detail
-			}
+	} else if ready, detail := s.harnessAvailability(); !ready {
+		screen.Status = "Selected but unavailable"
+		if strings.TrimSpace(detail) != "" {
+			screen.Status += ": " + detail
 		}
 	}
 	return screen
+}
+
+func (s *Service) harnessAvailability() (bool, string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ready, detail, err := s.Orchestrator.Availability(ctx)
+	if err != nil {
+		return false, "worker state unavailable"
+	}
+	return ready, detail
 }
 
 func (s *Service) modelCommand(ctx context.Context, message core.Message, remainder string, emit core.Emit) error {

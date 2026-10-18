@@ -48,6 +48,8 @@
 
 - Ordinary notify accepts an explicit owner-established same-operator private remote fallback as well as local fallbacks; this is an association supplied by the operator, never inferred from allow-lists or recency. Admission remains queue acceptance.
 
+- With an explicit private worker binding, primary orchestrator readiness polls authenticated worker availability with the existing election retry interval and caller cancellation; the inactive controller Supervisor cannot release or indefinitely block that gate. Normal production worker selection and coordinated version-changing restart/update/stop/uninstall remain gated.
+
 ## Child DOX Index
 
 No child DOX files.

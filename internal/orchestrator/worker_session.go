@@ -7,9 +7,9 @@ import (
 	"github.com/agent0ai/spynel/internal/harness"
 )
 
-// ConversationSession is advisory; provider admission still fences completion.
+// Session is advisory; provider admission still fences completion.
 // Call it outside ownership callbacks because a bound worker requires RPC.
-func (m *Manager) ConversationSession(ctx context.Context, key string) (harness.WorkerSession, error) {
+func (m *Manager) Session(ctx context.Context, key string) (harness.WorkerSession, error) {
 	if m.Worker == nil {
 		return harness.WorkerSession{Active: m.Harness.IsActive(key), ThreadID: m.Harness.ThreadID(key)}, nil
 	}
@@ -24,6 +24,23 @@ func (m *Manager) ConversationSession(ctx context.Context, key string) (harness.
 		return harness.WorkerSession{}, errors.New("conversation has a controller-owned execution")
 	}
 	return *reply.Session, nil
+}
+
+// Availability inspects the execution owner, including an unavailable adapter.
+// Like Session, it cannot be called inside an ownership callback.
+func (m *Manager) Availability(ctx context.Context) (bool, string, error) {
+	if m.Worker == nil {
+		if target, ok := m.Harness.(harness.Availability); ok {
+			ready, detail := target.Available()
+			return ready, detail, nil
+		}
+		return true, "", nil
+	}
+	reply, err := m.Worker.Call(ctx, harness.WorkerRequest{Action: "inspect"})
+	if err != nil || reply.Availability == nil {
+		return false, "", errors.New("worker availability unavailable")
+	}
+	return reply.Availability.Available, reply.Availability.Detail, nil
 }
 
 // ResetConversation confirms the owning reset before clearing history. Bound
@@ -47,7 +64,7 @@ func (m *Manager) ResetConversation(ctx context.Context, key string, clear func(
 	if err != nil {
 		return err
 	}
-	if reply.Session == nil || reply.Session.Active || reply.Session.ThreadID != "" {
+	if reply.Session == nil || reply.Session.Active || reply.Session.Retained || reply.Session.ThreadID != "" {
 		return errors.New("worker session reset was not confirmed")
 	}
 	return m.Worker.RunOwned(ctx, clear)
