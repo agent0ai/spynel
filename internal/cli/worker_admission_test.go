@@ -75,8 +75,12 @@ func runWorkerAdmissionProvider() int {
 			}
 		}
 		if request.Method == "turn/start" {
-			if os.Getenv("SPYNEL_TEST_WORKER_CONVERSATION_ERROR") == "1" {
-				if write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "synthetic-thread", "turnId": "synthetic-turn", "delta": "retained partial"}}) != nil {
+			if mode := os.Getenv("SPYNEL_TEST_WORKER_CONVERSATION_ERROR"); mode != "" {
+				partial := "retained partial"
+				if mode == "2" {
+					partial += "\n[Send attachment](<missing>)"
+				}
+				if write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": "synthetic-thread", "turnId": "synthetic-turn", "delta": partial}}) != nil {
 					return 1
 				}
 			}

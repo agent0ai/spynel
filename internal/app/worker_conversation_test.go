@@ -143,3 +143,35 @@ func TestWorkerConversationDeliveryFailsClosedAndRetriesStorage(t *testing.T) {
 		t.Fatal("retry lost coverage or duplicated history")
 	}
 }
+
+func TestWorkerConversationFinalPreservesOutputOnProcessingError(t *testing.T) {
+	for _, failure := range []string{"after-hook", "outbound-final-item"} {
+		t.Run(failure, func(t *testing.T) {
+			s, _, _ := newRecoveryTestService(t)
+			metadata := &harness.WorkerConversation{Channel: "telegram", Conversation: "TG-7", ExecutionID: "execution", SourceMessageID: "source", Sources: []string{"source"}}
+			if _, err := s.History.Append(metadata.Channel, metadata.Conversation, history.Entry{Role: "user", SourceMessageID: "source"}); err != nil {
+				t.Fatal(err)
+			}
+			id, err := s.Runtime.TryBeginJobWithDetails("chat:telegram:TG-7", metadata.Channel, metadata.Conversation, "synthetic", JobDetails{Kind: "conversation", WorkID: metadata.ExecutionID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			finalItem := "[Send attachment](<missing>)"
+			delivery := harness.WorkerDelivery{WorkerID: strings.Repeat("c", 32), Sequence: 1, WorkerEvent: harness.WorkerEvent{Cursor: 1, Conversation: metadata, Streamed: "useful partial", Event: core.Event{Kind: core.EventFinal, Text: "useful partial", FinalText: &finalItem, Done: true}}}
+			if failure == "after-hook" {
+				s.Config.Extensions.Enabled = true
+				s.Hooks.Directory = filepath.Join(t.TempDir(), "unreadable-extensions")
+				if err := os.WriteFile(s.Hooks.Directory, nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.ConsumeConversationDelivery(id, delivery, nil); err != nil {
+				t.Fatal(err)
+			}
+			entries, _, err := s.History.Entries(metadata.Channel, metadata.Conversation)
+			if err != nil || len(entries) != 3 || entries[1].Role != "assistant" || entries[1].Content != "useful partial" || entries[1].ReceiptID != delivery.ReceiptID()+":partial" || entries[2].Role != "error" || !entries[2].Terminal {
+				t.Fatal("application processing error lost output or its stable receipt", err)
+			}
+		})
+	}
+}

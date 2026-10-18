@@ -59,9 +59,8 @@ func (h *workerHost) captureConversationLocked(execution *workerExecution, event
 		execution.streamed += event.Text
 	}
 	if event.Done && !requestOnly && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
-		if event.Kind == core.EventError {
-			streamed = execution.streamed
-		}
+		// Application hooks or outbound validation can turn a final into an error.
+		streamed = execution.streamed
 		execution.streamed = ""
 	}
 	return &snapshot, streamed
