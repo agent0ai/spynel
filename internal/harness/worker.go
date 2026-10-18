@@ -203,7 +203,7 @@ type workerHost struct {
 	recordPath   string
 	stop         chan struct{}
 	stopOnce     sync.Once
-	operations   sync.Mutex
+	operations   operationGate
 	mu           sync.Mutex
 	lastSeen     time.Time
 	next         uint64
@@ -378,10 +378,17 @@ func (h *workerHost) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "worker identity changed", http.StatusConflict)
 		return
 	}
-	h.operations.Lock()
+	if err := h.operations.LockContext(r.Context()); err != nil {
+		http.Error(w, "worker request expired before admission", http.StatusRequestTimeout)
+		return
+	}
 	defer h.operations.Unlock()
 	var reply WorkerReply
 	ran, err := h.election.RunForOwner(request.InstanceID, request.TermToken, func() error {
+		// Election acquisition may wait too; admitted work keeps its own lifetime.
+		if err := r.Context().Err(); err != nil {
+			return err
+		}
 		h.mu.Lock()
 		if h.failure != nil {
 			h.mu.Unlock()

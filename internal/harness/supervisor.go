@@ -39,7 +39,7 @@ type Supervisor struct {
 	seenControl       map[string]map[string]time.Time
 	controlGeneration map[string]uint64
 	controlOpsMu      sync.Mutex
-	controlOps        map[string]sessionOperation
+	controlOps        map[string]*operationGate
 	ready             chan struct{}
 	closed            bool
 	processStartGuard func() error
@@ -70,16 +70,24 @@ type controlState struct {
 	continued           bool
 }
 
-type sessionOperation chan struct{}
+// The zero value is ready for use by both session and worker operations.
+type operationGate struct {
+	once  sync.Once
+	token chan struct{}
+}
 
-func (o sessionOperation) Lock()   { <-o }
-func (o sessionOperation) Unlock() { o <- struct{}{} }
+func (o *operationGate) Lock()   { _ = o.LockContext(context.Background()) }
+func (o *operationGate) Unlock() { o.token <- struct{}{} }
 
-func (o sessionOperation) LockContext(ctx context.Context) error {
+func (o *operationGate) LockContext(ctx context.Context) error {
+	o.once.Do(func() {
+		o.token = make(chan struct{}, 1)
+		o.token <- struct{}{}
+	})
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-o:
+	case <-o.token:
 		// Cancellation can win at the same time the session becomes available.
 		if err := ctx.Err(); err != nil {
 			o.Unlock()
@@ -93,7 +101,7 @@ func NewSupervisor(registry *Registry, cfg HarnessConfig) *Supervisor {
 	return &Supervisor{
 		registry: registry, config: cfg, active: map[string]int{}, pending: map[string][]pendingSend{},
 		controlEmit: map[string]core.Emit{}, controls: map[string]*controlState{}, seenControl: map[string]map[string]time.Time{},
-		controlGeneration: map[string]uint64{}, controlOps: map[string]sessionOperation{},
+		controlGeneration: map[string]uint64{}, controlOps: map[string]*operationGate{},
 		ready: make(chan struct{}, 1),
 	}
 }
@@ -765,13 +773,12 @@ func cancelQueuedRequests(queue ...pendingSend) {
 	}
 }
 
-func (s *Supervisor) controlOperation(key string) sessionOperation {
+func (s *Supervisor) controlOperation(key string) *operationGate {
 	s.controlOpsMu.Lock()
 	defer s.controlOpsMu.Unlock()
 	lock := s.controlOps[key]
 	if lock == nil {
-		lock = make(sessionOperation, 1)
-		lock.Unlock()
+		lock = &operationGate{}
 		s.controlOps[key] = lock
 	}
 	return lock
