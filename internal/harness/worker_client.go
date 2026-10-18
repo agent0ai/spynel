@@ -238,6 +238,9 @@ func (c *WorkerClient) Consume(ctx context.Context, sequence uint64, consume fun
 		return execution, errors.New("invalid worker consumer page")
 	}
 	execution = page.Executions[0]
+	if len(execution.ReceiptWorkerID) < 32 || len(execution.ReceiptWorkerID) > 128 {
+		return execution, errors.New("invalid worker delivery identity")
+	}
 	after := execution.CommittedCursor
 	for _, event := range page.Events {
 		if event.Cursor <= after {
@@ -247,7 +250,7 @@ func (c *WorkerClient) Consume(ctx context.Context, sequence uint64, consume fun
 			return execution, errors.New("worker consumer event gap")
 		}
 		err := c.RunOwned(ctx, func() error {
-			return consume(WorkerDelivery{WorkerID: c.record.Info.ID, Sequence: sequence, WorkerEvent: event})
+			return consume(WorkerDelivery{WorkerID: execution.ReceiptWorkerID, Sequence: sequence, WorkerEvent: event})
 		})
 		if err != nil {
 			return execution, err

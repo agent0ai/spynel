@@ -566,15 +566,20 @@ func TestWorkerConcurrentLaunchAndConfirmedDeadReplacement(t *testing.T) {
 		t.Fatal("discovery dispatched provider work")
 	}
 	prior := client.record
-	workerClientCall(t, client, WorkerRequest{Action: "shutdown"})
+	if err := updater.VerifyProcess(prior.Info.Process); err != nil {
+		t.Fatal(err)
+	}
+	process, err := os.FindProcess(prior.Info.PID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer process.Release()
+	if err := process.Kill(); err != nil {
+		t.Fatal(err)
+	}
 	waitWorkerExit(t, prior.Info)
 	lock, _ := ProcessOwnershipPath(root)
 	path, _ := workerRecordPath(lock)
-	// Preserve an authentic dead registration to exercise crash-left rendezvous.
-	data, _ := json.Marshal(prior)
-	if err := fsx.AtomicWriteFile(path, data, 0600); err != nil {
-		t.Fatal(err)
-	}
 	replacement, err := OpenWorker(t.Context(), cfg, owner.ID(), term)
 	if err != nil {
 		t.Fatal(err)

@@ -158,6 +158,7 @@ type WorkerEvent struct {
 }
 
 type WorkerExecution struct {
+	ReceiptWorkerID   string
 	Sequence          uint64
 	Key               string
 	ThreadID          string
@@ -247,6 +248,7 @@ type workerHost struct {
 	lastSeen     time.Time
 	next         uint64
 	executions   map[uint64]*workerExecution
+	incomplete   int
 	bytes        int64
 	failure      error
 	workflow     WorkerWorkflowAction
@@ -299,7 +301,12 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(directory)
+	published, retire := false, false
+	defer func() {
+		if !published || retire {
+			_ = os.RemoveAll(directory)
+		}
+	}()
 	election, err := instance.New(filepath.Join(root, ".spynel"))
 	if err != nil {
 		return err
@@ -328,8 +335,11 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	var host *workerHost
 	defer func() {
 		cancel()
-		runErr = errors.Join(runErr, supervisor.Close())
-		if current, err := readWorkerRecord(recordPath); err == nil && current.Info.ID == info.ID {
+		if err := supervisor.Close(); err != nil {
+			retire = false
+			runErr = errors.Join(runErr, err)
+		}
+		if current, err := readWorkerRecord(recordPath); retire && err == nil && current.Info.ID == info.ID {
 			runErr = errors.Join(runErr, os.Remove(recordPath))
 		}
 		if host != nil {
@@ -340,6 +350,12 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 			}
 		}
 	}()
+	host = &workerHost{
+		supervisor: supervisor, election: election, info: info, token: bootstrap.Token, directory: directory, recordPath: recordPath,
+		stop: make(chan struct{}), lastSeen: time.Now(), next: 1, executions: map[uint64]*workerExecution{},
+		workflow: workflow, settings: settings, conversation: conversation,
+	}
+	var previousDirectory string
 	startup, startupCancel := context.WithTimeout(workerCtx, 30*time.Second)
 	defer startupCancel()
 	startupTick := time.NewTicker(100 * time.Millisecond)
@@ -363,6 +379,10 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 				}
 				return err
 			}
+			previousDirectory, err = host.recoverPrevious(bootstrap.Harness)
+			if err != nil {
+				return err
+			}
 			// Availability reports startup errors; the control plane stays usable.
 			_ = supervisor.Start(workerCtx)
 			return workerCtx.Err()
@@ -380,13 +400,15 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 		case <-startupTick.C:
 		}
 	}
-	host = &workerHost{
-		supervisor: supervisor, election: election, info: info, token: bootstrap.Token, directory: directory, recordPath: recordPath,
-		stop: make(chan struct{}), lastSeen: time.Now(), next: 1, executions: map[uint64]*workerExecution{},
-		workflow: workflow, settings: settings, conversation: conversation,
-	}
 	if err := publishWorkerRecord(recordPath, workerRecord{Info: info, Token: bootstrap.Token}); err != nil {
 		return err
+	}
+	published = true
+	if previousDirectory != "" {
+		if err := os.RemoveAll(previousDirectory); err != nil {
+			// The published copy remains discoverable even if predecessor cleanup fails.
+			return errors.New("worker predecessor cleanup incomplete")
+		}
 	}
 	server := &http.Server{
 		Handler: http.HandlerFunc(host.serve), ReadHeaderTimeout: 5 * time.Second,
@@ -409,11 +431,13 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	for {
 		select {
 		case <-ctx.Done():
+			retire = true
 			return nil
 		case <-host.stop:
 			host.mu.Lock()
 			err := host.failure
 			host.mu.Unlock()
+			retire = err == nil
 			return err
 		case err := <-served:
 			return err
@@ -423,6 +447,7 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 			expired := time.Since(host.lastSeen) >= workerDetachedGrace
 			host.mu.Unlock()
 			if expired {
+				retire = true
 				return errors.New("worker detached grace expired")
 			}
 		}
@@ -630,7 +655,7 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 			return WorkerReply{Error: "workflow admission already retained; inspect and attach before any new dispatch"}
 		}
 	}
-	if len(h.executions) >= workerMaxExecutions {
+	if len(h.executions)+h.incomplete >= workerMaxExecutions {
 		h.mu.Unlock()
 		return WorkerReply{Error: "worker execution retention is full; consume completed executions"}
 	}
@@ -639,7 +664,7 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		h.mu.Unlock()
 		return WorkerReply{Error: "create worker journal failed"}
 	}
-	execution := &workerExecution{WorkerExecution: WorkerExecution{Sequence: request.Sequence, Key: request.Key, Workflow: request.Workflow, Agent: request.Agent, Conversation: request.Conversation}, file: file, digest: digest}
+	execution := &workerExecution{WorkerExecution: WorkerExecution{ReceiptWorkerID: h.info.ID, Sequence: request.Sequence, Key: request.Key, Workflow: request.Workflow, Agent: request.Agent, Conversation: request.Conversation}, file: file, digest: digest}
 	h.executions[request.Sequence] = execution
 	h.next++
 	if err := file.Sync(); err != nil || h.saveAdmissionLocked(execution) != nil {
