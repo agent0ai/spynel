@@ -36,7 +36,7 @@ func (b *workerAdmissionBody) Read(p []byte) (int, error) {
 }
 
 func TestWorkerCancelledRequestDoesNotAcquireOwnershipOrApply(t *testing.T) {
-	for _, action := range []string{"send", "control", "interrupt", "shutdown", "inspect"} {
+	for _, action := range []string{"send", "followup", "control", "interrupt", "shutdown", "inspect"} {
 		for _, contended := range []bool{false, true} {
 			t.Run(action+map[bool]string{false: "/already-cancelled", true: "/contended-deadline"}[contended], func(t *testing.T) {
 				target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}}

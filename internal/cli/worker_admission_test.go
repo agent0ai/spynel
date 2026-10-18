@@ -72,9 +72,12 @@ func runWorkerAdmissionProvider() int {
 		case "model/list":
 			result["data"] = []any{map[string]any{"id": "model-a", "model": "model-a", "isDefault": true, "supportedReasoningEfforts": []any{map[string]string{"reasoningEffort": "high"}}, "serviceTiers": []any{map[string]string{"id": "priority", "name": "Priority"}}}}
 		case "turn/steer":
-			if os.Getenv("SPYNEL_TEST_WORKER_UNCERTAIN_STEER") == "1" {
+			if mode := os.Getenv("SPYNEL_TEST_WORKER_UNCERTAIN_STEER"); mode != "" {
 				if _, err := file.WriteString("followup-effect\n"); err != nil || file.Sync() != nil {
 					return 1
+				}
+				if mode == "timeout" {
+					continue
 				}
 				if write(map[string]any{"id": request.ID, "error": map[string]any{"code": -32000, "message": "synthetic acknowledgement failed after effect"}}) != nil {
 					return 1

@@ -409,13 +409,13 @@ func (s *Supervisor) targetLocked() (Harness, error) {
 }
 
 func (s *Supervisor) Send(ctx context.Context, key, prompt string, emit core.Emit) (string, bool, error) {
-	return s.send(ctx, key, prompt, "", emit)
+	return s.send(ctx, key, prompt, "", emit, false)
 }
 
 // SendConversation gives the supervisor the raw user message needed for
 // lossless batching. When no queue forms it is identical to Send.
 func (s *Supervisor) SendConversation(ctx context.Context, key, prompt, message string, emit core.Emit) (string, bool, error) {
-	return s.send(ctx, key, prompt, message, emit)
+	return s.send(ctx, key, prompt, message, emit, false)
 }
 
 // ConversationAdmission reports the provider-neutral follow-up mode visible
@@ -434,7 +434,7 @@ func (s *Supervisor) ConversationAdmission(key string) string {
 	return "steered"
 }
 
-func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit core.Emit) (string, bool, error) {
+func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit core.Emit, followupOnly bool) (string, bool, error) {
 	operation := s.controlOperation(key)
 	if err := operation.LockContext(ctx); err != nil {
 		return "", false, &SendNotAdmittedError{Err: err}
@@ -452,6 +452,11 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 	wasActive := target.IsActive(key)
 	selection := inferenceSelection(s.config)
 	logicalActive := s.active[key] > 0
+	if followupOnly && !wasActive && !logicalActive {
+		s.mu.Unlock()
+		operation.Unlock()
+		return "", false, &SendNotAdmittedError{Err: errors.New("conversation is no longer active")}
+	}
 	if (!wasActive && logicalActive) || (wasActive && followUpMode(target) == FollowUpQueue) {
 		threadID := target.ThreadID(key)
 		s.pending[key] = append(s.pending[key], pendingSend{prompt: prompt, message: message, emit: emit})

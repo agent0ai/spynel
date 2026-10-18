@@ -15,7 +15,7 @@ var workerConversationName = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9_.-]{0,1
 // ConversationRefused identifies a journaled source refusal, never a provider result.
 func (e WorkerExecution) ConversationRefused() bool {
 	return e.Conversation.Validate() == nil && e.Key == "chat:"+e.Conversation.Channel+":"+e.Conversation.Conversation &&
-		e.Sequence > 0 && e.Workflow == nil && e.Agent == nil && e.Reservation == nil &&
+		e.Sequence > 0 && e.Workflow == nil && e.Agent == nil && e.Reservation == nil && len(e.Followups) == 0 &&
 		!e.SourcesReserved && e.Done && e.Error != "" && e.ThreadID == "" && !e.Steered && !e.Cancelled &&
 		e.LastCursor == 1 && e.CommittedCursor <= e.LastCursor
 }
@@ -49,7 +49,7 @@ func (h *workerHost) validateConversationLocked(request WorkerRequest) error {
 			return errors.New("invalid worker conversation admission")
 		}
 	}
-	// shortcut: one retained batch, integrate source reservation/rollback before conversation follow-ups.
+	// New sequences cannot bypass the owning same-execution follow-up operation.
 	for _, retained := range h.executions {
 		if retained.Key == request.Key && (retained.Conversation != nil || conversation != nil) {
 			return errors.New("conversation admission already retained; consume and retire before another dispatch")
@@ -58,8 +58,8 @@ func (h *workerHost) validateConversationLocked(request WorkerRequest) error {
 	return nil
 }
 
-// The descriptor is immutable for the retained admission; streaming state
-// belongs to that same worker rather than to an attached controller.
+// Published event descriptors are immutable snapshots. The retained execution
+// accumulates admitted batches, independently of its attached controller.
 func (h *workerHost) captureConversationLocked(execution *workerExecution, event core.Event, requestOnly bool) (*WorkerConversation, string) {
 	if execution.Conversation == nil {
 		return nil, ""

@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	WorkerProtocol      = 10
+	WorkerProtocol      = 11
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -110,7 +110,7 @@ type WorkerAgent struct {
 }
 
 // WorkerConversation retains private correlation independently of a controller.
-// Sources identifies the complete admitted conversation batch.
+// Sources identifies a request batch or an execution/event snapshot's accumulated sources.
 type WorkerConversation struct {
 	Channel, Conversation, SourceMessageID, ExecutionID string
 	Sources                                             []string
@@ -162,6 +162,17 @@ type WorkerExecution struct {
 	Cancelled       bool
 	Conversation    *WorkerConversation
 	SourcesReserved bool
+	Followups       []WorkerConversationFollowup
+}
+
+// Followups retain exact batch retry identities without storing prompt text.
+type WorkerConversationFollowup struct {
+	Conversation WorkerConversation
+	Digest       [32]byte
+	Error        string
+	Reserved     bool
+	Restored     bool
+	Unconfirmed  bool
 }
 
 type WorkerSession struct {
@@ -193,6 +204,15 @@ type workerExecution struct {
 	deadlineInterrupted bool
 	cancel              context.CancelFunc
 	streamed            string
+	conversationSending bool
+	pendingEvents       []workerPendingEvent
+	pendingBytes        int64
+}
+
+type workerPendingEvent struct {
+	Event       core.Event
+	RequestOnly bool
+	Source      string
 }
 
 type workerHost struct {
@@ -426,6 +446,8 @@ func (h *workerHost) apply(request WorkerRequest) WorkerReply {
 		return reply
 	case "send":
 		return h.send(request)
+	case "followup":
+		return h.followup(request)
 	case "control":
 		return h.control(request)
 	case "configure":
@@ -633,7 +655,11 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		turnCtx, execution.cancel = context.WithDeadline(turnCtx, request.Agent.Deadline)
 	}
 	threadID, steered, err := h.supervisor.SendConversation(turnCtx, request.Key, request.Prompt, request.Message, func(event core.Event) {
-		h.capture(execution, event)
+		if request.Conversation != nil {
+			h.captureSource(execution, event, request.Conversation.SourceMessageID)
+		} else {
+			h.capture(execution, event)
+		}
 	})
 	var rejected *SendNotAdmittedError
 	if errors.As(err, &rejected) {
@@ -734,14 +760,46 @@ func (h *workerHost) saveAdmissionLocked(execution *workerExecution) error {
 }
 
 func (h *workerHost) capture(execution *workerExecution, event core.Event) {
-	requestOnly := execution.Conversation != nil && event.Done && !event.Continues &&
-		(event.Kind == core.EventFinal || event.Kind == core.EventError) && h.supervisor.IsActive(execution.Key)
+	h.captureSource(execution, event, "")
+}
+
+func (h *workerHost) captureSource(execution *workerExecution, event core.Event, source string) {
+	active := false
+	if event.Done && !event.Continues && h.supervisor != nil {
+		h.mu.Lock()
+		conversation := execution.Conversation != nil
+		h.mu.Unlock()
+		active = conversation && h.supervisor.IsActive(execution.Key)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.failure != nil || execution.Done {
 		return
 	}
+	requestOnly := execution.Conversation != nil && execution.SourcesReserved && active
+	if execution.conversationSending {
+		pending := workerPendingEvent{Event: event, RequestOnly: requestOnly, Source: source}
+		data, err := json.Marshal(pending)
+		if err != nil || len(data) > workerEventBytes || h.bytes+int64(len(data)) > workerJournalBytes || len(execution.offsets)+len(execution.pendingEvents) >= workerMaxEvents {
+			h.failJournalLocked()
+			return
+		}
+		execution.pendingEvents = append(execution.pendingEvents, pending)
+		execution.pendingBytes += int64(len(data))
+		h.bytes += int64(len(data))
+		return
+	}
+	h.captureLocked(execution, event, requestOnly, source)
+}
+
+func (h *workerHost) captureLocked(execution *workerExecution, event core.Event, requestOnly bool, source string) {
+	if h.failure != nil || execution.Done {
+		return
+	}
 	conversation, streamed := h.captureConversationLocked(execution, event, requestOnly)
+	if conversation != nil && source != "" {
+		conversation.SourceMessageID = source
+	}
 	data, err := json.Marshal(WorkerEvent{Cursor: uint64(len(execution.offsets)) + 1, Event: event, Conversation: conversation, RequestOnly: requestOnly, Streamed: streamed})
 	if err == nil && (len(data) > workerEventBytes || h.bytes+int64(len(data)+1) > workerJournalBytes || len(execution.offsets) >= workerMaxEvents) {
 		err = errors.New("worker event journal capacity exceeded")
@@ -766,7 +824,7 @@ func (h *workerHost) capture(execution *workerExecution, event core.Event) {
 	execution.LastCursor = uint64(len(execution.offsets))
 	execution.bytes += int64(len(data))
 	h.bytes += int64(len(data))
-	if event.Done && !event.Continues {
+	if event.Done && !event.Continues && !requestOnly {
 		execution.Done = true
 		// The provider's actual terminal resolves a previously uncertain Send.
 		if !execution.deadlineInterrupted && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
