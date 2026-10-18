@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/agent0ai/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/shortid"
 )
 
 // SendControl routes to the execution owner. Controller-local callbacks are
@@ -62,7 +63,23 @@ func (m *Manager) Interrupt(ctx context.Context, key string) (bool, error) {
 					return false, err
 				}
 			}
+			var intent string
+			if execution.Conversation != nil && execution.SourcesReserved && !execution.Done {
+				if m.ConversationCancellation == nil {
+					return false, errors.New("durable conversation cancellation unavailable")
+				}
+				intent, err = shortid.New()
+				if err == nil {
+					err = m.Worker.RunOwned(ctx, func() error { return m.ConversationCancellation(*execution.Conversation, intent, false) })
+				}
+				if err != nil {
+					return false, err
+				}
+			}
 			reply, err := m.Worker.Call(ctx, harness.WorkerRequest{Action: "interrupt", Key: key})
+			if intent != "" && !execution.Cancelled && err == nil && !reply.Interrupted && ctx.Err() == nil {
+				err = m.Worker.RunOwned(ctx, func() error { return m.ConversationCancellation(*execution.Conversation, intent, true) })
+			}
 			if execution.Workflow != nil && !alreadyRequested && !execution.Cancelled && err == nil && !reply.Interrupted && ctx.Err() == nil {
 				_, err = m.workerCancellation(ctx, *execution.Workflow, "restore-cancellation")
 			}

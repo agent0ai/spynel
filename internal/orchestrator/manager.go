@@ -71,6 +71,7 @@ type Manager struct {
 	ConversationAttached     func(harness.WorkerExecution) (int, error)
 	ConversationStarted      func(harness.WorkerConversation) (int, error)
 	ConversationDelivery     func(context.Context, int, harness.WorkerDelivery) error
+	ConversationCancellation func(harness.WorkerConversation, string, bool) error
 	Cleanup                  func(context.Context, int) (string, error)
 	NotificationContext      func(Origin) (string, error)
 	notificationAgentTimeout time.Duration

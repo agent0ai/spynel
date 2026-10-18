@@ -29,6 +29,8 @@
 
 - `AdmitRecoveryConversation` shares admission identity/receipt validation and writes retrigger reservation plus admission in one synced record. Require the forward activation and recent window, validate every exact source against complete history, and reject any covered or previously reserved source. Run the owning application policy validator under the append lock before writing; it must not reenter history or acquire worker/election ownership. Any invalid member refuses the whole batch without reservation. Matching receipts confirm without rerunning policy or creating another admission. This does not prove provider delivery or authorize retry after an unknown Send.
 
+- `SetConversationCancellation` syncs append-only private request/restoration receipts for the exact admitted execution/source set under the caller's native/election fence. Recovery resolves bounded per-source intent separately from terminal coverage: pending requests suppress redispatch, restoration clears only the matching intent, earlier cancellation and terminal coverage survive, and a branch baseline clears prior correlation. Corrupt or changed admission fails closed before provider control. Receipts and cancellation identities remain absent from context and committed events; intent is not confirmed interruption or provider release.
+
 ## Child DOX Index
 
 No child DOX files.

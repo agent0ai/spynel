@@ -24,17 +24,25 @@ func (s *Store) AdmitRecoveryConversation(channel, conversation, executionID, re
 	return s.admitConversation(channel, conversation, executionID, receipt, sources, true, activation, cutoff, validate)
 }
 
-func (s *Store) admitConversation(channel, conversation, executionID, receipt string, sources []string, recovery bool, activation, cutoff time.Time, validate func([]Entry) error) error {
-	validID := func(id string) bool {
-		return id != "" && len(id) <= 128 && utf8.ValidString(id) && strings.IndexFunc(id, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) < 0
-	}
-	if !validID(executionID) || len(sources) == 0 || len(sources) > 1024 || !slices.IsSorted(sources) {
+func validConversationIdentity(id string) bool {
+	return id != "" && len(id) <= 128 && utf8.ValidString(id) && strings.IndexFunc(id, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) < 0
+}
+
+func validateConversationSources(executionID string, sources []string) error {
+	if !validConversationIdentity(executionID) || len(sources) == 0 || len(sources) > 1024 || !slices.IsSorted(sources) {
 		return errors.New("invalid conversation admission sources")
 	}
 	for i, id := range sources {
-		if !validID(id) || i > 0 && id == sources[i-1] {
+		if !validConversationIdentity(id) || i > 0 && id == sources[i-1] {
 			return errors.New("invalid conversation admission sources")
 		}
+	}
+	return nil
+}
+
+func (s *Store) admitConversation(channel, conversation, executionID, receipt string, sources []string, recovery bool, activation, cutoff time.Time, validate func([]Entry) error) error {
+	if err := validateConversationSources(executionID, sources); err != nil {
+		return err
 	}
 	entry := Entry{Role: "correlation", ExecutionID: executionID, Admission: "new", AdmittedSources: sources, Recovery: recovery}
 	if !activation.IsZero() {

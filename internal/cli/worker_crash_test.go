@@ -16,9 +16,155 @@ import (
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/orchestrator"
 	"github.com/agent0ai/spynel/internal/updater"
 )
+
+func TestWorkerConversationCancellationPersistenceBeforeInterruption(t *testing.T) {
+	for _, scenario := range []string{"inactive", "history-unavailable"} {
+		t.Run(scenario, func(t *testing.T) {
+			completion := filepath.Join(t.TempDir(), "complete")
+			t.Setenv("SPYNEL_TEST_WORKER_COMPLETIONS", completion)
+			f := newWorkerAgentFixture(t)
+			t.Logf("cancellation worker pid=%d start=%s generation=%s", f.client.Info().PID, f.client.Info().Process.StartTime, f.client.Info().Process.Generation)
+			c := harness.WorkerConversation{Channel: "cli", Conversation: "cancel", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
+			if _, err := f.service.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic request"}); err != nil {
+				t.Fatal(err)
+			}
+			execution, err := f.service.Orchestrator.AdmitConversation(t.Context(), c, "synthetic prompt", "synthetic request")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "inactive" {
+				persist := f.service.Orchestrator.ConversationCancellation
+				f.service.Orchestrator.ConversationCancellation = func(c harness.WorkerConversation, intent string, restore bool) error {
+					if err := persist(c, intent, restore); err != nil || restore {
+						return err
+					}
+					if err := os.WriteFile(completion+".1", nil, 0600); err != nil {
+						return err
+					}
+					// Observe the isolated journal directly: an RPC here would
+					// reacquire the election fence held by this callback.
+					waitWorkerAgent(t, func() bool {
+						data, err := os.ReadFile(filepath.Join(filepath.Dir(f.client.Info().Socket), fmt.Sprintf("%d.jsonl", execution.Sequence)))
+						return err == nil && strings.Contains(string(data), `"kind":"final"`)
+					})
+					return nil
+				}
+			} else {
+				path := f.service.History.Path(c.Channel, c.Conversation)
+				if err := os.Rename(path, path+".saved"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := os.Remove(path); err != nil {
+						t.Error(err)
+					}
+					if err := os.Rename(path+".saved", path); err != nil {
+						t.Error(err)
+					}
+				}()
+			}
+			stopped, err := f.service.Orchestrator.Interrupt(t.Context(), execution.Key)
+			if stopped || (err != nil) != (scenario == "history-unavailable") {
+				t.Fatal("incorrect cancellation result", stopped, err)
+			}
+			methods, err := os.ReadFile(f.log)
+			if err != nil || strings.Contains(string(methods), "turn/interrupt\n") {
+				t.Fatal("unavailable history or inactive provider still reached provider control", err)
+			}
+			if scenario == "inactive" {
+				snapshot, err := f.service.History.RecoveryWindow(c.Channel, c.Conversation, time.Time{}, 20)
+				if err != nil || snapshot.Covered["source"] != "" || !snapshot.Admitted["source"] {
+					t.Fatal("clean inactive result retained its new cancellation", err)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkerConversationCancellationSurvivesWorkerDeath(t *testing.T) {
+	for _, scenario := range []string{"recover", "stop", "unacknowledged-kill"} {
+		t.Run(scenario, func(t *testing.T) {
+			if scenario == "unacknowledged-kill" {
+				t.Setenv("SPYNEL_TEST_WORKER_DELAY_INTERRUPT", filepath.Join(t.TempDir(), "release-interrupt"))
+			}
+			f := newWorkerAgentFixture(t)
+			c := harness.WorkerConversation{Channel: "cli", Conversation: "crash", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
+			if _, err := f.service.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic request", AcceptedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			execution, err := f.service.Orchestrator.AdmitConversation(t.Context(), c, "synthetic prompt", "synthetic request")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario != "recover" {
+				command := "/stop"
+				if scenario == "unacknowledged-kill" {
+					job, _ := f.service.Runtime.JobForSession(execution.Key)
+					command = fmt.Sprintf("/job kill %d", job.Number)
+				}
+				var response string
+				if err := f.service.Handle(t.Context(), core.Message{Channel: c.Channel, Conversation: c.Conversation, Text: command}, func(e core.Event) { response += e.Text }); err != nil ||
+					scenario == "stop" && !strings.Contains(response, "requested") || scenario == "unacknowledged-kill" && !strings.Contains(response, context.DeadlineExceeded.Error()) {
+					t.Fatal("unexpected conversation cancellation response", response, err)
+				}
+			}
+			// No consumer has run: neither a saved terminal nor worker-local intent
+			// can protect the source after this verified worker/guardian death.
+			f.stop(t)
+			identity, guardian := f.client.Info(), workerCrashGuardian(t)
+			t.Logf("crash conversation worker pid=%d start=%s generation=%s; guardian pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation, guardian.PID, guardian.StartTime, guardian.Generation)
+			process, err := os.FindProcess(identity.PID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer process.Release()
+			if err := updater.VerifyProcess(identity.Process); err != nil {
+				t.Fatal(err)
+			}
+			if err := process.Kill(); err != nil {
+				t.Fatal(err)
+			}
+			waitWorkerAgent(t, func() bool {
+				return errors.Is(updater.VerifyProcess(identity.Process), syscall.ESRCH) && errors.Is(updater.VerifyProcess(guardian), syscall.ESRCH)
+			})
+			t.Cleanup(func() {
+				if err := os.RemoveAll(filepath.Dir(identity.Socket)); err != nil {
+					t.Error(err)
+				}
+			})
+			if err := f.owner.Release(f.term); err != nil {
+				t.Fatal(err)
+			}
+			f.client.Close()
+			f.open(t)
+			if f.client.Info().ID == identity.ID {
+				t.Fatal("dead conversation worker was adopted")
+			}
+			t.Logf("replacement conversation worker pid=%d start=%s generation=%s", f.client.Info().PID, f.client.Info().Process.StartTime, f.client.Info().Process.Generation)
+			f.service.SetPrimaryInstanceID(f.owner.ID())
+			f.service.SetRecoveryOwnershipFence(func(action func() error) (bool, error) { return f.owner.RunWhileOwner(f.term, action) })
+			if err := f.service.Start(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			waitWorkerAgent(t, func() bool { return !f.service.RecoveryStatus().ScannedAt.IsZero() })
+			want := 1
+			if scenario == "recover" {
+				want = 2
+			}
+			methods, err := os.ReadFile(f.log)
+			if err != nil || strings.Count(string(methods), "turn/start\n") != want || (len(f.inspect(t)) > 0) != (scenario == "recover") {
+				t.Fatalf("conversation cancellation lost across worker death: scenario=%s provider starts=%d want=%d err=%v", scenario, strings.Count(string(methods), "turn/start\n"), want, err)
+			}
+		})
+	}
+}
 
 func TestWorkerCrashRecoveryPreservesCancellation(t *testing.T) {
 	for _, scenario := range []string{"recover", "cancelled", "unacknowledged-cancellation"} {

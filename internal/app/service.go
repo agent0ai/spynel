@@ -202,6 +202,12 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	manager.ConversationAttached = service.attachWorkerConversation
 	manager.ConversationStarted = service.startWorkerConversation
 	manager.ConversationDelivery = service.deliverWorkerConversation
+	manager.ConversationCancellation = func(c harness.WorkerConversation, intent string, restore bool) error {
+		if err := c.Validate(); err != nil {
+			return err
+		}
+		return store.SetConversationCancellation(c.Channel, c.Conversation, c.ExecutionID, intent, c.Sources, restore)
+	}
 	manager.SetNotificationDelivery(service.deliverNotification)
 	manager.NotificationContext = service.notificationContext
 	manager.Outbox.FallbackAllowed = func(_ context.Context, origin orchestrator.Origin) error { return service.validateOrigin(origin) }
