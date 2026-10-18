@@ -58,6 +58,17 @@ func TestWorkerConversationNativeReplayAndSettlement(t *testing.T) {
 			}
 			f := newWorkerAgentFixture(t)
 			metadata := &harness.WorkerConversation{Channel: scenario.channel, Conversation: "retained", SourceMessageID: "second", ExecutionID: "synthetic-execution", Sources: []string{"first", "second"}}
+			if scenario.channel == "telegram" {
+				metadata.Conversation = "TG-7"
+				if _, err := f.service.Settings.Update(func(cfg *config.Config) error {
+					cfg.Orchestrator.SemanticHeartbeatMinutes = 5
+					cfg.Channels.Telegram.Enabled = true
+					cfg.Channels.Telegram.AllowedUsers = []string{"7"}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			for _, source := range metadata.Sources {
 				if _, err := f.service.History.Append(metadata.Channel, metadata.Conversation, history.Entry{Role: "user", Content: "synthetic", SourceMessageID: source, AcceptedAt: time.Now().UTC()}); err != nil {
 					t.Fatal(err)

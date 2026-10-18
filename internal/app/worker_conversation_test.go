@@ -15,6 +15,60 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 )
 
+func TestWorkerConversationRechecksRemoteAdmissionPolicy(t *testing.T) {
+	for _, channel := range []string{"telegram", "whatsapp"} {
+		for _, scenario := range []string{"valid", "disabled", "revoked", "unreadable"} {
+			t.Run(channel+"/"+scenario, func(t *testing.T) {
+				s, _, cfg := newRecoveryTestService(t)
+				name := "TG-7"
+				cfg.Channels.Telegram.Enabled = true
+				cfg.Channels.Telegram.AllowedUsers = []string{"7"}
+				cfg.Channels.WhatsApp.Enabled = true
+				cfg.Channels.WhatsApp.AllowedNumbers = []string{"15551234567"}
+				if channel == "whatsapp" {
+					name = "WA-15551234567"
+				}
+				switch scenario {
+				case "disabled":
+					cfg.Channels.Telegram.Enabled = false
+					cfg.Channels.WhatsApp.Enabled = false
+				case "revoked":
+					cfg.Channels.Telegram.AllowedUsers = []string{"8"}
+					cfg.Channels.WhatsApp.AllowedNumbers = []string{"15557654321"}
+				}
+				if err := config.Save(cfg); err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "unreadable" {
+					if err := os.Rename(config.PathForRoot(cfg.Root), config.PathForRoot(cfg.Root)+".saved"); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Mkdir(config.PathForRoot(cfg.Root), 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				c := harness.WorkerConversation{Channel: channel, Conversation: name, SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
+				if _, err := s.History.Append(channel, name, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic private request"}); err != nil {
+					t.Fatal(err)
+				}
+				before, err := os.ReadFile(s.History.Path(channel, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = AdmitWorkerConversation(cfg.Root, "chat:"+channel+":"+name, c, "worker:1:admission")
+				after, readErr := os.ReadFile(s.History.Path(channel, name))
+				if scenario == "valid" {
+					if err != nil || readErr != nil || string(before) == string(after) {
+						t.Fatal("authorized ordinary batch was not admitted", err, readErr)
+					}
+				} else if err == nil || readErr != nil || string(before) != string(after) {
+					t.Fatal("unavailable remote authorization still reserved ordinary sources", err, readErr)
+				}
+			})
+		}
+	}
+}
+
 func TestWorkerRecoveryRechecksSourcePolicyBeforeReservation(t *testing.T) {
 	for _, scenario := range []string{"disabled", "linked", "command", "covered", "valid"} {
 		t.Run(scenario, func(t *testing.T) {

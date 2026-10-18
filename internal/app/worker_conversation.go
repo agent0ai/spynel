@@ -139,25 +139,29 @@ func (s *Service) workerConversationRouter(c harness.WorkerConversation) (channe
 }
 
 // AdmitWorkerConversation runs inside the worker's existing owner fence.
-// Transport authorization and job admission precede this source reservation.
+// Recheck canonical remote authorization before reserving any source.
 func AdmitWorkerConversation(root, key string, conversation harness.WorkerConversation, receipt string) error {
 	if conversation.Validate() != nil || key != "chat:"+conversation.Channel+":"+conversation.Conversation {
 		return errors.New("invalid worker conversation admission")
 	}
 	store := history.New(filepath.Join(root, ".spynel", "history"))
-	if conversation.Recovery {
-		cfg, err := config.Load(config.PathForRoot(root))
+	var cfg config.Config
+	if conversation.Recovery || conversation.Channel == "telegram" || conversation.Channel == "whatsapp" {
+		var err error
+		cfg, err = config.Load(config.PathForRoot(root))
 		if err != nil {
 			return err
 		}
-		if !cfg.Orchestrator.RetriggerUnrespondedMessages || strings.Contains(conversation.Conversation, "-group-") {
-			return errors.New("worker conversation recovery is disabled or ineligible")
-		}
 		if conversation.Channel == "telegram" && !cfg.Channels.Telegram.Enabled || conversation.Channel == "whatsapp" && !cfg.Channels.WhatsApp.Enabled {
-			return errors.New("worker conversation recovery transport is disabled")
+			return errors.New("worker conversation transport is disabled")
 		}
 		if err := validateOrigin(cfg, store, telegram.NewIdentityStore(cfg.StatePath("runtime", "telegram-identities.json")), orchestrator.Origin{Channel: conversation.Channel, Conversation: conversation.Conversation}); err != nil {
 			return err
+		}
+	}
+	if conversation.Recovery {
+		if !cfg.Orchestrator.RetriggerUnrespondedMessages || strings.Contains(conversation.Conversation, "-group-") {
+			return errors.New("worker conversation recovery is disabled or ineligible")
 		}
 		activation, err := store.ActivateRecovery()
 		if err != nil {
