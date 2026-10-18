@@ -26,6 +26,11 @@ def main():
             path.mkdir()
         prefix = temp / "prefix"
         package = prefix / "lib/node_modules/spynel"
+        cleanup_runtime = temp / "cleanup-runtime"
+        cleanup_runtime.mkdir()
+        with tarfile.open(candidate_archive) as archive:
+            assert all((m.isfile() or m.isdir()) and not Path(m.name).is_absolute() and ".." not in Path(m.name).parts for m in archive.getmembers())
+            archive.extractall(cleanup_runtime)
         registry = home / ("Library/Application Support" if sys.platform == "darwin" else ".config") / "spynel/processes"
         env = {k: v for k, v in os.environ.items() if not k.startswith(("SPYNEL_", "npm_config_"))}
         env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"), XDG_RUNTIME_DIR=str(temp / "run"), npm_config_cache=str(temp / "npm-cache"), npm_config_userconfig=str(temp / "npmrc"), npm_config_audit="false", npm_config_fund="false", SPYNEL_SKIP_UPDATE_CHECK="1")
@@ -83,7 +88,13 @@ def main():
             return {str(p.relative_to(package)): hashlib.sha256(p.read_bytes()).hexdigest() for p in package.rglob("*") if p.is_file()}
 
         def records():
-            return [json.loads(path.read_text()) for path in registry.glob("*.json")]
+            result = []
+            for path in registry.glob("*.json"):
+                try:
+                    result.append(json.loads(path.read_text()))
+                except FileNotFoundError:
+                    pass  # A process may unregister after the directory snapshot.
+            return result
 
         def wait_for(predicate, seconds=45):
             deadline = time.monotonic() + seconds
@@ -104,6 +115,15 @@ def main():
             if sys.platform == "linux":
                 return (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
             return subprocess.check_output(["ps", "-o", "stat=", "-p", str(pid)], text=True).strip().startswith("Z")
+
+        def native_start(pid):
+            result = subprocess.run(["ps", "-p", str(pid), "-o", "stat=", "-o", "lstart="], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+            assert not result.stderr, result.stderr
+            if result.returncode == 1 and not result.stdout.strip():
+                return None
+            assert result.returncode == 0, result.stdout
+            state, *start = result.stdout.split()
+            return None if state.startswith(("Z", "X")) else " ".join(start)
 
         try:
             run(["npm", "install", "--global", "--prefix", str(prefix), str(old_package)])
@@ -181,6 +201,8 @@ for line in sys.stdin:
             executor = next(r for r in records() if r["pid"] == after["executor_pid"])
             assert executor["ready"] and executor["version"] == candidate_version and executor["generation"] == after["executor_generation"]
             assert executor["supervisor_generation"] == after["generation"]
+            workers = [r for r in records() if r.get("harness_worker")]
+            assert len(workers) == 1 and workers[0]["version"] == candidate_version and native_start(workers[0]["pid"]) is not None
             assert (registry / f"{zombie.pid}.json").read_bytes() == zombie_record
             assert kernel_zombie(zombie.pid), "upgrade depended on reaping the zombie"
             status = run([*launcher, "status"]).stdout
@@ -213,6 +235,25 @@ for line in sys.stdin:
                 print(log.read()[-2000:], file=sys.stderr)
             raise
         finally:
+            # Controller exit detaches workers; stop the whole owned installation
+            # before removing its images, registry and worker journal directories.
+            cleanup_records = records()
+            cleanup_starts = {r["pid"]: native_start(r["pid"]) for r in cleanup_records}
+            worker_roots = []
+            for path in (registry.parent / "harness").glob("*.lock.worker.json"):
+                info = json.loads(path.read_text())["Info"]
+                worker_roots.extend((path, Path(info["Socket"]).parent))
+            evidence("cleanup-owned-identities", records=cleanup_records, process_starts=cleanup_starts, worker_roots=[str(path) for path in worker_roots])
+            preserved = {p: p.read_bytes() for cwd in (workspace, zombie_workspace) for p in [cwd / ".spynel/config.yaml"] if p.exists()}
+            preserved.update({p: p.read_bytes() for p in (workspace / ".spynel/history/cli").glob("*") if p.is_file()})
+            cleanup_error = None
+            if package.exists():
+                try:
+                    cleaned = subprocess.run([str(cleanup_runtime / "spynel"), "uninstall-bundles", "--root", str(temp / "absent-standalone"), "--npm-root", str(package)], cwd=workspace, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
+                    if cleaned.returncode != 0:
+                        cleanup_error = cleaned.stderr
+                except subprocess.TimeoutExpired as error:
+                    cleanup_error = str(error)
             for child in children:
                 if child.poll() is None:
                     child.terminate()
@@ -235,6 +276,13 @@ for line in sys.stdin:
             for log in logs:
                 log.close()
             server.shutdown()
+            server.server_close()
+            assert cleanup_error is None, cleanup_error
+            assert not package.exists(), "fixture package survived uninstall"
+            assert all(start is None or native_start(pid) != start for pid, start in cleanup_starts.items()), "recorded fixture process survived uninstall"
+            assert all(not path.exists() for path in worker_roots), "worker endpoint or rendezvous survived uninstall"
+            assert all(path.read_bytes() == data for path, data in preserved.items()), "uninstall changed workspace configuration or history"
+            evidence("installation-owned-cleanup", recorded_processes_stopped=True, worker_roots_removed=True, workspace_bytes_preserved=True)
 
 
 if __name__ == "__main__":
