@@ -3,6 +3,7 @@
 package harness
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,6 +12,82 @@ import (
 
 	"github.com/agent0ai/spynel/internal/updater"
 )
+
+func TestWorkerStartupWaitsForPendingProcessOwnership(t *testing.T) {
+	fixture := newWorkerFixture(t, "codex", "codex-worker")
+	path, err := ProcessOwnershipPath(fixture.config.Cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordPath, err := workerRecordPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.mustCall(t, WorkerRequest{Action: "shutdown"})
+	waitWorkerExit(t, fixture.info)
+	// Preserve an authentic crash-left dead identity while a cleanup owner still
+	// holds the same OS lock. No PID-only or missing-record recovery is authorized.
+	if err := os.WriteFile(recordPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := lockProcessOwnership(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	type result struct {
+		client *WorkerClient
+		err    error
+	}
+	opened := make(chan result, 1)
+	go func() {
+		client, err := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term)
+		opened <- result{client, err}
+	}()
+	select {
+	case r := <-opened:
+		if r.client != nil {
+			r.client.Close()
+		}
+		t.Fatal("worker did not wait for confirmed-dead ownership cleanup", r.err)
+	case <-time.After(time.Second):
+	}
+	// Waiting must release the election mutation lock between acquisition attempts.
+	started := time.Now()
+	if _, owned, err := fixture.owner.Renew(fixture.term); err != nil || !owned || time.Since(started) > 500*time.Millisecond {
+		t.Fatal("pending harness ownership blocked the election fence", err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r := <-opened
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	client := r.client
+	defer client.Close()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := client.Call(ctx, WorkerRequest{Action: "shutdown"}); err != nil {
+			t.Error("replacement shutdown", err)
+			return
+		}
+		waitWorkerExit(t, client.Info())
+		if _, err := os.Stat(filepath.Dir(client.Info().Socket)); !os.IsNotExist(err) {
+			t.Error("replacement retained its endpoint or journals")
+		}
+	})
+	t.Logf("pending-ownership worker pid=%d start=%s generation=%s", client.Info().PID, client.Info().Process.StartTime, client.Info().Process.Generation)
+	state := workerClientCall(t, client, WorkerRequest{Action: "inspect"})
+	if state.Availability == nil || !state.Availability.Available || len(state.Executions) != 0 || state.NextSequence != 1 {
+		t.Fatal("pending ownership recovery invented provider admission or lost readiness")
+	}
+}
 
 func TestWorkerUnavailableStartupRetainsOwnershipAndRecovers(t *testing.T) {
 	for _, scenario := range []struct{ name, mode string }{

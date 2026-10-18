@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
@@ -338,20 +339,45 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 			}
 		}
 	}()
-	ran, err := election.RunForOwner(bootstrap.InstanceID, bootstrap.TermToken, func() error {
-		if err := workerCtx.Err(); err != nil {
-			return err
+	startup, startupCancel := context.WithTimeout(workerCtx, 30*time.Second)
+	defer startupCancel()
+	startupTick := time.NewTicker(100 * time.Millisecond)
+	defer startupTick.Stop()
+	for {
+		busy := false
+		ran, err := election.RunForOwner(bootstrap.InstanceID, bootstrap.TermToken, func() error {
+			if err := startup.Err(); err != nil {
+				return err
+			}
+			// Guardians may still be joining a confirmed-dead worker's provider.
+			if err := supervisor.processOwner.acquire(); err != nil {
+				if errors.Is(err, errProcessOwnershipBusy) {
+					// A competing live worker owns discovery; do not wait to
+					// replace it if that controller later shuts it down.
+					record, readErr := readWorkerRecord(recordPath)
+					if readErr == nil && errors.Is(updater.VerifyProcess(record.Info.Process), syscall.ESRCH) {
+						busy = true
+						return nil
+					}
+				}
+				return err
+			}
+			// Availability reports startup errors; the control plane stays usable.
+			_ = supervisor.Start(workerCtx)
+			return workerCtx.Err()
+		})
+		if !ran || err != nil {
+			return errors.New("worker startup ownership unavailable")
 		}
-		// Own the worker even when adapter construction cannot start a provider.
-		if err := supervisor.processOwner.acquire(); err != nil {
-			return err
+		if !busy {
+			break
 		}
-		// Availability reports startup errors; the control plane stays usable.
-		_ = supervisor.Start(workerCtx)
-		return workerCtx.Err()
-	})
-	if err != nil || !ran {
-		return errors.New("worker startup ownership unavailable")
+		// Never hold election ownership while waiting for provider cleanup.
+		select {
+		case <-startup.Done():
+			return errors.New("worker startup ownership unavailable")
+		case <-startupTick.C:
+		}
 	}
 	host = &workerHost{
 		supervisor: supervisor, election: election, info: info, token: bootstrap.Token, directory: directory, recordPath: recordPath,

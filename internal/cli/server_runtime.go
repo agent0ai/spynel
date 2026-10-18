@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/app"
@@ -79,6 +80,13 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 					reason = "renewal_failed"
 				}
 				stopErr := term.stopFor("", reason)
+				term = nil
+				return stopErr
+			}
+			// Transport failure is not death. Rebuild the fixed service binding
+			// only after the shared native verifier confirms this worker exited.
+			if worker := term.service.Orchestrator.Worker; worker != nil && errors.Is(updater.VerifyProcess(worker.Info().Process), syscall.ESRCH) {
+				stopErr := term.stopFor("", "worker_exited")
 				term = nil
 				return stopErr
 			}
