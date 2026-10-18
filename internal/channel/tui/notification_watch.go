@@ -13,8 +13,8 @@ import (
 )
 
 // watchTaskNotifications follows runtime-authored proactive assistant entries
-// plus stalled-message recovery terminals. Ordinary requested turns are
-// rendered by their response stream and remain intentionally ignored here.
+// plus stalled-message and retained-worker conversation results. Requested
+// turns are rendered by their response stream and remain ignored here.
 func watchTaskNotifications(ctx context.Context, path string, initialOffset ...int64) <-chan channel.Notification {
 	output := make(chan channel.Notification, 16)
 	var offset int64
@@ -61,7 +61,7 @@ func watchTaskNotifications(ctx context.Context, path string, initialOffset ...i
 				if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.Sender == "Spy" &&
 					(entry.Role == "notification_pending" || entry.Role == "assistant" || entry.Recovery) {
 					select {
-					case output <- channel.Notification{ID: entry.EventID, Text: entry.Content, Recovery: entry.Recovery, Error: entry.Recovery && entry.Role == "error"}:
+					case output <- channel.Notification{ID: entry.EventID, Text: entry.Content, Recovery: entry.Recovery, Error: entry.Recovery && entry.Role == "error", Continues: entry.Continues}:
 					case <-ctx.Done():
 						file.Close()
 						return

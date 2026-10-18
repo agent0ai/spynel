@@ -280,16 +280,20 @@ func TestWorkerConversationNativeReservedRecoveryAndLostSendReply(t *testing.T) 
 }
 
 func TestWorkerConversationScheduledAttachment(t *testing.T) {
-	for _, scenario := range []string{"normal", "lost-commit"} {
+	for _, scenario := range []string{"normal", "lost-commit", "tui", "tui-lost-commit"} {
 		t.Run(scenario, func(t *testing.T) {
 			t.Setenv("SPYNEL_TEST_WORKER_CONVERSATION_ERROR", "1")
 			f := newWorkerAgentFixture(t)
-			metadata := &harness.WorkerConversation{Channel: "cli", Conversation: "attached", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
-			if _, err := f.service.History.Append("cli", "attached", history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic", AcceptedAt: time.Now().UTC()}); err != nil {
+			channelName := "cli"
+			if strings.HasPrefix(scenario, "tui") {
+				channelName = "tui"
+			}
+			metadata := &harness.WorkerConversation{Channel: channelName, Conversation: "attached", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
+			if _, err := f.service.History.Append(channelName, "attached", history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic", AcceptedAt: time.Now().UTC()}); err != nil {
 				t.Fatal(err)
 			}
-			key := "chat:cli:attached"
-			id, err := f.service.Runtime.TryBeginJobWithDetails(key, "cli", "attached", "synthetic", app.JobDetails{Kind: "conversation", WorkID: metadata.ExecutionID})
+			key := "chat:" + channelName + ":attached"
+			id, err := f.service.Runtime.TryBeginJobWithDetails(key, channelName, "attached", "synthetic", app.JobDetails{Kind: "conversation", WorkID: metadata.ExecutionID})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -323,7 +327,35 @@ func TestWorkerConversationScheduledAttachment(t *testing.T) {
 			if restored.StableID != original.StableID || restored.Number != original.Number || restored.Generation != original.Generation || restored.ProviderIterations != 1 {
 				t.Fatal("scheduled attachment did not restore the same job")
 			}
-			if scenario == "lost-commit" {
+			if channelName == "tui" {
+				if err := f.service.RegisterLiveTUI("viewer", "attached", time.Now().UTC()); err != nil {
+					t.Fatal(err)
+				}
+				waitWorkerAgent(t, func() bool { return f.service.SharedStateForInstance("viewer").ConversationActivity == 1 })
+				if err := f.service.RegisterLiveTUI("other-viewer", "other", time.Now().UTC()); err != nil {
+					t.Fatal(err)
+				}
+				if f.service.SharedStateForInstance("other-viewer").ConversationActivity != 0 {
+					t.Fatal("retained activity leaked to another selected conversation")
+				}
+				f.stop(t)
+				if f.service.SharedStateForInstance("viewer").ConversationActivity != 0 {
+					t.Fatal("controller detach retained local activity")
+				}
+				if err := f.owner.Release(f.term); err != nil {
+					t.Fatal(err)
+				}
+				f.open(t)
+				if err := f.service.RegisterLiveTUI("viewer", "attached", time.Now().UTC()); err != nil {
+					t.Fatal(err)
+				}
+				f.start(t)
+				waitWorkerAgent(t, func() bool { return f.service.SharedStateForInstance("viewer").ConversationActivity == 1 })
+				if f.client.Info().Process != identity.Process {
+					t.Fatal("local activity reattachment replaced the worker")
+				}
+			}
+			if strings.HasSuffix(scenario, "lost-commit") {
 				f.client.Close()
 				restore := dropWorkerReply(t, f.client.Info().Socket, "commit", true, false)
 				defer restore()
@@ -332,7 +364,7 @@ func TestWorkerConversationScheduledAttachment(t *testing.T) {
 				t.Fatal(err)
 			}
 			waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 0 })
-			entries, _, err := f.service.History.Entries("cli", "attached")
+			entries, _, err := f.service.History.Entries(channelName, "attached")
 			terminals := 0
 			for _, entry := range entries {
 				if entry.Terminal {
@@ -340,11 +372,17 @@ func TestWorkerConversationScheduledAttachment(t *testing.T) {
 					if entry.ExecutionID != metadata.ExecutionID || strings.Join(entry.Covers, ",") != "source" {
 						t.Fatal("automatic attachment lost source coverage")
 					}
+					if channelName == "tui" && (!entry.Recovery || entry.Sender != "Spy") {
+						t.Fatal("reattached TUI terminal is invisible to the live history follower")
+					}
 				}
 			}
 			methods, readErr := os.ReadFile(f.log)
 			if err != nil || readErr != nil || terminals != 1 || f.service.Runtime.Status().Jobs != 0 || strings.Count(string(methods), "turn/start\n") != 1 {
 				t.Fatal("automatic attachment duplicated or lost history/job/provider admission", err, readErr)
+			}
+			if channelName == "tui" && f.service.SharedStateForInstance("viewer").ConversationActivity != 0 {
+				t.Fatal("retained TUI terminal did not stop activity")
 			}
 		})
 	}

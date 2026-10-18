@@ -861,6 +861,7 @@ func (s *Service) conversationEventConsumer(message core.Message, jobID int, dow
 			s.streamMu.Unlock()
 		}
 		if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+			localReplay := worker != nil && message.Channel == "tui" && !requestOnly
 			var streamed string
 			if worker != nil {
 				streamed = worker.Streamed
@@ -931,12 +932,16 @@ func (s *Service) conversationEventConsumer(message core.Message, jobID int, dow
 				historyText = strings.TrimSpace(historyText + "\n\n[Sent " + attachment.Kind + " " + attachment.Name + "]")
 			}
 			if event.Kind == core.EventError && streamed != "" {
-				if _, err := s.History.AppendOnce(message.Channel, message.Conversation, receipt+":partial", history.Entry{Role: "assistant", Content: streamed}); err != nil {
+				partial := history.Entry{Role: "assistant", Content: streamed}
+				if localReplay {
+					partial.Sender, partial.Recovery, partial.Continues = "Spy", true, true
+				}
+				if _, err := s.History.AppendOnce(message.Channel, message.Conversation, receipt+":partial", partial); err != nil {
 					return event, false, requestOnly, fmt.Errorf("save partial conversation result: %w", err)
 				}
 			}
 			entry := history.Entry{At: time.Now().UTC(), Role: map[bool]string{true: "error", false: "assistant"}[event.Kind == core.EventError], Content: historyText, Terminal: true, SourceMessageID: message.SourceMessageID, FinalText: event.FinalText, Continues: event.Continues}
-			if message.Sender == "recovery" {
+			if message.Sender == "recovery" || localReplay {
 				entry.Sender = "Spy"
 				entry.Recovery = true
 			}
@@ -1233,6 +1238,12 @@ func (s *Service) finishCancelledJobAfterGrace(job Job) {
 }
 
 func (s *Service) trackChatActivity(jobID int, activity *chatActivityEmitter) {
+	s.chatActivityMu.Lock()
+	defer s.chatActivityMu.Unlock()
+	s.trackChatActivityLocked(jobID, activity)
+}
+
+func (s *Service) trackChatActivityLocked(jobID int, activity *chatActivityEmitter) {
 	activity.onStop = func() {
 		s.chatActivityMu.Lock()
 		delete(s.chatActivity[jobID], activity)
@@ -1241,12 +1252,10 @@ func (s *Service) trackChatActivity(jobID int, activity *chatActivityEmitter) {
 		}
 		s.chatActivityMu.Unlock()
 	}
-	s.chatActivityMu.Lock()
 	if s.chatActivity[jobID] == nil {
 		s.chatActivity[jobID] = map[*chatActivityEmitter]struct{}{}
 	}
 	s.chatActivity[jobID][activity] = struct{}{}
-	s.chatActivityMu.Unlock()
 }
 
 func (s *Service) stopJobChatActivity(jobID int) {

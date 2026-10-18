@@ -23,6 +23,8 @@
 
 - AdmitConversation validates up to 1024 sorted unique sources against complete retained history and syncs one private admitted_sources batch plus its retry receipt in one record before provider Send. Ordinary sources must exist after the last baseline and be neither admitted nor covered; recovery sources require an existing uncovered retrigger reservation that has not already admitted recovery. Matching receipt confirmation is idempotent even after later settlement, changed receipts fail, and corrupt/incomplete history fails closed. Batch admission marks every source admitted without creating terminal coverage and stays absent from prompt/committed-event projections. The caller must hold exact cross-process ownership; this does not prove provider delivery or implement follow-up rollback/cross-worker recovery. Lookup uses the existing complete-history bounded-memory scans; index only if measured admission cost requires it.
 
+- On visible replies, `Recovery` is the private local asynchronous presentation marker for stalled-message or retained-worker results, not a provider-admission classification. Retained partial output carries `Continues` so its display does not settle execution activity; private admission records keep their existing recovery-reservation meaning.
+
 ## Child DOX Index
 
 No child DOX files.

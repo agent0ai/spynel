@@ -12,6 +12,8 @@
 - Route proactive canonical conversation events only through the currently connected channel generation and bind their activity references to that generation's cancellation context so disconnect, replacement, and shutdown clean up safely.
 - The proactive delivery contract carries validated attachments as well as text without communication activity. Canonical terminal events forward the same payload through it. Adapters upload files before the caption and return native upload/send failures; the outbox retries the whole message under each transport's existing identity contract.
 
+- Local history-followed conversation responses carry `Notification.Continues` through the existing recovery presentation path. Partial/intermediate output never settles activity and never enters task-notification acknowledgement.
+
 ## Child DOX Index
 
 Direct child DOX files:

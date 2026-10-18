@@ -21,9 +21,21 @@ func (s *Service) attachWorkerConversation(execution harness.WorkerExecution) (i
 	if job, ok := s.Runtime.JobForSession(execution.Key); ok && (job.Kind != "conversation" || job.WorkID != c.ExecutionID) {
 		return 0, errors.New("retained conversation conflicts with its live job")
 	}
-	return s.Runtime.TryBeginJobWithDetails(execution.Key, c.Channel, c.Conversation, "Retained conversation", JobDetails{
+	id, err := s.Runtime.TryBeginJobWithDetails(execution.Key, c.Channel, c.Conversation, "Retained conversation", JobDetails{
 		Kind: "conversation", WorkID: c.ExecutionID, Provider: s.Settings.Snapshot().Harness.Name,
 	})
+	if err == nil && c.Channel == "tui" && !execution.Done && !execution.Cancelled {
+		s.chatActivityMu.Lock()
+		if len(s.chatActivity[id]) == 0 {
+			activity := newChatActivityEmitter(func(event core.Event) {
+				s.setConversationActivity(c.Channel, c.Conversation, event.Active)
+			})
+			s.trackChatActivityLocked(id, activity)
+			activity.start()
+		}
+		s.chatActivityMu.Unlock()
+	}
+	return id, err
 }
 
 func (s *Service) deliverWorkerConversation(ctx context.Context, jobID int, delivery harness.WorkerDelivery) error {
@@ -84,6 +96,10 @@ func (s *Service) ConsumeConversationDelivery(jobID int, delivery harness.Worker
 	}
 	if !known {
 		return errors.New("retained conversation source is absent from history")
+	}
+	if delivery.Event.Done && !delivery.Event.Continues && !delivery.RequestOnly &&
+		(delivery.Event.Kind == core.EventFinal || delivery.Event.Kind == core.EventError) {
+		s.stopJobChatActivity(jobID)
 	}
 	message := core.Message{Channel: conversation.Channel, Conversation: conversation.Conversation, SourceMessageID: conversation.SourceMessageID}
 	if conversation.Recovery {

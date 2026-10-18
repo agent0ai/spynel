@@ -15,6 +15,82 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 )
 
+func TestWorkerConversationRestoresLocalActivityAndTranscript(t *testing.T) {
+	s, _, _ := newRecoveryTestService(t)
+	c := &harness.WorkerConversation{Channel: "tui", Conversation: "attached", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
+	if _, err := s.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic"}); err != nil {
+		t.Fatal(err)
+	}
+	execution := harness.WorkerExecution{Key: "chat:tui:attached", Conversation: c, SourcesReserved: true}
+	var id int
+	for range 3 {
+		var err error
+		id, err = s.attachWorkerConversation(execution)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	activity := func() int {
+		s.conversationActivityMu.Lock()
+		defer s.conversationActivityMu.Unlock()
+		return s.conversationActivity["tui/attached"]
+	}
+	if activity() != 1 {
+		t.Fatal("attachment did not restore exactly one local activity reference")
+	}
+	d := harness.WorkerDelivery{WorkerID: strings.Repeat("e", 32), Sequence: 1, WorkerEvent: harness.WorkerEvent{Cursor: 1, Conversation: c,
+		Event: core.Event{Kind: core.EventFinal, Text: "continuing result", Done: true, Continues: true}}}
+	if err := s.ConsumeConversationDelivery(id, d, nil); err != nil || activity() != 1 {
+		t.Fatal("continuing result stopped retained activity", err)
+	}
+	d.Cursor = 2
+	d.RequestOnly = true
+	d.Event = core.Event{Kind: core.EventError, Text: "cancelled request", Done: true}
+	if err := s.ConsumeConversationDelivery(id, d, nil); err != nil || activity() != 1 {
+		t.Fatal("request-only result stopped the retained execution", err)
+	}
+	d.Cursor = 3
+	d.RequestOnly = false
+	d.Streamed = "useful partial"
+	d.Event = core.Event{Kind: core.EventError, Text: "retained error", Done: true}
+	job, _ := s.Runtime.Job(id)
+	archive := filepath.Join(s.Config.StatePath("jobs"), job.StableID+".md")
+	if err := os.Rename(archive, archive+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(archive, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ConsumeConversationDelivery(id, d, nil); err == nil || activity() != 0 {
+		t.Fatal("terminal persistence/delivery failure retained a provider activity reference")
+	}
+	if err := os.Remove(archive); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(archive+".saved", archive); err != nil {
+		t.Fatal(err)
+	}
+	execution.Done = true
+	if _, err := s.attachWorkerConversation(execution); err != nil || activity() != 0 {
+		t.Fatal("terminal reattachment revived activity", err)
+	}
+	if err := s.ConsumeConversationDelivery(id, d, nil); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := s.History.Entries(c.Channel, c.Conversation)
+	if err != nil || len(entries) != 5 {
+		t.Fatal("local replay duplicated or lost transcript records", err)
+	}
+	for _, index := range []int{1, 3, 4} {
+		if entries[index].Sender != "Spy" || !entries[index].Recovery {
+			t.Fatal("retained local output is invisible to the live history follower")
+		}
+	}
+	if !entries[1].Continues || !entries[3].Continues || entries[4].Continues || entries[4].Role != "error" || entries[2].Recovery {
+		t.Fatal("local presentation lost intermediate/terminal/request-only boundaries")
+	}
+}
+
 func TestWorkerConversationAutomaticRoutingChecksAuthorizationBeforeEffects(t *testing.T) {
 	for _, boundary := range []string{"disabled", "revoked", "missing-router"} {
 		t.Run(boundary, func(t *testing.T) {

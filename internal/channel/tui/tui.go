@@ -1791,8 +1791,8 @@ func (m *model) flushNotificationPrefix(count int) {
 	m.pendingNotifications = m.pendingNotifications[count:]
 }
 
-// appendRecoveredResponse reconciles a durable recovery terminal without
-// touching the response buffer of a newer foreground turn. Recovery entries
+// appendRecoveredResponse displays a durable recovered response without
+// touching the response buffer of a newer foreground turn. Recovered entries
 // are not task notifications and therefore never enter the acknowledgement
 // protocol.
 func (m *model) appendRecoveredResponse(notification channel.Notification) {
@@ -1803,7 +1803,7 @@ func (m *model) appendRecoveredResponse(notification channel.Notification) {
 	// retain the authoritative observed count and credit its later inactive
 	// edge. Otherwise overlapping recoveries would both be settled by one
 	// terminal followed by that terminal's delayed inactive edge.
-	if m.recoveryActivity > m.recoveryTerminalAhead {
+	if !notification.Continues && m.recoveryActivity > m.recoveryTerminalAhead {
 		m.recoveryTerminalAhead++
 		if m.mainAgentActivity > 0 {
 			m.mainAgentActivity--
