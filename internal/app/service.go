@@ -582,6 +582,9 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 	// and the next agent prompt include the same error the user saw.
 	defer func() {
 		if resultErr != nil {
+			if errors.Is(resultErr, orchestrator.ErrConversationPending) {
+				return
+			}
 			if recordErr != nil {
 				s.Runtime.LogEvent("error", "history", "append_failed", fmt.Sprintf("Persist incoming history failed (%T)", recordErr))
 				return
@@ -643,6 +646,10 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	prompt, handled, err := s.prepareConversationPrompt(ctx, message, prompt, emit)
 	if err != nil || handled {
 		return err
+	}
+	// shortcut: CLI streams only, connect TUI/remote request lifecycles before production selection.
+	if s.Orchestrator.Worker != nil && message.Channel == "cli" {
+		return s.dispatchWorkerConversation(ctx, message, prompt, emit, additionalSourceIDs)
 	}
 	key := sessionKey(message)
 	jobID, jobCreated, err := s.Runtime.tryBeginJobWithDetails(key, message.Channel, message.Conversation, message.Text, JobDetails{Kind: "conversation", Provider: s.Settings.Snapshot().Harness.Name})

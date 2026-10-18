@@ -3,22 +3,61 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
 )
 
+// ErrConversationPending means provider admission or delivery must reconcile;
+// callers must not turn it into a fabricated terminal history result.
+var ErrConversationPending = errors.New("worker conversation remains pending reconciliation")
+
 // AdmitConversation requires already persisted sources. Application admission
 // runs under exact ownership; worker RPCs never run inside that callback.
 func (m *Manager) AdmitConversation(ctx context.Context, conversation harness.WorkerConversation, prompt, message string) (harness.WorkerExecution, error) {
+	m.workerAdmissionMu.Lock()
+	defer m.workerAdmissionMu.Unlock()
+	return m.admitConversation(ctx, conversation, prompt, message)
+}
+
+// Converse consumes an ordinary request through the same admission, receipt and
+// retirement boundary as scheduled attachment. Request cancellation detaches.
+func (m *Manager) Converse(ctx context.Context, conversation harness.WorkerConversation, prompt, message string, deliver func(context.Context, int, harness.WorkerDelivery) error) error {
+	if deliver == nil {
+		return errors.New("conversation request delivery unavailable")
+	}
+	m.workerAdmissionMu.Lock()
+	execution, err := m.admitConversation(ctx, conversation, prompt, message)
+	if err != nil {
+		pending := m.runtimeJob("worker-conversation:"+conversation.ExecutionID) > 0
+		m.workerAdmissionMu.Unlock()
+		if pending {
+			return fmt.Errorf("%w: %w", ErrConversationPending, err)
+		}
+		return err
+	}
+	key := "worker-conversation:" + strconv.FormatUint(execution.Sequence, 10)
+	m.setInflight(key, true)
+	m.jobs.Add(1)
+	m.workerAdmissionMu.Unlock()
+	defer m.jobs.Done()
+	defer m.setInflight(key, false)
+	if err := m.consumeWorkerConversation(ctx, execution, deliver); err != nil {
+		return fmt.Errorf("%w: %w", ErrConversationPending, err)
+	}
+	return nil
+}
+
+// The caller holds the shared snapshot/admission/retirement lock.
+func (m *Manager) admitConversation(ctx context.Context, conversation harness.WorkerConversation, prompt, message string) (harness.WorkerExecution, error) {
 	if m.Worker == nil || m.ConversationStarted == nil || m.ConversationAttached == nil || m.ConversationDelivery == nil || m.JobFinished == nil || conversation.Validate() != nil || prompt == "" {
 		return harness.WorkerExecution{}, errors.New("worker conversation admission unavailable or invalid")
 	}
 	conversation.Sources = slices.Clone(conversation.Sources)
-	m.workerAdmissionMu.Lock()
-	defer m.workerAdmissionMu.Unlock()
 	reply, err := m.Worker.Call(ctx, harness.WorkerRequest{Action: "inspect"})
 	if err != nil {
 		return harness.WorkerExecution{}, err

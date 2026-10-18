@@ -18,6 +18,38 @@ import (
 	"github.com/agent0ai/spynel/internal/shortid"
 )
 
+func (s *Service) dispatchWorkerConversation(ctx context.Context, message core.Message, prompt string, emit core.Emit, additionalSources []string) error {
+	executionID, err := shortid.New()
+	if err != nil {
+		return err
+	}
+	sources := append([]string{message.SourceMessageID}, additionalSources...)
+	sort.Strings(sources)
+	c := harness.WorkerConversation{Channel: message.Channel, Conversation: message.Conversation, SourceMessageID: message.SourceMessageID, ExecutionID: executionID, Sources: sources}
+	activity := newChatActivityEmitter(func(event core.Event) {
+		event.RequestID = message.SourceMessageID
+		if emit != nil {
+			emit(event)
+		}
+	})
+	defer activity.stop()
+	terminal := false
+	err = s.Orchestrator.Converse(ctx, c, prompt, message.Text, func(_ context.Context, jobID int, delivery harness.WorkerDelivery) error {
+		activity.start()
+		return s.ConsumeConversationDelivery(jobID, delivery, func(transformed harness.WorkerDelivery) error {
+			activity.emit(transformed.Event)
+			terminal = transformed.Event.Done && !transformed.Event.Continues &&
+				(transformed.Event.Kind == core.EventFinal || transformed.Event.Kind == core.EventError)
+			return nil
+		})
+	})
+	// A lost commit/retirement reply cannot replace an already delivered result.
+	if terminal {
+		return nil
+	}
+	return err
+}
+
 // Worker source reservation and Send share its exact-term fence. Preparing the
 // prompt here must never reserve recovery or enclose a worker RPC in that fence.
 func (s *Service) dispatchWorkerRecovery(ctx context.Context, origin orchestrator.Origin, candidates []recoveryCandidate) bool {

@@ -10,10 +10,24 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent0ai/spynel/internal/app"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
 )
+
+// Seed a controller-owned job explicitly: ordinary bound CLI dispatch now
+// belongs to the worker, while these tests must retain both execution owners.
+func startControllerCancellationFixture(t *testing.T, f *workerAgentFixture, local *heldCLIHarness) {
+	t.Helper()
+	key := "chat:cli:local"
+	if _, err := f.service.Runtime.TryBeginJobWithDetails(key, "cli", "local", "synthetic local request", app.JobDetails{Kind: "conversation"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := local.Send(t.Context(), key, "synthetic local request", func(core.Event) {}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestWorkerCancellationSelectsSessionOwner(t *testing.T) {
 	for _, command := range []string{"manager", "stop", "kill"} {
@@ -24,9 +38,7 @@ func TestWorkerCancellationSelectsSessionOwner(t *testing.T) {
 				t.Logf("cancellation worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
 				local := newHeldCLIHarness()
 				f.service.Harness, f.service.Orchestrator.Harness = local, local
-				if err := f.service.Handle(t.Context(), core.Message{Channel: "cli", Conversation: "local", Text: "synthetic local request"}, nil); err != nil {
-					t.Fatal(err)
-				}
+				startControllerCancellationFixture(t, f, local)
 				c := harness.WorkerConversation{Channel: "cli", Conversation: "worker", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
 				if _, err := f.service.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic worker request", AcceptedAt: time.Now().UTC()}); err != nil {
 					t.Fatal(err)
@@ -77,9 +89,7 @@ func TestWorkerCancellationInspectionFailurePreservesLocalJob(t *testing.T) {
 	f := newWorkerAgentFixture(t)
 	local := newHeldCLIHarness()
 	f.service.Harness, f.service.Orchestrator.Harness = local, local
-	if err := f.service.Handle(t.Context(), core.Message{Channel: "cli", Conversation: "local", Text: "synthetic local request"}, nil); err != nil {
-		t.Fatal(err)
-	}
+	startControllerCancellationFixture(t, f, local)
 	job, _ := f.service.Runtime.JobForSession("chat:cli:local")
 	f.client.Close()
 	restore := dropWorkerReply(t, f.client.Info().Socket, "inspect", false, false)

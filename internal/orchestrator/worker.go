@@ -38,14 +38,14 @@ func (m *Manager) attachWorkerConversations(ctx context.Context, executions []ha
 		go func() {
 			defer m.jobs.Done()
 			defer m.setInflight(key, false)
-			if err := m.consumeWorkerConversation(ctx, execution); err != nil && ctx.Err() == nil {
+			if err := m.consumeWorkerConversation(ctx, execution, m.ConversationDelivery); err != nil && ctx.Err() == nil {
 				m.log("retained conversation delivery requires reconciliation")
 			}
 		}()
 	}
 }
 
-func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harness.WorkerExecution) (resultErr error) {
+func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harness.WorkerExecution, deliver func(context.Context, int, harness.WorkerDelivery) error) (resultErr error) {
 	if !execution.SourcesReserved && (!execution.ConversationRefused() || m.JobDelivery == nil) {
 		return errors.New("conversation source refusal archive unavailable or invalid")
 	}
@@ -81,7 +81,7 @@ func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harne
 				}
 				return m.JobDelivery(jobID, delivery)
 			}
-			return m.ConversationDelivery(ctx, jobID, delivery)
+			return deliver(ctx, jobID, delivery)
 		})
 		if err != nil {
 			return err
