@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	WorkerProtocol      = 9
+	WorkerProtocol      = 10
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -88,6 +88,10 @@ type WorkerSettings struct {
 // WorkerSettingsAction prepares canonical persistence and restoration. Both
 // callbacks run under the worker's configuration/dispatch fence, without RPCs.
 type WorkerSettingsAction func(root string, current, next HarnessConfig, settings WorkerSettings) (commit, restore func() error, err error)
+
+// WorkerConversationAction reserves sources inside the worker's existing
+// exact-election fence, without another ownership acquisition or worker RPC.
+type WorkerConversationAction func(root, key string, conversation WorkerConversation, receipt string) error
 
 type WorkerControl struct {
 	ID                 string
@@ -156,6 +160,7 @@ type WorkerExecution struct {
 	Agent           *WorkerAgent
 	Cancelled       bool
 	Conversation    *WorkerConversation
+	SourcesReserved bool
 }
 
 type WorkerSession struct {
@@ -190,29 +195,30 @@ type workerExecution struct {
 }
 
 type workerHost struct {
-	supervisor *Supervisor
-	election   *instance.Election
-	info       WorkerInfo
-	token      string
-	directory  string
-	recordPath string
-	stop       chan struct{}
-	stopOnce   sync.Once
-	operations sync.Mutex
-	mu         sync.Mutex
-	lastSeen   time.Time
-	next       uint64
-	executions map[uint64]*workerExecution
-	bytes      int64
-	failure    error
-	workflow   WorkerWorkflowAction
-	settings   WorkerSettingsAction
+	supervisor   *Supervisor
+	election     *instance.Election
+	info         WorkerInfo
+	token        string
+	directory    string
+	recordPath   string
+	stop         chan struct{}
+	stopOnce     sync.Once
+	operations   sync.Mutex
+	mu           sync.Mutex
+	lastSeen     time.Time
+	next         uint64
+	executions   map[uint64]*workerExecution
+	bytes        int64
+	failure      error
+	workflow     WorkerWorkflowAction
+	settings     WorkerSettingsAction
+	conversation WorkerConversationAction
 }
 
 // RunWorker is a private same-binary entry point. Losing its bootstrap pipe,
 // HTTP clients or elected controller does not cancel its provider context.
 // Explicit shutdown, signal, journal failure or bounded detachment still do.
-func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *Registry, workflow WorkerWorkflowAction, settings WorkerSettingsAction) (runErr error) {
+func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *Registry, workflow WorkerWorkflowAction, settings WorkerSettingsAction, conversation WorkerConversationAction) (runErr error) {
 	var bootstrap WorkerBootstrap
 	data, err := io.ReadAll(io.LimitReader(input, workerRequestBytes+1))
 	if err != nil || len(data) > workerRequestBytes {
@@ -302,7 +308,7 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 	host = &workerHost{
 		supervisor: supervisor, election: election, info: info, token: bootstrap.Token, directory: directory, recordPath: recordPath,
 		stop: make(chan struct{}), lastSeen: time.Now(), next: 1, executions: map[uint64]*workerExecution{},
-		workflow: workflow, settings: settings,
+		workflow: workflow, settings: settings, conversation: conversation,
 	}
 	if err := publishWorkerRecord(recordPath, workerRecord{Info: info, Token: bootstrap.Token}); err != nil {
 		return err
@@ -557,6 +563,30 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 		return WorkerReply{Error: "persist worker admission failed"}
 	}
 	h.mu.Unlock()
+	if request.Conversation != nil {
+		if h.conversation == nil {
+			err = errors.New("worker conversation reservation unavailable")
+		} else {
+			receipt := h.info.ID + ":" + strconv.FormatUint(request.Sequence, 10) + ":admission"
+			err = h.conversation(h.supervisor.HarnessConfig().Cwd, request.Key, *request.Conversation, receipt)
+		}
+		h.mu.Lock()
+		execution.SourcesReserved = err == nil
+		if err != nil {
+			execution.Error, execution.Done = err.Error(), true
+		}
+		if saveErr := h.saveAdmissionLocked(execution); saveErr != nil {
+			h.failJournalLocked()
+			h.mu.Unlock()
+			return WorkerReply{Error: "persist worker source reservation failed"}
+		}
+		if err != nil {
+			reply := WorkerReply{Executions: []WorkerExecution{execution.WorkerExecution}}
+			h.mu.Unlock()
+			return reply
+		}
+		h.mu.Unlock()
+	}
 	if request.Workflow != nil {
 		var reservation WorkerReservation
 		if h.workflow == nil {

@@ -19,6 +19,12 @@ import (
 // this call; Store's mutex alone does not serialize different processes.
 // Replaying a matching receipt confirms durability without another append.
 func (s *Store) AppendOnce(channel, conversation, receipt string, entry Entry) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendOnceLocked(channel, conversation, receipt, entry, nil)
+}
+
+func (s *Store) appendOnceLocked(channel, conversation, receipt string, entry Entry, validate func() error) (bool, error) {
 	if receipt == "" || len(receipt) > 256 || !utf8.ValidString(receipt) || strings.IndexFunc(receipt, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
 		return false, errors.New("invalid history receipt identity")
 	}
@@ -34,8 +40,6 @@ func (s *Store) AppendOnce(channel, conversation, receipt string, entry Entry) (
 	}
 	digest := sha256.Sum256(data)
 	entry.ReceiptID, entry.ReceiptHash = receipt, hex.EncodeToString(digest[:])
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	file, err := os.OpenFile(s.Path(channel, conversation), os.O_RDWR, 0)
 	if err != nil && !os.IsNotExist(err) {
 		return false, err
@@ -76,6 +80,11 @@ func (s *Store) AppendOnce(channel, conversation, receipt string, entry Entry) (
 		if found {
 			// A prior Sync may have failed after the complete record was written.
 			return false, file.Sync()
+		}
+	}
+	if validate != nil {
+		if err := validate(); err != nil {
+			return false, err
 		}
 	}
 	_, err = s.appendLocked(channel, conversation, entry)

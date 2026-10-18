@@ -4,6 +4,7 @@ import (
 	"errors"
 	"regexp"
 	"slices"
+	"strings"
 
 	"github.com/agent0ai/spynel/internal/core"
 )
@@ -29,6 +30,9 @@ func (c *WorkerConversation) Validate() error {
 
 func (h *workerHost) validateConversationLocked(request WorkerRequest) error {
 	conversation := request.Conversation
+	if strings.HasPrefix(request.Key, "chat:") && conversation == nil {
+		return errors.New("worker conversation descriptor is required")
+	}
 	if conversation != nil {
 		if err := conversation.Validate(); err != nil {
 			return err

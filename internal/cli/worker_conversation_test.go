@@ -48,7 +48,7 @@ func TestWorkerConversationNativeReplayAndSettlement(t *testing.T) {
 			identity := f.client.Info()
 			t.Logf("conversation worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
 			request := harness.WorkerRequest{Action: "send", Sequence: 1, Key: "chat:" + metadata.Channel + ":" + metadata.Conversation, Prompt: "synthetic batch", Conversation: metadata}
-			if reply, err := f.client.Call(t.Context(), request); err != nil || reply.Executions[0].Error != "" {
+			if reply, err := f.client.Call(t.Context(), request); err != nil || reply.Executions[0].Error != "" || !reply.Executions[0].SourcesReserved {
 				t.Fatal("conversation admission failed", err)
 			}
 			waitWorkerAgent(t, func() bool { return f.inspect(t)[0].LastCursor >= 2 })
@@ -163,5 +163,90 @@ func TestWorkerConversationNativeReplayAndSettlement(t *testing.T) {
 				t.Fatal("attachment dispatched another provider turn", err)
 			}
 		})
+	}
+}
+
+func TestWorkerConversationNativeRejectsUnownedSources(t *testing.T) {
+	for _, scenario := range []string{"missing", "covered", "already-admitted", "unreserved-recovery", "corrupt", "storage-error"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newWorkerAgentFixture(t)
+			metadata := &harness.WorkerConversation{Channel: "cli", Conversation: "source-owner", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}, Recovery: scenario == "unreserved-recovery"}
+			if scenario != "missing" {
+				if _, err := f.service.History.Append("cli", metadata.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic", AcceptedAt: time.Now().UTC()}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "covered" || scenario == "already-admitted" {
+				entry := history.Entry{Role: "correlation", ExecutionID: "other-execution"}
+				if scenario == "covered" {
+					entry.Covers, entry.Outcome = []string{"source"}, "terminal_assistant"
+				} else {
+					entry.SourceMessageID, entry.Admission = "source", "new"
+				}
+				if _, err := f.service.History.Append("cli", metadata.Conversation, entry); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "corrupt" {
+				if err := os.WriteFile(f.service.History.Path("cli", metadata.Conversation), []byte("{broken\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "storage-error" {
+				path := f.service.History.Path("cli", metadata.Conversation)
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reply, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "send", Sequence: 1, Key: "chat:cli:" + metadata.Conversation, Prompt: "synthetic source gate", Conversation: metadata})
+			if err != nil || len(reply.Executions) != 1 || !reply.Executions[0].Done || reply.Executions[0].Error == "" || reply.Executions[0].SourcesReserved {
+				t.Fatal("unowned source reached provider admission", err)
+			}
+			methods, err := os.ReadFile(f.log)
+			if err != nil || strings.Contains(string(methods), "turn/start\n") {
+				t.Fatal("rejected source dispatched provider work", err)
+			}
+		})
+	}
+}
+
+func TestWorkerConversationNativeReservedRecoveryAndLostSendReply(t *testing.T) {
+	f := newWorkerAgentFixture(t)
+	metadata := &harness.WorkerConversation{Channel: "cli", Conversation: "reserved", SourceMessageID: "first", ExecutionID: "execution", Sources: []string{"first", "second"}, Recovery: true}
+	for _, source := range metadata.Sources {
+		if _, err := f.service.History.Append("cli", metadata.Conversation, history.Entry{Role: "user", SourceMessageID: source, Content: "synthetic", AcceptedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if reserved, err := f.service.History.ReserveRetrigger("cli", metadata.Conversation, metadata.Sources, time.Time{}, time.Time{}, 2); err != nil || len(reserved) != 2 {
+		t.Fatal("recovery reservation failed", err)
+	}
+	request := harness.WorkerRequest{Action: "send", Sequence: 1, Key: "chat:cli:" + metadata.Conversation, Prompt: "synthetic recovery", Conversation: metadata}
+	f.client.Close()
+	restore := dropWorkerReply(t, f.client.Info().Socket, "send", true, false)
+	_, err := f.client.Call(t.Context(), request)
+	restore()
+	f.client.Close()
+	if err == nil {
+		t.Fatal("lost send reply was reported as confirmed")
+	}
+	reply, err := f.client.Call(t.Context(), request)
+	if err != nil || len(reply.Executions) != 1 || reply.Executions[0].Error != "" || !reply.Executions[0].SourcesReserved {
+		t.Fatal("exact retry lost its source reservation", err)
+	}
+	entries, _, err := f.service.History.RecoveryEntries("cli", metadata.Conversation, 10)
+	if err != nil || len(entries) != 4 || strings.Join(entries[3].AdmittedSources, ",") != "first,second" {
+		t.Fatal("lost send reply duplicated or lost the source batch", err)
+	}
+	snapshot, err := f.service.History.RecoveryWindow("cli", metadata.Conversation, time.Time{}, 10)
+	if err != nil || !snapshot.Admitted["first"] || !snapshot.Admitted["second"] {
+		t.Fatal("recovery admission lost source correlation", err)
+	}
+	methods, err := os.ReadFile(f.log)
+	if err != nil || strings.Count(string(methods), "turn/start\n") != 1 {
+		t.Fatal("lost send reply dispatched another provider turn", err)
 	}
 }

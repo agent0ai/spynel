@@ -67,7 +67,8 @@ func TestMain(m *testing.M) {
 		if err != nil {
 			os.Exit(1)
 		}
-		if err := RunWorker(context.Background(), os.Stdin, os.Stdout, NewBuiltinRegistry(), reserveWorkerFixture, nil); err != nil {
+		// Protocol fixtures trust synthetic sources; native CLI tests exercise history admission.
+		if err := RunWorker(context.Background(), os.Stdin, os.Stdout, NewBuiltinRegistry(), reserveWorkerFixture, nil, func(string, string, WorkerConversation, string) error { return nil }); err != nil {
 			unregister()
 			_, _ = fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)

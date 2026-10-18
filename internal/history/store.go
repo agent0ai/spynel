@@ -41,6 +41,7 @@ type Entry struct {
 	AcceptedAt       time.Time `json:"accepted_at,omitempty"`
 	ExecutionID      string    `json:"execution_id,omitempty"`
 	Admission        string    `json:"admission,omitempty"`
+	AdmittedSources  []string  `json:"admitted_sources,omitempty"`
 	Covers           []string  `json:"covers,omitempty"`
 	Outcome          string    `json:"outcome,omitempty"`
 	RetriggerOf      []string  `json:"retrigger_of,omitempty"`
@@ -724,12 +725,13 @@ const maxRecoveryWindowBytes = 8 * 1024 * 1024
 // RecoverySnapshot retains recent user bodies and only their exact correlation.
 // Records counts recent records in this page, including replies and ledgers.
 type RecoverySnapshot struct {
-	Entries  []Entry
-	Covered  map[string]string
-	Admitted map[string]bool
-	Records  int
-	Next     int
-	More     bool
+	Entries          []Entry
+	Covered          map[string]string
+	Admitted         map[string]bool
+	Records          int
+	Next             int
+	More             bool
+	recoveryAdmitted map[string]bool
 }
 
 // RecoveryWindow returns the first bounded page of recent history. Callers
@@ -749,7 +751,7 @@ func (s *Store) RecoveryPage(channel, conversation string, cutoff time.Time, aft
 }
 
 func (s *Store) recoveryWindowLocked(channel, conversation string, cutoff time.Time, after, max int, requested []string) (RecoverySnapshot, error) {
-	result := RecoverySnapshot{Covered: map[string]string{}, Admitted: map[string]bool{}}
+	result := RecoverySnapshot{Covered: map[string]string{}, Admitted: map[string]bool{}, recoveryAdmitted: map[string]bool{}}
 	if max <= 0 || after < 0 {
 		return result, errors.New("invalid recovery page bounds")
 	}
@@ -831,6 +833,7 @@ func (s *Store) recoveryWindowLocked(channel, conversation string, cutoff time.T
 		if entry.RecoveryBaseline {
 			clear(result.Covered)
 			clear(result.Admitted)
+			clear(result.recoveryAdmitted)
 		}
 		for _, id := range entry.Covers {
 			if wanted[id] {
@@ -850,6 +853,14 @@ func (s *Store) recoveryWindowLocked(channel, conversation string, cutoff time.T
 		}
 		if wanted[entry.SourceMessageID] && entry.Admission != "" {
 			result.Admitted[entry.SourceMessageID] = true
+		}
+		for _, id := range entry.AdmittedSources {
+			if wanted[id] {
+				result.Admitted[id] = true
+				if entry.Recovery {
+					result.recoveryAdmitted[id] = true
+				}
+			}
 		}
 		return nil
 	})

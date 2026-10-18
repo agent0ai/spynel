@@ -2,10 +2,22 @@ package app
 
 import (
 	"errors"
+	"path/filepath"
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/history"
 )
+
+// AdmitWorkerConversation runs inside the worker's existing owner fence.
+// Transport authorization and job admission precede this source reservation.
+func AdmitWorkerConversation(root, key string, conversation harness.WorkerConversation, receipt string) error {
+	if conversation.Validate() != nil || key != "chat:"+conversation.Channel+":"+conversation.Conversation {
+		return errors.New("invalid worker conversation admission")
+	}
+	store := history.New(filepath.Join(root, ".spynel", "history"))
+	return store.AdmitConversation(conversation.Channel, conversation.Conversation, conversation.ExecutionID, receipt, conversation.Sources, conversation.Recovery)
+}
 
 // ConsumeConversationDelivery runs under WorkerClient.Consume's exact owner
 // fence. Its downstream must persist/deduplicate ReceiptID and must not use RPC.

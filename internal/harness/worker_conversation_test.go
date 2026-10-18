@@ -3,6 +3,7 @@
 package harness
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"reflect"
@@ -113,6 +114,9 @@ func TestWorkerConversationDescriptorSurvivesControllerTerms(t *testing.T) {
 
 func TestWorkerConversationRejectsInvalidDescriptorsBeforeAdmission(t *testing.T) {
 	host := &workerHost{next: 1, executions: map[uint64]*workerExecution{}}
+	if reply := host.send(WorkerRequest{Sequence: 1, Key: "chat:cli:synthetic", Prompt: "synthetic"}); reply.Error == "" || host.next != 1 || len(host.executions) != 0 {
+		t.Fatal("untyped chat admission bypassed source ownership")
+	}
 	base := WorkerConversation{Channel: "cli", Conversation: "synthetic", ExecutionID: "execution", SourceMessageID: "source", Sources: []string{"source"}}
 	for _, change := range []func(*WorkerConversation){
 		func(c *WorkerConversation) { c.Channel = "unknown" },
@@ -129,5 +133,54 @@ func TestWorkerConversationRejectsInvalidDescriptorsBeforeAdmission(t *testing.T
 		if reply.Error == "" || host.next != 1 || len(host.executions) != 0 {
 			t.Fatal("invalid conversation crossed admission")
 		}
+	}
+}
+
+func TestWorkerConversationReservationFailureNeverDispatches(t *testing.T) {
+	for _, failure := range []string{"missing-owner", "refused", "checkpoint"} {
+		t.Run(failure, func(t *testing.T) {
+			target := &supervisorHarness{name: "synthetic", active: map[string]bool{}, emits: map[string]core.Emit{}}
+			supervisor := NewSupervisor(NewRegistry(), HarnessConfig{Cwd: t.TempDir()})
+			supervisor.current, supervisor.ctx = target, context.Background()
+			host := &workerHost{supervisor: supervisor, directory: t.TempDir(), next: 1, executions: map[uint64]*workerExecution{}, stop: make(chan struct{})}
+			defer func() {
+				for _, execution := range host.executions {
+					_ = execution.file.Close()
+				}
+			}()
+			calls := 0
+			if failure != "missing-owner" {
+				host.conversation = func(root, key string, conversation WorkerConversation, receipt string) error {
+					calls++
+					if failure == "refused" {
+						return os.ErrPermission
+					}
+					path := host.executions[1].file.Name() + ".admission"
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+					return os.Mkdir(path, 0700)
+				}
+			}
+			metadata := &WorkerConversation{Channel: "cli", Conversation: "synthetic", ExecutionID: "execution", SourceMessageID: "source", Sources: []string{"source"}}
+			request := WorkerRequest{Action: "send", Sequence: 1, Key: "chat:cli:synthetic", Prompt: "synthetic", Conversation: metadata}
+			reply := host.send(request)
+			if len(target.prompts[request.Key]) != 0 {
+				t.Fatal("failed source reservation dispatched provider work")
+			}
+			if failure == "checkpoint" {
+				if reply.Error == "" || host.failure == nil {
+					t.Fatal("failed reservation checkpoint did not stop the worker")
+				}
+				return
+			}
+			if len(reply.Executions) != 1 || !reply.Executions[0].Done || reply.Executions[0].Error == "" || reply.Executions[0].SourcesReserved {
+				t.Fatal("refused source reservation was admitted")
+			}
+			_ = host.send(request)
+			if calls > 1 || len(target.prompts[request.Key]) != 0 {
+				t.Fatal("matching retry repeated a refused reservation")
+			}
+		})
 	}
 }
