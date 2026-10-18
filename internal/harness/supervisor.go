@@ -39,7 +39,7 @@ type Supervisor struct {
 	seenControl       map[string]map[string]time.Time
 	controlGeneration map[string]uint64
 	controlOpsMu      sync.Mutex
-	controlOps        map[string]*sync.Mutex
+	controlOps        map[string]sessionOperation
 	ready             chan struct{}
 	closed            bool
 	processStartGuard func() error
@@ -70,11 +70,30 @@ type controlState struct {
 	continued           bool
 }
 
+type sessionOperation chan struct{}
+
+func (o sessionOperation) Lock()   { <-o }
+func (o sessionOperation) Unlock() { o <- struct{}{} }
+
+func (o sessionOperation) LockContext(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-o:
+		// Cancellation can win at the same time the session becomes available.
+		if err := ctx.Err(); err != nil {
+			o.Unlock()
+			return err
+		}
+		return nil
+	}
+}
+
 func NewSupervisor(registry *Registry, cfg HarnessConfig) *Supervisor {
 	return &Supervisor{
 		registry: registry, config: cfg, active: map[string]int{}, pending: map[string][]pendingSend{},
 		controlEmit: map[string]core.Emit{}, controls: map[string]*controlState{}, seenControl: map[string]map[string]time.Time{},
-		controlGeneration: map[string]uint64{}, controlOps: map[string]*sync.Mutex{},
+		controlGeneration: map[string]uint64{}, controlOps: map[string]sessionOperation{},
 		ready: make(chan struct{}, 1),
 	}
 }
@@ -409,7 +428,9 @@ func (s *Supervisor) ConversationAdmission(key string) string {
 
 func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit core.Emit) (string, bool, error) {
 	operation := s.controlOperation(key)
-	operation.Lock()
+	if err := operation.LockContext(ctx); err != nil {
+		return "", false, err
+	}
 	// Selecting the target and marking a new turn active must be atomic with
 	// respect to Reconfigure. Otherwise a swap could close the old harness in
 	// the narrow window after target selection but before active bookkeeping.
@@ -476,6 +497,11 @@ func (s *Supervisor) SendControl(ctx context.Context, key string, request Contro
 	if request.ID == "" || request.Prompt == "" {
 		return ControlResult{}, errors.New("invalid empty control request")
 	}
+	operation := s.controlOperation(key)
+	if err := operation.LockContext(ctx); err != nil {
+		return ControlResult{}, err
+	}
+	defer operation.Unlock()
 	s.mu.Lock()
 	target, err := s.targetLocked()
 	if err != nil {
@@ -522,9 +548,6 @@ func (s *Supervisor) SendControl(ctx context.Context, key string, request Contro
 	s.controls[key] = state
 	generation := s.controlGeneration[key]
 	s.mu.Unlock()
-	operation := s.controlOperation(key)
-	operation.Lock()
-	defer operation.Unlock()
 	if state.validate != nil && !state.validate() {
 		s.mu.Lock()
 		if s.controls[key] == state {
@@ -742,12 +765,13 @@ func cancelQueuedRequests(queue ...pendingSend) {
 	}
 }
 
-func (s *Supervisor) controlOperation(key string) *sync.Mutex {
+func (s *Supervisor) controlOperation(key string) sessionOperation {
 	s.controlOpsMu.Lock()
 	defer s.controlOpsMu.Unlock()
 	lock := s.controlOps[key]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = make(sessionOperation, 1)
+		lock.Unlock()
 		s.controlOps[key] = lock
 	}
 	return lock
@@ -874,7 +898,9 @@ func (s *Supervisor) startQueuedOwned(key string, target Harness, next pendingSe
 
 func (s *Supervisor) Interrupt(ctx context.Context, key string) (bool, error) {
 	operation := s.controlOperation(key)
-	operation.Lock()
+	if err := operation.LockContext(ctx); err != nil {
+		return false, err
+	}
 	defer operation.Unlock()
 	target, err := s.target()
 	if err != nil {
