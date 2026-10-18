@@ -37,6 +37,7 @@ type Lease struct {
 	SessionKey             string          `json:"session_key"`
 	ThreadID               string          `json:"thread_id,omitempty"`
 	State                  string          `json:"state"`
+	CancellationRequested  bool            `json:"cancellation_requested,omitempty"`
 	StartedAt              time.Time       `json:"started_at"`
 	HeartbeatAt            time.Time       `json:"heartbeat_at"`
 	RecoveryCount          int             `json:"recovery_count"`
@@ -1585,6 +1586,15 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 	}
 	now := time.Now()
 	for _, lease := range leases {
+		if lease.CancellationRequested {
+			if lease.State != "cancelled" {
+				lease.State = "cancelled"
+				if err := m.saveLease(lease); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		if lease.State == "hook_cancelled" || lease.State == "cancelled" {
 			continue
 		}
@@ -1956,7 +1966,7 @@ func (m *Manager) ControlStillValid(expected Lease, expectedDocumentID string) b
 	if err != nil || current.OwnerID != expected.OwnerID || current.SessionKey != expected.SessionKey || current.File != expected.File || current.Phase != expected.Phase {
 		return false
 	}
-	if current.State != "awaiting_transition" && current.State != "processing" && current.State != "recovering" {
+	if current.CancellationRequested || current.State != "awaiting_transition" && current.State != "processing" && current.State != "recovering" {
 		return false
 	}
 	document, err := ReadDocument(current.File)

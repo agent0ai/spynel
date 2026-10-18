@@ -160,7 +160,7 @@ func (m *Manager) attachWorkerWorkflows(ctx context.Context, executions []harnes
 		if !execution.Done {
 			lease.State = "processing"
 		}
-		if execution.Cancelled {
+		if execution.Cancelled || lease.CancellationRequested {
 			lease.State = "cancelled"
 		}
 		if err := m.saveLease(lease); err != nil {
@@ -302,7 +302,8 @@ func (m *Manager) recordDispatchError(ctx context.Context, lease Lease, err erro
 // document lock for validation, continuation preparation and reservations.
 func ApplyWorkerWorkflow(root, key string, work harness.WorkerWorkflow, action string) (harness.WorkerReservation, error) {
 	var result harness.WorkerReservation
-	if action != "reserve" && action != "validate" && action != "continue" && action != "reserve-control" {
+	cancellation := action == "cancel" || action == "restore-cancellation"
+	if action != "reserve" && action != "validate" && action != "continue" && action != "reserve-control" && !cancellation {
 		return result, errors.New("invalid worker workflow action")
 	}
 	path, leasePath, err := workerWorkflowPaths(root, key, work)
@@ -310,6 +311,10 @@ func ApplyWorkerWorkflow(root, key string, work harness.WorkerWorkflow, action s
 		return result, err
 	}
 	for _, candidate := range []string{path, leasePath} {
+		// Cancellation identifies the retained lease even after its document moved.
+		if cancellation && candidate == path {
+			continue
+		}
 		resolved, err := filepath.EvalSymlinks(candidate)
 		if err != nil || resolved != candidate {
 			return result, errors.New("worker workflow document or lease unavailable")
@@ -336,8 +341,17 @@ func ApplyWorkerWorkflow(root, key string, work harness.WorkerWorkflow, action s
 	}
 	if lease.ID != work.LeaseID || lease.WorkID != "" && lease.WorkID != work.WorkID || lease.ClaimID != work.ClaimID || lease.OwnerID != work.OwnerID ||
 		lease.SessionKey != key || lease.File != path || lease.Route != work.Route || lease.Phase != work.Phase ||
-		lease.ClaimAttempt != work.ClaimAttempt || lease.State != "processing" && lease.State != "recovering" && (action == "reserve" || lease.State != "awaiting_transition") {
+		lease.ClaimAttempt != work.ClaimAttempt || lease.CancellationRequested && !cancellation ||
+		lease.State != "processing" && lease.State != "recovering" && (action == "reserve" || lease.State != "awaiting_transition") && !(cancellation && (lease.State == "cancelled" || lease.State == "error")) {
 		return result, errors.New("worker workflow claim changed before admission")
+	}
+	if cancellation {
+		lease.CancellationRequested = action == "cancel"
+		data, err := json.Marshal(lease)
+		if err != nil {
+			return result, err
+		}
+		return result, fsx.AtomicWriteFile(leasePath, append(data, '\n'), 0600)
 	}
 	document, err := ReadDocument(path)
 	if err != nil {

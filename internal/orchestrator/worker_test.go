@@ -110,6 +110,48 @@ func TestWorkerControlActionsValidateAndReserveExactClaim(t *testing.T) {
 	}
 }
 
+func TestWorkerWorkflowCancellationIntentFencesAdmission(t *testing.T) {
+	root, key, work, manager := workerWorkflowFixture(t, "tasks", phaseTaskImplementation)
+	if _, err := ApplyWorkerWorkflow(root, key, work, "cancel"); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := manager.loadLease(work.LeaseID)
+	if err != nil || !lease.CancellationRequested || lease.State != "processing" {
+		t.Fatal("intent did not preserve the admitted execution state", err)
+	}
+	for _, action := range []string{"reserve", "validate", "continue", "reserve-control"} {
+		if _, err := ApplyWorkerWorkflow(root, key, work, action); err == nil {
+			t.Fatal("paused workflow admitted work", action)
+		}
+	}
+	changed := work
+	changed.OwnerID += "-changed"
+	if _, err := ApplyWorkerWorkflow(root, key, changed, "restore-cancellation"); err == nil {
+		t.Fatal("changed owner cleared cancellation intent")
+	}
+	if _, err := ApplyWorkerWorkflow(root, key, work, "restore-cancellation"); err != nil {
+		t.Fatal(err)
+	}
+	lease, _ = manager.loadLease(work.LeaseID)
+	if lease.CancellationRequested || lease.State != "processing" {
+		t.Fatal("clean refusal did not restore only its intent")
+	}
+	if _, err := ApplyWorkerWorkflow(root, key, work, "validate"); err != nil {
+		t.Fatal("restored execution remained fenced", err)
+	}
+	if _, err := ApplyWorkerWorkflow(root, key, work, "cancel"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.recoverStale(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	lease, _ = manager.loadLease(work.LeaseID)
+	document, err := ReadDocument(work.File)
+	if !lease.CancellationRequested || lease.State != "cancelled" || err != nil || numberValue(document.FrontMatter["provider_iterations"]) != 4 {
+		t.Fatal("recovery redispatched a cancellation whose worker is gone", err)
+	}
+}
+
 func TestReserveWorkerTurnRejectsChangedOrUnsafeClaim(t *testing.T) {
 	for _, scenario := range []string{"wrong-key", "wrong-route", "wrong-path", "wrong-claim", "changed-owner", "changed-work-id", "changed-attempt", "terminal-lease", "changed-document", "moved-document", "corrupt-lease", "symlink"} {
 		t.Run(scenario, func(t *testing.T) {

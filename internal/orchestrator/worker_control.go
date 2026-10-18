@@ -55,7 +55,17 @@ func (m *Manager) Interrupt(ctx context.Context, key string) (bool, error) {
 			if m.Harness.IsActive(key) {
 				return false, errors.New("session has conflicting execution owners")
 			}
+			var alreadyRequested bool
+			if execution.Workflow != nil {
+				alreadyRequested, err = m.workerCancellation(ctx, *execution.Workflow, "cancel")
+				if err != nil {
+					return false, err
+				}
+			}
 			reply, err := m.Worker.Call(ctx, harness.WorkerRequest{Action: "interrupt", Key: key})
+			if execution.Workflow != nil && !alreadyRequested && !execution.Cancelled && err == nil && !reply.Interrupted && ctx.Err() == nil {
+				_, err = m.workerCancellation(ctx, *execution.Workflow, "restore-cancellation")
+			}
 			return reply.Interrupted, err
 		}
 	}
@@ -66,4 +76,21 @@ func (m *Manager) Interrupt(ctx context.Context, key string) (bool, error) {
 		return err
 	})
 	return stopped, err
+}
+
+// Persist before the RPC: worker death must not erase an uncertain interruption.
+func (m *Manager) workerCancellation(ctx context.Context, work harness.WorkerWorkflow, action string) (alreadyRequested bool, err error) {
+	work.OwnerID = m.ownerID
+	err = m.Worker.RunOwned(ctx, func() error {
+		m.scanMu.Lock()
+		defer m.scanMu.Unlock()
+		lease, err := m.loadLease(work.LeaseID)
+		if err != nil {
+			return err
+		}
+		alreadyRequested = lease.CancellationRequested
+		_, err = ApplyWorkerWorkflow(m.Config.Root, lease.SessionKey, work, action)
+		return err
+	})
+	return alreadyRequested, err
 }
