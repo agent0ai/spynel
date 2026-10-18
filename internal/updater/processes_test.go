@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/agent0ai/spynel/internal/core"
 )
 
 func TestLifecycleProcessFixture(t *testing.T) {
@@ -138,6 +140,98 @@ func TestStopWaitsForUnregisteredDependentExit(t *testing.T) {
 	}
 }
 
+func TestRestartPreflightPreservesIncompatibleWorker(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SPYNEL_TEST_HARNESS_WORKER", "1")
+	root := t.TempDir()
+	worker := lifecycleFixture(t, root)
+	record, err := ProcessRecord(worker.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, _ := processDirectory()
+	path := filepath.Join(directory, strconv.Itoa(record.PID)+".json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(before, &data); err != nil {
+		t.Fatal(err)
+	}
+	data["worker_protocol"] = core.WorkerProtocol - 1
+	incompatible, _ := json.Marshal(data)
+	if err := os.WriteFile(path, incompatible, 0600); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{InstallRoot: root, CurrentVersion: "1.0.0"}
+	if err := manager.CheckRestartable(); err == nil {
+		t.Fatal("preflight allowed a controller to strand its incompatible live worker")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(after) != string(incompatible) || VerifyProcess(record) != nil {
+		t.Fatalf("refusal changed the live worker: %v", err)
+	}
+}
+
+func TestUpdateWorkerCompatibilityBeforePublication(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SPYNEL_TEST_HARNESS_WORKER", "1")
+	root := t.TempDir()
+	worker := lifecycleFixture(t, root)
+	record, err := ProcessRecord(worker.Process.Pid)
+	if err != nil || record.WorkerProtocol != core.WorkerProtocol {
+		t.Fatalf("worker compatibility registration = %#v, %v", record, err)
+	}
+	identity, err := json.Marshal(record)
+	if err != nil || strings.Contains(string(identity), "worker_protocol") {
+		t.Fatalf("registry metadata changed the strict native-identity wire schema: %s, %v", identity, err)
+	}
+	directory, _ := processDirectory()
+	path := filepath.Join(directory, strconv.Itoa(record.PID)+".json")
+	manager := &Manager{InstallRoot: root, CurrentVersion: "1.0.0"}
+	for _, test := range []struct {
+		name                                  string
+		worker, target                        int
+		otherInstallation, available, allowed bool
+	}{
+		{"compatible-release", core.WorkerProtocol, core.WorkerProtocol, false, true, true},
+		{"new-incompatible-target", core.WorkerProtocol, core.WorkerProtocol + 1, false, true, false},
+		{"old-incompatible-worker", core.WorkerProtocol - 1, core.WorkerProtocol, false, true, false},
+		{"unknown-worker", 0, core.WorkerProtocol, false, true, false},
+		{"unknown-target", core.WorkerProtocol, 0, false, true, false},
+		{"current-restart", core.WorkerProtocol, 0, false, false, true},
+		{"other-installation", 0, 0, true, true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			current := record
+			current.WorkerProtocol = test.worker
+			selected := *manager
+			if test.otherInstallation {
+				selected.InstallRoot = t.TempDir()
+			}
+			before, _ := current.registryJSON()
+			if err := os.WriteFile(path, before, 0600); err != nil {
+				t.Fatal(err)
+			}
+			result := Result{CanAutoInstall: true, Source: "npm", Current: "1.0.0", Latest: "2.0.0", Available: test.available, WorkerProtocol: test.target}
+			err := selected.PrepareUpdate(t.Context(), result)
+			if (err == nil) != test.allowed {
+				t.Fatalf("publication preflight = %v, allowed %t", err, test.allowed)
+			}
+			if !test.allowed && !strings.Contains(err.Error(), "spynel killall") {
+				t.Fatalf("missing explicit drain/stop guidance: %v", err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(after) != string(before) || VerifyProcess(current) != nil {
+				t.Fatalf("preflight changed or stopped worker: %v", err)
+			}
+		})
+	}
+}
+
 func TestUnregisteredLiveProcessIsNotDeadOrSignalled(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
@@ -160,6 +254,42 @@ func TestUnregisteredLiveProcessIsNotDeadOrSignalled(t *testing.T) {
 	}
 	if !processAlive(record.PID) {
 		t.Fatal("unregistered live process was signalled")
+	}
+}
+
+func TestStopWaitsForUnconfirmedImageExitWithoutSignalAuthority(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	fixture := lifecycleFixture(t, t.TempDir())
+	record, err := ProcessRecord(fixture.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processGone(errProcessImageUnavailable) {
+		t.Fatal("missing live image became death evidence")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancel()
+	past := time.Now().Add(-time.Second)
+	err = waitForStoppedProcess(ctx, record, past, time.Now().Add(time.Second), func(ProcessRegistration) error {
+		return errProcessImageUnavailable
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || VerifyProcess(record) != nil {
+		t.Fatalf("unconfirmed image wait = %v; fixture must remain live until timeout", err)
+	}
+	if err := signalRegisteredProcess(record, terminationSignal()); err != nil {
+		t.Fatal(err)
+	}
+	probes := 0
+	err = waitForStoppedProcess(t.Context(), record, time.Now().Add(time.Second), time.Now().Add(5*time.Second), func(r ProcessRegistration) error {
+		probes++
+		if probes <= 3 {
+			return errProcessImageUnavailable
+		}
+		return VerifyProcess(r)
+	})
+	if err != nil || probes < 4 || !errors.Is(VerifyProcess(record), syscall.ESRCH) {
+		t.Fatalf("unconfirmed exit was not joined: probes %d, %v", probes, err)
 	}
 }
 

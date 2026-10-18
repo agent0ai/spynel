@@ -39,6 +39,8 @@
 - Its kernel termios checks compare all saved fields, excluding only Darwin's transient PENDIN local flag, which the kernel sets when restoring canonical mode. Wait for the runtime's alternate-screen entry separately from any preceding workspace chooser before injecting a crash.
 - Its parent-loss fixture keeps a separate shell-like controlling-session owner alive while killing only the registered native supervisor. Check executor control-EOF cleanup and full terminal restoration before closing that session; session-leader death revokes the Darwin terminal and is outside this recovery contract.
 
+- Raw native inventories may include diagnostic helpers without the optional installation field; inventory comparisons honor that shared schema while cleanup still checks every recorded native identity. The instance-update verifier also advertises unknown and incompatible target protocols while the same provider turn is active, through shell and channel updates. Require no npm call, installed-byte changes, generation changes, worker replacement or extra admission/completion. Retain a second synthetic target image built with a test-only shared-protocol overlay (optional third output argument) and its hash; this qualifies refusal, not live incompatible adoption. The local npm fixture validates exact-version install arguments while retaining immutable old-wrapper update behavior.
+
 ## Child DOX Index
 
 Direct child DOX files:

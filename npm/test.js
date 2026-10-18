@@ -222,7 +222,7 @@ if (action === process.env.UPDATE_TEST_FAIL) process.exit(1);
 if (action === "update") {
   if (process.env.UPDATE_TEST_FAIL === "raw75") process.exit(75);
   if (process.env.UPDATE_TEST_FAIL === "invalid75") { fs.writeFileSync(process.env.SPYNEL_NPM_UPDATE_STATE, "{}", {mode: 0o600}); process.exit(75); }
-  fs.writeFileSync(process.env.SPYNEL_NPM_UPDATE_STATE, JSON.stringify({args: ["version"], install: process.env.UPDATE_TEST_CURRENT !== "1", version: "2.0.0"}), {mode: 0o600});
+  fs.writeFileSync(process.env.SPYNEL_NPM_UPDATE_STATE, JSON.stringify({args: ["version"], install: process.env.UPDATE_TEST_CURRENT !== "1", version: "2.0.0", worker_protocol: 14}), {mode: 0o600});
   process.exit(75);
 }
 `;
@@ -278,7 +278,7 @@ if (action === "restart-instances" && process.env.HANDOFF_MODE === "stop-coordin
   setInterval(() => {}, 1000);
 }
 if (action === "update" || action === "serve" && process.env.HANDOFF_MODE === "repeat" && require("../../package.json").version === "0.13.1") {
-  fs.writeFileSync(process.env.SPYNEL_NPM_UPDATE_STATE, JSON.stringify({args: ["serve", "--config", "space ü/.spynel/config.yaml"], install: true, version: "0.13.1"}), {mode: 0o600});
+  fs.writeFileSync(process.env.SPYNEL_NPM_UPDATE_STATE, JSON.stringify({args: ["serve", "--config", "space ü/.spynel/config.yaml"], install: true, version: action === "serve" ? "0.13.2" : "0.13.1", worker_protocol: 14}), {mode: 0o600});
   process.exit(75);
 }
 if (action === "serve" && process.env.HANDOFF_MODE === "stop-native") {
@@ -290,11 +290,11 @@ if (action === "serve" && process.env.HANDOFF_MODE === "stop-native") {
     fs.writeFileSync(path.join(directory, "tools", "npm"), `#!${process.execPath}
 const fs = require("fs");
 if (process.argv[2] === "root") process.exit(1);
-fs.appendFileSync(process.env.HANDOFF_LOG, JSON.stringify({action: "npm", pid: process.pid}) + "\\n");
+fs.appendFileSync(process.env.HANDOFF_LOG, JSON.stringify({action: "npm", pid: process.pid, args: process.argv.slice(2)}) + "\\n");
 if (process.env.HANDOFF_MODE === "startup-failure") process.exit(1);
 if (process.env.HANDOFF_MODE === "package-only") process.exit(0);
 const before = require(process.cwd() + "/package.json").version;
-fs.writeFileSync("package.json", JSON.stringify({name: "spynel", version: before === "0.13.1" ? "0.13.2" : "0.13.1"}));
+fs.writeFileSync("package.json", JSON.stringify({name: "spynel", version: before === "0.13.1" || process.env.HANDOFF_MODE === "unexpected-version" ? "0.13.2" : "0.13.1"}));
 fs.copyFileSync("fresh-launcher.js", "npm/bin/spynel.js");
 fs.copyFileSync("fresh-update.js", "npm/update.js");
 fs.appendFileSync("npm/update.js", '\\nrequire("fs").appendFileSync(process.env.HANDOFF_LOG, JSON.stringify({action: "fresh-helper", version: require("../package.json").version, parent: process.pid, listeners: process.listenerCount("SIGTERM")}) + "\\\\n");\\n');
@@ -304,14 +304,14 @@ if (process.env.HANDOFF_MODE.endsWith("stop-update")) {
   setInterval(() => {}, 1000);
 }
 `, { mode: 0o700 });
-    for (const mode of ["repeat", "startup", "startup-failure", "startup-stop-update", "unsupported", "coordination-failure", "package-only", "stop-update", "stop-coordination", "stop-native"]) {
+    for (const mode of ["repeat", "startup", "startup-failure", "startup-stop-update", "unsupported", "coordination-failure", "package-only", "unexpected-version", "stop-update", "stop-coordination", "stop-native"]) {
       const startup = mode.startsWith("startup");
       const log = path.join(directory, "calls");
       fs.writeFileSync(log, "");
       fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({ name: "spynel", version: "0.13.0" }));
       fs.writeFileSync(path.join(directory, "npm", "bin", "spynel.js"), launcherSource);
       fs.writeFileSync(path.join(directory, "npm", "update.js"), updateSource + (startup ? `
-module.exports.checkForUpdate = async () => ({available: true, latest: "0.13.1"});
+module.exports.checkForUpdate = async () => ({available: true, latest: "0.13.1", workerProtocol: 14});
 module.exports.promptForStartupUpdate = async () => true;
 ` : ""));
       const command = [...(startup ? ["-r", path.join(directory, "tty.js")] : []), path.join(directory, "npm", "bin", "spynel.js"), ...(startup ? ["serve", "--tui"] : ["update"])];
@@ -345,14 +345,23 @@ module.exports.promptForStartupUpdate = async () => true;
       }
       const calls = fs.readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line));
       const actions = calls.map(call => call.action);
-      assert.strictEqual(result.status, ["unsupported", "coordination-failure", "package-only", "startup-failure"].includes(mode) ? 1 : 0, result.stderr);
+      assert.strictEqual(result.status, ["unsupported", "coordination-failure", "package-only", "unexpected-version", "startup-failure"].includes(mode) ? 1 : 0, result.stderr);
       const expected = [...(startup ? [] : ["update"]), "check-restartable", "npm"];
-      if (!["unsupported", "package-only", "stop-update", "startup-stop-update", "startup-failure"].includes(mode)) {
+      if (!["unsupported", "package-only", "unexpected-version", "stop-update", "startup-stop-update", "startup-failure"].includes(mode)) {
         expected.push("fresh-helper", "restart-instances");
         if (!["coordination-failure", "stop-coordination"].includes(mode)) expected.push("serve");
         if (mode === "repeat") expected.push("check-restartable", "npm", "fresh-helper", "restart-instances", "serve");
       }
       assert.deepStrictEqual(actions, expected, mode);
+      for (const call of calls.filter(call => call.action === "check-restartable")) {
+        assert.deepStrictEqual(call.args, ["check-restartable", "--worker-protocol", "14"]);
+      }
+      const installs = calls.filter(call => call.action === "npm");
+      for (let index = 0; index < installs.length; index++) {
+        const version = index === 0 ? "0.13.1" : "0.13.2";
+        assert(installs[index].args.includes(`spynel@${version}`), "install must pin the preflighted target");
+        assert.deepStrictEqual(installs[index].args.slice(0, 3), ["install", "--no-save", "--package-lock=false"]);
+      }
       const nativeCalls = calls.filter(call => ["update", "serve", "check-restartable", "restart-instances"].includes(call.action));
       assert.strictEqual(new Set(nativeCalls.map(call => call.parent)).size, 1, "handoff must retain a single Node process");
       for (const call of calls.filter(call => call.action === "fresh-helper")) {
@@ -370,6 +379,7 @@ module.exports.promptForStartupUpdate = async () => true;
       }
       if (mode === "unsupported") assert.match(result.stderr, /cannot accept the update handoff/);
       if (mode === "package-only") assert.match(result.stderr, /remained at 0.13.0/);
+      if (mode === "unexpected-version") assert.match(result.stderr, /remained at 0.13.2/);
     }
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -405,12 +415,12 @@ async function main() {
 
   const registry = http.createServer((_, response) => {
     response.setHeader("content-type", "application/json");
-    response.end(JSON.stringify({ name: "spynel", version: "0.3.0" }));
+    response.end(JSON.stringify({ name: "spynel", version: "0.3.0", workerProtocol: 14 }));
   });
   const registryURL = await listen(registry);
   try {
     const result = await checkForUpdate({ current: "0.2.0", registryURL, timeoutMs: 1_000 });
-    assert.deepStrictEqual(result, { current: "0.2.0", latest: "0.3.0", available: true });
+    assert.deepStrictEqual(result, { current: "0.2.0", latest: "0.3.0", available: true, workerProtocol: 14 });
   } finally {
     await close(registry);
   }

@@ -109,9 +109,13 @@ async function checkForUpdate(options = {}) {
   if (!metadata || typeof metadata.version !== "string" || !parseVersion(metadata.version)) {
     throw new Error("npm registry did not return a semantic Spynel version");
   }
+  if (metadata.workerProtocol !== undefined && (!Number.isInteger(metadata.workerProtocol) || metadata.workerProtocol < 0 || metadata.workerProtocol > 2147483647)) {
+    throw new Error("npm registry returned invalid worker compatibility");
+  }
   return {
     current,
     latest: metadata.version,
+    workerProtocol: metadata.workerProtocol === undefined ? 0 : metadata.workerProtocol,
     available: compareVersions(metadata.version, current) > 0
   };
 }
@@ -155,30 +159,32 @@ function runCommand(command, args, options = {}) {
   });
 }
 
-async function npmInvocation(packageRoot = path.resolve(__dirname, ".."), signal) {
+async function npmInvocation(packageRoot = path.resolve(__dirname, ".."), signal, version) {
   const npm = process.platform === "win32" ? "npm.cmd" : "npm";
   const rootResult = await runCommand(npm, ["root", "--global"], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true, timeout: DEFAULT_TIMEOUT_MS, signal });
   if (signal && signal.aborted) throw new Error("Spynel update stopped");
   const globalRoot = rootResult.status === 0 && rootResult.stdout.length <= 4096 ? rootResult.stdout.trim() : "";
+  const target = version ? `${pkg.name}@${version}` : pkg.name;
   if (globalRoot && samePath(packageRoot, path.join(globalRoot, pkg.name))) {
-    return { command: npm, args: ["update", "--global", pkg.name], display: `npm update --global ${pkg.name}` };
+    return { command: npm, args: ["install", "--global", target], display: `npm install --global ${target}` };
   }
   const nodeModules = path.dirname(packageRoot);
   const prefix = path.basename(nodeModules) === "node_modules" ? path.dirname(nodeModules) : process.cwd();
-  return { command: npm, args: ["update", pkg.name, "--prefix", prefix], display: `npm update ${pkg.name}` };
+  return { command: npm, args: ["install", "--no-save", "--package-lock=false", target, "--prefix", prefix], display: `npm install ${target}` };
 }
 
 async function runNPMUpdate(options = {}) {
   const packageRoot = options.packageRoot || path.resolve(__dirname, "..");
   const before = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")).version;
-  const invocation = await npmInvocation(packageRoot, options.signal);
+  if (!options.expectedVersion || !parseVersion(options.expectedVersion)) throw new Error("Spynel update requires an exact target version");
+  const invocation = await npmInvocation(packageRoot, options.signal, options.expectedVersion);
   const result = await runCommand(invocation.command, invocation.args, {
     cwd: packageRoot, stdio: options.stdio || "inherit", windowsHide: false, signal: options.signal
   });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`${invocation.display} exited with status ${result.status}`);
   const after = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")).version;
-  if (compareVersions(after, before) < 0 || (options.expectedVersion ? compareVersions(after, options.expectedVersion) < 0 : compareVersions(after, before) <= 0)) {
+  if (compareVersions(after, before) < 0 || after !== options.expectedVersion) {
     throw new Error(`${invocation.display} completed but Spynel remained at ${after}; check the project's dependency range or update it manually`);
   }
   return { ...invocation, before, after };

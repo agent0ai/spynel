@@ -68,8 +68,10 @@ function createLaunchEnvironment(parentEnvironment = process.env, periodicChecks
   return environment;
 }
 
-async function coordinateInstances(command, environment, signal) {
-  const result = await runCommand(path.join(packageRoot, "npm", "vendor", "spynel"), [command], {
+async function coordinateInstances(command, environment, signal, workerProtocol) {
+  const args = [command];
+  if (workerProtocol !== undefined) args.push("--worker-protocol", String(workerProtocol));
+  const result = await runCommand(path.join(packageRoot, "npm", "vendor", "spynel"), args, {
     stdio: ["ignore", "ignore", "inherit"], env: environment, timeout: 70_000, signal
   });
   if (result.error || result.status !== 0) {
@@ -93,7 +95,7 @@ async function main(handoff, lifetime) {
       if (update.available && await promptForStartupUpdate(update, { packageRoot, signal: controller.signal })) {
         try {
           const environment = createLaunchEnvironment(process.env, false);
-          await coordinateInstances("check-restartable", environment, controller.signal);
+          await coordinateInstances("check-restartable", environment, controller.signal, update.workerProtocol);
           await runNPMUpdate({ packageRoot, expectedVersion: update.latest, signal: controller.signal });
           return controller.signal.aborted ? 0 : nextLauncher();
         } catch (error) {
@@ -151,7 +153,8 @@ async function main(handoff, lifetime) {
       request = JSON.parse(fs.readFileSync(environment.SPYNEL_NPM_UPDATE_STATE, "utf8"));
       if (!Array.isArray(request.args) || request.args.length < 1 || request.args.length > 128 ||
           !request.args.every(arg => typeof arg === "string" && arg.length <= 4096) ||
-          typeof request.install !== "boolean" || typeof request.version !== "string" || !parseVersion(request.version)) {
+          typeof request.install !== "boolean" || typeof request.version !== "string" || !parseVersion(request.version) ||
+          !Number.isSafeInteger(request.worker_protocol) || request.worker_protocol < 0) {
         throw new Error("invalid update request");
       }
       args = request.args;
@@ -162,7 +165,7 @@ async function main(handoff, lifetime) {
     }
     fs.rmSync(environment.SPYNEL_NPM_UPDATE_STATE, { force: true });
     try {
-      await coordinateInstances("check-restartable", environment, controller.signal);
+      await coordinateInstances("check-restartable", environment, controller.signal, request.worker_protocol);
       if (request.install) {
         await runNPMUpdate({ packageRoot, expectedVersion: request.version, signal: controller.signal });
         return controller.signal.aborted ? 0 : nextLauncher();

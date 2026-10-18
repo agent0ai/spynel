@@ -1,7 +1,6 @@
 package updater
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -55,7 +54,7 @@ func SetExecutor(pid int, ready, stopping bool) error {
 		}
 		record.ExecutorPID, record.ExecutorGeneration = pid, child.Generation
 	}
-	data, err := json.Marshal(record)
+	data, err := record.registryJSON()
 	if err != nil {
 		return err
 	}

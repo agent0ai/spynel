@@ -29,6 +29,8 @@
 
 - Code 75 authorizes replacement only with its current private, bounded structured request (normalized arguments, install boolean and semantic version). Missing or invalid intent preserves status 75 and stops without an update; never infer intent from the exit code alone.
 
+- Publish workerProtocol in root package metadata, matching the shared native constant. Both startup offers and explicit handoffs pass the target protocol to native preflight before replacement; missing target metadata is unknown, never assumed compatible. Pin npm install to the preflighted exact version (global, or local with --no-save --package-lock=false), then require that exact installed version and use the installed native coordinator before restarts. This prevents a moving latest release from changing the compatibility target after preflight.
+
 ## Child DOX Index
 
 Direct child DOX files:

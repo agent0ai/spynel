@@ -27,7 +27,7 @@ import (
 
 const (
 	// Bump for incompatible worker behavior as well as wire/schema changes.
-	WorkerProtocol      = 14
+	WorkerProtocol      = core.WorkerProtocol
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024

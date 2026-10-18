@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// WorkerProtocol binds harness adoption and installation update compatibility.
+// Bump whenever a successor cannot safely consume or control a prior worker.
+const WorkerProtocol = 14
+
 const SpynelASCII = `    ████     ████     ███████ ██████  ██    ██ ███    ██ ███████ ██
   ██    ██ ██    ██   ██      ██   ██  ██  ██  ████   ██ ██      ██
  ██      ███      ██  ███████ ██████    ████   ██ ██  ██ █████   ██

@@ -23,6 +23,8 @@
 
 - Code 75 authorizes replacement only with its current private, bounded structured request (normalized arguments, install boolean and semantic version). Missing or invalid intent preserves status 75 and stops without an update; never infer intent from the exit code alone.
 
+- Startup offers pass advertised target worker compatibility into native preflight; structured code-75 requests also require a nonnegative integer worker_protocol. Zero is explicitly unknown, and the native owner decides whether live workers permit it. Preserve refusal before npm and pass the exact preflighted version to package installation. Post-publication coordination uses the installed native protocol before application signals.
+
 ## Child DOX Index
 
 No child DOX files.

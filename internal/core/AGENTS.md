@@ -17,6 +17,8 @@
 
 - A conversation-changing screen carries its transcript snapshot byte offset in `HistoryOffset` so the TUI follows only later durable entries without losing the handoff window or replaying restored messages.
 
+- WorkerProtocol is the shared compatibility value for harness adoption and installation coordination. Change it when a successor cannot safely consume/control prior workers; npm package metadata must match, enforced by the updater release-metadata test.
+
 ## Child DOX Index
 
 No child DOX files.

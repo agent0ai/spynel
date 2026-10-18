@@ -56,6 +56,8 @@
 
 - Register public application CLI requests and subscriptions through the updater as application clients for their entire command lifetime, including stdin preparation and explicit sockets. They remain visible to verified stop/uninstall without being restarted alongside servers/TUIs or blocking coordinated updates. Keep this at process dispatch so in-process application calls cannot overwrite a server registration. Offline docs/help/version and standalone installer/update ownership retain their existing boundaries.
 
+- Internal check-restartable accepts --worker-protocol N, with 0 explicitly unknown and omission selecting the local protocol. Native npm handoffs carry the shared updater-owned target protocol alongside exact version/arguments/install intent. CLI and channel updates retain the same shared prepublication compatibility check and explicit drain/stop guidance.
+
 ## Child DOX Index
 
 No child DOX files.

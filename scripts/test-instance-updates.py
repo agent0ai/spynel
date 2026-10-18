@@ -22,6 +22,7 @@ import time
 
 def main():
     repo = Path(__file__).resolve().parent.parent
+    protocol = json.loads((repo / "package.json").read_text())["workerProtocol"]
     archive = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix=".tmp-instance-updates-", dir=repo) as temporary:
         temp = Path(temporary)
@@ -38,7 +39,7 @@ def main():
             target = package / "npm" / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(repo / "npm" / name, target)
-        (package / "package.json").write_text(json.dumps({"name": "spynel", "version": version}))
+        (package / "package.json").write_text(json.dumps({"name": "spynel", "version": version, "workerProtocol": protocol}))
         (vendor / ".installed.json").write_text(json.dumps({"version": version}))
         legacy_replacement = temp / "legacy-replacement"
         shutil.copytree(package, legacy_replacement)
@@ -51,8 +52,24 @@ def main():
         if len(sys.argv) > 2:
             shutil.copy2(updated_image, Path(sys.argv[2]).resolve())
         print(json.dumps({"event": "native_images", "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(), "updated_image_sha256": hashlib.sha256(updated_image.read_bytes()).hexdigest()}), flush=True)
-        (replacement / "package.json").write_text(json.dumps({"name": "spynel", "version": updated}))
+        (replacement / "package.json").write_text(json.dumps({"name": "spynel", "version": updated, "workerProtocol": protocol}))
         (replacement / "npm" / "vendor" / ".installed.json").write_text(json.dumps({"version": updated}))
+        incompatible = temp / "incompatible"
+        shutil.copytree(replacement, incompatible)
+        core_source = repo / "internal" / "core" / "types.go"
+        changed = core_source.read_text().replace(f"const WorkerProtocol = {protocol}\n", f"const WorkerProtocol = {protocol + 1}\n")
+        assert changed != core_source.read_text(), "missing protocol overlay boundary"
+        core_overlay = temp / "incompatible-core.go"
+        core_overlay.write_text(changed)
+        overlay = temp / "incompatible-overlay.json"
+        overlay.write_text(json.dumps({"Replace": {str(core_source): str(core_overlay)}}))
+        incompatible_image = incompatible / "npm" / "vendor" / "spynel"
+        subprocess.run([os.environ.get("SPYNEL_GO_BINARY", "go"), "build", "-trimpath", "-overlay", str(overlay), "-ldflags=-s -w -X main.version=" + updated, "-o", str(incompatible_image), "./cmd/spynel"], cwd=repo, env=build_env, check=True, timeout=180)
+        (incompatible / "package.json").write_text(json.dumps({"name": "spynel", "version": updated, "workerProtocol": protocol + 1}))
+        assert subprocess.check_output([str(incompatible_image), "--version"], text=True).strip() == "spynel " + updated
+        if len(sys.argv) > 3:
+            shutil.copy2(incompatible_image, Path(sys.argv[3]).resolve())
+        print(json.dumps({"event": "incompatible_target", "worker_protocol": protocol + 1, "image_sha256": hashlib.sha256(incompatible_image.read_bytes()).hexdigest()}), flush=True)
         tools = temp / "tools"
         tools.mkdir()
         npm = tools / "npm"
@@ -65,7 +82,10 @@ if sys.argv[1:] == ["root", "--global"]:
 if sys.argv[1:] == ["uninstall", "--global", "--prefix", str(package.parents[2]), "spynel"]:
     shutil.rmtree(package)
     sys.exit(0)
-assert sys.argv[1] == "update", sys.argv
+assert sys.argv[1] in ("update", "install"), sys.argv
+if sys.argv[1] == "install":
+    version = json.loads((pathlib.Path(os.environ["INSTANCE_TEST_REPLACEMENT"]) / "package.json").read_text())["version"]
+    assert "spynel@" + version in sys.argv, sys.argv
 with open(os.environ["INSTANCE_TEST_CALLS"], "a") as log:
     log.write("update\\n")
 old = package.with_name(".spynel-replaced")
@@ -117,12 +137,14 @@ for line in sys.stdin:
         unrelated = None
         registry = home / ("Library/Application Support" if sys.platform == "darwin" else ".config") / "spynel" / "processes"
 
+        advertised_protocol = protocol
+
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
 
             def do_GET(self):
-                data = json.dumps({"version": version if self.path == "/legacy/latest" else updated}).encode()
+                data = json.dumps({"version": version if self.path == "/legacy/latest" else updated, "workerProtocol": advertised_protocol}).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -155,6 +177,14 @@ for line in sys.stdin:
             return {record["pid"]: record for record in records(workers=True)}
 
         def native_start(pid):
+            if sys.platform == "linux":
+                try:
+                    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                except FileNotFoundError:
+                    return None
+                if fields[0] in ("Z", "X"):
+                    return None
+                return Path("/proc/sys/kernel/random/boot_id").read_text().strip() + ":" + fields[19]
             result = subprocess.run(["ps", "-p", str(pid), "-o", "stat=", "-o", "lstart="], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
             assert not result.stderr, result.stderr
             if result.returncode == 1 and not result.stdout.strip():
@@ -221,6 +251,19 @@ for line in sys.stdin:
             assert provider_start is not None, "admitted provider already exited"
             evidence("provider_admitted", pid=active_provider, native_start=provider_start, starts=provider_starts)
             before = {record["pid"]: record["generation"] for record in records()}
+            package_before = {p.relative_to(package): hashlib.sha256(p.read_bytes()).hexdigest() for p in package.rglob("*") if p.is_file()}
+            for advertised_protocol in (0, protocol + 1):
+                for route, command in (("shell", [*launcher, "update"]), ("channel", [*launcher, "command", "update"])):
+                    refused = subprocess.run(command, cwd=workspaces[0], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                    assert "update cannot preserve a live worker" in refused.stdout + refused.stderr, refused
+                    assert {r["pid"]: r["generation"] for r in records()} == before, "refusal restarted an application"
+                    assert worker_identity() == workers_before, "refusal changed a live worker"
+                    assert native_start(active_provider) == provider_start, "refusal lost the active provider"
+                    assert not (temp / "npm-calls").exists(), "refused update invoked npm"
+                    assert {p.relative_to(package): hashlib.sha256(p.read_bytes()).hexdigest() for p in package.rglob("*") if p.is_file()} == package_before, "refusal changed installed bytes"
+                    assert len([e for e in provider_events() if e["event"] == "prompt"]) == 1 and not any(e["event"] == "completed" for e in provider_events()), "refusal changed the active turn"
+                    evidence("update_compatibility_refused", route=route, target_protocol=advertised_protocol, workers=list(worker_identity().values()), provider_pid=active_provider, installed_bytes_preserved=True)
+            advertised_protocol = protocol
             result = subprocess.run([*launcher, "update"], cwd=temp, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
             assert result.returncode == 0, result.stderr
             wait_for(lambda: len(records()) == 3 and all(record["ready"] and record["version"] == updated and before.get(record["pid"]) != record["generation"] for record in records()))
@@ -330,8 +373,8 @@ assert sys.argv[1] == "check-restartable", sys.argv
             active_starts = {pid: native_start(pid) for pid in active}
             assert all(active_starts.values()), "teardown provider already exited"
             before_uninstall = records(workers=None)
-            owned = [r for r in before_uninstall if r["installation"] == str(package)]
-            other = [r for r in before_uninstall if r["installation"] == str(legacy)]
+            owned = [r for r in before_uninstall if r.get("installation") == str(package)]
+            other = [r for r in before_uninstall if r.get("installation") == str(legacy)]
             assert owned and other and any(r.get("harness_worker") for r in owned) and any(r.get("harness_worker") for r in other)
             worker_roots = {}
             for path in (registry.parent / "harness").glob("*.lock.worker.json"):
@@ -346,7 +389,7 @@ assert sys.argv[1] == "check-restartable", sys.argv
             assert not package.exists(), "npm installation was not removed"
             assert all(native_start(r["pid"]) is None for r in owned), "uninstall left an owned process alive"
             assert all(native_start(r["pid"]) is not None for r in other), "uninstall stopped another installation"
-            assert {r["pid"]: r for r in records(workers=None) if r["installation"] == str(legacy)} == {r["pid"]: r for r in other}, "uninstall changed another installation's generations"
+            assert {r["pid"]: r for r in records(workers=None) if r.get("installation") == str(legacy)} == {r["pid"]: r for r in other}, "uninstall changed another installation's generations"
             assert all(not p.exists() for r in owned if r.get("harness_worker") for p in worker_roots[r["pid"]]), "uninstall retained an owned endpoint or rendezvous"
             assert all(p.exists() for r in other if r.get("harness_worker") for p in worker_roots[r["pid"]]), "uninstall removed another worker's state"
             assert sum(native_start(pid) == start for pid, start in active_starts.items()) == 1, "uninstall did not preserve exactly the other installation's provider"

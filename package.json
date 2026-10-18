@@ -1,6 +1,7 @@
 {
   "name": "spynel",
   "version": "0.0.0-development",
+  "workerProtocol": 14,
   "description": "A non-AI orchestration layer connecting one human to many coding agents",
   "license": "MIT",
   "keywords": [

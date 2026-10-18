@@ -60,6 +60,8 @@
 
 - Protocol 14 is the explicit worker compatibility boundary, including behavior and schema. Bump it whenever a successor cannot safely consume/control the previous worker. Its configuration digest binds that protocol and every serialized runtime setting except the native client version. A same-protocol controller with an otherwise exact selection may adopt across release versions without reconfiguration or another provider turn; native PID/start/executable/generation verification and authenticated exact-term inspection still apply. The retained worker keeps its native registration and original provider client version. Canonical settings derive from authenticated worker configuration, and direct attempts to change its workspace/version still refuse. Live incompatible protocols and changed runtime settings fail closed; no automatic stop, admission retry or compatibility reader is added. A strictly validated current-schema rendezvous with a different positive protocol may authorize replacement only after native verification confirms death; pending guardian cleanup retains the existing bounded harness-lock wait. Malformed or changed schemas and live/unknown native identity still refuse replacement. This resolves version-only discovery compatibility, not complete coordinated update/stop/uninstall or final release qualification.
 
+- WorkerProtocol aliases the shared core compatibility constant so native update coordination and wire adoption cannot drift. Worker registrations advertise it without changing the worker wire schema. A refused update never changes worker lifetime, admission or exact-term controls.
+
 ## Child DOX Index
 
 No child DOX files.

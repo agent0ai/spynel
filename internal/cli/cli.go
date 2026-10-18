@@ -213,10 +213,15 @@ func run(args []string, version string) error {
 	case "update":
 		return runUpdateCommand(args[1:], version)
 	case "check-restartable":
-		if len(args) != 1 {
-			return errors.New("usage: spynel check-restartable")
+		flags := flag.NewFlagSet("check-restartable", flag.ContinueOnError)
+		protocol := flags.Int("worker-protocol", core.WorkerProtocol, "target worker protocol (0 if unknown)")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
 		}
-		return updater.Detect(version).CheckRestartable()
+		if flags.NArg() != 0 || *protocol < 0 {
+			return errors.New("usage: spynel check-restartable [--worker-protocol N]")
+		}
+		return updater.Detect(version).CheckRestartableFor(*protocol)
 	case "restart-instances":
 		if len(args) != 1 {
 			return errors.New("usage: spynel restart-instances")
@@ -563,10 +568,11 @@ func (r *updateRequest) writeRestartArgs() error {
 		return errors.New("npm update handoff channel is unavailable")
 	}
 	data, err := json.Marshal(struct {
-		Args    []string `json:"args"`
-		Install bool     `json:"install"`
-		Version string   `json:"version"`
-	}{Args: append([]string(nil), r.args...), Install: r.result.Available, Version: r.result.Latest})
+		Args           []string `json:"args"`
+		Install        bool     `json:"install"`
+		Version        string   `json:"version"`
+		WorkerProtocol int      `json:"worker_protocol"`
+	}{Args: append([]string(nil), r.args...), Install: r.result.Available, Version: r.result.Latest, WorkerProtocol: r.result.TargetWorkerProtocol()})
 	if err != nil {
 		return err
 	}
