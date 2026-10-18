@@ -74,6 +74,9 @@ func TestWorkerConversationCancellationPersistenceBeforeInterruption(t *testing.
 			if stopped || (err != nil) != (scenario == "history-unavailable") {
 				t.Fatal("incorrect cancellation result", stopped, err)
 			}
+			if err != nil && strings.Contains(err.Error(), f.cfg.Root) {
+				t.Fatal("conversation cancellation exposed a private history path")
+			}
 			methods, err := os.ReadFile(f.log)
 			if err != nil || strings.Contains(string(methods), "turn/interrupt\n") {
 				t.Fatal("unavailable history or inactive provider still reached provider control", err)

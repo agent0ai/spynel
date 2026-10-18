@@ -206,7 +206,11 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 		if err := c.Validate(); err != nil {
 			return err
 		}
-		return store.SetConversationCancellation(c.Channel, c.Conversation, c.ExecutionID, intent, c.Sources, restore)
+		if err := store.SetConversationCancellation(c.Channel, c.Conversation, c.ExecutionID, intent, c.Sources, restore); err != nil {
+			runtime.LogEvent("error", "history", "conversation_cancellation_failed", fmt.Sprintf("Persist conversation cancellation failed (%T)", err))
+			return errors.New("conversation cancellation could not be saved")
+		}
+		return nil
 	}
 	manager.SetNotificationDelivery(service.deliverNotification)
 	manager.NotificationContext = service.notificationContext
