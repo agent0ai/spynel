@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/agent0ai/spynel/internal/app"
 	"github.com/agent0ai/spynel/internal/config"
@@ -14,6 +15,68 @@ import (
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
 )
+
+func TestWatchRetainedWorkerResponsesPassesOversizedHistory(t *testing.T) {
+	cfg := config.Default()
+	cfg.Root = t.TempDir()
+	cfg.Extensions.Enabled = false
+	s := app.New(cfg, harness.NewSupervisor(harness.NewBuiltinRegistry(), harness.HarnessConfig{}))
+	defer s.Close()
+	c := &harness.WorkerConversation{Channel: "tui", Conversation: "large", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
+	if _, err := s.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic"}); err != nil {
+		t.Fatal(err)
+	}
+	_, path, offset, err := s.History.RecentEntriesSnapshot(c.Channel, c.Conversation, 10, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := watchTaskNotifications(t.Context(), path, offset)
+	// An ordinary requested reply is ignored by this follower, even when large.
+	if _, err := s.History.Append(c.Channel, c.Conversation, history.Entry{Role: "assistant", Content: strings.Repeat("x", 5<<20)}); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.Runtime.TryBeginJobWithDetails("chat:tui:large", c.Channel, c.Conversation, "synthetic", app.JobDetails{Kind: "conversation", WorkID: c.ExecutionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := harness.WorkerDelivery{WorkerID: strings.Repeat("f", 32), Sequence: 1, WorkerEvent: harness.WorkerEvent{Cursor: 1, Conversation: c,
+		Event: core.Event{Kind: core.EventFinal, Text: strings.Repeat("界", 2<<20), Done: true, Continues: true}}}
+	if err := s.ConsumeConversationDelivery(id, d, nil); err != nil {
+		t.Fatal(err)
+	}
+	d.Cursor = 2
+	d.Event = core.Event{Kind: core.EventError, Text: "later error", Done: true}
+	if err := s.ConsumeConversationDelivery(id, d, nil); err != nil {
+		t.Fatal(err)
+	}
+	m := testModel()
+	next, _ := m.Update(uiEvent{event: core.Event{Kind: core.EventActivity, Active: true}, conversation: true})
+	m = next.(model)
+	for i := range 2 {
+		select {
+		case event := <-events:
+			if !event.Recovery || event.Error != (i == 1) || event.Continues != (i == 0) {
+				t.Fatal("large history changed response metadata")
+			}
+			if i == 0 && (!utf8.ValidString(event.Text) || strings.ContainsRune(event.Text, utf8.RuneError) || len(event.Text) > 40000 || !strings.Contains(event.Text, "Body excerpt")) {
+				t.Fatal("large response lost bounded Unicode text or its omission notice")
+			}
+			if i == 1 && event.Text != "later error" {
+				t.Fatal("large history lost the later response")
+			}
+			next, _ = m.Update(taskNotificationEvent{notification: event})
+			m = next.(model)
+			if m.mainAgentActivity != 1-i || m.notificationAckBusy || len(m.pendingNotifications) != 0 {
+				t.Fatal("large history disturbed activity or entered notification acknowledgement")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("oversized history blocked retained responses")
+		}
+	}
+	if len(m.transcript) != 2 || m.transcript[1].role != "error" {
+		t.Fatal("large response displaced the later error")
+	}
+}
 
 func TestWatchRetainedWorkerResponsesPreservesActivityAndRetryOrder(t *testing.T) {
 	cfg := config.Default()

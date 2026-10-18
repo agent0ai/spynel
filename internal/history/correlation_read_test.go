@@ -9,7 +9,34 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
+
+func TestDisplayEntryProjectsCompleteRecordsAndKeepsExactOffsets(t *testing.T) {
+	first, err := json.Marshal(Entry{Role: "error", Sender: "Spy", Content: strings.Repeat("界", 2<<20), Recovery: true, Continues: true, EventID: "delivery", Covers: []string{"source"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(strings.NewReader(" \n" + string(first) + "\n" + `{"role":"assistant","content":"later"}` + "\n"))
+	entry, size, err := ReadDisplayEntry(reader)
+	if err != nil || size != len(first)+3 || entry.Role != "error" || entry.EventID != "delivery" || !entry.Recovery || !entry.Continues || len(entry.Covers) != 1 || entry.Covers[0] != "source" {
+		t.Fatal("display projection changed metadata or byte offset", size, err)
+	}
+	if !utf8.ValidString(entry.Content) || strings.ContainsRune(entry.Content, utf8.RuneError) || len(entry.Content) > 40000 || !strings.Contains(entry.Content, "Body excerpt") {
+		t.Fatal("display projection lost bounded Unicode text or its omission notice")
+	}
+	if later, _, err := ReadDisplayEntry(reader); err != nil || later.Content != "later" {
+		t.Fatal("large record blocked the next record", err)
+	}
+	for _, tail := range []string{`{"content":"still writing`, `{"content":"complete JSON awaiting newline"}`} {
+		if _, _, err := ReadDisplayEntry(bufio.NewReader(strings.NewReader(tail))); err == nil {
+			t.Fatal("uncommitted append tail was displayed")
+		}
+	}
+	if _, _, err := ReadDisplayEntry(bufio.NewReader(strings.NewReader(`{"content":"` + strings.Repeat("x", 5<<20) + `\q"}` + "\n"))); !errors.Is(err, ErrRecoveryCorrupt) {
+		t.Fatal("display accepted corruption in omitted content", err)
+	}
+}
 
 func TestRecoveryProjectsLargeBodiesAndValidatesOmittedSuffix(t *testing.T) {
 	body := strings.Repeat(`escaped \"\u4e16界 `, 400000)

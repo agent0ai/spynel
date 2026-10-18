@@ -41,6 +41,7 @@
 - Invoke the CLI startup-admission callback once from model Init, after Tea has initialized its terminal and all fatal TUI setup checks passed. A failed callback quits and returns that error; copy/clear/stop/quit priorities remain unchanged. The surviving native parent restores kernel terminal flags/modes only after confirmed executor death.
 
 - Own history following for the selected conversation: startup and resume use their exact transcript snapshot offset, new conversations start at zero, and switches cancel the previous watcher. Fence queued notification/recovery events and asynchronous acknowledgement results/retries to their originating conversation, clear old pending interleave state on switch, and acknowledge only that exact destination. History I/O stays in the existing bounded polling goroutine, outside the event loop.
+- Follow complete history records through `history.ReadDisplayEntry`, with bounded body excerpts and an explicit omission notice, so a large valid reply cannot block later responses. Read only the observed file snapshot and advance by the exact complete-record byte count; incomplete appends retain their offset. Keep recovery/continuation/error and notification identity metadata exact. Corrupt or structurally excessive records remain unconsumed; this follower does not repair history.
 
 ## Child DOX Index
 

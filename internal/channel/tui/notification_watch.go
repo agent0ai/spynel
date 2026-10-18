@@ -3,7 +3,6 @@ package tui
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"io"
 	"os"
 	"time"
@@ -45,20 +44,14 @@ func watchTaskNotifications(ctx context.Context, path string, initialOffset ...i
 			if info.Size() < offset {
 				offset = 0
 			}
-			_, _ = file.Seek(offset, io.SeekStart)
-			scanner := bufio.NewScanner(file)
-			scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-			for scanner.Scan() {
-				// Scanner returns an unterminated final token at EOF. Do not
-				// advance past it: a concurrent history append may still be
-				// completing that JSONL record, and the next poll must retry it.
-				nextOffset := offset + int64(len(scanner.Bytes())+1)
-				if nextOffset > info.Size() {
+			reader := bufio.NewReader(io.NewSectionReader(file, offset, info.Size()-offset))
+			for {
+				entry, size, err := history.ReadDisplayEntry(reader)
+				if err != nil {
 					break
 				}
-				offset = nextOffset
-				var entry history.Entry
-				if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.Sender == "Spy" &&
+				offset += int64(size)
+				if entry.Sender == "Spy" &&
 					(entry.Role == "notification_pending" || entry.Role == "assistant" || entry.Recovery) {
 					select {
 					case output <- channel.Notification{ID: entry.EventID, Text: entry.Content, Recovery: entry.Recovery, Error: entry.Recovery && entry.Role == "error", Continues: entry.Continues}:

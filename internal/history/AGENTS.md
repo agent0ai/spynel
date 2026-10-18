@@ -25,6 +25,8 @@
 
 - On visible replies, `Recovery` is the private local asynchronous presentation marker for stalled-message or retained-worker results, not a provider-admission classification. Retained partial output carries `Continues` so its display does not settle execution activity; private admission records keep their existing recovery-reservation meaning.
 
+- `ReadDisplayEntry` shares the bounded streaming history parser with correlation readers, preserving exact metadata and complete UTF-8 runes in body excerpts. Display readers require a complete newline-terminated record, count every consumed byte including blank prefixes, and retry incomplete appends without advancing their offset. Omitted bodies have an explicit excerpt notice; full JSONL remains unchanged. Validate omitted suffixes and fail closed on corrupt or structurally excessive records.
+
 ## Child DOX Index
 
 No child DOX files.

@@ -5,11 +5,26 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"unicode/utf8"
 )
+
+// ReadDisplayEntry reads one complete append-only record with bounded body
+// text and exact metadata. Incomplete records must be retried at the same offset.
+func ReadDisplayEntry(reader *bufio.Reader) (Entry, int, error) {
+	entry, size, err := readProjectedEntry(reader, true)
+	if err == nil && entry.IsContentExcerpt() {
+		entry.Content += "\n[Body excerpt; inspect the full history file for complete text.]"
+	}
+	return entry, size, err
+}
 
 // Correlation checks need exact metadata, but body text is context. Project long
 // body strings before decoding, validating even the omitted string suffix.
 func readCorrelationEntry(reader *bufio.Reader) (Entry, int, error) {
+	return readProjectedEntry(reader, false)
+}
+
+func readProjectedEntry(reader *bufio.Reader, requireNewline bool) (Entry, int, error) {
 	var raw []byte
 	depth, size := 0, 0
 	key, expectKey, omitted := "", false, false
@@ -34,8 +49,10 @@ func readCorrelationEntry(reader *bufio.Reader) (Entry, int, error) {
 					return Entry{}, 0, io.EOF
 				}
 				raw = raw[:0]
-				size = 0
 				continue
+			}
+			if err == io.EOF && requireNewline {
+				return Entry{}, size, io.ErrUnexpectedEOF
 			}
 			var entry Entry
 			if json.Unmarshal(raw, &entry) != nil {
@@ -75,6 +92,15 @@ func readCorrelationEntry(reader *bufio.Reader) (Entry, int, error) {
 						}
 					} else if escape != '"' && escape != '\\' && escape != '/' && escape != 'b' && escape != 'f' && escape != 'n' && escape != 'r' && escape != 't' {
 						return Entry{}, size, ErrRecoveryCorrupt
+					}
+				} else if b >= utf8.RuneSelf {
+					// Keep a complete UTF-8 rune at the excerpt boundary.
+					for !utf8.FullRune(unit) {
+						next, err := read()
+						if err != nil || next < 0x80 || next > 0xbf {
+							return Entry{}, size, ErrRecoveryCorrupt
+						}
+						unit = append(unit, next)
 					}
 				}
 				if !body || kept < 32*1024 {
