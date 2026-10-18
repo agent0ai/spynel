@@ -301,7 +301,7 @@ func runHarnessFixture(mode string) int {
 	executable, _ := os.Executable()
 	appendFixtureLog(map[string]any{"kind": "invocation", "pid": os.Getpid(), "args": os.Args[1:], "cwd": mustGetwd(), "executable": executable})
 	switch mode {
-	case "codex-lifecycle", "codex-interrupt", "codex-worker", "codex-models", "codex-init-missing-method", "codex-resume-missing-method", "codex-resume-error", "codex-stream-overflow", "codex-thread-changed-field", "codex-terminal-changed-status":
+	case "codex-lifecycle", "codex-interrupt", "codex-worker", "codex-followup-refusal", "codex-models", "codex-init-missing-method", "codex-resume-missing-method", "codex-resume-error", "codex-stream-overflow", "codex-thread-changed-field", "codex-terminal-changed-status":
 		return runCodexFixture(mode)
 	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero":
 		return runClaudeFixture(mode)
@@ -597,7 +597,7 @@ func runCodexFixture(mode string) int {
 				continue
 			}
 			threadID := "thr_test"
-			if mode == "codex-interrupt" || mode == "codex-worker" {
+			if mode == "codex-interrupt" || mode == "codex-worker" || mode == "codex-followup-refusal" {
 				threadID = "thr_stop"
 			}
 			if mode == "codex-lifecycle" && message.Method == "thread/resume" {
@@ -613,7 +613,7 @@ func runCodexFixture(mode string) int {
 			write(map[string]any{"id": message.ID, "result": map[string]any{"thread": map[string]any{"id": threadID}}})
 		case "turn/start":
 			threadID, turnID := "thr_test", "turn_test"
-			if mode == "codex-interrupt" || mode == "codex-worker" {
+			if mode == "codex-interrupt" || mode == "codex-worker" || mode == "codex-followup-refusal" {
 				threadID, turnID = "thr_stop", "turn_stop"
 			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{"turn": map[string]any{"id": turnID, "status": "inProgress"}}})
@@ -648,6 +648,16 @@ func runCodexFixture(mode string) int {
 				}()
 			}
 		case "turn/steer":
+			if mode == "codex-followup-refusal" {
+				var params struct {
+					Input []struct{ Text string }
+				}
+				_ = json.Unmarshal(message.Params, &params)
+				if len(params.Input) == 1 && params.Input[0].Text == "rejected" {
+					write(map[string]any{"id": message.ID, "error": map[string]any{"code": -32000, "message": "synthetic follow-up refused"}})
+					continue
+				}
+			}
 			if os.Getenv("SPYNEL_TEST_CODEX_STALL_CONTROL") != "" {
 				continue
 			}

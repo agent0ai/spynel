@@ -773,6 +773,119 @@ func TestSupervisorControlRetainsEmitterAndContinuesOnlyOnce(t *testing.T) {
 	}
 }
 
+func TestSupervisorRejectedFollowupRetainsControlEmitter(t *testing.T) {
+	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = supervisor.Close() })
+	checkRejectedFollowupControlEmitter(t, supervisor, func() { target.finish("job") }, func(refuse bool) {
+		target.mu.Lock()
+		target.refuseSteer = refuse
+		target.mu.Unlock()
+	})
+}
+
+func TestSupervisorNativeRejectedFollowupRetainsControlEmitter(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "codex-followup-refusal")
+	supervisor := NewSupervisor(NewBuiltinRegistry(), HarnessConfig{Name: "codex", Command: command, Cwd: root, Sandbox: "read-only", ApprovalPolicy: "never"})
+	if err := supervisor.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = supervisor.Close() })
+	target := supervisor.current.(*Codex)
+	checkRejectedFollowupControlEmitter(t, supervisor, func() {
+		if ok, err := target.Interrupt(t.Context(), "job"); err != nil || !ok {
+			t.Fatal("synthetic provider completion injection", ok, err)
+		}
+	}, func(bool) {})
+	starts, steers, processes := 0, 0, 0
+	for _, record := range readFixtureRecords(t, logPath) {
+		switch record.Kind {
+		case "invocation":
+			processes++
+			t.Logf("synthetic native provider pid=%d", record.PID)
+		case "request":
+			if record.Method == "turn/start" {
+				starts++
+			}
+			if record.Method == "turn/steer" {
+				steers++
+			}
+		}
+	}
+	if processes != 1 || starts != 2 || steers != 2 {
+		t.Fatalf("unexpected provider work: processes=%d starts=%d steers=%d", processes, starts, steers)
+	}
+}
+
+func checkRejectedFollowupControlEmitter(t *testing.T, supervisor *Supervisor, finish func(), refuse func(bool)) {
+	t.Helper()
+	var mu sync.Mutex
+	var original, rejected []core.Event
+	if _, _, err := supervisor.SendConversation(t.Context(), "job", "original", "original", func(event core.Event) {
+		mu.Lock()
+		original = append(original, event)
+		mu.Unlock()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	refuse(true)
+	if _, _, err := supervisor.SendConversation(t.Context(), "job", "rejected", "rejected", func(event core.Event) {
+		mu.Lock()
+		rejected = append(rejected, event)
+		mu.Unlock()
+	}); err == nil || !supervisor.IsActive("job") {
+		t.Fatal("follow-up did not fail while preserving the original turn", err)
+	}
+	refuse(false)
+	if _, err := supervisor.SendControl(t.Context(), "job", ControlRequest{
+		ID: "control", Prompt: "guidance", ContinuationPrompt: "continue original",
+		Validate: func() bool { return true },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	finish()
+	waitSupervisorState(t, func() bool {
+		supervisor.mu.RLock()
+		target := supervisor.current
+		supervisor.mu.RUnlock()
+		return target.IsActive("job")
+	})
+	finish()
+	waitSupervisorState(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, event := range append(append([]core.Event(nil), original...), rejected...) {
+			if event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+				return true
+			}
+		}
+		return false
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if len(rejected) != 0 {
+		t.Fatalf("control continuation reached the rejected follow-up: %#v", rejected)
+	}
+	continuing, terminal := 0, 0
+	for _, event := range original {
+		if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+			if event.Continues {
+				continuing++
+			} else {
+				terminal++
+			}
+		}
+	}
+	if continuing != 1 || terminal != 1 || supervisor.IsActive("job") {
+		t.Fatalf("original execution lost ownership: continuing=%d terminal=%d active=%t", continuing, terminal, supervisor.IsActive("job"))
+	}
+}
+
 func TestSupervisorQueuesControlsInOrderDeduplicatesAndBoundsBackpressure(t *testing.T) {
 	target := &supervisorHarness{name: "claude-code", followUp: FollowUpQueue, active: map[string]bool{}, emits: map[string]core.Emit{}}
 	registry := NewRegistry()

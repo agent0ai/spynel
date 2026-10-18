@@ -437,10 +437,18 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 		s.active[key] = 1
 	}
 	wrapper := s.executionEmit(key, target, emit)
+	previousEmit := s.controlEmit[key]
 	s.controlEmit[key] = wrapper
 	s.mu.Unlock()
 	threadID, steered, err := sendWithInference(target, ctx, key, prompt, selection, wrapper)
 	if err != nil {
+		if wasActive {
+			s.mu.Lock()
+			if s.active[key] > 0 && target.IsActive(key) {
+				s.controlEmit[key] = previousEmit
+			}
+			s.mu.Unlock()
+		}
 		if wasActive && steered {
 			// The active turn finished during the failed steering attempt. Retry
 			// as the next ordinary turn instead of losing the follow-up.
