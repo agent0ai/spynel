@@ -356,7 +356,7 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 					// A competing live worker owns discovery; do not wait to
 					// replace it if that controller later shuts it down.
 					record, readErr := readWorkerRecord(recordPath)
-					if readErr == nil && errors.Is(updater.VerifyProcess(record.Info.Process), syscall.ESRCH) {
+					if (readErr == nil || errors.Is(readErr, errWorkerProtocol)) && errors.Is(updater.VerifyProcess(record.Info.Process), syscall.ESRCH) {
 						busy = true
 						return nil
 					}

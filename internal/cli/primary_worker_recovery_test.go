@@ -16,6 +16,7 @@ import (
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/localapi"
@@ -31,12 +32,16 @@ func TestPrimaryRecoversConfirmedDeadWorker(t *testing.T) {
 			if cancelled {
 				name = role + "/cancelled"
 			}
-			t.Run(name, func(t *testing.T) { primaryWorkerRecovery(t, role, cancelled) })
+			t.Run(name, func(t *testing.T) { primaryWorkerRecovery(t, role, cancelled, false) })
 		}
 	}
 }
 
-func primaryWorkerRecovery(t *testing.T, role string, cancelled bool) {
+func TestPrimaryRecoversConfirmedDeadIncompatibleWorker(t *testing.T) {
+	primaryWorkerRecovery(t, "workflow", false, true)
+}
+
+func primaryWorkerRecovery(t *testing.T, role string, cancelled, incompatible bool) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
 	bin := t.TempDir()
@@ -203,6 +208,28 @@ func primaryWorkerRecovery(t *testing.T, role string, cancelled bool) {
 	t.Logf("automatic recovery worker pid=%d start=%s generation=%s; guardian pid=%d start=%s generation=%s", initialInfo.PID, initialInfo.Process.StartTime, initialInfo.Process.Generation, guardian.PID, guardian.StartTime, guardian.Generation)
 	if err := updater.VerifyProcess(initialInfo.Process); err != nil {
 		t.Fatal(err)
+	}
+	if incompatible {
+		// Model a previous protocol's strict current-schema crash-left record;
+		// a separate retained native test also runs the actual older image.
+		data, err := os.ReadFile(lock + ".worker.json")
+		var record map[string]json.RawMessage
+		if err != nil || json.Unmarshal(data, &record) != nil {
+			t.Fatal("read fixture rendezvous", err)
+		}
+		info := initialInfo
+		info.Protocol--
+		record["Info"], err = json.Marshal(info)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err = json.Marshal(record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := fsx.AtomicWriteFile(lock+".worker.json", data, 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	process, err := os.FindProcess(initialInfo.PID)
 	if err != nil {

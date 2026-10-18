@@ -3,10 +3,13 @@
 package harness
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -14,6 +17,14 @@ import (
 )
 
 func TestWorkerStartupWaitsForPendingProcessOwnership(t *testing.T) {
+	for _, protocol := range []int{WorkerProtocol, WorkerProtocol - 1} {
+		t.Run(strconv.Itoa(protocol), func(t *testing.T) {
+			testWorkerPendingProcessOwnership(t, protocol)
+		})
+	}
+}
+
+func testWorkerPendingProcessOwnership(t *testing.T, protocol int) {
 	fixture := newWorkerFixture(t, "codex", "codex-worker")
 	path, err := ProcessOwnershipPath(fixture.config.Cwd)
 	if err != nil {
@@ -27,8 +38,32 @@ func TestWorkerStartupWaitsForPendingProcessOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var record workerRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatal(err)
+	}
+	record.Info.Protocol = protocol
+	data, err = json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fixture.mustCall(t, WorkerRequest{Action: "shutdown"})
 	waitWorkerExit(t, fixture.info)
+	for _, invalid := range [][]byte{
+		bytes.Replace(data, []byte(`"Protocol":`+strconv.Itoa(protocol)), []byte(`"Protocol":0`), 1),
+		append([]byte(`{"FutureSchema":true,`), data[1:]...),
+	} {
+		if err := os.WriteFile(recordPath, invalid, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if client, err := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term); err == nil {
+			client.Close()
+			t.Fatal("malformed dead worker record authorized replacement")
+		}
+		if current, err := os.ReadFile(recordPath); err != nil || !bytes.Equal(current, invalid) {
+			t.Fatal("malformed dead worker record was changed", err)
+		}
+	}
 	// Preserve an authentic crash-left dead identity while a cleanup owner still
 	// holds the same OS lock. No PID-only or missing-record recovery is authorized.
 	if err := os.WriteFile(recordPath, data, 0600); err != nil {

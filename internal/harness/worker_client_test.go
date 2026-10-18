@@ -215,6 +215,7 @@ func TestWorkerDiscoveryAdoptsAllAdaptersWithoutAdmission(t *testing.T) {
 
 func TestWorkerDiscoveryFailsClosedOnUncertainIdentity(t *testing.T) {
 	fixture := newWorkerFixture(t, "codex", "codex-worker")
+	fixture.mustCall(t, WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/identity", Prompt: "synthetic retained turn"})
 	lockPath, _ := ProcessOwnershipPath(fixture.config.Cwd)
 	path, _ := workerRecordPath(lockPath)
 	original, err := os.ReadFile(path)
@@ -253,6 +254,14 @@ func TestWorkerDiscoveryFailsClosedOnUncertainIdentity(t *testing.T) {
 			if client, err := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term); err == nil {
 				client.Close()
 				t.Fatal("uncertain worker identity accepted")
+			}
+			if test.name == "protocol" {
+				if err := publishWorkerRecord(path, record); err == nil {
+					t.Fatal("live incompatible worker record was replaced")
+				}
+				if current, err := os.ReadFile(path); err != nil || string(current) != string(data) {
+					t.Fatal("protocol refusal changed the original record", err)
+				}
 			}
 			if err := updater.VerifyProcess(record.Info.Process); err != nil {
 				t.Fatal("failed discovery disturbed the original worker")
@@ -305,8 +314,8 @@ func TestWorkerDiscoveryFailsClosedOnUncertainIdentity(t *testing.T) {
 	if err := os.Rename(path+".saved", path); err != nil {
 		t.Fatal(err)
 	}
-	if reply := fixture.mustCall(t, WorkerRequest{Action: "inspect"}); reply.NextSequence != 1 {
-		t.Fatal("identity failures caused a provider admission")
+	if reply := fixture.mustCall(t, WorkerRequest{Action: "inspect"}); reply.NextSequence != 2 || len(reply.Executions) != 1 || reply.Executions[0].Done {
+		t.Fatal("identity failures replaced, duplicated or stopped the active execution")
 	}
 }
 

@@ -21,6 +21,8 @@ import (
 	"github.com/agent0ai/spynel/internal/updater"
 )
 
+var errWorkerProtocol = errors.New("worker protocol is incompatible")
+
 type workerRecord struct {
 	Info  WorkerInfo
 	Token string
@@ -64,7 +66,7 @@ func OpenWorker(ctx context.Context, cfg HarnessConfig, instanceID, termToken st
 	}
 	discover := func(ctx context.Context) (*WorkerClient, error) {
 		record, err := readWorkerRecord(path)
-		if err != nil {
+		if err != nil && !errors.Is(err, errWorkerProtocol) {
 			return nil, err
 		}
 		if err := updater.VerifyProcess(record.Info.Process); err != nil {
@@ -72,6 +74,9 @@ func OpenWorker(ctx context.Context, cfg HarnessConfig, instanceID, termToken st
 				return nil, syscall.ESRCH
 			}
 			return nil, errors.New("worker native identity unavailable")
+		}
+		if err != nil {
+			return nil, err
 		}
 		if record.Info.EnvironmentID != election.EnvironmentID() || record.Info.WorkspaceID != filepath.Base(lockPath) || record.Info.ConfigDigest != ConfigDigest(cfg) {
 			return nil, errors.New("worker environment, workspace or configuration changed")
@@ -361,10 +366,15 @@ func readWorkerRecord(path string) (workerRecord, error) {
 		return record, errors.New("invalid worker record")
 	}
 	native := record.Info.Process
-	if record.Info.Protocol != WorkerProtocol || len(record.Info.ID) < 32 || len(record.Token) < 32 || len(record.Token) > 128 ||
+	if record.Info.Protocol <= 0 || len(record.Info.ID) < 32 || len(record.Token) < 32 || len(record.Token) > 128 ||
 		!filepath.IsAbs(record.Info.Socket) || record.Info.PID <= 1 || native.PID != record.Info.PID || !native.HarnessWorker || native.Stopping ||
 		len(native.Generation) != 32 || native.StartTime == "" || !filepath.IsAbs(native.Executable) {
 		return record, errors.New("invalid worker identity")
+	}
+	// A strict current-schema identity can prove death without speaking its
+	// incompatible protocol. All live/unknown identities still refuse discovery.
+	if record.Info.Protocol != WorkerProtocol {
+		return record, errWorkerProtocol
 	}
 	return record, nil
 }
@@ -383,7 +393,7 @@ func validateWorkerSocket(path string) error {
 
 func publishWorkerRecord(path string, record workerRecord) error {
 	prior, err := readWorkerRecord(path)
-	if err == nil {
+	if err == nil || errors.Is(err, errWorkerProtocol) {
 		if err := updater.VerifyProcess(prior.Info.Process); !errors.Is(err, syscall.ESRCH) {
 			return errors.New("prior worker identity is still live or unverified")
 		}
