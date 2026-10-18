@@ -3016,6 +3016,7 @@ func TestFrameworkCommandDuringRecipientTurnKeepsResponsesAndSpinnerFlow(t *test
 	m.input.SetValue("start long work")
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = next.(model)
+	source := m.responseRequestID
 	next, _ = m.Update(uiEvent{event: core.Event{Kind: core.EventDelta, Text: "first response"}})
 	m = next.(model)
 
@@ -3025,7 +3026,7 @@ func TestFrameworkCommandDuringRecipientTurnKeepsResponsesAndSpinnerFlow(t *test
 	if !m.working || m.streaming != "" || len(m.transcript) != 3 {
 		t.Fatalf("command did not commit active response: working=%t streaming=%q transcript=%#v", m.working, m.streaming, m.transcript)
 	}
-	if m.transcript[1] != (transcriptEntry{role: "assistant", text: "first response"}) || m.transcript[2] != (transcriptEntry{role: "user", text: "/jobs"}) {
+	if m.transcript[1] != (transcriptEntry{role: "assistant", text: "first response", requestID: source}) || m.transcript[2] != (transcriptEntry{role: "user", text: "/jobs"}) {
 		t.Fatalf("committed response and command are out of order: %#v", m.transcript)
 	}
 

@@ -19,6 +19,14 @@ import (
 )
 
 func TestWorkerConversationOrdinaryCLIStream(t *testing.T) {
+	testWorkerConversationOrdinaryStream(t, "cli")
+}
+
+func TestWorkerConversationOrdinaryTUIStream(t *testing.T) {
+	testWorkerConversationOrdinaryStream(t, "tui")
+}
+
+func testWorkerConversationOrdinaryStream(t *testing.T, channel string) {
 	for _, name := range []string{"complete", "detached", "lost-ack"} {
 		t.Run(name, func(t *testing.T) {
 			detached := name == "detached"
@@ -52,7 +60,7 @@ func TestWorkerConversationOrdinaryCLIStream(t *testing.T) {
 			}
 			identity := f.client.Info()
 			t.Logf("ordinary request worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
-			message := core.Message{Channel: "cli", Conversation: "ordinary", SourceMessageID: "request:one", Text: "synthetic request"}
+			message := core.Message{Channel: channel, Conversation: "ordinary", SourceMessageID: "request:one", Text: "synthetic request"}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			events := make(chan core.Event, 64)
@@ -77,7 +85,7 @@ func TestWorkerConversationOrdinaryCLIStream(t *testing.T) {
 			if len(executions) != 1 || !executions[0].SourcesReserved || executions[0].Conversation.SourceMessageID != message.SourceMessageID {
 				t.Fatal("ordinary request lost source ownership")
 			}
-			original, ok := f.service.Runtime.JobForSession("chat:cli:ordinary")
+			original, ok := f.service.Runtime.JobForSession("chat:" + channel + ":ordinary")
 			if !ok || original.WorkID != executions[0].Conversation.ExecutionID || original.ProviderIterations != 1 {
 				t.Fatal("ordinary request lost job identity")
 			}
@@ -94,7 +102,7 @@ func TestWorkerConversationOrdinaryCLIStream(t *testing.T) {
 				if current := f.inspect(t); len(current) != 1 || current[0].Done {
 					t.Fatal("request detach interrupted the provider")
 				}
-				entries, _, err := f.service.History.RecoveryEntries("cli", "ordinary", 10)
+				entries, _, err := f.service.History.RecoveryEntries(channel, "ordinary", 10)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -113,7 +121,7 @@ func TestWorkerConversationOrdinaryCLIStream(t *testing.T) {
 				}
 				f.start(t)
 				waitWorkerAgent(t, func() bool {
-					job, ok := f.service.Runtime.JobForSession("chat:cli:ordinary")
+					job, ok := f.service.Runtime.JobForSession("chat:" + channel + ":ordinary")
 					return ok && job.StableID == original.StableID && job.Number == original.Number &&
 						job.Generation == original.Generation && job.ProviderIterations == 1
 				})
@@ -151,6 +159,9 @@ func TestWorkerConversationOrdinaryCLIStream(t *testing.T) {
 							t.Fatal("activity remained active at terminal delivery")
 						}
 						terminal++
+						if channel == "tui" && e.ResponseID == "" {
+							t.Fatal("TUI result lost its durable presentation identity")
+						}
 					}
 				}
 				if terminal != 1 {
@@ -162,10 +173,13 @@ func TestWorkerConversationOrdinaryCLIStream(t *testing.T) {
 				f.client.Close()
 			}
 			waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 0 })
-			entries, _, err := f.service.History.RecoveryEntries("cli", "ordinary", 20)
+			entries, _, err := f.service.History.RecoveryEntries(channel, "ordinary", 20)
 			terminals := 0
 			for _, entry := range entries {
 				if entry.Terminal {
+					if channel == "tui" && (!entry.Recovery || entry.ReceiptID == "") {
+						t.Fatal("TUI terminal cannot be followed after detach")
+					}
 					terminals++
 					if entry.SourceMessageID != message.SourceMessageID || len(entry.Covers) != 1 || entry.Covers[0] != message.SourceMessageID {
 						t.Fatal("terminal lost exact request coverage")
@@ -181,6 +195,14 @@ func TestWorkerConversationOrdinaryCLIStream(t *testing.T) {
 }
 
 func TestWorkerConversationOrdinaryCLIUnknownSend(t *testing.T) {
+	testWorkerConversationOrdinaryUnknownSend(t, "cli")
+}
+
+func TestWorkerConversationOrdinaryTUIUnknownSend(t *testing.T) {
+	testWorkerConversationOrdinaryUnknownSend(t, "tui")
+}
+
+func testWorkerConversationOrdinaryUnknownSend(t *testing.T, channel string) {
 	for _, accepted := range []bool{false, true} {
 		name := "absent"
 		if accepted {
@@ -193,7 +215,7 @@ func TestWorkerConversationOrdinaryCLIUnknownSend(t *testing.T) {
 			f := newWorkerAgentFixture(t)
 			identity := f.client.Info()
 			t.Logf("uncertain request worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
-			message := core.Message{Channel: "cli", Conversation: "uncertain", SourceMessageID: "request:unknown", Text: "synthetic request"}
+			message := core.Message{Channel: channel, Conversation: "uncertain", SourceMessageID: "request:unknown", Text: "synthetic request"}
 			f.client.Close()
 			restore := dropWorkerReply(t, f.client.Info().Socket, "send", accepted, false)
 			err := f.service.Handle(t.Context(), message, nil)
@@ -202,7 +224,7 @@ func TestWorkerConversationOrdinaryCLIUnknownSend(t *testing.T) {
 			if !errors.Is(err, orchestrator.ErrConversationPending) {
 				t.Fatal("unknown Send was not left pending", err)
 			}
-			entries, _, err := f.service.History.RecoveryEntries("cli", "uncertain", 10)
+			entries, _, err := f.service.History.RecoveryEntries(channel, "uncertain", 10)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -211,7 +233,7 @@ func TestWorkerConversationOrdinaryCLIUnknownSend(t *testing.T) {
 					t.Fatal("unknown Send fabricated terminal history")
 				}
 			}
-			if _, ok := f.service.Runtime.JobForSession("chat:cli:uncertain"); !ok {
+			if _, ok := f.service.Runtime.JobForSession("chat:" + channel + ":uncertain"); !ok {
 				t.Fatal("unknown Send discarded its provisional job")
 			}
 			f.start(t)
@@ -221,10 +243,10 @@ func TestWorkerConversationOrdinaryCLIUnknownSend(t *testing.T) {
 				}
 			}
 			waitWorkerAgent(t, func() bool {
-				_, ok := f.service.Runtime.JobForSession("chat:cli:uncertain")
+				_, ok := f.service.Runtime.JobForSession("chat:" + channel + ":uncertain")
 				return !ok && len(f.inspect(t)) == 0
 			})
-			entries, _, err = f.service.History.RecoveryEntries("cli", "uncertain", 10)
+			entries, _, err = f.service.History.RecoveryEntries(channel, "uncertain", 10)
 			terminals := 0
 			for _, entry := range entries {
 				if entry.Terminal {

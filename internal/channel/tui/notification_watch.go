@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/channel"
@@ -13,7 +14,8 @@ import (
 
 // watchTaskNotifications follows runtime-authored proactive assistant entries
 // plus stalled-message and retained-worker conversation results. Requested
-// turns are rendered by their response stream and remain ignored here.
+// controller turns remain stream-owned; worker request copies are reconciled
+// by their private request/response identities in the model.
 func watchTaskNotifications(ctx context.Context, path string, initialOffset ...int64) <-chan channel.Notification {
 	output := make(chan channel.Notification, 16)
 	var offset int64
@@ -54,7 +56,9 @@ func watchTaskNotifications(ctx context.Context, path string, initialOffset ...i
 				if entry.Sender == "Spy" &&
 					(entry.Role == "notification_pending" || entry.Role == "assistant" || entry.Recovery) {
 					select {
-					case output <- channel.Notification{ID: entry.EventID, Text: entry.Content, Recovery: entry.Recovery, Error: entry.Recovery && entry.Role == "error", Continues: entry.Continues}:
+					case output <- channel.Notification{ID: entry.EventID, RequestID: entry.SourceMessageID,
+						ResponseID: strings.TrimSuffix(strings.TrimSuffix(entry.ReceiptID, ":result"), ":partial"),
+						Text:       entry.Content, Recovery: entry.Recovery, Error: entry.Recovery && entry.Role == "error", Continues: entry.Continues}:
 					case <-ctx.Done():
 						file.Close()
 						return

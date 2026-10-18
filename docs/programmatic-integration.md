@@ -95,6 +95,9 @@ letters/digits/dots/underscores/colons/hyphens, beginning with a letter/digit.
 The server generates one when omitted. Keep explicit IDs if retry correlation
 matters. Each streamed HTTP line wraps a core response in `event`, with
 `request_id` on the envelope and event. CLI JSON exposes the core event directly.
+Local reply events may also carry an opaque `response_id` to correlate a durable
+reply with its request-stream copy; it is not provider identity, admission or a
+delivery acknowledgement, and clients must not require its presence.
 Provider thread/turn fields are opaque optional diagnostic data, not stable
 adapter identifiers. HTTP envelopes can instead contain `error`, `code` and
 `request_id`; codes include `request_failed`, `duplicate_request` and

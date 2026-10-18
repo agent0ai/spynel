@@ -647,8 +647,8 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	if err != nil || handled {
 		return err
 	}
-	// shortcut: CLI streams only, connect TUI/remote request lifecycles before production selection.
-	if s.Orchestrator.Worker != nil && message.Channel == "cli" {
+	// shortcut: local streams only, connect remote lifecycles before production selection.
+	if s.Orchestrator.Worker != nil && (message.Channel == "cli" || message.Channel == "tui") {
 		return s.dispatchWorkerConversation(ctx, message, prompt, emit, additionalSourceIDs)
 	}
 	key := sessionKey(message)
@@ -860,6 +860,12 @@ func (s *Service) conversationEventConsumer(message core.Message, jobID int, dow
 		receipt := fmt.Sprintf("conversation:%s:%d", consumerID, cursor+1)
 		if worker != nil {
 			receipt = worker.ReceiptID()
+			if message.Channel == "tui" {
+				event.RequestID = message.SourceMessageID
+				if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+					event.ResponseID = receipt
+				}
+			}
 		}
 		key := sessionKey(message)
 		// A queued request can be cancelled while the shared provider turn is
@@ -953,6 +959,7 @@ func (s *Service) conversationEventConsumer(message core.Message, jobID int, dow
 				partial := history.Entry{Role: "assistant", Content: streamed}
 				if localReplay {
 					partial.Sender, partial.Recovery, partial.Continues = "Spy", true, true
+					partial.SourceMessageID = message.SourceMessageID
 				}
 				if _, err := s.History.AppendOnce(message.Channel, message.Conversation, receipt+":partial", partial); err != nil {
 					return event, false, requestOnly, fmt.Errorf("save partial conversation result: %w", err)
