@@ -33,11 +33,7 @@ func (m *Manager) Converse(ctx context.Context, conversation harness.WorkerConve
 	m.workerAdmissionMu.Lock()
 	execution, err := m.admitConversation(ctx, conversation, prompt, message)
 	if err != nil {
-		pending := m.runtimeJob("worker-conversation:"+conversation.ExecutionID) > 0
 		m.workerAdmissionMu.Unlock()
-		if pending {
-			return fmt.Errorf("%w: %w", ErrConversationPending, err)
-		}
 		return err
 	}
 	key := "worker-conversation:" + strconv.FormatUint(execution.Sequence, 10)
@@ -53,7 +49,12 @@ func (m *Manager) Converse(ctx context.Context, conversation harness.WorkerConve
 }
 
 // The caller holds the shared snapshot/admission/retirement lock.
-func (m *Manager) admitConversation(ctx context.Context, conversation harness.WorkerConversation, prompt, message string) (harness.WorkerExecution, error) {
+func (m *Manager) admitConversation(ctx context.Context, conversation harness.WorkerConversation, prompt, message string) (result harness.WorkerExecution, resultErr error) {
+	defer func() {
+		if resultErr != nil && m.runtimeJob("worker-conversation:"+conversation.ExecutionID) > 0 {
+			resultErr = fmt.Errorf("%w: %w", ErrConversationPending, resultErr)
+		}
+	}()
 	if m.Worker == nil || m.ConversationStarted == nil || m.ConversationAttached == nil || m.ConversationDelivery == nil || m.JobFinished == nil || conversation.Validate() != nil || prompt == "" {
 		return harness.WorkerExecution{}, errors.New("worker conversation admission unavailable or invalid")
 	}

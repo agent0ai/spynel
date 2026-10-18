@@ -26,6 +26,12 @@ func (s *Service) dispatchWorkerConversation(ctx context.Context, message core.M
 	sources := append([]string{message.SourceMessageID}, additionalSources...)
 	sort.Strings(sources)
 	c := harness.WorkerConversation{Channel: message.Channel, Conversation: message.Conversation, SourceMessageID: message.SourceMessageID, ExecutionID: executionID, Sources: sources}
+	if message.Channel == "telegram" || message.Channel == "whatsapp" {
+		// The inbound emitter cannot acknowledge delivery. The ordinary scan
+		// consumes through the fallible router after this intake returns.
+		_, err := s.Orchestrator.AdmitConversation(ctx, c, prompt, message.Text)
+		return err
+	}
 	activity := newChatActivityEmitter(func(event core.Event) {
 		event.RequestID = message.SourceMessageID
 		if emit != nil {
@@ -121,12 +127,13 @@ func (s *Service) attachWorkerConversation(execution harness.WorkerExecution) (i
 		return 0, errors.New("invalid retained conversation admission")
 	}
 	id, err := s.beginWorkerConversation(*c)
-	if err == nil && c.Channel == "tui" && !execution.Done && !execution.Cancelled {
+	if err == nil && (c.Channel == "tui" || c.Channel == "telegram" || c.Channel == "whatsapp") && !execution.Done && !execution.Cancelled {
+		if _, routeErr := s.workerConversationRouter(*c); routeErr != nil {
+			return id, nil // Restore the job, but never start unauthorized activity.
+		}
 		s.chatActivityMu.Lock()
 		if len(s.chatActivity[id]) == 0 {
-			activity := newChatActivityEmitter(func(event core.Event) {
-				s.setConversationActivity(c.Channel, c.Conversation, event.Active)
-			})
+			activity := newChatActivityEmitter(s.recoveryEmitter(orchestrator.Origin{Channel: c.Channel, Conversation: c.Conversation}))
 			s.trackChatActivityLocked(id, activity)
 			activity.start()
 		}

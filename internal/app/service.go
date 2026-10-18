@@ -647,8 +647,7 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	if err != nil || handled {
 		return err
 	}
-	// shortcut: local streams only, connect remote lifecycles before production selection.
-	if s.Orchestrator.Worker != nil && (message.Channel == "cli" || message.Channel == "tui") {
+	if s.Orchestrator.Worker != nil {
 		return s.dispatchWorkerConversation(ctx, message, prompt, emit, additionalSourceIDs)
 	}
 	key := sessionKey(message)
