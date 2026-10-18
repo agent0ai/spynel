@@ -7,12 +7,94 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
 )
+
+// Scan already holds the snapshot/election fence. Consumers run outside it;
+// retirement shares the snapshot lock so a retired stream cannot reattach.
+func (m *Manager) attachWorkerConversations(ctx context.Context, executions []harness.WorkerExecution) {
+	if m.ConversationAttached == nil || m.ConversationDelivery == nil || m.JobFinished == nil {
+		return
+	}
+	for _, execution := range executions {
+		if execution.Conversation == nil {
+			continue
+		}
+		key := "worker-conversation:" + strconv.FormatUint(execution.Sequence, 10)
+		m.mu.Lock()
+		if m.inflight[key] {
+			m.mu.Unlock()
+			continue
+		}
+		m.inflight[key] = true
+		m.mu.Unlock()
+		m.jobs.Add(1)
+		go func() {
+			defer m.jobs.Done()
+			defer m.setInflight(key, false)
+			if err := m.consumeWorkerConversation(ctx, execution); err != nil && ctx.Err() == nil {
+				m.log("retained conversation delivery requires reconciliation")
+			}
+		}()
+	}
+}
+
+func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harness.WorkerExecution) (resultErr error) {
+	var jobID int
+	if err := m.Worker.RunOwned(ctx, func() error {
+		var err error
+		jobID, err = m.ConversationAttached(execution)
+		return err
+	}); err != nil {
+		return err
+	}
+	if jobID <= 0 {
+		return errors.New("retained conversation job unavailable")
+	}
+	defer func() {
+		if resultErr != nil && ctx.Err() == nil && m.JobExecutionUpdated != nil {
+			_ = m.Worker.RunOwned(ctx, func() error {
+				m.JobExecutionUpdated(jobID, core.ExecutionStatus{State: "degraded", Detail: "Conversation delivery remains pending"})
+				return nil
+			})
+		}
+	}()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		current, err := m.Worker.Consume(ctx, execution.Sequence, func(delivery harness.WorkerDelivery) error {
+			return m.ConversationDelivery(ctx, jobID, delivery)
+		})
+		if err != nil {
+			return err
+		}
+		if current.Done && current.CommittedCursor == current.LastCursor {
+			if current.LastCursor == 0 || current.Error != "" {
+				return errors.New("retained conversation has no confirmed terminal delivery")
+			}
+			m.workerAdmissionMu.Lock()
+			err := m.Worker.RunOwned(ctx, func() error {
+				m.JobFinished(jobID)
+				return nil
+			})
+			if err == nil {
+				_, err = m.Worker.Call(ctx, harness.WorkerRequest{Action: "ack", Sequence: current.Sequence, After: current.LastCursor})
+			}
+			m.workerAdmissionMu.Unlock()
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err() // Detach without interrupting the retained provider.
+		case <-ticker.C:
+		}
+	}
+}
 
 // attachWorkerWorkflows runs under the election fence and scan lock, using a
 // snapshot fetched before either lock. No RPC may run inside this callback.

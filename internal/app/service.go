@@ -199,6 +199,8 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	manager.JobEvent = runtime.RecordJobEvent
 	manager.JobDelivery = runtime.RecordJobDelivery
 	manager.JobFinished = runtime.EndJob
+	manager.ConversationAttached = service.attachWorkerConversation
+	manager.ConversationDelivery = service.deliverWorkerConversation
 	manager.SetNotificationDelivery(service.deliverNotification)
 	manager.NotificationContext = service.notificationContext
 	manager.Outbox.FallbackAllowed = func(_ context.Context, origin orchestrator.Origin) error { return service.validateOrigin(origin) }

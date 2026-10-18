@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -8,10 +9,61 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
 )
+
+func TestWorkerConversationAutomaticRoutingChecksAuthorizationBeforeEffects(t *testing.T) {
+	for _, boundary := range []string{"disabled", "revoked", "missing-router"} {
+		t.Run(boundary, func(t *testing.T) {
+			s, _, _ := newRecoveryTestService(t)
+			if _, err := s.Settings.Update(func(cfg *config.Config) error {
+				cfg.Channels.Telegram.Enabled = boundary != "disabled"
+				cfg.Channels.Telegram.AllowedUsers = []string{"7"}
+				if boundary == "revoked" {
+					cfg.Channels.Telegram.AllowedUsers = []string{"8"}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			c := &harness.WorkerConversation{Channel: "telegram", Conversation: "TG-7", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
+			if _, err := s.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic"}); err != nil {
+				t.Fatal(err)
+			}
+			id, err := s.attachWorkerConversation(harness.WorkerExecution{Key: "chat:telegram:TG-7", Conversation: c, SourcesReserved: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := harness.WorkerDelivery{WorkerID: strings.Repeat("d", 32), Sequence: 1, WorkerEvent: harness.WorkerEvent{Cursor: 1, Conversation: c, Event: core.Event{Kind: core.EventFinal, Text: "private synthetic result", Done: true}}}
+			if err := s.deliverWorkerConversation(context.Background(), id, d); err == nil {
+				t.Fatal("unavailable or unauthorized route consumed a result")
+			}
+			entries, _, err := s.History.Entries(c.Channel, c.Conversation)
+			if err != nil || len(entries) != 1 {
+				t.Fatal("route refusal persisted terminal effects", err)
+			}
+		})
+	}
+}
+
+func TestWorkerConversationAttachmentRejectsConflictingJob(t *testing.T) {
+	s, _, _ := newRecoveryTestService(t)
+	c := &harness.WorkerConversation{Channel: "cli", Conversation: "same", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
+	execution := harness.WorkerExecution{Key: "chat:cli:same", Conversation: c}
+	if _, err := s.attachWorkerConversation(execution); err == nil {
+		t.Fatal("unreserved conversation restored a job")
+	}
+	execution.SourcesReserved = true
+	if _, err := s.Runtime.TryBeginJobWithDetails(execution.Key, c.Channel, c.Conversation, "synthetic", JobDetails{Kind: "conversation", WorkID: "different"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.attachWorkerConversation(execution); err == nil {
+		t.Fatal("conflicting live job was reused")
+	}
+}
 
 func TestWorkerConversationSettlementSurvivesControllerReplacement(t *testing.T) {
 	s, _, cfg := newRecoveryTestService(t)

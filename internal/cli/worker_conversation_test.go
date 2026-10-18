@@ -3,19 +3,47 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/app"
+	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 )
+
+type workerConversationRouter struct {
+	fail     atomic.Bool
+	attempts atomic.Int32
+	sent     atomic.Int32
+}
+
+func (r *workerConversationRouter) Deliver(context.Context, string, string, string, string, []core.OutboundAttachment) error {
+	return errors.New("conversation delivery must use the ordinary event router")
+}
+
+func (r *workerConversationRouter) DeliverEvent(_ context.Context, channel, conversation, receipt string, event core.Event) error {
+	if channel != "telegram" || conversation != "TG-7" || receipt == "" {
+		return errors.New("changed synthetic route or receipt")
+	}
+	if !event.Done {
+		return nil
+	}
+	r.attempts.Add(1)
+	if r.fail.Load() {
+		return errors.New("synthetic response outage")
+	}
+	r.sent.Add(1)
+	return nil
+}
 
 func TestWorkerConversationNativeReplayAndSettlement(t *testing.T) {
 	for _, scenario := range []struct{ name, mode, channel, partial string }{
@@ -248,5 +276,150 @@ func TestWorkerConversationNativeReservedRecoveryAndLostSendReply(t *testing.T) 
 	methods, err := os.ReadFile(f.log)
 	if err != nil || strings.Count(string(methods), "turn/start\n") != 1 {
 		t.Fatal("lost send reply dispatched another provider turn", err)
+	}
+}
+
+func TestWorkerConversationScheduledAttachment(t *testing.T) {
+	for _, scenario := range []string{"normal", "lost-commit"} {
+		t.Run(scenario, func(t *testing.T) {
+			t.Setenv("SPYNEL_TEST_WORKER_CONVERSATION_ERROR", "1")
+			f := newWorkerAgentFixture(t)
+			metadata := &harness.WorkerConversation{Channel: "cli", Conversation: "attached", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
+			if _, err := f.service.History.Append("cli", "attached", history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic", AcceptedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			key := "chat:cli:attached"
+			id, err := f.service.Runtime.TryBeginJobWithDetails(key, "cli", "attached", "synthetic", app.JobDetails{Kind: "conversation", WorkID: metadata.ExecutionID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			original, _ := f.service.Runtime.Job(id)
+			identity := f.client.Info()
+			t.Logf("automatic conversation worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
+			if reply, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "send", Sequence: 1, Key: key, Prompt: "synthetic", Conversation: metadata}); err != nil || reply.Executions[0].Error != "" {
+				t.Fatal("conversation admission failed", err)
+			}
+			waitWorkerAgent(t, func() bool { return f.inspect(t)[0].LastCursor >= 2 })
+			f.stop(t)
+			if err := f.owner.Release(f.term); err != nil {
+				t.Fatal(err)
+			}
+			f.open(t)
+			if f.client.Info().ID != identity.ID || f.client.Info().Process != identity.Process {
+				t.Fatal("replacement changed worker identity")
+			}
+			f.cfg.Orchestrator.IntervalSec = 1
+			f.service.Orchestrator.ApplyRuntimeConfig(f.cfg)
+			f.start(t)
+			deadline := time.Now().Add(4 * time.Second)
+			var restored app.Job
+			for time.Now().Before(deadline) {
+				if job, ok := f.service.Runtime.JobForSession(key); ok {
+					restored = job
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if restored.StableID != original.StableID || restored.Number != original.Number || restored.Generation != original.Generation || restored.ProviderIterations != 1 {
+				t.Fatal("scheduled attachment did not restore the same job")
+			}
+			if scenario == "lost-commit" {
+				f.client.Close()
+				restore := dropWorkerReply(t, f.client.Info().Socket, "commit", true, false)
+				defer restore()
+			}
+			if _, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "interrupt", Key: key}); err != nil {
+				t.Fatal(err)
+			}
+			waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 0 })
+			entries, _, err := f.service.History.Entries("cli", "attached")
+			terminals := 0
+			for _, entry := range entries {
+				if entry.Terminal {
+					terminals++
+					if entry.ExecutionID != metadata.ExecutionID || strings.Join(entry.Covers, ",") != "source" {
+						t.Fatal("automatic attachment lost source coverage")
+					}
+				}
+			}
+			methods, readErr := os.ReadFile(f.log)
+			if err != nil || readErr != nil || terminals != 1 || f.service.Runtime.Status().Jobs != 0 || strings.Count(string(methods), "turn/start\n") != 1 {
+				t.Fatal("automatic attachment duplicated or lost history/job/provider admission", err, readErr)
+			}
+		})
+	}
+}
+
+func TestWorkerConversationScheduledDeliveryFailureAndRevocation(t *testing.T) {
+	t.Setenv("SPYNEL_TEST_WORKER_CONVERSATION_ERROR", "1")
+	f := newWorkerAgentFixture(t)
+	setAuthorized := func(allowed string) {
+		t.Helper()
+		if _, err := f.service.Settings.Update(func(cfg *config.Config) error {
+			cfg.Orchestrator.SemanticHeartbeatMinutes = 5
+			cfg.Channels.Telegram.Enabled = true
+			cfg.Channels.Telegram.AllowedUsers = []string{allowed}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setAuthorized("7")
+	router := &workerConversationRouter{}
+	router.fail.Store(true)
+	f.service.SetConversationDelivery(router)
+	c := &harness.WorkerConversation{Channel: "telegram", Conversation: "TG-7", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}
+	if _, err := f.service.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic"}); err != nil {
+		t.Fatal(err)
+	}
+	key := "chat:telegram:TG-7"
+	identity := f.client.Info()
+	t.Logf("automatic remote worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
+	if reply, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "send", Sequence: 1, Key: key, Prompt: "synthetic", Conversation: c}); err != nil || reply.Executions[0].Error != "" {
+		t.Fatal("conversation admission failed", err)
+	}
+	f.cfg.Orchestrator.IntervalSec = 1
+	f.service.Orchestrator.ApplyRuntimeConfig(f.cfg)
+	f.start(t)
+	waitWorkerAgent(t, func() bool {
+		state := f.inspect(t)[0]
+		return state.CommittedCursor >= 2
+	})
+	original, ok := f.service.Runtime.JobForSession(key)
+	if !ok {
+		t.Fatal("automatic remote job was not restored")
+	}
+	if _, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "interrupt", Key: key}); err != nil {
+		t.Fatal(err)
+	}
+	waitWorkerAgent(t, func() bool { return router.attempts.Load() > 0 })
+	before := f.inspect(t)[0]
+	if before.CommittedCursor == before.LastCursor || router.sent.Load() != 0 {
+		t.Fatal("failed remote delivery was acknowledged")
+	}
+	setAuthorized("8")
+	attempts := router.attempts.Load()
+	time.Sleep(1300 * time.Millisecond) // Allow the ordinary scheduled retry.
+	state := f.inspect(t)[0]
+	if router.attempts.Load() != attempts || state.CommittedCursor != before.CommittedCursor {
+		t.Fatal("revocation permitted a response or cursor commit")
+	}
+	pending, ok := f.service.Runtime.JobForSession(key)
+	if !ok || pending.StableID != original.StableID || pending.Execution != app.JobDegraded {
+		t.Fatal("failed delivery lost its visibly degraded job")
+	}
+	router.fail.Store(false)
+	setAuthorized("7")
+	waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 0 })
+	entries, _, err := f.service.History.Entries(c.Channel, c.Conversation)
+	terminals := 0
+	for _, entry := range entries {
+		if entry.Terminal {
+			terminals++
+		}
+	}
+	methods, readErr := os.ReadFile(f.log)
+	if err != nil || readErr != nil || terminals != 1 || router.sent.Load() != 1 || strings.Count(string(methods), "turn/start\n") != 1 || f.client.Info().Process != identity.Process {
+		t.Fatal("scheduled delivery recovery duplicated effects or execution", err, readErr)
 	}
 }

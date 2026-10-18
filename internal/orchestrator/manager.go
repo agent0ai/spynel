@@ -67,6 +67,8 @@ type Manager struct {
 	JobEvent                 func(id int, event core.Event)
 	JobDelivery              func(id int, delivery harness.WorkerDelivery) error
 	JobFinished              func(id int)
+	ConversationAttached     func(harness.WorkerExecution) (int, error)
+	ConversationDelivery     func(context.Context, int, harness.WorkerDelivery) error
 	Cleanup                  func(context.Context, int) (string, error)
 	NotificationContext      func(Origin) (string, error)
 	notificationAgentTimeout time.Duration
@@ -470,6 +472,7 @@ func (m *Manager) runScan(ctx context.Context, generation *uint64) error {
 			return err
 		}
 		m.attachWorkerAgents(ctx, retained)
+		m.attachWorkerConversations(ctx, retained)
 		return m.scanOnce(ctx)
 	}
 	if m.Worker != nil {

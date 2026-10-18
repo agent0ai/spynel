@@ -1,13 +1,54 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 
+	"github.com/agent0ai/spynel/internal/channel"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
+	"github.com/agent0ai/spynel/internal/orchestrator"
 )
+
+// Called under the Manager's native/exact-owner fence; it must not use RPC.
+func (s *Service) attachWorkerConversation(execution harness.WorkerExecution) (int, error) {
+	c := execution.Conversation
+	if c.Validate() != nil || execution.Key != "chat:"+c.Channel+":"+c.Conversation || !execution.SourcesReserved || execution.Workflow != nil || execution.Agent != nil {
+		return 0, errors.New("invalid retained conversation admission")
+	}
+	if job, ok := s.Runtime.JobForSession(execution.Key); ok && (job.Kind != "conversation" || job.WorkID != c.ExecutionID) {
+		return 0, errors.New("retained conversation conflicts with its live job")
+	}
+	return s.Runtime.TryBeginJobWithDetails(execution.Key, c.Channel, c.Conversation, "Retained conversation", JobDetails{
+		Kind: "conversation", WorkID: c.ExecutionID, Provider: s.Settings.Snapshot().Harness.Name,
+	})
+}
+
+func (s *Service) deliverWorkerConversation(ctx context.Context, jobID int, delivery harness.WorkerDelivery) error {
+	c := delivery.Conversation
+	if c.Validate() != nil {
+		return errors.New("invalid retained conversation delivery")
+	}
+	if c.Channel != "telegram" && c.Channel != "whatsapp" {
+		return s.ConsumeConversationDelivery(jobID, delivery, nil)
+	}
+	cfg := s.Settings.Snapshot()
+	if c.Channel == "telegram" && !cfg.Channels.Telegram.Enabled || c.Channel == "whatsapp" && !cfg.Channels.WhatsApp.Enabled {
+		return errors.New("retained conversation transport is disabled")
+	}
+	if err := s.validateOrigin(orchestrator.Origin{Channel: c.Channel, Conversation: c.Conversation}); err != nil {
+		return err
+	}
+	router, ok := s.conversationDelivery().(channel.ConversationEventRouter)
+	if !ok {
+		return errors.New("retained conversation response router unavailable")
+	}
+	return s.ConsumeConversationDelivery(jobID, delivery, func(transformed harness.WorkerDelivery) error {
+		return router.DeliverEvent(ctx, c.Channel, c.Conversation, transformed.ReceiptID(), transformed.Event)
+	})
+}
 
 // AdmitWorkerConversation runs inside the worker's existing owner fence.
 // Transport authorization and job admission precede this source reservation.
