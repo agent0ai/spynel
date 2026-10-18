@@ -23,15 +23,16 @@ func (h *workerHost) configure(request WorkerRequest) WorkerReply {
 		return WorkerReply{Error: "invalid worker reasoning effort"}
 	}
 	var commit, restore func() error
+	var unavailable error
 	if request.Settings != nil {
 		if h.settings == nil {
 			return WorkerReply{Error: "canonical worker settings are unavailable"}
 		}
-		var err error
-		commit, restore, err = h.settings(previous.Cwd, previous, next, *request.Settings)
-		if err != nil || commit == nil || restore == nil {
+		plan, err := h.settings(previous.Cwd, previous, next, *request.Settings)
+		if err != nil || plan.Commit == nil || plan.Restore == nil {
 			return WorkerReply{Error: "canonical worker settings are invalid or changed"}
 		}
+		commit, restore, unavailable = plan.Commit, plan.Restore, plan.Unavailable
 	}
 	digest := ConfigDigest(next)
 	publish := func() error {
@@ -77,7 +78,9 @@ func (h *workerHost) configure(request WorkerRequest) WorkerReply {
 		if retained {
 			return WorkerReply{Error: "consume and retire worker executions before replacing their harness"}
 		}
-		if err = h.supervisor.Reconfigure(next); err == nil {
+		if unavailable != nil {
+			err = h.supervisor.CommitUnavailable(next, unavailable, publish)
+		} else if err = h.supervisor.Reconfigure(next); err == nil {
 			if err = publish(); err != nil {
 				if rollback := h.supervisor.Reconfigure(previous); rollback != nil {
 					h.mu.Lock()

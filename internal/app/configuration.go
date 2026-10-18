@@ -1555,10 +1555,10 @@ func (s *Service) commitWorkerSettings(previous, next config.Config) (config.Con
 	if err != nil || current.Config == nil {
 		return previous, errors.New("worker settings inspection unavailable")
 	}
-	runtimeConfig, err := next.RuntimeHarness(*current.Config)
-	if err != nil {
-		return previous, err
-	}
+	// The complete selection is valid even when its command is unavailable.
+	// The worker's canonical validator owns that availability decision and
+	// refuses to replace a running provider with an unavailable selection.
+	runtimeConfig, _ := next.RuntimeHarness(*current.Config)
 	before, err := previous.Encode()
 	if err != nil {
 		return previous, err

@@ -221,27 +221,27 @@ func TestWorkerConfigurationCanonicalCommitFenceAndFailure(t *testing.T) {
 			next.Model = "new"
 			saved := "old"
 			initialSelection := target.selection
-			host.settings = func(_ string, current, desired HarnessConfig, _ WorkerSettings) (func() error, func() error, error) {
-				return func() error {
-						// CommitInference holds the dispatch snapshot fence here.
-						if target.selection != initialSelection {
-							t.Error("runtime changed before canonical persistence")
-						}
-						if stage == "save" {
-							return errors.New("synthetic save failure")
-						}
-						saved = "new"
-						if stage == "publication" || stage == "restore" {
-							_ = os.Remove(host.recordPath)
-						}
-						return nil
-					}, func() error {
-						if stage == "restore" {
-							return errors.New("synthetic restoration failure")
-						}
-						saved = "old"
-						return nil
-					}, nil
+			host.settings = func(_ string, current, desired HarnessConfig, _ WorkerSettings) (WorkerSettingsPlan, error) {
+				return WorkerSettingsPlan{Commit: func() error {
+					// CommitInference holds the dispatch snapshot fence here.
+					if target.selection != initialSelection {
+						t.Error("runtime changed before canonical persistence")
+					}
+					if stage == "save" {
+						return errors.New("synthetic save failure")
+					}
+					saved = "new"
+					if stage == "publication" || stage == "restore" {
+						_ = os.Remove(host.recordPath)
+					}
+					return nil
+				}, Restore: func() error {
+					if stage == "restore" {
+						return errors.New("synthetic restoration failure")
+					}
+					saved = "old"
+					return nil
+				}}, nil
 			}
 			reply := host.apply(WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: ConfigDigest(previous), Settings: &WorkerSettings{}})
 			if stage == "success" {
@@ -256,6 +256,84 @@ func TestWorkerConfigurationCanonicalCommitFenceAndFailure(t *testing.T) {
 				case <-host.stop:
 				default:
 					t.Fatal("unrestored settings kept admitting provider work")
+				}
+			}
+		})
+	}
+}
+
+func TestWorkerConfigurationUnavailableCanonicalCommitAndFailure(t *testing.T) {
+	for _, stage := range []string{"success", "save", "publication", "restore", "running", "retained", "stale"} {
+		t.Run(stage, func(t *testing.T) {
+			host, target := newWorkerConfigurationHost(t)
+			previous := host.supervisor.HarnessConfig()
+			if stage != "running" {
+				if err := host.supervisor.Close(); err != nil {
+					t.Fatal(err)
+				}
+				registry := NewRegistry()
+				registry.Register(previous.Name, func(HarnessConfig) (Harness, error) { return nil, errors.New("synthetic missing command") })
+				host.supervisor = NewSupervisor(registry, previous)
+				if err := host.supervisor.Start(t.Context()); err == nil {
+					t.Fatal("unavailable fixture started")
+				}
+				t.Cleanup(func() { _ = host.supervisor.Close() })
+			}
+			next := previous
+			next.Model = "saved-intent"
+			if stage == "running" {
+				next.Command = "synthetic-missing-command"
+			}
+			saved, commits := "old", 0
+			missing := errors.New("synthetic missing command")
+			host.settings = func(string, HarnessConfig, HarnessConfig, WorkerSettings) (WorkerSettingsPlan, error) {
+				return WorkerSettingsPlan{Unavailable: missing, Commit: func() error {
+					commits++
+					if stage == "save" {
+						return errors.New("synthetic save failure")
+					}
+					saved = "new"
+					if stage == "publication" || stage == "restore" {
+						_ = os.Remove(host.recordPath)
+					}
+					return nil
+				}, Restore: func() error {
+					if stage == "restore" {
+						return errors.New("synthetic restoration failure")
+					}
+					saved = "old"
+					return nil
+				}}, nil
+			}
+			request := WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: ConfigDigest(previous), Settings: &WorkerSettings{}}
+			if stage == "retained" {
+				host.executions[1] = &workerExecution{WorkerExecution: WorkerExecution{Done: true}}
+			}
+			if stage == "stale" {
+				request.ExpectedConfig = [32]byte{}
+			}
+			reply := host.apply(request)
+			if stage == "success" {
+				if reply.Error != "" || saved != "new" || host.supervisor.HarnessConfig().Model != next.Model || host.info.ConfigDigest != ConfigDigest(next) {
+					t.Fatal("unavailable intent did not commit", reply.Error)
+				}
+				if available, detail := host.supervisor.Available(); available || detail != missing.Error() {
+					t.Fatal("saving unavailable intent invented readiness")
+				}
+			} else if reply.Error == "" || host.supervisor.HarnessConfig().Model != previous.Model || host.info.ConfigDigest != ConfigDigest(previous) || stage != "restore" && saved != "old" {
+				t.Fatal("refused unavailable commit changed selection", reply.Error)
+			}
+			if stage == "running" && (commits != 0 || target.closed) {
+				t.Fatal("unavailable intent replaced a running provider")
+			}
+			if (stage == "retained" || stage == "stale") && commits != 0 {
+				t.Fatal("unavailable intent bypassed delivery or configuration fencing")
+			}
+			if stage == "restore" {
+				select {
+				case <-host.stop:
+				default:
+					t.Fatal("unrestored canonical intent kept the worker alive")
 				}
 			}
 		})

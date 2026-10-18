@@ -337,6 +337,12 @@ func (s *Supervisor) Reconfigure(cfg HarnessConfig) error {
 // intent and remain usable; it never replaces a working harness with a broken
 // selection.
 func (s *Supervisor) ConfigureUnavailable(cfg HarnessConfig, cause error) error {
+	return s.CommitUnavailable(cfg, cause, func() error { return nil })
+}
+
+// CommitUnavailable saves valid intent under the dispatch fence only when no
+// provider is running. Failed persistence leaves the previous selection intact.
+func (s *Supervisor) CommitUnavailable(cfg HarnessConfig, cause error, commit func() error) error {
 	s.operationMu.Lock()
 	defer s.operationMu.Unlock()
 	s.mu.Lock()
@@ -347,8 +353,14 @@ func (s *Supervisor) ConfigureUnavailable(cfg HarnessConfig, cause error) error 
 	if len(s.active) > 0 {
 		return errors.New("cannot change the harness while a harness turn is active; use /stop or wait for completion")
 	}
+	if cause == nil || commit == nil {
+		return errors.New("unavailable harness requires a cause and configuration commit")
+	}
 	if s.current != nil {
 		return cause
+	}
+	if err := commit(); err != nil {
+		return err
 	}
 	s.config = cfg
 	s.startErr = cause

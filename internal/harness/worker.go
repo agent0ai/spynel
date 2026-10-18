@@ -85,9 +85,16 @@ type WorkerSettings struct {
 	YAML     []byte
 }
 
-// WorkerSettingsAction prepares canonical persistence and restoration. Both
-// callbacks run under the worker's configuration/dispatch fence, without RPCs.
-type WorkerSettingsAction func(root string, current, next HarnessConfig, settings WorkerSettings) (commit, restore func() error, err error)
+// WorkerSettingsPlan separates valid saved intent from provider availability.
+// Only the trusted canonical-settings validator supplies Unavailable.
+type WorkerSettingsPlan struct {
+	Commit, Restore func() error
+	Unavailable     error
+}
+
+// WorkerSettingsAction validates canonical selection and prepares persistence.
+// The callbacks run under the worker's configuration/dispatch fence, without RPCs.
+type WorkerSettingsAction func(root string, current, next HarnessConfig, settings WorkerSettings) (WorkerSettingsPlan, error)
 
 // WorkerConversationAction reserves sources when sendErr is nil, or restores
 // the exact ordinary batch after SendNotAdmittedError. It runs inside the
