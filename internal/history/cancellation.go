@@ -32,7 +32,7 @@ func (s *Store) SetConversationCancellation(channel, conversation, executionID, 
 			return errors.New("conversation cancellation source is absent from history")
 		}
 		for _, id := range sources {
-			if snapshot.admittedExecution[id] != executionID {
+			if snapshot.admissions[id].execution != executionID {
 				return errors.New("conversation cancellation admission changed or is unavailable")
 			}
 		}

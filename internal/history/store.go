@@ -25,30 +25,31 @@ const (
 )
 
 type Entry struct {
-	At               time.Time `json:"at"`
-	Role             string    `json:"role"`
-	Sender           string    `json:"sender,omitempty"`
-	ReplyTo          string    `json:"reply_to,omitempty"`
-	Content          string    `json:"content"`
-	EventID          string    `json:"event_id,omitempty"`
-	ReceiptID        string    `json:"receipt_id,omitempty"`
-	ReceiptHash      string    `json:"receipt_hash,omitempty"`
-	AfterChars       int       `json:"after_chars,omitempty"`
-	Terminal         bool      `json:"terminal,omitempty"`
-	FinalText        *string   `json:"final_text,omitempty"`
-	Continues        bool      `json:"continues,omitempty"`
-	SourceMessageID  string    `json:"source_message_id,omitempty"`
-	AcceptedAt       time.Time `json:"accepted_at,omitempty"`
-	ExecutionID      string    `json:"execution_id,omitempty"`
-	Admission        string    `json:"admission,omitempty"`
-	AdmittedSources  []string  `json:"admitted_sources,omitempty"`
-	Covers           []string  `json:"covers,omitempty"`
-	Outcome          string    `json:"outcome,omitempty"`
-	CancellationID   string    `json:"cancellation_id,omitempty"`
-	RetriggerOf      []string  `json:"retrigger_of,omitempty"`
-	Recovery         bool      `json:"recovery,omitempty"`
-	RecoveryBaseline bool      `json:"recovery_baseline,omitempty"`
-	compact          bool
+	At                time.Time `json:"at"`
+	Role              string    `json:"role"`
+	Sender            string    `json:"sender,omitempty"`
+	ReplyTo           string    `json:"reply_to,omitempty"`
+	Content           string    `json:"content"`
+	EventID           string    `json:"event_id,omitempty"`
+	ReceiptID         string    `json:"receipt_id,omitempty"`
+	ReceiptHash       string    `json:"receipt_hash,omitempty"`
+	AfterChars        int       `json:"after_chars,omitempty"`
+	Terminal          bool      `json:"terminal,omitempty"`
+	FinalText         *string   `json:"final_text,omitempty"`
+	Continues         bool      `json:"continues,omitempty"`
+	SourceMessageID   string    `json:"source_message_id,omitempty"`
+	AcceptedAt        time.Time `json:"accepted_at,omitempty"`
+	ExecutionID       string    `json:"execution_id,omitempty"`
+	Admission         string    `json:"admission,omitempty"`
+	AdmittedSources   []string  `json:"admitted_sources,omitempty"`
+	RestoresAdmission string    `json:"restores_admission,omitempty"`
+	Covers            []string  `json:"covers,omitempty"`
+	Outcome           string    `json:"outcome,omitempty"`
+	CancellationID    string    `json:"cancellation_id,omitempty"`
+	RetriggerOf       []string  `json:"retrigger_of,omitempty"`
+	Recovery          bool      `json:"recovery,omitempty"`
+	RecoveryBaseline  bool      `json:"recovery_baseline,omitempty"`
+	compact           bool
 }
 
 // ActivateRecovery establishes the forward-only correlation boundary. The
@@ -726,14 +727,19 @@ const maxRecoveryWindowBytes = 8 * 1024 * 1024
 // RecoverySnapshot retains recent user bodies and only their exact correlation.
 // Records counts recent records in this page, including replies and ledgers.
 type RecoverySnapshot struct {
-	Entries           []Entry
-	Covered           map[string]string
-	Admitted          map[string]bool
-	Records           int
-	Next              int
-	More              bool
-	recoveryAdmitted  map[string]bool
-	admittedExecution map[string]string
+	Entries          []Entry
+	Covered          map[string]string
+	Admitted         map[string]bool
+	Records          int
+	Next             int
+	More             bool
+	recoveryAdmitted map[string]bool
+	admissions       map[string]conversationAdmission
+}
+
+type conversationAdmission struct {
+	execution, receipt string
+	batchSize          int
 }
 
 // RecoveryWindow returns the first bounded page of recent history. Callers
@@ -753,7 +759,7 @@ func (s *Store) RecoveryPage(channel, conversation string, cutoff time.Time, aft
 }
 
 func (s *Store) recoveryWindowLocked(channel, conversation string, cutoff time.Time, after, max int, requested []string) (RecoverySnapshot, error) {
-	result := RecoverySnapshot{Covered: map[string]string{}, Admitted: map[string]bool{}, recoveryAdmitted: map[string]bool{}, admittedExecution: map[string]string{}}
+	result := RecoverySnapshot{Covered: map[string]string{}, Admitted: map[string]bool{}, recoveryAdmitted: map[string]bool{}, admissions: map[string]conversationAdmission{}}
 	if max <= 0 || after < 0 {
 		return result, errors.New("invalid recovery page bounds")
 	}
@@ -837,8 +843,27 @@ func (s *Store) recoveryWindowLocked(channel, conversation string, cutoff time.T
 			clear(result.Covered)
 			clear(result.Admitted)
 			clear(result.recoveryAdmitted)
-			clear(result.admittedExecution)
+			clear(result.admissions)
 			clear(cancellation)
+		}
+		if entry.RestoresAdmission != "" || entry.Outcome == "admission_restored" {
+			if entry.Role != "correlation" || entry.Outcome != "admission_restored" ||
+				validateReceiptIdentity(entry.RestoresAdmission) != nil || validateConversationSources(entry.ExecutionID, entry.AdmittedSources) != nil ||
+				entry.Admission != "" || entry.SourceMessageID != "" || len(entry.Covers) != 0 || len(entry.RetriggerOf) != 0 || entry.CancellationID != "" || entry.Recovery || entry.RecoveryBaseline {
+				return ErrRecoveryCorrupt
+			}
+			for _, id := range entry.AdmittedSources {
+				if !wanted[id] {
+					continue
+				}
+				if result.recoveryAdmitted[id] || result.admissions[id] != (conversationAdmission{execution: entry.ExecutionID, receipt: entry.RestoresAdmission, batchSize: len(entry.AdmittedSources)}) {
+					return ErrRecoveryCorrupt
+				}
+				delete(result.Admitted, id)
+				delete(result.admissions, id)
+				delete(result.recoveryAdmitted, id)
+			}
+			return nil
 		}
 		if entry.CancellationID != "" || entry.Outcome == "cancellation_requested" || entry.Outcome == "cancellation_restored" {
 			if !validConversationIdentity(entry.CancellationID) || entry.Role != "correlation" || (entry.Outcome != "cancellation_requested" && entry.Outcome != "cancellation_restored") || validateConversationSources(entry.ExecutionID, entry.Covers) != nil {
@@ -874,12 +899,12 @@ func (s *Store) recoveryWindowLocked(channel, conversation string, cutoff time.T
 		}
 		if wanted[entry.SourceMessageID] && entry.Admission != "" {
 			result.Admitted[entry.SourceMessageID] = true
-			result.admittedExecution[entry.SourceMessageID] = entry.ExecutionID
+			result.admissions[entry.SourceMessageID] = conversationAdmission{execution: entry.ExecutionID, receipt: entry.ReceiptID, batchSize: 1}
 		}
 		for _, id := range entry.AdmittedSources {
 			if wanted[id] {
 				result.Admitted[id] = true
-				result.admittedExecution[id] = entry.ExecutionID
+				result.admissions[id] = conversationAdmission{execution: entry.ExecutionID, receipt: entry.ReceiptID, batchSize: len(entry.AdmittedSources)}
 				if entry.Recovery {
 					result.recoveryAdmitted[id] = true
 				}

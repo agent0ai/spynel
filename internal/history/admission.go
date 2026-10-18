@@ -1,13 +1,49 @@
 package history
 
 import (
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
 )
+
+// RestoreConversationAdmission releases an exact ordinary batch after proven
+// non-admission. The caller must hold the exact cross-process owner fence and
+// retain uncertain delivery. Recovery reservations, coverage and cancellation
+// are never released by this operation.
+func (s *Store) RestoreConversationAdmission(channel, conversation, executionID, admissionReceipt string, sources []string) error {
+	if err := validateConversationSources(executionID, sources); err != nil {
+		return err
+	}
+	if err := validateReceiptIdentity(admissionReceipt); err != nil {
+		return err
+	}
+	entry := Entry{Role: "correlation", ExecutionID: executionID, AdmittedSources: sources, RestoresAdmission: admissionReceipt, Outcome: "admission_restored"}
+	// Admission receipts may already occupy the full identity bound.
+	receipt := fmt.Sprintf("admission-restore:%x", sha256.Sum256([]byte(admissionReceipt)))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.appendOnceLocked(channel, conversation, receipt, entry, func() error {
+		snapshot, err := s.recoveryWindowLocked(channel, conversation, time.Time{}, 0, len(sources), sources)
+		if err != nil {
+			return err
+		}
+		if len(snapshot.Entries) != len(sources) {
+			return errors.New("conversation restoration source is absent from history")
+		}
+		for _, id := range sources {
+			if snapshot.recoveryAdmitted[id] || snapshot.admissions[id] != (conversationAdmission{execution: executionID, receipt: admissionReceipt, batchSize: len(sources)}) {
+				return errors.New("conversation restoration admission changed or batch is incomplete")
+			}
+		}
+		return nil
+	})
+	return err
+}
 
 // AdmitConversation validates and syncs the complete source batch in one
 // receipted record. Its caller must hold the exact cross-process owner fence.

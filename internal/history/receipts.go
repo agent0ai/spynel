@@ -24,9 +24,16 @@ func (s *Store) AppendOnce(channel, conversation, receipt string, entry Entry) (
 	return s.appendOnceLocked(channel, conversation, receipt, entry, nil)
 }
 
-func (s *Store) appendOnceLocked(channel, conversation, receipt string, entry Entry, validate func() error) (bool, error) {
+func validateReceiptIdentity(receipt string) error {
 	if receipt == "" || len(receipt) > 256 || !utf8.ValidString(receipt) || strings.IndexFunc(receipt, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
-		return false, errors.New("invalid history receipt identity")
+		return errors.New("invalid history receipt identity")
+	}
+	return nil
+}
+
+func (s *Store) appendOnceLocked(channel, conversation, receipt string, entry Entry, validate func() error) (bool, error) {
+	if err := validateReceiptIdentity(receipt); err != nil {
+		return false, err
 	}
 	if entry.ReceiptID != "" || entry.ReceiptHash != "" || entry.Role != "assistant" && entry.Role != "error" && entry.Role != "correlation" {
 		return false, errors.New("invalid receipted history effect")
