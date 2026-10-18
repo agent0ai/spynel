@@ -339,3 +339,26 @@ func TestWorkerConfigurationUnavailableCanonicalCommitAndFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkerUnavailableSettingsPreservesPendingProviderShutdown(t *testing.T) {
+	host, _ := newWorkerConfigurationHost(t)
+	previous := host.supervisor.HarnessConfig()
+	failed := &uncertainCloseHarness{supervisorHarness: supervisorHarness{startErr: errors.New("synthetic startup failure"), active: map[string]bool{}, emits: map[string]core.Emit{}}}
+	host.supervisor.registry.Register("unconfirmed-close", func(HarnessConfig) (Harness, error) { return failed, nil })
+	broken := previous
+	broken.Name = "unconfirmed-close"
+	first := host.apply(WorkerRequest{Action: "configure", Config: &broken, ExpectedConfig: ConfigDigest(previous)})
+	if !strings.Contains(first.Error, errProviderShutdownPending.Error()) {
+		t.Fatal("fixture did not retain unconfirmed provider shutdown", first.Error)
+	}
+	next := previous
+	next.Name = "unavailable-selection"
+	committed := false
+	host.settings = func(string, HarnessConfig, HarnessConfig, WorkerSettings) (WorkerSettingsPlan, error) {
+		return WorkerSettingsPlan{Unavailable: errors.New("synthetic missing command"), Commit: func() error { committed = true; return nil }, Restore: func() error { committed = false; return nil }}, nil
+	}
+	reply := host.apply(WorkerRequest{Action: "configure", Config: &next, ExpectedConfig: ConfigDigest(previous), Settings: &WorkerSettings{}})
+	if !strings.Contains(reply.Error, errProviderShutdownPending.Error()) || committed || host.supervisor.HarnessConfig().Name != previous.Name || host.info.ConfigDigest != ConfigDigest(previous) {
+		t.Fatal("unavailable intent bypassed unconfirmed provider shutdown", reply.Error)
+	}
+}

@@ -359,6 +359,9 @@ func (s *Supervisor) CommitUnavailable(cfg HarnessConfig, cause error, commit fu
 	if s.current != nil {
 		return cause
 	}
+	if s.closing != nil {
+		return errProviderShutdownPending
+	}
 	if err := commit(); err != nil {
 		return err
 	}

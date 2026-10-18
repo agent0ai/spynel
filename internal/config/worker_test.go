@@ -115,6 +115,7 @@ func TestWorkerSettingsUnavailableSelectionRemainsCanonical(t *testing.T) {
 			previous, current := workerSettingsConfig(t)
 			t.Setenv("PATH", t.TempDir())
 			t.Setenv("HOME", t.TempDir())
+			t.Setenv("USERPROFILE", t.TempDir())
 			if _, err := SetSettings(&previous, map[string]string{"harness.name": name, "harness.acp_command": filepath.Join(previous.Root, "missing custom provider"), "harness.model": "", "harness.reasoning_effort": "inherit"}); err != nil {
 				t.Fatal(err)
 			}
