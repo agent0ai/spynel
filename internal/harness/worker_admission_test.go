@@ -41,7 +41,7 @@ func TestWorkerUnknownSendRetainsExecutionUntilProviderTerminal(t *testing.T) {
 	for _, role := range []string{"conversation", "workflow", "agent"} {
 		t.Run(role, func(t *testing.T) {
 			root := t.TempDir()
-			target := &workerSendErrorHarness{supervisorHarness: &supervisorHarness{active: map[string]bool{}, emits: map[string]core.Emit{}}}
+			target := &workerSendErrorHarness{supervisorHarness: &supervisorHarness{active: map[string]bool{}, emits: map[string]core.Emit{}}, returnErr: errors.Join(errors.New("synthetic acknowledgement failed after effect"), context.DeadlineExceeded)}
 			supervisor := NewSupervisor(NewRegistry(), HarnessConfig{Cwd: root})
 			supervisor.current, supervisor.ctx = target, context.Background()
 			host := &workerHost{supervisor: supervisor, directory: root, next: 1, executions: map[uint64]*workerExecution{}, stop: make(chan struct{})}

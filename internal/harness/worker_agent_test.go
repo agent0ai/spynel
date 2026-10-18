@@ -18,7 +18,7 @@ type deadlineAgentHarness struct{ *supervisorHarness }
 
 func (h *deadlineAgentHarness) Send(ctx context.Context, _, _ string, _ core.Emit) (string, bool, error) {
 	<-ctx.Done()
-	return "", false, ctx.Err()
+	return "", false, &SendNotAdmittedError{Err: ctx.Err()}
 }
 
 func (h *deadlineAgentHarness) SendWithModel(ctx context.Context, key, prompt, _ string, emit core.Emit) (string, bool, error) {
