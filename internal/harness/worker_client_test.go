@@ -174,7 +174,7 @@ func TestWorkerDiscoveryAdoptsAllAdaptersWithoutAdmission(t *testing.T) {
 		{"codex", "codex-worker"}, {"claude-code", "claude-interrupt"}, {"pi", "pi-interrupt"}, {"acp", "acp-interrupt"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
-			fixture := newWorkerFixture(t, scenario.name, scenario.mode)
+			fixture := newWorkerFixture(t, scenario.name, scenario.mode, func(cfg *HarnessConfig) { cfg.Version = "synthetic-initial-version" })
 			before, err := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term)
 			if err != nil {
 				t.Fatal(err)
@@ -182,7 +182,15 @@ func TestWorkerDiscoveryAdoptsAllAdaptersWithoutAdmission(t *testing.T) {
 			defer before.Close()
 			workerClientCall(t, before, WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/discovery", Prompt: "synthetic discovery"})
 			fixture.replaceOwner(t)
-			after, err := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term)
+			successor := fixture.config
+			successor.Version = "synthetic-next-version"
+			changed := successor
+			changed.Model = "different-selection"
+			if client, err := OpenWorker(t.Context(), changed, fixture.owner.ID(), fixture.term); err == nil {
+				client.Close()
+				t.Fatal("version compatibility admitted changed runtime settings")
+			}
+			after, err := OpenWorker(t.Context(), successor, fixture.owner.ID(), fixture.term)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -195,7 +203,7 @@ func TestWorkerDiscoveryAdoptsAllAdaptersWithoutAdmission(t *testing.T) {
 				t.Fatal("obsolete client could cancel retained work")
 			}
 			reply := workerClientCall(t, after, WorkerRequest{Action: "inspect"})
-			if reply.NextSequence != 2 || len(reply.Executions) != 1 || reply.Executions[0].Done {
+			if reply.NextSequence != 2 || len(reply.Executions) != 1 || reply.Executions[0].Done || reply.Config == nil || reply.Config.Version != fixture.config.Version {
 				t.Fatal("discovery admitted or lost existing work")
 			}
 			if !workerClientCall(t, after, WorkerRequest{Action: "interrupt", Key: "synthetic/discovery"}).Interrupted {

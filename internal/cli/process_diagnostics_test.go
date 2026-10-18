@@ -69,8 +69,12 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
-	if len(os.Args) == 3 && os.Args[1] == "__primary_worker_fixture" {
-		if err := Run([]string{"serve", "--automatic-startup", "--config", os.Args[2]}, "synthetic-version"); err != nil {
+	if (len(os.Args) == 3 || len(os.Args) == 4) && os.Args[1] == "__primary_worker_fixture" {
+		version := "synthetic-version"
+		if len(os.Args) == 4 {
+			version = os.Args[3]
+		}
+		if err := Run([]string{"serve", "--automatic-startup", "--config", os.Args[2]}, version); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

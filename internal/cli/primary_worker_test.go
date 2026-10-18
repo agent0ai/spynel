@@ -5,6 +5,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,14 @@ import (
 )
 
 func TestPrimaryWorkerSurvivesOrdinaryControllerReplacement(t *testing.T) {
+	testPrimaryWorkerContinuity(t, []string{"synthetic-version", "synthetic-version", "synthetic-version"})
+}
+
+func TestPrimaryWorkerSurvivesVersionChangingControllerReplacement(t *testing.T) {
+	testPrimaryWorkerContinuity(t, []string{"synthetic-version", "synthetic-next-version", "synthetic-final-version"})
+}
+
+func testPrimaryWorkerContinuity(t *testing.T, versions []string) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
 	bin := t.TempDir()
@@ -63,6 +72,7 @@ func TestPrimaryWorkerSurvivesOrdinaryControllerReplacement(t *testing.T) {
 	defer api.HTTP.CloseIdleConnections()
 	var controller *exec.Cmd
 	var controllerDone chan error
+	version := versions[0]
 	start := func() {
 		t.Helper()
 		log, err := os.CreateTemp(root, "controller-*.log")
@@ -70,7 +80,7 @@ func TestPrimaryWorkerSurvivesOrdinaryControllerReplacement(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer log.Close()
-		controller = exec.Command(executable, "__primary_worker_fixture", cfg.Path)
+		controller = exec.Command(executable, "__primary_worker_fixture", cfg.Path, version)
 		controller.Stdout, controller.Stderr = log, log
 		if err := controller.Start(); err != nil {
 			t.Fatal(err)
@@ -81,6 +91,10 @@ func TestPrimaryWorkerSurvivesOrdinaryControllerReplacement(t *testing.T) {
 		defer cancel()
 		if _, err := api.WaitReady(ctx); err != nil {
 			t.Fatal("ordinary primary readiness", err)
+		}
+		status, err := api.Status(ctx, "cli/surviving")
+		if err != nil || status.Version != version {
+			t.Fatal("ordinary controller did not serve its selected version", err)
 		}
 	}
 	stop := func(signal os.Signal) {
@@ -121,6 +135,7 @@ func TestPrimaryWorkerSurvivesOrdinaryControllerReplacement(t *testing.T) {
 		}
 		if worker != nil {
 			waitWorkerAgent(t, func() bool { _, err := os.Stat(filepath.Dir(worker.Info().Socket)); return os.IsNotExist(err) })
+			waitWorkerAgent(t, func() bool { return errors.Is(updater.VerifyProcess(worker.Info().Process), syscall.ESRCH) })
 		}
 	})
 	start()
@@ -141,7 +156,7 @@ func TestPrimaryWorkerSurvivesOrdinaryControllerReplacement(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		runtime, err := cfg.RuntimeHarness(harness.HarnessConfig{Version: "synthetic-version"})
+		runtime, err := cfg.RuntimeHarness(harness.HarnessConfig{Version: version})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -171,7 +186,7 @@ func TestPrimaryWorkerSurvivesOrdinaryControllerReplacement(t *testing.T) {
 	}
 	waitWorkerAgent(t, func() bool { return len(inspect().Executions) == 1 && inspect().Executions[0].ThreadID != "" })
 	initial := inspect().Executions[0]
-	for _, signal := range []os.Signal{syscall.SIGTERM, syscall.SIGKILL} {
+	for index, signal := range []os.Signal{syscall.SIGTERM, syscall.SIGKILL} {
 		obsolete := worker
 		stop(signal)
 		if signal == syscall.SIGTERM {
@@ -185,6 +200,7 @@ func TestPrimaryWorkerSurvivesOrdinaryControllerReplacement(t *testing.T) {
 		if err := updater.VerifyProcess(record.Info.Process); err != nil {
 			t.Fatal("controller exit killed the independent worker", err)
 		}
+		version = versions[index+1]
 		start() // Abrupt exit uses ordinary stale takeover, without lease edits.
 		open()
 		if _, err := obsolete.Call(t.Context(), harness.WorkerRequest{Action: "interrupt", Key: initial.Key}); err == nil {
@@ -195,6 +211,14 @@ func TestPrimaryWorkerSurvivesOrdinaryControllerReplacement(t *testing.T) {
 		if len(current) != 1 || current[0].Sequence != initial.Sequence || current[0].ThreadID != initial.ThreadID || current[0].Done || current[0].ConversationTurns != initial.ConversationTurns {
 			t.Fatal("ordinary primary replaced or completed the retained provider turn")
 		}
+	}
+	// Settings must use the retained worker's runtime after a version change.
+	if err := api.ApplySettings(t.Context(), map[string]string{"harness.model": "model-a"}); err != nil {
+		t.Fatal("successor canonical settings", err)
+	}
+	configured := inspect()
+	if configured.Config == nil || configured.Config.Version != versions[0] || configured.Config.Model != "model-a" {
+		t.Fatal("successor settings changed worker image metadata or lost the selection")
 	}
 	if err := api.Handle(t.Context(), core.Message{Channel: "cli", Conversation: "surviving", Text: "/stop", SourceMessageID: "stop"}, func(core.Event) {}); err != nil {
 		t.Fatal("successor application interruption", err)

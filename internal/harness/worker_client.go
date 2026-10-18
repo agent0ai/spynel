@@ -305,9 +305,15 @@ func (c *WorkerClient) Call(ctx context.Context, request WorkerRequest) (WorkerR
 	return reply, nil
 }
 
-// ConfigDigest binds the wire-visible runtime selection, excluding process-owned writers.
+// ConfigDigest binds a runtime selection to its worker compatibility contract.
+// Version identifies the native image, not a provider setting; a compatible
+// successor retains that image and its original provider client metadata.
 func ConfigDigest(cfg HarnessConfig) [32]byte {
-	data, _ := json.Marshal(cfg)
+	cfg.Version = ""
+	data, _ := json.Marshal(struct {
+		Protocol int
+		Config   HarnessConfig
+	}{WorkerProtocol, cfg})
 	return sha256.Sum256(data)
 }
 
