@@ -113,7 +113,8 @@ for line in sys.stdin:
         env = {k: v for k, v in os.environ.items() if not k.startswith("SPYNEL_")}
         env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"), XDG_RUNTIME_DIR=str(temp / "run"), TERM="xterm-256color", SPYNEL_SKIP_UPDATE_CHECK="1", PATH=str(tools) + os.pathsep + os.environ["PATH"], INSTANCE_TEST_PACKAGE=str(package), INSTANCE_TEST_REPLACEMENT=str(replacement), INSTANCE_TEST_CALLS=str(temp / "npm-calls"), INSTANCE_TEST_PROVIDER_EVENTS=str(temp / "provider-events"), INSTANCE_TEST_COMPLETE=str(temp / "complete"))
         processes, terminals, logs = [], [], []
-        request = None
+        requests = []
+        unrelated = None
         registry = home / ("Library/Application Support" if sys.platform == "darwin" else ".config") / "spynel" / "processes"
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -184,6 +185,7 @@ for line in sys.stdin:
                 pass
 
         try:
+            unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             workspaces = [temp / "workspace one", temp / "workspace two", temp / "older launcher workspace"]
             for workspace in workspaces:
                 workspace.mkdir()
@@ -211,6 +213,7 @@ for line in sys.stdin:
             request_log = (temp / "request.log").open("w")
             logs.append(request_log)
             request = subprocess.Popen([*launcher, "send", "--conversation", "installation-continuity", "synthetic installation continuity request"], cwd=workspaces[0], env=env, stdin=subprocess.DEVNULL, stdout=request_log, stderr=request_log)
+            requests.append(request)
             wait_for(lambda: len([e for e in provider_events() if e["event"] == "prompt"]) == 1)
             active_provider = next(e["pid"] for e in provider_events() if e["event"] == "prompt")
             provider_starts = [e for e in provider_events() if e["event"] == "started"]
@@ -316,12 +319,68 @@ assert sys.argv[1] == "check-restartable", sys.argv
             assert recovered.returncode == 0 and "Restarting" in recovered.stdout, recovered
             wait_for(lambda: any(record["installation"] == str(legacy) and record["ready"] and record["version"] == version and record["generation"] != before_recovery["generation"] for record in records()))
             assert legacy_calls.read_text() == "update\n", "already-current recovery invoked npm replacement"
-            print("Verified npm image replacement and current-version channel update preserve native workers and one active ACP turn/result, cross-workspace ready generations and PTYs, exact v0.12.14 stale-launcher refusal, and fresh-launcher recovery.")
+
+            # Explicit teardown must stop live work, unlike controller restart.
+            Path(env["INSTANCE_TEST_COMPLETE"]).unlink()
+            for command, workspace in ((launcher, workspaces[0]), (legacy_launcher, workspaces[2])):
+                requests.append(subprocess.Popen([*command, "send", "--conversation", "active-teardown", "synthetic active teardown request"], cwd=workspace, env=env, stdin=subprocess.DEVNULL, stdout=request_log, stderr=request_log))
+            wait_for(lambda: len([e for e in provider_events() if e["event"] == "prompt"]) == 3)
+            assert len([e for e in provider_events() if e["event"] == "completed"]) == 1
+            active = [e["pid"] for e in provider_events() if e["event"] == "prompt"][-2:]
+            active_starts = {pid: native_start(pid) for pid in active}
+            assert all(active_starts.values()), "teardown provider already exited"
+            before_uninstall = records(workers=None)
+            owned = [r for r in before_uninstall if r["installation"] == str(package)]
+            other = [r for r in before_uninstall if r["installation"] == str(legacy)]
+            assert owned and other and any(r.get("harness_worker") for r in owned) and any(r.get("harness_worker") for r in other)
+            worker_roots = {}
+            for path in (registry.parent / "harness").glob("*.lock.worker.json"):
+                info = json.loads(path.read_text())["Info"]
+                worker_roots[info["PID"]] = (path, Path(info["Socket"]).parent)
+            assert set(worker_roots) == {r["pid"] for r in before_uninstall if r.get("harness_worker")}
+            configurations = {workspace / ".spynel" / "config.yaml": (workspace / ".spynel" / "config.yaml").read_bytes() for workspace in workspaces}
+            evidence("active_teardown_before_uninstall", records=before_uninstall, provider_starts=active_starts, worker_roots={pid: [str(p) for p in paths] for pid, paths in worker_roots.items()}, unrelated_pid=unrelated.pid, unrelated_start=native_start(unrelated.pid))
+            binary = replacement / "npm" / "vendor" / "spynel"
+            removed = subprocess.run([str(binary), "uninstall-bundles", "--root", str(temp / "absent-standalone"), "--npm-root", str(package)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=40)
+            assert removed.returncode == 0, removed.stderr
+            assert not package.exists(), "npm installation was not removed"
+            assert all(native_start(r["pid"]) is None for r in owned), "uninstall left an owned process alive"
+            assert all(native_start(r["pid"]) is not None for r in other), "uninstall stopped another installation"
+            assert {r["pid"]: r for r in records(workers=None) if r["installation"] == str(legacy)} == {r["pid"]: r for r in other}, "uninstall changed another installation's generations"
+            assert all(not p.exists() for r in owned if r.get("harness_worker") for p in worker_roots[r["pid"]]), "uninstall retained an owned endpoint or rendezvous"
+            assert all(p.exists() for r in other if r.get("harness_worker") for p in worker_roots[r["pid"]]), "uninstall removed another worker's state"
+            assert sum(native_start(pid) == start for pid, start in active_starts.items()) == 1, "uninstall did not preserve exactly the other installation's provider"
+            assert unrelated.poll() is None, "uninstall stopped an unrelated process"
+            assert all(path.read_bytes() == content for path, content in configurations.items())
+            for process in processes[:3]:
+                process.wait(timeout=10)
+            evidence("active_uninstall_passed", stopped=owned, preserved=other)
+
+            # Discovery sees the host's native processes despite private HOME;
+            # exercise the same stop boundary through this installation only.
+            stopped = subprocess.run([str(binary), "uninstall-bundles", "--root", str(temp / "absent-standalone"), "--npm-root", str(legacy)], cwd=workspaces[2], env={**env, "INSTANCE_TEST_PACKAGE": str(legacy)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=40)
+            assert stopped.returncode == 0, stopped.stderr
+            assert all(native_start(r["pid"]) is None for r in other), "second uninstall left a registered process alive"
+            assert all(native_start(pid) is None for pid in active), "active provider survived teardown"
+            assert not records(workers=True), "active worker survived teardown"
+            assert all(not p.exists() for paths in worker_roots.values() for p in paths), "active worker endpoint or rendezvous survived teardown"
+            assert not legacy.exists() and unrelated.poll() is None, "second uninstall failed or stopped an unrelated process"
+            assert all(path.read_bytes() == content for path, content in configurations.items())
+            assert sum(e.get("role") == "assistant" and e.get("content") == "synthetic installed worker result" for e in completed_history()) == 1, "teardown lost or duplicated the completed result"
+            assert len([e for e in provider_events() if e["event"] == "prompt"]) == 3
+            assert len([e for e in provider_events() if e["event"] == "completed"]) == 1, "teardown invented provider completion"
+            for process in processes:
+                process.wait(timeout=10)
+            evidence("second_active_uninstall_passed", stopped=other, provider_pids=active)
+            print("Verified npm worker/turn continuity, cross-workspace ready generations/PTYs, stale-launcher refusal/recovery, and installation-scoped active uninstall with unrelated-process/workspace preservation.")
         finally:
+            if unrelated is not None:
+                unrelated.terminate()
+                unrelated.wait(timeout=10)
             cleanup_records = records(workers=None)
             cleanup_providers = {e["pid"] for e in provider_events() if e["event"] == "started"}
             evidence("cleanup_owned_identities", records=cleanup_records, provider_pids=sorted(cleanup_providers))
-            if request is not None:
+            for request in requests:
                 if request.poll() is None:
                     request.terminate()
                 request.wait(timeout=10)
