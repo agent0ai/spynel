@@ -331,7 +331,18 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 			}
 		}
 	}()
-	ran, err := election.RunForOwner(bootstrap.InstanceID, bootstrap.TermToken, func() error { return supervisor.Start(workerCtx) })
+	ran, err := election.RunForOwner(bootstrap.InstanceID, bootstrap.TermToken, func() error {
+		if err := workerCtx.Err(); err != nil {
+			return err
+		}
+		// Own the worker even when adapter construction cannot start a provider.
+		if err := supervisor.processOwner.acquire(); err != nil {
+			return err
+		}
+		// Availability reports startup errors; the control plane stays usable.
+		_ = supervisor.Start(workerCtx)
+		return workerCtx.Err()
+	})
 	if err != nil || !ran {
 		return errors.New("worker startup ownership unavailable")
 	}

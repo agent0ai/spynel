@@ -35,7 +35,7 @@ type workerFixture struct {
 	config  HarnessConfig
 }
 
-func newWorkerFixture(t *testing.T, name, mode string) *workerFixture {
+func newWorkerFixture(t *testing.T, name, mode string, configure ...func(*HarnessConfig)) *workerFixture {
 	t.Helper()
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
@@ -53,6 +53,9 @@ func newWorkerFixture(t *testing.T, name, mode string) *workerFixture {
 	bootstrap := WorkerBootstrap{Protocol: WorkerProtocol, Token: token, InstanceID: owner.ID(), TermToken: term, Harness: HarnessConfig{
 		Name: name, Command: provider, Cwd: root, ApprovalPolicy: "plan", Sandbox: "read-only", SessionsFile: filepath.Join(root, "sessions.json"),
 	}}
+	for _, update := range configure {
+		update(&bootstrap.Harness)
+	}
 	data, err := json.Marshal(bootstrap)
 	if err != nil {
 		t.Fatal(err)
