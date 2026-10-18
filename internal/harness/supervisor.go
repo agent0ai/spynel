@@ -478,16 +478,8 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 			}
 			s.mu.Unlock()
 		}
-		if wasActive && steered {
-			// The active turn finished during the failed steering attempt. Retry
-			// as the next ordinary turn instead of losing the follow-up.
-			if !target.IsActive(key) {
-				operation.Unlock()
-				return s.send(ctx, key, prompt, message, emit)
-			}
-			operation.Unlock()
-			return threadID, steered, err
-		}
+		// Completion after a steering error does not prove non-delivery.
+		// Return the original result instead of admitting another provider turn.
 		if !wasActive {
 			s.mu.Lock()
 			delete(s.active, key)

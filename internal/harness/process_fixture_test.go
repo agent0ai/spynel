@@ -653,6 +653,12 @@ func runCodexFixture(mode string) int {
 					Input []struct{ Text string }
 				}
 				_ = json.Unmarshal(message.Params, &params)
+				if len(params.Input) == 1 && params.Input[0].Text == "completed-before-error" {
+					appendFixtureLog(map[string]any{"kind": "effect", "pid": os.Getpid()})
+					write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thr_stop", "turn": map[string]any{"id": "turn_stop", "status": "completed"}}})
+					write(map[string]any{"id": message.ID, "error": map[string]any{"code": -32000, "message": "synthetic acknowledgement failed after effect"}})
+					continue
+				}
 				if len(params.Input) == 1 && params.Input[0].Text == "rejected" {
 					write(map[string]any{"id": message.ID, "error": map[string]any{"code": -32000, "message": "synthetic follow-up refused"}})
 					continue

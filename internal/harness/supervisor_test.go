@@ -789,6 +789,94 @@ func TestSupervisorRejectedFollowupRetainsControlEmitter(t *testing.T) {
 	})
 }
 
+type completedFollowupHarness struct {
+	*supervisorHarness
+	sends int
+	err   error
+}
+
+func (h *completedFollowupHarness) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+	h.sends++
+	if h.sends == 2 {
+		h.finish(key)
+		return h.name + "-thread", true, h.err
+	}
+	return h.supervisorHarness.SendWithModel(ctx, key, prompt, model, emit)
+}
+
+func TestSupervisorCompletedFollowupErrorNeverRedispatches(t *testing.T) {
+	for _, sendErr := range []error{errors.New("acknowledgement unavailable"), context.DeadlineExceeded, errNativeTurnInactive} {
+		t.Run(sendErr.Error(), func(t *testing.T) {
+			target := &completedFollowupHarness{
+				supervisorHarness: &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}},
+				err:               sendErr,
+			}
+			registry := NewRegistry()
+			registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+			supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+			if err := supervisor.Start(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = supervisor.Close() })
+			if _, _, err := supervisor.SendConversation(t.Context(), "job", "original", "original", nil); err != nil {
+				t.Fatal(err)
+			}
+			_, steered, err := supervisor.SendConversation(t.Context(), "job", "follow-up", "follow-up", nil)
+			if !errors.Is(err, sendErr) || !steered || target.sends != 2 || supervisor.IsActive("job") || target.IsActive("job") {
+				t.Fatalf("completed follow-up redispatched: err=%v steered=%t sends=%d active=%t", err, steered, target.sends, supervisor.IsActive("job"))
+			}
+			if _, steered, err := supervisor.SendConversation(t.Context(), "job", "explicit next request", "explicit next request", nil); err != nil || steered || target.sends != 3 {
+				t.Fatalf("explicit next request failed: err=%v steered=%t sends=%d", err, steered, target.sends)
+			}
+		})
+	}
+}
+
+func TestSupervisorNativeCompletedFollowupErrorNeverRedispatches(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "codex-followup-refusal")
+	supervisor := NewSupervisor(NewBuiltinRegistry(), HarnessConfig{Name: "codex", Command: command, Cwd: root, Sandbox: "read-only", ApprovalPolicy: "never"})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := supervisor.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := supervisor.Close(); err != nil {
+			t.Error("native provider cleanup", err)
+		}
+	})
+	if _, _, err := supervisor.SendConversation(ctx, "job", "original", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	var terminal atomic.Int32
+	_, steered, err := supervisor.SendConversation(ctx, "job", "completed-before-error", "completed-before-error", func(event core.Event) {
+		if event.Kind == core.EventFinal && event.Done && !event.Continues {
+			terminal.Add(1)
+		}
+	})
+	starts, steers, effects, processes := 0, 0, 0, 0
+	for _, record := range readFixtureRecords(t, logPath) {
+		switch record.Kind {
+		case "invocation":
+			processes++
+			t.Logf("synthetic native provider pid=%d", record.PID)
+		case "effect":
+			effects++
+		case "request":
+			if record.Method == "turn/start" {
+				starts++
+			}
+			if record.Method == "turn/steer" {
+				steers++
+			}
+		}
+	}
+	t.Logf("provider work: processes=%d starts=%d steers=%d effects=%d", processes, starts, steers, effects)
+	if err == nil || !strings.Contains(err.Error(), "synthetic acknowledgement failed after effect") || !steered || supervisor.IsActive("job") || terminal.Load() != 1 || processes != 1 || starts != 1 || steers != 1 || effects != 1 {
+		t.Fatalf("completed native follow-up redispatched: err=%v steered=%t active=%t terminal=%d starts=%d", err, steered, supervisor.IsActive("job"), terminal.Load(), starts)
+	}
+}
+
 func TestSupervisorNativeRejectedFollowupRetainsControlEmitter(t *testing.T) {
 	command, root, logPath := portableHarnessFixture(t, "codex-followup-refusal")
 	supervisor := NewSupervisor(NewBuiltinRegistry(), HarnessConfig{Name: "codex", Command: command, Cwd: root, Sandbox: "read-only", ApprovalPolicy: "never"})
