@@ -31,6 +31,7 @@ func TestWorkerConversationManagerFollowup(t *testing.T) {
 				first := core.Message{Channel: channel, Conversation: "manager-followup", SourceMessageID: "alpha", Text: "synthetic first"}
 				second := first
 				second.SourceMessageID, second.Text = "beta", "synthetic follow-up"
+				second.FollowupOnly = true
 				a, b := make(chan core.Event, 64), make(chan core.Event, 64)
 				firstDone, secondDone := make(chan error, 1), make(chan error, 1)
 				go func() { firstDone <- f.service.Handle(t.Context(), first, func(e core.Event) { a <- e }) }()

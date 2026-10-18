@@ -41,7 +41,7 @@ func (s *Service) dispatchWorkerConversation(ctx context.Context, message core.M
 	})
 	defer activity.stop()
 	terminal := false
-	err = s.Orchestrator.Converse(ctx, c, prompt, message.Text, func(_ context.Context, jobID int, delivery harness.WorkerDelivery) error {
+	err = s.Orchestrator.Converse(ctx, c, prompt, message.Text, message.FollowupOnly, func(_ context.Context, jobID int, delivery harness.WorkerDelivery) error {
 		activity.start()
 		return s.ConsumeConversationDelivery(jobID, delivery, func(transformed harness.WorkerDelivery) error {
 			activity.emit(transformed.Event)

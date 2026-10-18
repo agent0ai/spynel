@@ -164,11 +164,8 @@ func (s *Service) screenAction(ctx context.Context, instanceID, screenID, action
 		if err != nil {
 			return nil, err
 		}
-		if err := s.Harness.ResetSession(sessionKey(core.Message{Channel: channelName, Conversation: conversation})); err != nil {
+		if err := s.clearConversation(ctx, core.Message{Channel: channelName, Conversation: conversation}); err != nil {
 			return nil, fmt.Errorf("cannot discard the conversation's harness thread: %w", err)
-		}
-		if err := s.History.Clear(channelName, conversation); err != nil {
-			return nil, err
 		}
 		screen, err := s.resumeScreen()
 		return &screen, err

@@ -21,19 +21,19 @@ var ErrConversationPending = errors.New("conversation remains pending reconcilia
 func (m *Manager) AdmitConversation(ctx context.Context, conversation harness.WorkerConversation, prompt, message string) (harness.WorkerExecution, error) {
 	m.workerAdmissionMu.Lock()
 	defer m.workerAdmissionMu.Unlock()
-	return m.admitConversation(ctx, conversation, prompt, message, nil)
+	return m.admitConversation(ctx, conversation, prompt, message, false, nil)
 }
 
 // Converse consumes an ordinary request through the same admission, receipt and
 // retirement boundary as scheduled attachment. Request cancellation detaches.
-func (m *Manager) Converse(ctx context.Context, conversation harness.WorkerConversation, prompt, message string, deliver func(context.Context, int, harness.WorkerDelivery) error) error {
+func (m *Manager) Converse(ctx context.Context, conversation harness.WorkerConversation, prompt, message string, followupOnly bool, deliver func(context.Context, int, harness.WorkerDelivery) error) error {
 	if deliver == nil {
 		return errors.New("conversation request delivery unavailable")
 	}
 	m.workerAdmissionMu.Lock()
 	request := &conversationRequest{deliver: deliver, done: make(chan error, 1)}
 	var sequence uint64
-	execution, err := m.admitConversation(ctx, conversation, prompt, message, func(execution harness.WorkerExecution) error {
+	execution, err := m.admitConversation(ctx, conversation, prompt, message, followupOnly, func(execution harness.WorkerExecution) error {
 		sequence = execution.Sequence
 		return m.registerConversationRequest(sequence, conversation.SourceMessageID, request)
 	})
@@ -54,7 +54,7 @@ func (m *Manager) Converse(ctx context.Context, conversation harness.WorkerConve
 }
 
 // The caller holds the shared snapshot/admission/retirement lock.
-func (m *Manager) admitConversation(ctx context.Context, conversation harness.WorkerConversation, prompt, message string, prepare func(harness.WorkerExecution) error) (result harness.WorkerExecution, resultErr error) {
+func (m *Manager) admitConversation(ctx context.Context, conversation harness.WorkerConversation, prompt, message string, followupOnly bool, prepare func(harness.WorkerExecution) error) (result harness.WorkerExecution, resultErr error) {
 	pending := m.runtimeJob("worker-conversation:"+conversation.ExecutionID) > 0
 	defer func() {
 		if pending {
@@ -95,6 +95,9 @@ func (m *Manager) admitConversation(ctx context.Context, conversation harness.Wo
 		} else if retained.Conversation != nil && retained.Conversation.ExecutionID == conversation.ExecutionID {
 			return harness.WorkerExecution{}, errors.New("conversation execution belongs to another session")
 		}
+	}
+	if followupOnly && action != "followup" {
+		return harness.WorkerExecution{}, &harness.SendNotAdmittedError{Err: errors.New("there is no active execution for this conversation")}
 	}
 	jobKey := "worker-conversation:" + conversation.ExecutionID
 	if action == "send" && m.runtimeJob(jobKey) > 0 {

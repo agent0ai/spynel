@@ -575,8 +575,14 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 		}
 		return ErrDuplicateMessage
 	}
-	if message.FollowupOnly && !s.Harness.IsActive(sessionKey(message)) {
-		return errors.New("there is no active execution for this conversation")
+	if message.FollowupOnly {
+		session, err := s.Orchestrator.ConversationSession(ctx, sessionKey(message))
+		if err != nil {
+			return fmt.Errorf("inspect active conversation: %w", err)
+		}
+		if !session.Active {
+			return errors.New("there is no active execution for this conversation")
+		}
 	}
 	recorded := false
 	var recordErr error
@@ -1194,11 +1200,8 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 	case "job":
 		return s.jobCommand(ctx, message, remainder, emit)
 	case "clear":
-		if err := s.Harness.ResetSession(sessionKey(message)); err != nil {
+		if err := s.clearConversation(ctx, message); err != nil {
 			return s.localReply(message, "Cannot clear this conversation: "+err.Error(), emit)
-		}
-		if err := s.History.Clear(message.Channel, message.Conversation); err != nil {
-			return err
 		}
 		if emit != nil {
 			emit(core.Event{Kind: core.EventFinal, Text: "Conversation history and harness thread cleared.", Clear: true, Done: true, Local: true})

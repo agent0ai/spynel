@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"regexp"
 	"strings"
@@ -49,6 +50,9 @@ func (s *Service) admitMessage(message core.Message) (func(), error) {
 	s.admissionMu.Lock()
 	defer s.admissionMu.Unlock()
 	key := sessionKey(message) + "\x00" + message.SourceMessageID
+	if s.admissions[sessionKey(message)+"\x00"] {
+		return nil, ErrMessageAdmissionBusy
+	}
 	if s.admissions[key] {
 		return nil, ErrDuplicateMessage
 	}
@@ -60,4 +64,26 @@ func (s *Service) admitMessage(message core.Message) (func(), error) {
 	}
 	s.admissions[key] = true
 	return func() { s.admissionMu.Lock(); delete(s.admissions, key); s.admissionMu.Unlock() }, nil
+}
+
+// The empty-source slot excludes new intake while reset/clear is in progress.
+func (s *Service) clearConversation(ctx context.Context, message core.Message) error {
+	prefix := sessionKey(message) + "\x00"
+	current := prefix + message.SourceMessageID
+	s.admissionMu.Lock()
+	for key := range s.admissions {
+		if strings.HasPrefix(key, prefix) && (key != current || key == prefix) {
+			s.admissionMu.Unlock()
+			return errors.New("conversation has a message pending; wait for it before clearing")
+		}
+	}
+	if s.admissions == nil {
+		s.admissions = make(map[string]bool)
+	}
+	s.admissions[prefix] = true
+	s.admissionMu.Unlock()
+	defer func() { s.admissionMu.Lock(); delete(s.admissions, prefix); s.admissionMu.Unlock() }()
+	return s.Orchestrator.ResetConversation(ctx, sessionKey(message), func() error {
+		return s.History.Clear(message.Channel, message.Conversation)
+	})
 }

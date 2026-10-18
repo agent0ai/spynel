@@ -43,6 +43,8 @@
 
 - Private ordinary conversation follow-ups reuse the retained execution ID, sequence and durable job; recovery requests never join an active execution. Reject overlapping or previously attempted sources before job admission. Register local request callbacks before delivery can begin, share the existing inflight key with scheduled scans, and keep exactly one journal consumer. Immutable event source identities select a live callback; detached requests use canonical history/router delivery. The Manager run context owns consumption when running, while a one-shot caller supplies its own lifetime. Per-request done releases only that request; full terminal delivery and retirement settle the shared execution. Exact batch refusal/restoration is explicit non-admission and preserves the original job, while absent/lost replies remain pending with no automatic resend. Finish request registrations under the existing admission lock before allowing a replacement consumer.
 
+- ConversationSession supplies advisory authenticated worker state for strict follow-up intake; the serialized conversation admission must still refuse a new send when followupOnly is set. ResetConversation shares the worker admission/retirement lock, refuses local ownership conflicts and requires a confirmed empty inactive worker session before its caller's history-clear callback runs under exact native/election ownership. Failed or lost replies never authorize clearing. Its caller excludes concurrent local message intake; neither callback nor any other ownership callback may call worker RPCs. These private session operations do not select production composition.
+
 ## Child DOX Index
 
 No child DOX files.

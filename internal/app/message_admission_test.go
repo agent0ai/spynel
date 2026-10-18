@@ -11,6 +11,49 @@ import (
 	"github.com/agent0ai/spynel/internal/core"
 )
 
+type blockingResetHarness struct {
+	*serviceHarness
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingResetHarness) ResetSession(key string) error {
+	close(h.entered)
+	<-h.release
+	return h.serviceHarness.ResetSession(key)
+}
+
+func TestConversationClearExcludesPendingAndNewIntake(t *testing.T) {
+	s, target, _ := newRecoveryTestService(t)
+	message := core.Message{Channel: "cli", Conversation: "clear-race", SourceMessageID: "pending", Text: "synthetic request"}
+	release, err := s.admitMessage(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.clearConversation(t.Context(), core.Message{Channel: message.Channel, Conversation: message.Conversation}); err == nil {
+		t.Fatal("clear discarded an admitted request before provider dispatch")
+	}
+	release()
+	blocked := &blockingResetHarness{serviceHarness: target, entered: make(chan struct{}), release: make(chan struct{})}
+	s.Orchestrator.Harness = blocked
+	done := make(chan error, 1)
+	go func() { done <- s.clearConversation(t.Context(), message) }()
+	<-blocked.entered
+	_, err = s.admitMessage(message)
+	close(blocked.release)
+	if !errors.Is(err, ErrMessageAdmissionBusy) {
+		t.Fatal("new intake raced the owning reset", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	release, err = s.admitMessage(message)
+	if err != nil {
+		t.Fatal("clear retained the intake fence", err)
+	}
+	release()
+}
+
 func TestConcurrentMessageIdentityDispatchesOnce(t *testing.T) {
 	s, target, _ := newRecoveryTestService(t)
 	message := core.Message{Channel: "cli", Conversation: "retry", Text: "hello", SourceMessageID: "retry-1"}

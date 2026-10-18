@@ -71,6 +71,8 @@
 
 - Apply monotonic worker-owned conversation turn reservations before recording each event, including terminal events, so replay, attachment and merged queued messages cannot inflate public counts. Reuse the durable timing/archive path for exact-WorkID conversation jobs as well as workflows. A live local request owns only its source-routed presentation callback; cancellation detaches it while the Manager's shared consumer and worker retain their owning lifetimes.
 
+- With a bound worker, strict follow-up intake reads authenticated session state through the Manager, and serialized Manager admission still requires a retained execution before selecting follow-up. Clear and resume-delete share one service reset/clear path: exclude pending/new same-conversation intake through the existing admission map, confirm the owning worker reset before clearing, and fence the history mutation under the same exact controller. Retained delivery, conflicting local ownership, unavailable inspection and lost reset replies refuse deletion. RPCs remain outside ownership callbacks. Production selection and coordinated lifecycle remain gated.
+
 ## Child DOX Index
 
 No child DOX files.
