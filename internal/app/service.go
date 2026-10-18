@@ -687,6 +687,17 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	}
 	if err != nil {
 		activity.stop()
+		var rejected *harness.SendNotAdmittedError
+		if !errors.As(err, &rejected) {
+			// A missing acknowledgement cannot release a source the provider
+			// may already have acted on. Its terminal still owns exact coverage.
+			s.Runtime.LogEvent("error", "harness", "admission_unconfirmed", "Harness message admission was not confirmed ("+harnessFailureEvidence(err)+")")
+			s.Runtime.RecordJobEvent(jobID, core.Event{Kind: core.EventStatus, Text: "Message admission requires reconciliation"})
+			if !s.Harness.IsActive(key) {
+				s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobDegraded), Detail: "Message admission requires reconciliation"})
+			}
+			return fmt.Errorf("%w: %w", orchestrator.ErrConversationPending, err)
+		}
 		s.rollbackRecoveryReservation(message, reservation)
 		s.Runtime.RecordJobEvent(jobID, core.Event{Kind: core.EventError, Text: err.Error(), Done: true})
 		s.Runtime.LogEvent("error", "harness", "start_failed", "Harness turn failed to start ("+harnessFailureEvidence(err)+")")

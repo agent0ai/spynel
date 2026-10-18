@@ -517,7 +517,7 @@ func (r *failingServiceHarness) Send(_ context.Context, key, prompt string, _ co
 	r.mu.Lock()
 	r.prompts[key] = append(r.prompts[key], prompt)
 	r.mu.Unlock()
-	return "", false, r.err
+	return "", false, &harness.SendNotAdmittedError{Err: r.err}
 }
 
 func (r *heldServiceHarness) finish(key string) {

@@ -437,7 +437,7 @@ func (s *Supervisor) ConversationAdmission(key string) string {
 func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit core.Emit) (string, bool, error) {
 	operation := s.controlOperation(key)
 	if err := operation.LockContext(ctx); err != nil {
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	// Selecting the target and marking a new turn active must be atomic with
 	// respect to Reconfigure. Otherwise a swap could close the old harness in
@@ -447,7 +447,7 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 	if err != nil {
 		s.mu.Unlock()
 		operation.Unlock()
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	wasActive := target.IsActive(key)
 	selection := inferenceSelection(s.config)

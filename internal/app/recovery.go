@@ -589,6 +589,10 @@ func (s *Service) dispatchRecovery(ctx context.Context, origin orchestrator.Orig
 		return skip("reservation_suppressed")
 	}
 	if dispatchErr != nil {
+		if errors.Is(dispatchErr, orchestrator.ErrConversationPending) {
+			s.Runtime.LogEvent("error", "recovery", "admission_unconfirmed", "Recovery provider admission was not confirmed")
+			return false
+		}
 		s.Runtime.LogEvent("error", "recovery", "dispatch_failed", "Recovery provider admission failed")
 		s.recoveryFailure(origin, dispatchErr)
 	}

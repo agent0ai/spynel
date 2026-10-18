@@ -186,20 +186,20 @@ func (p *Pi) SendWithModel(ctx context.Context, key, prompt, model string, emit 
 
 func (p *Pi) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", false, errors.New("harness prompt is empty")
+		return "", false, &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	if selection.ServiceMode != "" {
-		return "", false, errors.New("Pi does not support a Spynel service mode; reset harness.service_mode to inherit")
+		return "", false, &SendNotAdmittedError{Err: errors.New("Pi does not support a Spynel service mode; reset harness.service_mode to inherit")}
 	}
 	if err := ValidateInferenceSelection(nil, selection); err != nil {
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	lock := p.lockForKey(key)
 	lock.Lock()
 	defer lock.Unlock()
 	process, err := p.ensureProcess(ctx, key, selection.Model, selection.Effort)
 	if err != nil {
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	process.mu.Lock()
 	active := process.active
@@ -212,7 +212,7 @@ func (p *Pi) SendWithInference(ctx context.Context, key, prompt string, selectio
 	process.mu.Lock()
 	if process.closed {
 		process.mu.Unlock()
-		return process.session.ID, false, errors.New("Pi RPC process is closed")
+		return process.session.ID, false, &SendNotAdmittedError{Err: errors.New("Pi RPC process is closed")}
 	}
 	process.active = turn
 	process.mu.Unlock()

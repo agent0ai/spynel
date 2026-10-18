@@ -14,7 +14,7 @@ import (
 
 // ErrConversationPending means provider admission or delivery must reconcile;
 // callers must not turn it into a fabricated terminal history result.
-var ErrConversationPending = errors.New("worker conversation remains pending reconciliation")
+var ErrConversationPending = errors.New("conversation remains pending reconciliation")
 
 // AdmitConversation requires already persisted sources. Application admission
 // runs under exact ownership; worker RPCs never run inside that callback.

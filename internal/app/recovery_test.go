@@ -523,7 +523,7 @@ func (r *rejectedSteerServiceHarness) SendWithModel(ctx context.Context, key, pr
 	r.mu.Unlock()
 	if reject {
 		// Native steering can reject a request while retaining the original emitter.
-		return r.ThreadID(key), true, errors.New("provider rejected follow-up")
+		return r.ThreadID(key), true, &harness.SendNotAdmittedError{Err: errors.New("provider rejected follow-up")}
 	}
 	return r.heldServiceHarness.SendWithModel(ctx, key, prompt, model, emit)
 }

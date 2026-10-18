@@ -95,6 +95,9 @@ func (s *Supervisor) reconcileConfig(ctx context.Context, cfg config.Config) err
 	defer s.reconcileMu.Unlock()
 	var problems []error
 	for _, managed := range s.managed {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if managed.Name == "" || managed.Enabled == nil || managed.Fingerprint == nil || managed.Build == nil {
 			problems = append(problems, errors.New("invalid managed channel registration"))
 			continue
@@ -122,6 +125,10 @@ func (s *Supervisor) reconcileConfig(ctx context.Context, cfg config.Config) err
 		// generation. A rejected save therefore cannot strand a live channel.
 		s.mu.Unlock()
 		instance, err := managed.Build(cfg)
+		if cancelled := ctx.Err(); cancelled != nil {
+			revokeRuntimeAuthorization(instance)
+			return cancelled
+		}
 		if err != nil {
 			if current == nil {
 				_, cancel := context.WithCancel(ctx)
@@ -150,6 +157,11 @@ func (s *Supervisor) reconcileConfig(ctx context.Context, cfg config.Config) err
 			}
 		}
 		s.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			s.mu.Unlock()
+			revokeRuntimeAuthorization(instance)
+			return err
+		}
 		current = s.running[managed.Name]
 		if current != nil && current.fingerprint == fingerprint {
 			s.mu.Unlock()

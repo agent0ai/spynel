@@ -324,25 +324,25 @@ func (c *Codex) SendWithModel(ctx context.Context, key, prompt, model string, em
 
 func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", false, errors.New("harness prompt is empty")
+		return "", false, &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	var models []Model
 	if selection.ServiceMode != "" {
 		var err error
 		models, err = c.Models(ctx)
 		if err != nil {
-			return "", false, fmt.Errorf("validate Codex inference properties: %w", err)
+			return "", false, &SendNotAdmittedError{Err: fmt.Errorf("validate Codex inference properties: %w", err)}
 		}
 	}
 	if err := ValidateInferenceSelection(models, selection); err != nil {
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	lock := c.lockForKey(key)
 	lock.Lock()
 	defer lock.Unlock()
 	threadID, err := c.ensureThread(ctx, key, selection.Model)
 	if err != nil {
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	c.mu.Lock()
 	active := c.active[threadID]

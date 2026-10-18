@@ -299,13 +299,13 @@ func (c *Claude) SendWithModel(ctx context.Context, key, prompt, model string, e
 
 func (c *Claude) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", false, errors.New("harness prompt is empty")
+		return "", false, &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	if selection.ServiceMode != "" {
-		return "", false, errors.New("Claude Code does not support a Spynel service mode; reset harness.service_mode to inherit")
+		return "", false, &SendNotAdmittedError{Err: errors.New("Claude Code does not support a Spynel service mode; reset harness.service_mode to inherit")}
 	}
 	if err := ValidateInferenceSelection(nil, selection); err != nil {
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	lock := c.lockForKey(key)
 	lock.Lock()
@@ -315,7 +315,7 @@ func (c *Claude) SendWithInference(ctx context.Context, key, prompt string, sele
 		c.mu.Lock()
 		if c.closed || c.ctx == nil {
 			c.mu.Unlock()
-			return "", false, errors.New("Claude Code harness is not running")
+			return "", false, &SendNotAdmittedError{Err: errors.New("Claude Code harness is not running")}
 		}
 		active := c.active[key]
 		session := c.sessions[key]
@@ -328,7 +328,7 @@ func (c *Claude) SendWithInference(ctx context.Context, key, prompt string, sele
 				case <-active.done:
 					continue
 				case <-ctx.Done():
-					return threadID, true, ctx.Err()
+					return threadID, true, &SendNotAdmittedError{Err: ctx.Err()}
 				}
 			}
 			if err != nil {
@@ -414,7 +414,7 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 		stdin, err = providerStdin(cmd)
 		if err != nil {
 			cancel()
-			return "", false, err
+			return "", false, &SendNotAdmittedError{Err: err}
 		}
 	} else {
 		cmd.Stdin = strings.NewReader(prompt)
@@ -422,7 +422,7 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	stderr := newTailBuffer(64 * 1024)
 	turn := &claudeTurn{
@@ -438,12 +438,12 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 	if c.closed {
 		c.mu.Unlock()
 		cancel()
-		return "", false, errors.New("Claude Code harness is closed")
+		return "", false, &SendNotAdmittedError{Err: errors.New("Claude Code harness is closed")}
 	}
 	if err := startProvider(cmd, cfg.processOwner); err != nil {
 		c.mu.Unlock()
 		cancel()
-		return "", false, fmt.Errorf("start Claude Code: %w", err)
+		return "", false, &SendNotAdmittedError{Err: fmt.Errorf("start Claude Code: %w", err)}
 	}
 	c.processWait.Add(1)
 	c.active[key] = turn

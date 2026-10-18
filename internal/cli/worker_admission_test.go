@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,6 +29,11 @@ func runWorkerAdmissionProvider() int {
 		return 1
 	}
 	defer file.Close()
+	if os.Getenv("SPYNEL_TEST_WORKER_UNCERTAIN_STEER") == "1" {
+		if _, err := fmt.Fprintf(file, "provider:%d\n", os.Getpid()); err != nil {
+			return 1
+		}
+	}
 	var outputMu sync.Mutex
 	write := func(value any) error {
 		outputMu.Lock()
@@ -66,6 +72,15 @@ func runWorkerAdmissionProvider() int {
 		case "model/list":
 			result["data"] = []any{map[string]any{"id": "model-a", "model": "model-a", "isDefault": true, "supportedReasoningEfforts": []any{map[string]string{"reasoningEffort": "high"}}, "serviceTiers": []any{map[string]string{"id": "priority", "name": "Priority"}}}}
 		case "turn/steer":
+			if os.Getenv("SPYNEL_TEST_WORKER_UNCERTAIN_STEER") == "1" {
+				if _, err := file.WriteString("followup-effect\n"); err != nil || file.Sync() != nil {
+					return 1
+				}
+				if write(map[string]any{"id": request.ID, "error": map[string]any{"code": -32000, "message": "synthetic acknowledgement failed after effect"}}) != nil {
+					return 1
+				}
+				continue
+			}
 			result["turnId"] = "synthetic-turn"
 		case "thread/start", "thread/resume":
 			result["thread"] = map[string]string{"id": "synthetic-thread"}

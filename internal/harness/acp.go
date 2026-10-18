@@ -250,24 +250,24 @@ func (a *ACP) SendWithModel(ctx context.Context, key, prompt, model string, emit
 
 func (a *ACP) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", false, errors.New("harness prompt is empty")
+		return "", false, &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	lock := a.lockForKey(key)
 	lock.Lock()
 	defer lock.Unlock()
 	session, err := a.ensureSession(ctx, key, selection.Model)
 	if err != nil {
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	turn := &acpTurn{emit: emit}
 	a.mu.Lock()
 	if a.closed || a.ctx == nil {
 		a.mu.Unlock()
-		return session.ID, false, errors.New("ACP harness is not running")
+		return session.ID, false, &SendNotAdmittedError{Err: errors.New("ACP harness is not running")}
 	}
 	if a.active[key] != nil {
 		a.mu.Unlock()
-		return session.ID, false, errors.New("ACP session already has an active prompt turn")
+		return session.ID, false, &SendNotAdmittedError{Err: errors.New("ACP session already has an active prompt turn")}
 	}
 	a.active[key] = turn
 	a.mu.Unlock()

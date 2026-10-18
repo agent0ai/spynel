@@ -199,8 +199,16 @@ type ConversationSender interface {
 	SendConversation(context.Context, string, string, string, core.Emit) (threadID string, steered bool, err error)
 }
 
+// SendNotAdmittedError proves this request reached neither the provider nor
+// its continuation queue. Other Send errors leave delivery uncertain.
+type SendNotAdmittedError struct{ Err error }
+
+func (e *SendNotAdmittedError) Error() string { return e.Err.Error() }
+func (e *SendNotAdmittedError) Unwrap() error { return e.Err }
+
 type Harness interface {
 	Start(context.Context) error
+	// Only SendNotAdmittedError permits rollback of source admission.
 	Send(context.Context, string, string, core.Emit) (threadID string, steered bool, err error)
 	// Errors leave interruption uncertain; false with nil error means no interruption was needed.
 	Interrupt(context.Context, string) (bool, error)
