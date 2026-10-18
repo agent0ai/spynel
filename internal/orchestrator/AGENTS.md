@@ -38,6 +38,8 @@
 
 - Private `AdmitConversation` serializes sequence allocation and Send with the existing worker snapshot/retirement lock. Its application callback must admit a durable job under exact native/election ownership before the worker reserves sources or Sends; RPCs stay outside that callback. Refuse retained sessions/execution identities and unreconciled provisional admissions rather than retrying. A lost Send reply remains unknown; ordinary scans attach the retained admission or end a proven absent/non-dispatched provisional job. Source refusals remain inspectable without conversation effects; reserved provider failures consume their journaled terminal normally. This single-batch entry point is not yet selected by ordinary application dispatch; follow-up reservation/rollback, live request streams and coordinated lifecycle still require integration.
 
+- Share canonical workflow status directories with the worker source-link validator through `WorkflowDirectories`; never invent a caller-specific folder inventory. Worker-backed stalled-message recovery enters the existing serialized conversation admission path without a controller-side retrigger reservation or a nested election/RPC acquisition. Ordinary scheduled scans retain attachment and provisional-job reconciliation ownership.
+
 ## Child DOX Index
 
 No child DOX files.

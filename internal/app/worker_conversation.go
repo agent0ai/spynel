@@ -4,13 +4,62 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sort"
+	"strings"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/channel"
+	"github.com/agent0ai/spynel/internal/channel/telegram"
+	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/orchestrator"
+	"github.com/agent0ai/spynel/internal/shortid"
 )
+
+// Worker source reservation and Send share its exact-term fence. Preparing the
+// prompt here must never reserve recovery or enclose a worker RPC in that fence.
+func (s *Service) dispatchWorkerRecovery(ctx context.Context, origin orchestrator.Origin, candidates []recoveryCandidate) bool {
+	entries := make([]history.Entry, 0, len(candidates))
+	sources := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		entry := candidate.entry
+		if candidate.admitted {
+			entry.Admission = "admitted"
+		}
+		entries = append(entries, entry)
+		sources = append(sources, entry.SourceMessageID)
+	}
+	message, prompt, err := s.recoveryPrompt(origin, entries)
+	if err != nil {
+		s.recoveryFailure(origin, err)
+		return false
+	}
+	prompt, handled, err := s.prepareConversationPrompt(ctx, message, prompt, s.recoveryEmitter(origin))
+	if err != nil {
+		s.recoveryFailure(origin, err)
+		return false
+	}
+	if handled {
+		return false
+	}
+	executionID, err := shortid.New()
+	if err != nil {
+		s.recoveryFailure(origin, err)
+		return false
+	}
+	sort.Strings(sources)
+	c := harness.WorkerConversation{Channel: origin.Channel, Conversation: origin.Conversation, SourceMessageID: message.SourceMessageID, ExecutionID: executionID, Sources: sources, Recovery: true}
+	execution, err := s.Orchestrator.AdmitConversation(ctx, c, prompt, message.Text)
+	if err != nil {
+		// Unknown Send must reconcile through the ordinary scan, never through
+		// a fabricated terminal failure or a repeated recovery dispatch.
+		s.Runtime.LogEvent("info", "recovery", "admission_unconfirmed", "Worker recovery admission was not confirmed")
+		return false
+	}
+	return execution.SourcesReserved
+}
 
 // Called before worker source reservation, under the exact owner fence.
 func (s *Service) startWorkerConversation(c harness.WorkerConversation) (int, error) {
@@ -96,6 +145,37 @@ func AdmitWorkerConversation(root, key string, conversation harness.WorkerConver
 		return errors.New("invalid worker conversation admission")
 	}
 	store := history.New(filepath.Join(root, ".spynel", "history"))
+	if conversation.Recovery {
+		cfg, err := config.Load(config.PathForRoot(root))
+		if err != nil {
+			return err
+		}
+		if !cfg.Orchestrator.RetriggerUnrespondedMessages || strings.Contains(conversation.Conversation, "-group-") {
+			return errors.New("worker conversation recovery is disabled or ineligible")
+		}
+		if conversation.Channel == "telegram" && !cfg.Channels.Telegram.Enabled || conversation.Channel == "whatsapp" && !cfg.Channels.WhatsApp.Enabled {
+			return errors.New("worker conversation recovery transport is disabled")
+		}
+		if err := validateOrigin(cfg, store, telegram.NewIdentityStore(cfg.StatePath("runtime", "telegram-identities.json")), orchestrator.Origin{Channel: conversation.Channel, Conversation: conversation.Conversation}); err != nil {
+			return err
+		}
+		activation, err := store.ActivateRecovery()
+		if err != nil {
+			return err
+		}
+		return store.AdmitRecoveryConversation(conversation.Channel, conversation.Conversation, conversation.ExecutionID, receipt, conversation.Sources, activation, time.Now().UTC().Add(-recoveryWindow), func(entries []history.Entry) error {
+			for _, entry := range entries {
+				if !eligibleRecoveryCommand(entry.Content) {
+					return errors.New("worker recovery source command is ineligible")
+				}
+			}
+			linked, err := durableRecoverySources(orchestrator.WorkflowDirectories(root), conversation.Sources)
+			if err != nil || len(linked) != 0 {
+				return errors.New("worker recovery source links are unavailable or already own the request")
+			}
+			return nil
+		})
+	}
 	return store.AdmitConversation(conversation.Channel, conversation.Conversation, conversation.ExecutionID, receipt, conversation.Sources, conversation.Recovery)
 }
 

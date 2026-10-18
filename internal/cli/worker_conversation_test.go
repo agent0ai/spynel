@@ -195,12 +195,17 @@ func TestWorkerConversationNativeReplayAndSettlement(t *testing.T) {
 }
 
 func TestWorkerConversationNativeRejectsUnownedSources(t *testing.T) {
-	for _, scenario := range []string{"missing", "covered", "already-admitted", "unreserved-recovery", "corrupt", "storage-error"} {
+	for _, scenario := range []string{"missing", "covered", "already-admitted", "prior-reserved-recovery", "corrupt", "storage-error"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := newWorkerAgentFixture(t)
-			metadata := &harness.WorkerConversation{Channel: "cli", Conversation: "source-owner", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}, Recovery: scenario == "unreserved-recovery"}
+			metadata := &harness.WorkerConversation{Channel: "cli", Conversation: "source-owner", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}, Recovery: scenario == "prior-reserved-recovery"}
 			if scenario != "missing" {
 				if _, err := f.service.History.Append("cli", metadata.Conversation, history.Entry{Role: "user", SourceMessageID: "source", Content: "synthetic", AcceptedAt: time.Now().UTC()}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "prior-reserved-recovery" {
+				if _, err := f.service.History.ReserveRetrigger("cli", metadata.Conversation, metadata.Sources, time.Time{}, time.Time{}, 1); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -241,16 +246,13 @@ func TestWorkerConversationNativeRejectsUnownedSources(t *testing.T) {
 	}
 }
 
-func TestWorkerConversationNativeReservedRecoveryAndLostSendReply(t *testing.T) {
+func TestWorkerConversationNativeAtomicRecoveryAndLostSendReply(t *testing.T) {
 	f := newWorkerAgentFixture(t)
 	metadata := &harness.WorkerConversation{Channel: "cli", Conversation: "reserved", SourceMessageID: "first", ExecutionID: "execution", Sources: []string{"first", "second"}, Recovery: true}
 	for _, source := range metadata.Sources {
 		if _, err := f.service.History.Append("cli", metadata.Conversation, history.Entry{Role: "user", SourceMessageID: source, Content: "synthetic", AcceptedAt: time.Now().UTC()}); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if reserved, err := f.service.History.ReserveRetrigger("cli", metadata.Conversation, metadata.Sources, time.Time{}, time.Time{}, 2); err != nil || len(reserved) != 2 {
-		t.Fatal("recovery reservation failed", err)
 	}
 	request := harness.WorkerRequest{Action: "send", Sequence: 1, Key: "chat:cli:" + metadata.Conversation, Prompt: "synthetic recovery", Conversation: metadata}
 	f.client.Close()
@@ -266,7 +268,7 @@ func TestWorkerConversationNativeReservedRecoveryAndLostSendReply(t *testing.T) 
 		t.Fatal("exact retry lost its source reservation", err)
 	}
 	entries, _, err := f.service.History.RecoveryEntries("cli", metadata.Conversation, 10)
-	if err != nil || len(entries) != 4 || strings.Join(entries[3].AdmittedSources, ",") != "first,second" {
+	if err != nil || len(entries) != 3 || strings.Join(entries[2].AdmittedSources, ",") != "first,second" || strings.Join(entries[2].RetriggerOf, ",") != "first,second" {
 		t.Fatal("lost send reply duplicated or lost the source batch", err)
 	}
 	snapshot, err := f.service.History.RecoveryWindow("cli", metadata.Conversation, time.Time{}, 10)

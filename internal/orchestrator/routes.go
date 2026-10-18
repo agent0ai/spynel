@@ -35,10 +35,15 @@ func routeByName(name string) (workflowRoute, bool) {
 
 // WorkflowDirectories lists only canonical live task and goal status folders.
 func (m *Manager) WorkflowDirectories() []string {
+	return WorkflowDirectories(m.Config.Root)
+}
+
+// WorkflowDirectories shares the canonical source-link boundary with workers.
+func WorkflowDirectories(root string) []string {
 	var paths []string
 	for _, route := range workflowRoutes() {
 		for _, status := range route.AllowedNext {
-			paths = append(paths, filepath.Join(filepath.Dir(m.Config.Resolve(route.Source)), status))
+			paths = append(paths, filepath.Join(root, filepath.Dir(route.Source), status))
 		}
 	}
 	return paths

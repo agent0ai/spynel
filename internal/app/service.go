@@ -228,16 +228,19 @@ func (s *Service) Close() error {
 }
 
 func (s *Service) validateOrigin(origin orchestrator.Origin) error {
+	return validateOrigin(s.Settings.Snapshot(), s.History, s.telegramIdentity, origin)
+}
+
+func validateOrigin(cfg config.Config, store *history.Store, identity *telegram.IdentityStore, origin orchestrator.Origin) error {
 	if err := ValidateConversationName(origin.Conversation); err != nil {
 		return err
 	}
-	if _, err := os.Stat(s.History.Path(origin.Channel, origin.Conversation)); err != nil {
+	if _, err := os.Stat(store.Path(origin.Channel, origin.Conversation)); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("origin %s/%s is not a known conversation", origin.Channel, origin.Conversation)
 		}
 		return err
 	}
-	cfg := s.Settings.Snapshot()
 	switch origin.Channel {
 	case "telegram":
 		if strings.HasPrefix(origin.Conversation, "TG-group-") {
@@ -250,7 +253,7 @@ func (s *Service) validateOrigin(origin orchestrator.Origin) error {
 			return errors.New("invalid Telegram origin")
 		}
 		id := strings.TrimPrefix(origin.Conversation, "TG-")
-		if s.telegramIdentity.AuthorizedPrivate(cfg.Channels.Telegram.AllowedUsers, id) {
+		if identity.AuthorizedPrivate(cfg.Channels.Telegram.AllowedUsers, id) {
 			return nil
 		}
 		return errors.New("Telegram origin is not authorized by allowed_users")
@@ -637,25 +640,10 @@ func messageHookPayload(message core.Message) map[string]any {
 }
 
 func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Message, prompt string, emit core.Emit, additionalSourceIDs ...string) error {
-	if s.Config.Extensions.Enabled {
-		output, err := s.Hooks.Run(ctx, "harness.before", map[string]any{
-			"session_key": sessionKey(message), "prompt": prompt, "channel": message.Channel,
-		})
-		if err != nil {
-			return err
-		}
-		if output.Cancel {
-			return s.localReply(message, output.Message, emit)
-		}
-		if value, ok := output.Payload["prompt"].(string); ok {
-			prompt = value
-		}
-	}
-	preparedPrompt, err := s.prepareChatHarnessPrompt(prompt)
-	if err != nil {
+	prompt, handled, err := s.prepareConversationPrompt(ctx, message, prompt, emit)
+	if err != nil || handled {
 		return err
 	}
-	prompt = preparedPrompt
 	key := sessionKey(message)
 	jobID, jobCreated, err := s.Runtime.tryBeginJobWithDetails(key, message.Channel, message.Conversation, message.Text, JobDetails{Kind: "conversation", Provider: s.Settings.Snapshot().Harness.Name})
 	if err != nil {
@@ -711,6 +699,28 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 		emit(core.Event{Kind: core.EventStatus, Text: verb, ThreadID: threadID})
 	}
 	return nil
+}
+
+func (s *Service) prepareConversationPrompt(ctx context.Context, message core.Message, prompt string, emit core.Emit) (string, bool, error) {
+	if s.Config.Extensions.Enabled {
+		output, err := s.Hooks.Run(ctx, "harness.before", map[string]any{
+			"session_key": sessionKey(message), "prompt": prompt, "channel": message.Channel,
+		})
+		if err != nil {
+			return "", false, err
+		}
+		if output.Cancel {
+			return "", true, s.localReply(message, output.Message, emit)
+		}
+		if value, ok := output.Payload["prompt"].(string); ok {
+			prompt = value
+		}
+	}
+	preparedPrompt, err := s.prepareChatHarnessPrompt(prompt)
+	if err != nil {
+		return "", false, err
+	}
+	return preparedPrompt, false, nil
 }
 
 func (s *Service) prepareChatHarnessPrompt(prompt string) (string, error) {

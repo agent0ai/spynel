@@ -15,6 +15,50 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 )
 
+func TestWorkerRecoveryRechecksSourcePolicyBeforeReservation(t *testing.T) {
+	for _, scenario := range []string{"disabled", "linked", "command", "covered", "valid"} {
+		t.Run(scenario, func(t *testing.T) {
+			s, _, cfg := newRecoveryTestService(t)
+			c := harness.WorkerConversation{Channel: "cli", Conversation: "recover", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}, Recovery: true}
+			text := "synthetic request"
+			if scenario == "command" {
+				text = "/stop"
+			}
+			if _, err := s.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", Content: text, SourceMessageID: "source", AcceptedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			switch scenario {
+			case "disabled":
+				cfg.Orchestrator.RetriggerUnrespondedMessages = false
+				if err := config.Save(cfg); err != nil {
+					t.Fatal(err)
+				}
+			case "linked":
+				if err := os.WriteFile(cfg.StatePath("tasks", "todo", "linked.md"), []byte("---\nid: linked\nsource_message_ids: [source]\n---\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "covered":
+				if _, err := s.History.Append(c.Channel, c.Conversation, history.Entry{Role: "correlation", Covers: c.Sources, Outcome: "terminal_assistant"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.ReadFile(s.History.Path(c.Channel, c.Conversation))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = AdmitWorkerConversation(cfg.Root, "chat:cli:recover", c, "worker:1:admission")
+			after, readErr := os.ReadFile(s.History.Path(c.Channel, c.Conversation))
+			if scenario == "valid" {
+				if err != nil || readErr != nil || string(before) == string(after) {
+					t.Fatal("valid recovery was not reserved", err, readErr)
+				}
+			} else if err == nil || readErr != nil || string(before) != string(after) {
+				t.Fatal("refused source policy still reserved recovery", err, readErr)
+			}
+		})
+	}
+}
+
 func TestWorkerConversationRestoresLocalActivityAndTranscript(t *testing.T) {
 	s, _, _ := newRecoveryTestService(t)
 	c := &harness.WorkerConversation{Channel: "tui", Conversation: "attached", SourceMessageID: "source", ExecutionID: "execution", Sources: []string{"source"}}

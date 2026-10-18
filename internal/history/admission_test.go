@@ -2,12 +2,77 @@ package history
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestRecoveryConversationAdmissionReservesExactBatchAtomically(t *testing.T) {
+	for _, scenario := range []string{"accepted", "covered", "reserved", "legacy", "stale", "missing", "validation"} {
+		t.Run(scenario, func(t *testing.T) {
+			store := New(t.TempDir())
+			now := time.Now().UTC()
+			for _, source := range []string{"first", "second"} {
+				entry := Entry{At: now, AcceptedAt: now, Role: "user", SourceMessageID: source, Content: "synthetic"}
+				if source == "second" {
+					switch scenario {
+					case "missing":
+						continue
+					case "legacy":
+						entry.AcceptedAt = now.Add(-time.Hour)
+					case "stale":
+						entry.At = now.Add(-48 * time.Hour)
+					}
+				}
+				if _, err := store.Append("cli", "owned", entry); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario == "covered" || scenario == "reserved" {
+				entry := Entry{Role: "correlation", Covers: []string{"second"}, Outcome: "terminal_assistant"}
+				if scenario == "reserved" {
+					entry.Covers, entry.RetriggerOf = nil, []string{"second"}
+				}
+				if _, err := store.Append("cli", "owned", entry); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.ReadFile(store.Path("cli", "owned"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			admit := func(receipt string) error {
+				return store.AdmitRecoveryConversation("cli", "owned", "execution", receipt, []string{"first", "second"}, now.Add(-time.Minute), now.Add(-24*time.Hour), func(entries []Entry) error {
+					if len(entries) != 2 {
+						t.Fatal("validation did not receive the exact source set")
+					}
+					if scenario == "validation" {
+						return errors.New("source policy refused")
+					}
+					return nil
+				})
+			}
+			err = admit("worker:1:admission")
+			after, readErr := os.ReadFile(store.Path("cli", "owned"))
+			if scenario != "accepted" {
+				if err == nil || readErr != nil || string(before) != string(after) {
+					t.Fatal("failed recovery partially reserved its batch", err, readErr)
+				}
+				return
+			}
+			if err != nil || readErr != nil || admit("worker:1:admission") != nil || admit("worker:2:admission") == nil {
+				t.Fatal("recovery receipt was not idempotent and exclusive", err, readErr)
+			}
+			entries, _, err := store.RecoveryEntries("cli", "owned", 10)
+			if err != nil || len(entries) != 3 || !reflect.DeepEqual(entries[2].AdmittedSources, entries[2].RetriggerOf) || !entries[2].Recovery {
+				t.Fatal("recovery reservation and admission were not one record", err)
+			}
+		})
+	}
+}
 
 func TestConversationAdmissionCommitsExactBatchAndPrivateReceipt(t *testing.T) {
 	root := t.TempDir()

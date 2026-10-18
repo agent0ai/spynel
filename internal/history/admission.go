@@ -12,6 +12,19 @@ import (
 // AdmitConversation validates and syncs the complete source batch in one
 // receipted record. Its caller must hold the exact cross-process owner fence.
 func (s *Store) AdmitConversation(channel, conversation, executionID, receipt string, sources []string, recovery bool) error {
+	return s.admitConversation(channel, conversation, executionID, receipt, sources, recovery, time.Time{}, time.Time{}, nil)
+}
+
+// AdmitRecoveryConversation reserves and admits the exact eligible batch in one
+// synced receipt; no controller-side reservation may precede this operation.
+func (s *Store) AdmitRecoveryConversation(channel, conversation, executionID, receipt string, sources []string, activation, cutoff time.Time, validate func([]Entry) error) error {
+	if activation.IsZero() || cutoff.IsZero() || validate == nil {
+		return errors.New("conversation recovery requires its activation and recent window")
+	}
+	return s.admitConversation(channel, conversation, executionID, receipt, sources, true, activation, cutoff, validate)
+}
+
+func (s *Store) admitConversation(channel, conversation, executionID, receipt string, sources []string, recovery bool, activation, cutoff time.Time, validate func([]Entry) error) error {
 	validID := func(id string) bool {
 		return id != "" && len(id) <= 128 && utf8.ValidString(id) && strings.IndexFunc(id, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) < 0
 	}
@@ -24,6 +37,9 @@ func (s *Store) AdmitConversation(channel, conversation, executionID, receipt st
 		}
 	}
 	entry := Entry{Role: "correlation", ExecutionID: executionID, Admission: "new", AdmittedSources: sources, Recovery: recovery}
+	if !activation.IsZero() {
+		entry.RetriggerOf = sources
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.appendOnceLocked(channel, conversation, receipt, entry, func() error {
@@ -33,6 +49,14 @@ func (s *Store) AdmitConversation(channel, conversation, executionID, receipt st
 		}
 		if len(snapshot.Entries) != len(sources) {
 			return errors.New("conversation admission source is absent from history")
+		}
+		if !activation.IsZero() {
+			for _, source := range snapshot.Entries {
+				if source.AcceptedAt.IsZero() || source.AcceptedAt.Before(activation) || source.At.Before(cutoff) || snapshot.Covered[source.SourceMessageID] != "" {
+					return errors.New("conversation recovery source is no longer eligible")
+				}
+			}
+			return validate(snapshot.Entries)
 		}
 		for _, id := range sources {
 			if recovery {

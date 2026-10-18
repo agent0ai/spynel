@@ -27,6 +27,8 @@
 
 - `ReadDisplayEntry` shares the bounded streaming history parser with correlation readers, preserving exact metadata and complete UTF-8 runes in body excerpts. Display readers require a complete newline-terminated record, count every consumed byte including blank prefixes, and retry incomplete appends without advancing their offset. Omitted bodies have an explicit excerpt notice; full JSONL remains unchanged. Validate omitted suffixes and fail closed on corrupt or structurally excessive records.
 
+- `AdmitRecoveryConversation` shares admission identity/receipt validation and writes retrigger reservation plus admission in one synced record. Require the forward activation and recent window, validate every exact source against complete history, and reject any covered or previously reserved source. Run the owning application policy validator under the append lock before writing; it must not reenter history or acquire worker/election ownership. Any invalid member refuses the whole batch without reservation. Matching receipts confirm without rerunning policy or creating another admission. This does not prove provider delivery or authorize retry after an unknown Send.
+
 ## Child DOX Index
 
 No child DOX files.
