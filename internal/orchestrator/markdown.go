@@ -55,26 +55,37 @@ func ReadDocumentMetadata(path string) (Document, error) {
 		return Document{}, err
 	}
 	defer file.Close()
-	scanner := bufio.NewScanner(io.LimitReader(file, (1<<20)+1))
-	scanner.Buffer(make([]byte, 4096), 1<<20)
+	return readDocumentMetadata(bufio.NewReader(file))
+}
+
+func readDocumentMetadata(reader *bufio.Reader) (Document, error) {
 	var header strings.Builder
-	for scanner.Scan() {
-		line := strings.TrimSuffix(scanner.Text(), "\r")
-		if header.Len() == 0 && line != "---" {
-			return Document{}, errors.New("markdown document must begin with YAML front matter")
+	lineStart := 0
+	for {
+		line, more, err := reader.ReadLine()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return Document{}, errors.New("markdown front matter is not terminated within read limit")
+			}
+			return Document{}, err
 		}
 		if header.Len()+len(line)+1 > 1<<20 {
 			return Document{}, errors.New("workflow metadata exceeds read limit")
 		}
-		header.WriteString(line + "\n")
-		if line == "---" && header.Len() > 4 {
+		header.Write(line)
+		if more {
+			continue
+		}
+		delimiter := header.Len()-lineStart == 3 && string(line) == "---"
+		header.WriteByte('\n')
+		if lineStart == 0 && !delimiter {
+			return Document{}, errors.New("markdown document must begin with YAML front matter")
+		}
+		if delimiter && lineStart > 0 {
 			return ParseDocument([]byte(header.String()))
 		}
+		lineStart = header.Len()
 	}
-	if err := scanner.Err(); err != nil {
-		return Document{}, err
-	}
-	return Document{}, errors.New("markdown front matter is not terminated within read limit")
 }
 
 func ParseDocument(data []byte) (Document, error) {

@@ -1,16 +1,93 @@
 package orchestrator
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/extensions"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
+
+func TestStatusReadersKeepLargeProgressDocuments(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	checkpoint := now.Add(time.Hour)
+	body := "# Evidence\n" + strings.Repeat("historical evidence\n", 100000) + "\n## Progress\n- " + strings.Repeat("界", 500000) + "\n- Latest 確認\n  continued\n\n## Notes\n- Not progress\n"
+	for _, item := range []struct{ kind, status string }{{"tasks", "working"}, {"goals", "active"}} {
+		path := cfg.StatePath(item.kind, item.status, "large.md")
+		document := Document{FrontMatter: map[string]any{
+			"id": item.kind, "title": "Large evidence", "status": item.status, "review_required": true,
+			"updated_at": now.Format(time.RFC3339), "review_trigger": "scheduled", "next_review_at": checkpoint.Format(time.RFC3339),
+		}, Body: body}
+		if err := WriteDocument(path, document); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := os.ReadFile(path)
+		manager := New(cfg, &heartbeatHarness{}, extensions.Runner{})
+		inventory := manager.WorkflowItems(item.kind)
+		if len(inventory.Diagnostics) != 0 || len(inventory.Items) != 1 || !inventory.Items[0].DetailsAvailable || inventory.Items[0].ID != item.kind || inventory.Items[0].Step != "Latest 確認 continued" || !inventory.Items[0].UpdatedAt.Equal(now) || !inventory.Items[0].ReviewRequired {
+			t.Errorf("large %s listing lost metadata/progress: %#v", item.kind, inventory)
+		}
+		if status := manager.WorkStatus(); len(status.CountDiagnostics) != 0 {
+			t.Errorf("large %s status falsely unreadable: %#v", item.kind, status)
+		}
+		if item.kind == "goals" {
+			checkpoints, err := manager.ScheduledCheckpoints(now)
+			if err != nil || len(checkpoints) != 1 || !checkpoints[0].At.Equal(checkpoint) {
+				t.Errorf("large goal checkpoint lost: %#v %v", checkpoints, err)
+			}
+		}
+		after, _ := os.ReadFile(path)
+		if string(before) != string(after) {
+			t.Fatal("inspection changed durable evidence")
+		}
+	}
+}
+
+func TestLatestWorkflowProgressStreamsOversizedLines(t *testing.T) {
+	for _, body := range []string{
+		"## Progress\n- " + strings.Repeat("界", 500000),
+		"## Progress\r\n- First\r\n  " + strings.Repeat("界", 500000),
+	} {
+		step := latestWorkflowProgress(body)
+		if !utf8.ValidString(step) || len([]rune(step)) != maxWorkflowStepRunes || !strings.HasSuffix(step, "…") {
+			t.Fatalf("invalid oversized progress projection: %q", step)
+		}
+	}
+	ignored := "## Progress\n- Latest\n" + strings.Repeat("irrelevant", 200000)
+	if got := latestWorkflowProgress(ignored); got != "Latest" {
+		t.Fatalf("ignored oversized paragraph changed the step: %q", got)
+	}
+	if got := latestWorkflowProgress("## Progress\n" + strings.Repeat(" ", 10000) + "- Latest\n"); got != "Latest" {
+		t.Fatalf("indented entry lost beyond the line prefix: %q", got)
+	}
+}
+
+func TestStatusMetadataStillRejectsInvalidAndOversizedHeaders(t *testing.T) {
+	for _, header := range []string{"---\nid: [broken\n---\n", "---\n" + strings.Repeat("x", 1<<20) + "\n---\n"} {
+		path := filepath.Join(t.TempDir(), "invalid.md")
+		if err := os.WriteFile(path, []byte(header+"## Progress\n- Must not hide the invalid header\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readStatusDocument(path, true); !errors.Is(err, errStatusMetadata) {
+			t.Fatalf("invalid metadata accepted or misclassified: %v", err)
+		}
+	}
+}
 
 func TestWorkStatusCountsDurableActiveFoldersConservatively(t *testing.T) {
 	root := t.TempDir()

@@ -1806,11 +1806,7 @@ func (m *Manager) ScheduledCheckpoints(now time.Time) ([]ScheduledCheckpoint, er
 			return waits, fmt.Errorf("scheduled goal checkpoints are incomplete: document limit reached")
 		}
 		inspected++
-		data, err := readStatusDocument(filepath.Join(directory, entry.Name()))
-		if err != nil {
-			continue
-		}
-		document, err := ParseDocument(data)
+		document, err := readStatusDocument(filepath.Join(directory, entry.Name()), false)
 		if err != nil {
 			continue
 		}
