@@ -26,23 +26,35 @@ func (m *Manager) attachWorkerConversations(ctx context.Context, executions []ha
 		if execution.Conversation == nil || !execution.SourcesReserved && !execution.ConversationRefused() {
 			continue
 		}
-		key := "worker-conversation:" + strconv.FormatUint(execution.Sequence, 10)
-		m.mu.Lock()
-		if m.inflight[key] {
-			m.mu.Unlock()
-			continue
-		}
-		m.inflight[key] = true
-		m.mu.Unlock()
-		m.jobs.Add(1)
-		go func() {
-			defer m.jobs.Done()
-			defer m.setInflight(key, false)
-			if err := m.consumeWorkerConversation(ctx, execution, m.ConversationDelivery); err != nil && ctx.Err() == nil {
-				m.log("retained conversation delivery requires reconciliation")
-			}
-		}()
+		m.startWorkerConversationConsumer(ctx, execution)
 	}
+}
+
+// Caller holds the snapshot/admission lock. Requests and scans share this key.
+func (m *Manager) startWorkerConversationConsumer(ctx context.Context, execution harness.WorkerExecution) {
+	key := "worker-conversation:" + strconv.FormatUint(execution.Sequence, 10)
+	m.mu.Lock()
+	if m.inflight[key] {
+		m.mu.Unlock()
+		return
+	}
+	m.inflight[key] = true
+	if m.workerConsumerContext != nil {
+		ctx = m.workerConsumerContext
+	}
+	m.mu.Unlock()
+	m.jobs.Add(1)
+	go func() {
+		defer m.jobs.Done()
+		err := m.consumeWorkerConversation(ctx, execution, m.deliverConversationRequest)
+		m.workerAdmissionMu.Lock()
+		m.finishConversationRequests(execution.Sequence, err)
+		m.setInflight(key, false)
+		m.workerAdmissionMu.Unlock()
+		if err != nil && ctx.Err() == nil {
+			m.log("retained conversation delivery requires reconciliation")
+		}
+	}()
 }
 
 func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harness.WorkerExecution, deliver func(context.Context, int, harness.WorkerDelivery) error) (resultErr error) {
@@ -55,6 +67,9 @@ func (m *Manager) consumeWorkerConversation(ctx context.Context, execution harne
 		jobID, err = m.ConversationAttached(execution)
 		if err == nil && jobID > 0 {
 			m.setRuntimeJob("worker-conversation:"+execution.Conversation.ExecutionID, jobID)
+			if m.JobTimingUpdated != nil && execution.ConversationTurns > 0 {
+				m.JobTimingUpdated(jobID, time.Time{}, execution.ConversationTurns)
+			}
 		}
 		return err
 	}); err != nil {

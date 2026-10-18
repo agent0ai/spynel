@@ -246,6 +246,9 @@ func (s *Service) ConsumeConversationDelivery(jobID int, delivery harness.Worker
 		job.Kind != "conversation" || job.WorkID != conversation.ExecutionID {
 		return errors.New("retained conversation job does not match its execution")
 	}
+	if delivery.ConversationTurns > 0 {
+		s.Runtime.UpdateJobDurableTiming(jobID, time.Time{}, delivery.ConversationTurns)
+	}
 	defer func() {
 		if resultErr != nil {
 			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobDegraded), Detail: "Conversation delivery remains pending"})

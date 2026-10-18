@@ -9,13 +9,29 @@ import (
 	"github.com/agent0ai/spynel/internal/core"
 )
 
+// Reserve at actual dispatch, including one reservation for a merged queue.
+// This checkpoint survives controller replacement without counting attachment.
+func (h *workerHost) reserveConversationTurn(execution *workerExecution) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.failure != nil || execution.Done {
+		return false
+	}
+	execution.ConversationTurns++
+	if h.saveAdmissionLocked(execution) != nil {
+		h.failJournalLocked()
+		return false
+	}
+	return true
+}
+
 var workerConversationIdentity = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
 var workerConversationName = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9_.-]{0,118}[A-Za-z0-9-])?$`)
 
 // ConversationRefused identifies a journaled source refusal, never a provider result.
 func (e WorkerExecution) ConversationRefused() bool {
 	return e.Conversation.Validate() == nil && e.Key == "chat:"+e.Conversation.Channel+":"+e.Conversation.Conversation &&
-		e.Sequence > 0 && e.Workflow == nil && e.Agent == nil && e.Reservation == nil && len(e.Followups) == 0 &&
+		e.Sequence > 0 && e.Workflow == nil && e.Agent == nil && e.Reservation == nil && len(e.Followups) == 0 && e.ConversationTurns == 0 &&
 		!e.SourcesReserved && e.Done && e.Error != "" && e.ThreadID == "" && !e.Steered && !e.Cancelled &&
 		e.LastCursor == 1 && e.CommittedCursor <= e.LastCursor
 }

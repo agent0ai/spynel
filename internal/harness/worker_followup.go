@@ -100,7 +100,7 @@ func (h *workerHost) followup(request WorkerRequest) WorkerReply {
 		// Only the acknowledgement is bounded; the active turn and queue retain
 		// their original worker lifetime. Strict admission cannot start a new turn.
 		ctx, cancel := context.WithTimeout(h.supervisor.ctx, 5*time.Second)
-		_, _, err = h.supervisor.send(ctx, request.Key, request.Prompt, request.Message, func(event core.Event) { h.captureSource(e, event, batch.SourceMessageID) }, true)
+		_, _, err = h.supervisor.sendReserved(ctx, request.Key, request.Prompt, request.Message, func(event core.Event) { h.captureSource(e, event, batch.SourceMessageID) }, true, func() bool { return h.reserveConversationTurn(e) })
 		cancel()
 		var rejected *SendNotAdmittedError
 		if errors.As(err, &rejected) {

@@ -389,6 +389,9 @@ func TestWorkerConversationFollowupQueuedCompletion(t *testing.T) {
 			t.Fatal(reply.Error)
 		}
 	}
+	if e.ConversationTurns != 1 {
+		t.Fatal("queued messages reserved provider turns before dispatch")
+	}
 	target.finish(request.Key)
 	waitSupervisorState(t, func() bool { return target.IsActive(request.Key) })
 	target.mu.Lock()
@@ -396,6 +399,12 @@ func TestWorkerConversationFollowupQueuedCompletion(t *testing.T) {
 	target.mu.Unlock()
 	if count != 2 {
 		t.Fatal("queued follow-ups did not share one continuation")
+	}
+	host.mu.Lock()
+	turns := e.ConversationTurns
+	host.mu.Unlock()
+	if turns != 2 {
+		t.Fatal("batched continuation did not reserve exactly one provider turn")
 	}
 	target.finish(request.Key)
 	page := host.events(WorkerRequest{Sequence: 1})
@@ -413,5 +422,44 @@ func TestWorkerConversationFollowupQueuedCompletion(t *testing.T) {
 	}
 	if terminals != 1 {
 		t.Fatalf("terminal count = %d", terminals)
+	}
+}
+
+func TestWorkerConversationFollowupQueuedReservationFailure(t *testing.T) {
+	root := t.TempDir()
+	target := &supervisorHarness{name: "acp", followUp: FollowUpQueue, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	supervisor := NewSupervisor(NewRegistry(), HarnessConfig{Cwd: root})
+	supervisor.current, supervisor.ctx = target, context.Background()
+	host := &workerHost{supervisor: supervisor, info: WorkerInfo{ID: "synthetic-worker"}, directory: root, next: 1, executions: map[uint64]*workerExecution{}, stop: make(chan struct{}), conversation: func(string, string, WorkerConversation, string, error) error { return nil }}
+	c := &WorkerConversation{Channel: "cli", Conversation: "owned", ExecutionID: "execution", SourceMessageID: "alpha", Sources: []string{"alpha"}}
+	request := WorkerRequest{Action: "send", Sequence: 1, Key: "chat:cli:owned", Prompt: "first", Conversation: c}
+	if reply := host.apply(request); reply.Error != "" {
+		t.Fatal(reply.Error)
+	}
+	e := host.executions[1]
+	defer e.file.Close()
+	batch := *c
+	batch.SourceMessageID, batch.Sources = "beta", []string{"beta"}
+	request.Action, request.Conversation = "followup", &batch
+	if reply := host.apply(request); reply.Error != "" {
+		t.Fatal(reply.Error)
+	}
+	if err := os.Remove(e.file.Name() + ".admission"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(e.file.Name()+".admission", 0700); err != nil {
+		t.Fatal(err)
+	}
+	target.finish(request.Key)
+	select {
+	case <-host.stop:
+	case <-time.After(5 * time.Second):
+		t.Fatal("unrecorded reservation did not stop worker")
+	}
+	target.mu.Lock()
+	count := len(target.prompts[request.Key])
+	target.mu.Unlock()
+	if count != 1 {
+		t.Fatal("provider started without a synced turn reservation")
 	}
 }

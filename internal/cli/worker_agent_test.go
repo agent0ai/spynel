@@ -40,7 +40,7 @@ type workerAgentFixture struct {
 	done          chan error
 }
 
-func newWorkerAgentFixture(t *testing.T) *workerAgentFixture {
+func newWorkerAgentFixture(t *testing.T, names ...string) *workerAgentFixture {
 	t.Helper()
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
@@ -61,6 +61,9 @@ func newWorkerAgentFixture(t *testing.T) *workerAgentFixture {
 	t.Setenv("SPYNEL_TEST_WORKER_EVIDENCE", f.log)
 	executable, _ := os.Executable()
 	f.harnessConfig = harness.HarnessConfig{Name: "codex", Command: executable, Cwd: root, Sandbox: "read-only", ApprovalPolicy: "never", SessionsFile: filepath.Join(root, "sessions.json")}
+	if len(names) > 0 {
+		f.harnessConfig.Name = names[0]
+	}
 	f.open(t)
 	t.Cleanup(func() {
 		f.stop(t)

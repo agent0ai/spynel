@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	WorkerProtocol      = 11
+	WorkerProtocol      = 12
 	workerDetachedGrace = 10 * time.Minute
 	workerRequestBytes  = 256 * 1024
 	workerEventBytes    = 32 * 1024 * 1024
@@ -140,29 +140,31 @@ type WorkerReservation struct {
 type WorkerWorkflowAction func(root, key string, work WorkerWorkflow, action string) (WorkerReservation, error)
 
 type WorkerEvent struct {
-	Cursor       uint64
-	Event        core.Event
-	Conversation *WorkerConversation
-	RequestOnly  bool
-	Streamed     string
+	Cursor            uint64
+	Event             core.Event
+	Conversation      *WorkerConversation
+	RequestOnly       bool
+	Streamed          string
+	ConversationTurns int
 }
 
 type WorkerExecution struct {
-	Sequence        uint64
-	Key             string
-	ThreadID        string
-	Steered         bool
-	Done            bool
-	Error           string
-	LastCursor      uint64
-	CommittedCursor uint64
-	Workflow        *WorkerWorkflow
-	Reservation     *WorkerReservation
-	Agent           *WorkerAgent
-	Cancelled       bool
-	Conversation    *WorkerConversation
-	SourcesReserved bool
-	Followups       []WorkerConversationFollowup
+	Sequence          uint64
+	Key               string
+	ThreadID          string
+	Steered           bool
+	Done              bool
+	Error             string
+	LastCursor        uint64
+	CommittedCursor   uint64
+	Workflow          *WorkerWorkflow
+	Reservation       *WorkerReservation
+	Agent             *WorkerAgent
+	Cancelled         bool
+	Conversation      *WorkerConversation
+	SourcesReserved   bool
+	Followups         []WorkerConversationFollowup
+	ConversationTurns int
 }
 
 // Followups retain exact batch retry identities without storing prompt text.
@@ -654,13 +656,17 @@ func (h *workerHost) send(request WorkerRequest) WorkerReply {
 	if request.Agent != nil {
 		turnCtx, execution.cancel = context.WithDeadline(turnCtx, request.Agent.Deadline)
 	}
-	threadID, steered, err := h.supervisor.SendConversation(turnCtx, request.Key, request.Prompt, request.Message, func(event core.Event) {
+	var reserveTurn func() bool
+	if request.Conversation != nil {
+		reserveTurn = func() bool { return h.reserveConversationTurn(execution) }
+	}
+	threadID, steered, err := h.supervisor.sendReserved(turnCtx, request.Key, request.Prompt, request.Message, func(event core.Event) {
 		if request.Conversation != nil {
 			h.captureSource(execution, event, request.Conversation.SourceMessageID)
 		} else {
 			h.capture(execution, event)
 		}
-	})
+	}, false, reserveTurn)
 	var rejected *SendNotAdmittedError
 	if errors.As(err, &rejected) {
 		if request.Conversation != nil && !request.Conversation.Recovery {
@@ -800,7 +806,7 @@ func (h *workerHost) captureLocked(execution *workerExecution, event core.Event,
 	if conversation != nil && source != "" {
 		conversation.SourceMessageID = source
 	}
-	data, err := json.Marshal(WorkerEvent{Cursor: uint64(len(execution.offsets)) + 1, Event: event, Conversation: conversation, RequestOnly: requestOnly, Streamed: streamed})
+	data, err := json.Marshal(WorkerEvent{Cursor: uint64(len(execution.offsets)) + 1, Event: event, Conversation: conversation, RequestOnly: requestOnly, Streamed: streamed, ConversationTurns: execution.ConversationTurns})
 	if err == nil && (len(data) > workerEventBytes || h.bytes+int64(len(data)+1) > workerJournalBytes || len(execution.offsets) >= workerMaxEvents) {
 		err = errors.New("worker event journal capacity exceeded")
 	}

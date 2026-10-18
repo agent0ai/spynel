@@ -222,6 +222,7 @@ func TestWorkerConversationRefusalClassification(t *testing.T) {
 		func(e *WorkerExecution) { e.Agent = &WorkerAgent{} },
 		func(e *WorkerExecution) { e.Reservation = &WorkerReservation{} },
 		func(e *WorkerExecution) { e.Followups = []WorkerConversationFollowup{{}} },
+		func(e *WorkerExecution) { e.ConversationTurns = 1 },
 		func(e *WorkerExecution) { e.Key = "chat:cli:other" },
 		func(e *WorkerExecution) { e.Conversation = nil },
 		func(e *WorkerExecution) { e.Sequence = 0 },

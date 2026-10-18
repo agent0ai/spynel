@@ -57,6 +57,26 @@ func runWorkerAdmissionProvider() int {
 		result := map[string]any{}
 		switch request.Method {
 		case "initialize":
+			result["protocolVersion"] = 1
+			result["agentCapabilities"] = map[string]any{}
+		case "session/new":
+			result["sessionId"] = "synthetic-session"
+		case "session/prompt":
+			starts++
+			if write(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{"sessionId": "synthetic-session", "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]string{"type": "text", "text": "synthetic queued progress"}}}}) != nil {
+				return 1
+			}
+			go func(id, turn int) {
+				path := os.Getenv("SPYNEL_TEST_WORKER_COMPLETIONS") + "." + strconv.Itoa(turn)
+				for tick := 0; tick < 3000; tick++ {
+					if _, err := os.Stat(path); err == nil {
+						_ = write(map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]string{"stopReason": "end_turn"}})
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}(request.ID, starts)
+			continue
 		case "turn/interrupt":
 			if os.Getenv("SPYNEL_TEST_WORKER_DISCONNECT_INTERRUPT") == "1" {
 				return 0
@@ -107,7 +127,7 @@ func runWorkerAdmissionProvider() int {
 		default:
 			continue
 		}
-		if write(map[string]any{"id": request.ID, "result": result}) != nil {
+		if write(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": result}) != nil {
 			return 1
 		}
 		if request.Method == "turn/interrupt" {

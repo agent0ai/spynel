@@ -58,6 +58,7 @@ type pendingSend struct {
 	generation      uint64
 	release         []core.Emit
 	terminal        *core.Event
+	reserveTurn     func() bool
 }
 
 type controlState struct {
@@ -435,6 +436,10 @@ func (s *Supervisor) ConversationAdmission(key string) string {
 }
 
 func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit core.Emit, followupOnly bool) (string, bool, error) {
+	return s.sendReserved(ctx, key, prompt, message, emit, followupOnly, nil)
+}
+
+func (s *Supervisor) sendReserved(ctx context.Context, key, prompt, message string, emit core.Emit, followupOnly bool, reserveTurn func() bool) (string, bool, error) {
 	operation := s.controlOperation(key)
 	if err := operation.LockContext(ctx); err != nil {
 		return "", false, &SendNotAdmittedError{Err: err}
@@ -459,7 +464,7 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 	}
 	if (!wasActive && logicalActive) || (wasActive && followUpMode(target) == FollowUpQueue) {
 		threadID := target.ThreadID(key)
-		s.pending[key] = append(s.pending[key], pendingSend{prompt: prompt, message: message, emit: emit})
+		s.pending[key] = append(s.pending[key], pendingSend{prompt: prompt, message: message, emit: emit, reserveTurn: reserveTurn})
 		s.mu.Unlock()
 		operation.Unlock()
 		if emit != nil {
@@ -486,6 +491,8 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 		} else {
 			err = &SendNotAdmittedError{Err: errors.New("active harness has no strict conversation steering operation")}
 		}
+	} else if !wasActive && reserveTurn != nil && !reserveTurn() {
+		err = &SendNotAdmittedError{Err: errors.New("conversation provider reservation failed")}
 	} else {
 		threadID, steered, err = sendWithInference(target, ctx, key, prompt, selection, wrapper)
 	}
@@ -898,6 +905,10 @@ func (s *Supervisor) startQueuedOwned(key string, target Harness, next pendingSe
 	s.mu.RUnlock()
 	if closed || ctx == nil {
 		wrapper(core.Event{Kind: core.EventError, Text: "queued follow-up failed: harness supervisor is closed", Done: true})
+		return
+	}
+	if next.reserveTurn != nil && !next.reserveTurn() {
+		s.finishQueuedControl(key, next)
 		return
 	}
 	threadID := target.ThreadID(key)

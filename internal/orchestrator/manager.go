@@ -125,6 +125,8 @@ type Manager struct {
 	cleanupDays                 atomic.Int64
 	cleanupTicks                <-chan time.Time
 	workerAdmissionMu           sync.Mutex
+	conversationRequests        map[uint64]map[string]*conversationRequest
+	workerConsumerContext       context.Context
 	claimDocument               func(source, target, status, attemptField string, now time.Time) (Document, error)
 }
 
@@ -247,6 +249,9 @@ func (m *Manager) SetNotificationDelivery(deliver func(context.Context, Origin, 
 }
 
 func (m *Manager) Run(ctx context.Context) error {
+	m.mu.Lock()
+	m.workerConsumerContext = ctx
+	m.mu.Unlock()
 	if err := m.ScanOnce(ctx); err != nil {
 		m.log("orchestrator scan: " + err.Error())
 	}

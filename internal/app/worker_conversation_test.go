@@ -407,3 +407,33 @@ func TestWorkerConversationFinalPreservesOutputOnProcessingError(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkerConversationDeliveryRestoresTurnCount(t *testing.T) {
+	s, _, _ := newRecoveryTestService(t)
+	c := &harness.WorkerConversation{Channel: "cli", Conversation: "counted", SourceMessageID: "alpha", ExecutionID: "execution", Sources: []string{"alpha"}}
+	if _, err := s.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", SourceMessageID: "alpha"}); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.beginWorkerConversation(*c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := harness.WorkerDelivery{WorkerID: strings.Repeat("f", 32), Sequence: 1, WorkerEvent: harness.WorkerEvent{Cursor: 1, Conversation: c, ConversationTurns: 3, Event: core.Event{Kind: core.EventDelta, Text: "retained third turn"}}}
+	for range 2 {
+		if err := s.ConsumeConversationDelivery(id, d, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job, _ := s.Runtime.Job(id)
+	if job.ProviderIterations != 3 {
+		t.Fatal("restored provider count was lost or incremented on replay")
+	}
+	d.Cursor, d.Event = 2, core.Event{Kind: core.EventFinal, Text: "done", Done: true}
+	if err := s.ConsumeConversationDelivery(id, d, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(s.Config.StatePath("jobs"), job.StableID+".md"))
+	if err != nil || !strings.Contains(string(data), "provider_iterations: \"3\"\n") {
+		t.Fatal("terminal archive lost actual provider count", err)
+	}
+}

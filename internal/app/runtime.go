@@ -415,13 +415,13 @@ func (r *Runtime) tryBeginJobWithDetails(sessionKey, channel, conversation, desc
 	return job.ID, true, nil
 }
 
-// UpdateJobDurableTiming applies only non-regressing durable observations to
-// an active job, allowing controls and guarded continuations to refresh the
+// UpdateJobDurableTiming applies non-regressing workflow and worker-conversation
+// observations, allowing controls and guarded continuations to refresh the
 // same process-local execution handle without resetting its current execution age.
 func (r *Runtime) UpdateJobDurableTiming(id int, firstAssignedAt time.Time, providerIterations int) bool {
 	r.mu.Lock()
 	job, ok := r.jobs[id]
-	if !ok || !job.Durable {
+	if !ok || !job.Durable && (job.Kind != "conversation" || job.WorkID == "") {
 		r.mu.Unlock()
 		return false
 	}
