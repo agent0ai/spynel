@@ -4,8 +4,10 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -18,6 +20,116 @@ type conversationFollowupHarness struct {
 	err      error
 	complete bool
 	sends    int
+}
+
+// Complete after Supervisor's activity observation, at real adapter admission.
+type completingConversationCodex struct {
+	*Codex
+	completeBeforeSend bool
+}
+
+func (c *completingConversationCodex) complete() {
+	if !c.completeBeforeSend {
+		return
+	}
+	c.mu.Lock()
+	state := c.active[c.session["chat:cli:completion"]]
+	c.mu.Unlock()
+	if state != nil {
+		data, _ := json.Marshal(map[string]any{"threadId": state.threadID, "turn": map[string]any{"id": state.turnID, "status": "completed"}})
+		c.handleNotification(wireMessage{Method: "turn/completed", Params: data})
+	}
+}
+
+func (c *completingConversationCodex) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
+	c.complete()
+	return c.Codex.SendWithInference(ctx, key, prompt, selection, emit)
+}
+
+func (c *completingConversationCodex) SteerConversation(ctx context.Context, key, prompt string, emit core.Emit) (string, error) {
+	c.complete()
+	return c.Codex.SteerConversation(ctx, key, prompt, emit)
+}
+
+func TestWorkerConversationFollowupCompletionAtAdapterAdmission(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "codex-interrupt")
+	codex, err := NewCodex(CodexConfig{Command: command, Cwd: root, SessionsFile: filepath.Join(root, "sessions.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := codex.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer codex.Close()
+	target := &completingConversationCodex{Codex: codex}
+	supervisor := NewSupervisor(NewRegistry(), HarnessConfig{Cwd: root})
+	supervisor.current, supervisor.ctx = target, ctx
+	reserved, restored := 0, 0
+	host := &workerHost{supervisor: supervisor, info: WorkerInfo{ID: "completion-worker"}, directory: root, next: 1, executions: map[uint64]*workerExecution{}, stop: make(chan struct{})}
+	host.conversation = func(_, _ string, c WorkerConversation, receipt string, sendErr error) error {
+		if sendErr == nil {
+			reserved++
+			return nil
+		}
+		var rejected *SendNotAdmittedError
+		if !errors.As(sendErr, &rejected) || !reflect.DeepEqual(c.Sources, []string{"beta"}) || receipt != "completion-worker:1:followup:beta" {
+			t.Fatal("completion did not restore only its proven rejected batch")
+		}
+		for _, event := range host.events(WorkerRequest{Sequence: 1}).Events {
+			if event.Event.Done && !event.RequestOnly {
+				t.Fatal("completion published before source restoration")
+			}
+		}
+		restored++
+		return nil
+	}
+	c := &WorkerConversation{Channel: "cli", Conversation: "completion", ExecutionID: "execution", SourceMessageID: "alpha", Sources: []string{"alpha"}}
+	request := WorkerRequest{Action: "send", Sequence: 1, Key: "chat:cli:completion", Prompt: "first", Conversation: c}
+	if reply := host.apply(request); reply.Error != "" {
+		t.Fatal(reply.Error)
+	}
+	defer host.executions[1].file.Close()
+	target.completeBeforeSend = true
+	batch := *c
+	batch.SourceMessageID, batch.Sources = "beta", []string{"beta"}
+	request.Action, request.Prompt, request.Conversation = "followup", "second", &batch
+	reply := host.apply(request)
+	starts, steers := 0, 0
+	for _, record := range readFixtureRecords(t, logPath) {
+		if record.Method == "turn/start" {
+			starts++
+		}
+		if record.Method == "turn/steer" {
+			steers++
+		}
+	}
+	e := host.executions[1]
+	if starts != 1 || steers != 0 || codex.IsActive(request.Key) || reply.Error == "" {
+		t.Fatalf("strict follow-up admitted after completion: starts=%d, steers=%d, provider_active=%t, worker_done=%t, reply_error=%q", starts, steers, codex.IsActive(request.Key), e.Done, reply.Error)
+	}
+	if !e.Done || !e.Followups[0].Restored || reserved != 2 || restored != 1 {
+		t.Fatal("completion lost its terminal or exact source restoration")
+	}
+	terminals := 0
+	for _, event := range host.events(WorkerRequest{Sequence: 1}).Events {
+		if event.Event.Done && !event.RequestOnly {
+			terminals++
+			if !reflect.DeepEqual(event.Conversation.Sources, []string{"alpha"}) {
+				t.Fatal("terminal covered a rejected follow-up source")
+			}
+		}
+	}
+	host.apply(request)
+	if terminals != 1 || reserved != 2 || restored != 1 || codex.IsActive(request.Key) {
+		t.Fatal("retry repeated admission, restoration or provider delivery")
+	}
+}
+
+func (h *conversationFollowupHarness) SteerConversation(ctx context.Context, key, prompt string, emit core.Emit) (string, error) {
+	threadID, _, err := h.SendWithModel(ctx, key, prompt, "", emit)
+	return threadID, err
 }
 
 func TestWorkerConversationFollowupNativeAdapters(t *testing.T) {

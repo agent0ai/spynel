@@ -160,6 +160,13 @@ type NativeSteerer interface {
 	Steer(context.Context, string, string, func() bool) (threadID string, err error)
 }
 
+// ConversationSteerer transfers the response stream only within an existing
+// native turn. Completion and emitter replacement share the adapter's delivery
+// fence; an inactive turn is refused before delivery, never started again.
+type ConversationSteerer interface {
+	SteerConversation(context.Context, string, string, core.Emit) (threadID string, err error)
+}
+
 var (
 	errNativeTurnInactive       = errors.New("native provider turn is no longer active")
 	errNativeDeliveryUnreserved = errors.New("native provider delivery was not reserved")

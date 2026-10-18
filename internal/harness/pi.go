@@ -233,8 +233,16 @@ func (p *Pi) SendWithInference(ctx context.Context, key, prompt string, selectio
 }
 
 func (p *Pi) Steer(ctx context.Context, key, prompt string, beforeDelivery func() bool) (string, error) {
+	return p.steer(ctx, key, prompt, nil, false, beforeDelivery)
+}
+
+func (p *Pi) SteerConversation(ctx context.Context, key, prompt string, emit core.Emit) (string, error) {
+	return p.steer(ctx, key, prompt, emit, true, nil)
+}
+
+func (p *Pi) steer(ctx context.Context, key, prompt string, emit core.Emit, replace bool, beforeDelivery func() bool) (string, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", errors.New("harness prompt is empty")
+		return "", &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	lock := p.lockForKey(key)
 	lock.Lock()
@@ -245,7 +253,7 @@ func (p *Pi) Steer(ctx context.Context, key, prompt string, beforeDelivery func(
 	if process == nil {
 		return p.ThreadID(key), fmt.Errorf("Pi turn is no longer active: %w", errNativeTurnInactive)
 	}
-	return p.steerLocked(ctx, process, prompt, nil, false, beforeDelivery)
+	return p.steerLocked(ctx, process, prompt, emit, replace, beforeDelivery)
 }
 
 func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string, emit core.Emit, replace bool, beforeDelivery func() bool) (string, error) {
@@ -280,7 +288,7 @@ func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string,
 	})
 	if err != nil {
 		turn.mu.Lock()
-		if !turn.completed && replace {
+		if reserved && !turn.completed && replace {
 			turn.emit = previous
 		}
 		turn.mu.Unlock()

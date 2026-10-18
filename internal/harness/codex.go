@@ -348,31 +348,11 @@ func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selec
 	active := c.active[threadID]
 	c.mu.Unlock()
 	if active != nil {
-		previousEmit := active.replaceEmit(emit)
-		params := map[string]any{
-			"threadId":       threadID,
-			"expectedTurnId": active.turnID,
-			"input":          []map[string]any{{"type": "text", "text": prompt}},
+		err := c.steerLocked(ctx, threadID, active, prompt, emit, true, nil)
+		if errors.Is(err, errNativeTurnInactive) {
+			err = &SendNotAdmittedError{Err: err}
 		}
-		if _, err := c.call(ctx, "turn/steer", params); err != nil {
-			c.mu.Lock()
-			stillActive := c.active[threadID] == active
-			c.mu.Unlock()
-			if stillActive {
-				active.replaceEmit(previousEmit)
-			}
-			return threadID, true, err
-		}
-		// The newest message owns the rest of the streamed response. Release
-		// transport-local activity associated with the older message without
-		// declaring the underlying harness turn complete.
-		if previousEmit != nil {
-			previousEmit(core.Event{Kind: core.EventStatus, Done: true, ThreadID: threadID, TurnID: active.turnID})
-		}
-		if emit != nil {
-			emit(core.Event{Kind: core.EventStatus, Text: "Steering active Codex turn", ThreadID: threadID, TurnID: active.turnID})
-		}
-		return threadID, true, nil
+		return threadID, true, err
 	}
 
 	params := map[string]any{
@@ -436,8 +416,16 @@ func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selec
 
 // Steer addresses only the current turn and cannot fall back to turn/start.
 func (c *Codex) Steer(ctx context.Context, key, prompt string, beforeDelivery func() bool) (string, error) {
+	return c.steer(ctx, key, prompt, nil, false, beforeDelivery)
+}
+
+func (c *Codex) SteerConversation(ctx context.Context, key, prompt string, emit core.Emit) (string, error) {
+	return c.steer(ctx, key, prompt, emit, true, nil)
+}
+
+func (c *Codex) steer(ctx context.Context, key, prompt string, emit core.Emit, replace bool, beforeDelivery func() bool) (string, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", errors.New("harness prompt is empty")
+		return "", &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	lock := c.lockForKey(key)
 	lock.Lock()
@@ -449,14 +437,22 @@ func (c *Codex) Steer(ctx context.Context, key, prompt string, beforeDelivery fu
 	if threadID == "" || active == nil {
 		return threadID, fmt.Errorf("Codex turn is no longer active: %w", errNativeTurnInactive)
 	}
+	return threadID, c.steerLocked(ctx, threadID, active, prompt, emit, replace, beforeDelivery)
+}
+
+func (c *Codex) steerLocked(ctx context.Context, threadID string, active *turnState, prompt string, emit core.Emit, replace bool, beforeDelivery func() bool) error {
 	active.deliveryMu.Lock()
 	if active.completed {
 		active.deliveryMu.Unlock()
-		return threadID, fmt.Errorf("Codex turn is no longer active: %w", errNativeTurnInactive)
+		return fmt.Errorf("Codex turn is no longer active: %w", errNativeTurnInactive)
 	}
 	if beforeDelivery != nil && !beforeDelivery() {
 		active.deliveryMu.Unlock()
-		return threadID, errNativeDeliveryUnreserved
+		return errNativeDeliveryUnreserved
+	}
+	var previous core.Emit
+	if replace {
+		previous = active.replaceEmit(emit)
 	}
 	params := map[string]any{
 		"threadId": threadID, "expectedTurnId": active.turnID,
@@ -468,10 +464,18 @@ func (c *Codex) Steer(ctx context.Context, key, prompt string, beforeDelivery fu
 		_, err = c.awaitCall(ctx, "turn/steer", id, response)
 	}
 	if err != nil {
-		return threadID, err
+		active.deliveryMu.Lock()
+		if replace && !active.completed {
+			active.replaceEmit(previous)
+		}
+		active.deliveryMu.Unlock()
+		return err
+	}
+	if replace && previous != nil {
+		previous(core.Event{Kind: core.EventStatus, Done: true, ThreadID: threadID, TurnID: active.turnID})
 	}
 	active.emitEvent(core.Event{Kind: core.EventStatus, Text: "Steering active Codex turn", ThreadID: threadID, TurnID: active.turnID})
-	return threadID, nil
+	return nil
 }
 
 func (c *Codex) ensureThread(ctx context.Context, key, model string) (string, error) {

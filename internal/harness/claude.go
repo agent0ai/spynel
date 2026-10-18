@@ -355,8 +355,16 @@ func (c *Claude) SendWithInference(ctx context.Context, key, prompt string, sele
 // Steer writes only to an active streaming-input turn. Closing or absent
 // turns are refused instead of being resumed as a new process.
 func (c *Claude) Steer(_ context.Context, key, prompt string, beforeDelivery func() bool) (string, error) {
+	return c.steer(key, prompt, nil, false, beforeDelivery)
+}
+
+func (c *Claude) SteerConversation(_ context.Context, key, prompt string, emit core.Emit) (string, error) {
+	return c.steer(key, prompt, emit, true, nil)
+}
+
+func (c *Claude) steer(key, prompt string, emit core.Emit, replace bool, beforeDelivery func() bool) (string, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", errors.New("harness prompt is empty")
+		return "", &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	lock := c.lockForKey(key)
 	lock.Lock()
@@ -368,12 +376,15 @@ func (c *Claude) Steer(_ context.Context, key, prompt string, beforeDelivery fun
 	if active == nil {
 		return threadID, fmt.Errorf("Claude Code turn is no longer active: %w", errNativeTurnInactive)
 	}
-	_, err := active.writePromptPrepared(prompt, nil, false, beforeDelivery)
+	previous, err := active.writePromptPrepared(prompt, emit, replace, beforeDelivery)
 	if err != nil {
 		if errors.Is(err, errClaudeTurnClosing) {
 			err = fmt.Errorf("%w: %v", errNativeTurnInactive, err)
 		}
 		return threadID, fmt.Errorf("steer active Claude Code turn: %w", err)
+	}
+	if replace && previous != nil {
+		previous(core.Event{Kind: core.EventStatus, Text: "Response continued on a newer message", ThreadID: threadID, Done: true})
 	}
 	active.emitEvent(core.Event{Kind: core.EventStatus, Text: "Steering active Claude Code turn", ThreadID: threadID})
 	return threadID, nil

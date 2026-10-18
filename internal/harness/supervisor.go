@@ -452,7 +452,7 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 	wasActive := target.IsActive(key)
 	selection := inferenceSelection(s.config)
 	logicalActive := s.active[key] > 0
-	if followupOnly && !wasActive && !logicalActive {
+	if followupOnly && !wasActive && (!logicalActive || followUpMode(target) == FollowUpSteer) {
 		s.mu.Unlock()
 		operation.Unlock()
 		return "", false, &SendNotAdmittedError{Err: errors.New("conversation is no longer active")}
@@ -474,7 +474,21 @@ func (s *Supervisor) send(ctx context.Context, key, prompt, message string, emit
 	previousEmit := s.controlEmit[key]
 	s.controlEmit[key] = wrapper
 	s.mu.Unlock()
-	threadID, steered, err := sendWithInference(target, ctx, key, prompt, selection, wrapper)
+	var threadID string
+	var steered bool
+	if followupOnly {
+		if steerer, ok := target.(ConversationSteerer); ok {
+			threadID, err = steerer.SteerConversation(ctx, key, prompt, wrapper)
+			steered = true
+			if errors.Is(err, errNativeTurnInactive) {
+				err = &SendNotAdmittedError{Err: err}
+			}
+		} else {
+			err = &SendNotAdmittedError{Err: errors.New("active harness has no strict conversation steering operation")}
+		}
+	} else {
+		threadID, steered, err = sendWithInference(target, ctx, key, prompt, selection, wrapper)
+	}
 	if err != nil {
 		if wasActive {
 			s.mu.Lock()
