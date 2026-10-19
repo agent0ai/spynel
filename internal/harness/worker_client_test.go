@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -24,6 +25,24 @@ import (
 )
 
 type workerTransportHook func(*http.Request) (*http.Response, error)
+
+func TestWorkerWithLongTemporaryDirectory(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), strings.Repeat("temporary", 16))
+	if err := os.Mkdir(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", directory)
+	fixture := newWorkerFixture(t, "codex", "codex-worker")
+	client, err := OpenWorker(t.Context(), fixture.config, fixture.owner.ID(), fixture.term)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if len(client.Info().Socket) > 103 {
+		t.Fatal("worker socket exceeds the supported Unix path budget")
+	}
+	workerClientCall(t, client, WorkerRequest{Action: "inspect"})
+}
 
 func (hook workerTransportHook) RoundTrip(request *http.Request) (*http.Response, error) {
 	return hook(request)

@@ -209,6 +209,12 @@ func primaryWorkerRecovery(t *testing.T, role string, cancelled, incompatible bo
 	if err := updater.VerifyProcess(initialInfo.Process); err != nil {
 		t.Fatal(err)
 	}
+	if role == "conversation" && !cancelled {
+		// Model a checkpoint write interrupted by the imminent native death.
+		if err := os.WriteFile(filepath.Join(filepath.Dir(initialInfo.Socket), ".spynel-write-1234567890"), []byte{0xff, '{'}, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if incompatible {
 		// Model a previous protocol's strict current-schema crash-left record;
 		// a separate retained native test also runs the actual older image.

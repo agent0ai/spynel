@@ -35,7 +35,7 @@ func (h *workerHost) recoverPrevious(cfg HarnessConfig) (string, error) {
 		return "", errors.New("prior worker journal directory unsafe")
 	}
 	entries, err := os.ReadDir(directory)
-	if err != nil || len(entries) > workerMaxExecutions*3+1 {
+	if err != nil || len(entries) > workerMaxExecutions*3+2 {
 		return "", errors.New("prior worker journal inventory unavailable")
 	}
 	files := map[string][]byte{}
@@ -50,6 +50,16 @@ func (h *workerHost) recoverPrevious(cfg HarnessConfig) (string, error) {
 			continue
 		}
 		name := entry.Name()
+		if suffix, scratch := strings.CutPrefix(name, ".spynel-write-"); scratch {
+			// A killed AtomicWriteFile may leave an uncommitted sibling.
+			number, parseErr := strconv.ParseUint(suffix, 10, 32)
+			info, statErr := os.Lstat(filepath.Join(directory, name))
+			if parseErr != nil || strconv.FormatUint(number, 10) != suffix || statErr != nil ||
+				!info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > workerRequestBytes {
+				return "", errors.New("prior worker journal scratch unsafe")
+			}
+			continue
+		}
 		base := strings.TrimSuffix(strings.TrimSuffix(name, ".admission"), ".cursor")
 		sequence, err := strconv.ParseUint(strings.TrimSuffix(base, ".jsonl"), 10, 64)
 		if err != nil || sequence == 0 || sequence == ^uint64(0) || base != strconv.FormatUint(sequence, 10)+".jsonl" ||

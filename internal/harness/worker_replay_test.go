@@ -96,7 +96,7 @@ func TestWorkerCrashReplayPreservesTerminalOutcome(t *testing.T) {
 }
 
 func TestWorkerCrashJournalValidation(t *testing.T) {
-	for _, scenario := range []string{"terminal", "unfinished", "truncated", "future-cursor", "rewound-cursor", "invalid-utf8", "unsafe-file", "symlink", "missing-directory", "changed-config", "unverified-process"} {
+	for _, scenario := range []string{"terminal", "unfinished", "atomic-scratch", "unsafe-scratch", "symlink-scratch", "unknown-scratch", "truncated", "future-cursor", "rewound-cursor", "invalid-utf8", "unsafe-file", "symlink", "missing-directory", "changed-config", "unverified-process"} {
 		t.Run(scenario, func(t *testing.T) {
 			root := t.TempDir()
 			previous, err := os.MkdirTemp(root, "spynel-worker-")
@@ -150,6 +150,26 @@ func TestWorkerCrashJournalValidation(t *testing.T) {
 			journal := filepath.Join(previous, "1.jsonl")
 			write(journal, data)
 			switch scenario {
+			case "atomic-scratch", "unsafe-scratch", "symlink-scratch", "unknown-scratch":
+				// AtomicWriteFile can die before renaming this uncommitted sibling.
+				scratch := filepath.Join(previous, ".spynel-write-1234567890")
+				if scenario == "unknown-scratch" {
+					scratch += "-unknown"
+				}
+				write(scratch, []byte{0xff, '{'})
+				if scenario == "unsafe-scratch" {
+					if err := os.Chmod(scratch, 0644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if scenario == "symlink-scratch" {
+					if err := os.Remove(scratch); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(journal, scratch); err != nil {
+						t.Fatal(err)
+					}
+				}
 			case "future-cursor":
 				write(journal+".cursor", []byte("2\n"))
 			case "rewound-cursor":
@@ -184,7 +204,7 @@ func TestWorkerCrashJournalValidation(t *testing.T) {
 					defer execution.file.Close()
 				}
 			}
-			if scenario != "terminal" && scenario != "unfinished" {
+			if scenario != "terminal" && scenario != "unfinished" && scenario != "atomic-scratch" {
 				if err == nil {
 					t.Fatal("invalid or unverified journal accepted")
 				}
@@ -212,6 +232,11 @@ func TestWorkerCrashJournalValidation(t *testing.T) {
 			}
 			if _, err := os.Stat(filepath.Join(previous, "1.jsonl")); err != nil {
 				t.Fatal("predecessor changed before publication", err)
+			}
+			if scenario == "atomic-scratch" {
+				if _, err := os.Stat(filepath.Join(current, ".spynel-write-1234567890")); !os.IsNotExist(err) {
+					t.Fatal("uncommitted scratch copied into successor", err)
+				}
 			}
 		})
 	}

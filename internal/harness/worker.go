@@ -298,7 +298,7 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 		return errors.New("worker native identity unavailable")
 	}
 	// Unix socket names have a small platform limit; workspace/config paths do not.
-	directory, err := os.MkdirTemp("", "spynel-worker-")
+	directory, err := newWorkerDirectory()
 	if err != nil {
 		return err
 	}
