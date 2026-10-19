@@ -184,7 +184,7 @@ func TestWorkerInterruptTimeoutRetainsIntentAndReleasesOwnership(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("late provider terminal did not settle")
+			t.Fatalf("late provider terminal did not settle: done=%t cancelled=%t produced=%d committed=%d", retained.Done, retained.Cancelled, retained.LastCursor, retained.CommittedCursor)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

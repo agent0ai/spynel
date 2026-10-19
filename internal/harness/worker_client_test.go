@@ -510,7 +510,7 @@ func TestWorkerLaunchSurvivesActualControllerExit(t *testing.T) {
 					break
 				}
 				if time.Now().After(deadline) {
-					t.Fatal("original execution did not settle cancellation")
+					t.Fatalf("original execution did not settle cancellation: done=%t terminal=%t produced=%d committed=%d applied=%d", state.Done, terminal, state.LastCursor, state.CommittedCursor, applied)
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
