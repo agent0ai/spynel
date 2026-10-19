@@ -62,11 +62,13 @@ type notifyRequest struct {
 	Origin           string `json:"origin,omitempty"`
 	FallbackOrigin   string `json:"fallback_origin,omitempty"`
 	EscalationKey    string `json:"escalation_key,omitempty"`
+	CancelID         string `json:"cancel_id,omitempty"`
 	RecentAuthorized bool   `json:"recent_authorized,omitempty"`
 	Message          string `json:"message"`
 }
 type notifyResponse struct {
-	ID string `json:"id"`
+	ID    string `json:"id"`
+	State string `json:"state,omitempty"`
 }
 type notificationAckRequest struct {
 	Origin     string `json:"origin"`
@@ -199,8 +201,16 @@ func (s *Server) notify(response http.ResponseWriter, request *http.Request) {
 		return
 	}
 	var id string
+	var state string
 	var err error
-	if input.RecentAuthorized {
+	if input.CancelID != "" {
+		if input.RecentAuthorized || input.FallbackOrigin != "" || input.EscalationKey != "" || input.Message != "" {
+			http.Error(response, "cancel_id requires only origin and an event ID", http.StatusBadRequest)
+			return
+		}
+		id = input.CancelID
+		state, err = s.Service.CancelNotification(request.Context(), input.Origin, id)
+	} else if input.RecentAuthorized {
 		if strings.TrimSpace(input.FallbackOrigin) != "" || input.EscalationKey != "" {
 			http.Error(response, "fallback_origin requires origin", http.StatusBadRequest)
 			return
@@ -215,7 +225,11 @@ func (s *Server) notify(response http.ResponseWriter, request *http.Request) {
 		writeError(response, err)
 		return
 	}
-	writeJSON(response, http.StatusAccepted, notifyResponse{ID: id})
+	status := http.StatusAccepted
+	if input.CancelID != "" {
+		status = http.StatusOK
+	}
+	writeJSON(response, status, notifyResponse{ID: id, State: state})
 }
 
 func (s *Server) authorize(next http.HandlerFunc) http.HandlerFunc {

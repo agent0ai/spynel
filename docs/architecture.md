@@ -166,3 +166,5 @@ Every harness event refreshes the heartbeat. A completed harness turn does not r
 ## Extension direction
 
 New built-in transports implement `channel.Channel`. New coding agents add one catalog/factory entry, implement `harness.Harness`, and explicitly declare native steering or queue behavior. ACP-compatible agents normally need only a command/argument alias around the shared adapter; other adapters own their protocol translation. Queue-mode chat bursts are batched automatically. Project extensions remain executable hooks with JSON stdin/stdout so they are portable across languages and Go versions. They are intentionally trusted code rather than a misleading partial sandbox.
+
+The ordinary outbox owns exact-event retry cancellation through `notify --origin ... --cancel EVENT_ID`. Communication, notification and heartbeat agents validate answers and cancel resolved questions before their ordinary task transitions. Cancellation shares the send/retry mutex, preserves failures and terminal delivery truth, and remains effective after restart. It sends nothing, grants no routing authority, and does not parse answers or add reminder state.

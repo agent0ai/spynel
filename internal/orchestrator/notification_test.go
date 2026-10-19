@@ -371,3 +371,102 @@ func decodeOutboxForTest(data []byte) (OutboxEntry, error) {
 	err := json.Unmarshal(data, &entry)
 	return entry, err
 }
+
+func TestOutboxCancelPreservesFailureAndPreventsRestartRetry(t *testing.T) {
+	now := time.Now().UTC()
+	calls := 0
+	outbox := &Outbox{Directory: t.TempDir(), Now: func() time.Time { return now },
+		FallbackAllowed: func(context.Context, Origin) error { return nil },
+		Deliver:         func(context.Context, Origin, string, string) error { calls++; return errors.New("offline") },
+	}
+	entry, err := outbox.EnqueueEscalation("choice", "tui/original", "telegram/TG-7", "GREEN or RED?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.Process(context.Background()); err == nil {
+		t.Fatal("missing failed send")
+	}
+	if _, err := outbox.Cancel("tui/another", entry.ID); err == nil {
+		t.Fatal("cancelled wrong route")
+	}
+	for _, id := range []string{"../escape", "", strings.Repeat("z", 32), strings.Repeat("a", 32)} {
+		if _, err := outbox.Cancel(entry.Origin, id); err == nil {
+			t.Fatal("invalid or absent event accepted")
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if state, err := outbox.Cancel(entry.Origin, entry.ID); err != nil || state != "cancelled" {
+			t.Fatalf("cancel: %s %v", state, err)
+		}
+	}
+	data, err := os.ReadFile(outbox.path(entry.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cancelled OutboxEntry
+	if err := json.Unmarshal(data, &cancelled); err != nil {
+		t.Fatal(err)
+	}
+	if cancelled.Attempts != 1 || cancelled.LastError != "offline" || !cancelled.DeliveredAt.IsZero() || !cancelled.NextAttemptAt.IsZero() || cancelled.Message != entry.Message {
+		t.Fatalf("lost failure evidence: %#v", cancelled)
+	}
+	now = now.Add(time.Minute)
+	restarted := &Outbox{Directory: outbox.Directory, Now: outbox.Now, Deliver: outbox.Deliver, FallbackAllowed: outbox.FallbackAllowed}
+	replay, err := restarted.EnqueueEscalation("choice", entry.Origin, entry.FallbackOrigin, entry.Message)
+	if err != nil || replay.State != "cancelled" || replay.ID != entry.ID {
+		t.Fatalf("reopened cancelled decision: %#v %v", replay, err)
+	}
+	if err := restarted.Process(context.Background()); err != nil || calls != 1 {
+		t.Fatalf("retried resolved question: %d %v", calls, err)
+	}
+	other, err := restarted.Enqueue("unrelated", "manual", entry.Origin, "different question")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.State != "pending" {
+		t.Fatal("unrelated question retired")
+	}
+	for _, state := range []string{"delivered", "expired"} {
+		other.State = state
+		if err := restarted.write(other); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := os.ReadFile(restarted.path(other.ID))
+		if got, err := restarted.Cancel(other.Origin, other.ID); err != nil || got != state {
+			t.Fatalf("terminal state: %s %v", got, err)
+		}
+		after, _ := os.ReadFile(restarted.path(other.ID))
+		if string(before) != string(after) {
+			t.Fatal("terminal evidence changed")
+		}
+	}
+}
+
+func TestOutboxCancelSerializesWithInFlightDelivery(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	outbox := &Outbox{Directory: t.TempDir(), Deliver: func(context.Context, Origin, string, string) error {
+		close(started)
+		<-release
+		return errors.New("failed in flight")
+	}}
+	entry, err := outbox.Enqueue("choice", "manual", "cli/original", "question")
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed := make(chan error, 1)
+	go func() { processed <- outbox.Process(context.Background()) }()
+	<-started
+	cancelled := make(chan error, 1)
+	go func() { _, err := outbox.Cancel(entry.Origin, entry.ID); cancelled <- err }()
+	close(release)
+	if err := <-processed; err == nil {
+		t.Fatal("missing delivery failure")
+	}
+	if err := <-cancelled; err != nil {
+		t.Fatal(err)
+	}
+	outbox.Now = func() time.Time { return time.Now().Add(time.Minute) }
+	if err := outbox.Process(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

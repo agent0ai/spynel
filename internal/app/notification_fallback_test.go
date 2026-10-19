@@ -11,6 +11,7 @@ import (
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/orchestrator"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
@@ -352,6 +353,108 @@ func TestUnansweredEscalationUsesAssociatedRouteAndDeduplicates(t *testing.T) {
 			}
 			if router.calls != before {
 				t.Fatal("revoked route leaked at retry")
+			}
+		})
+	}
+}
+
+func TestResolvedQuestionStopsPendingEscalation(t *testing.T) {
+	for _, answerOrigin := range []string{"tui/original", "telegram/TG-7"} {
+		t.Run(answerOrigin, func(t *testing.T) {
+			root := t.TempDir()
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(config.PathForRoot(root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Channels.Telegram.AllowedUsers = []string{"7"}
+			s := New(cfg, newServiceHarness())
+			t.Cleanup(func() { _ = s.Close() })
+			_, _ = s.History.Ensure("tui", "original")
+			_, _ = s.History.Ensure("telegram", "TG-7")
+			router := &fallibleNotificationRouter{err: errors.New("synthetic disconnected transport")}
+			s.DeliveryControl = router
+			waiting := cfg.StatePath("tasks", "waiting", "choice.md")
+			doc := orchestrator.Document{FrontMatter: map[string]any{
+				"id": "choice", "title": "Choice", "status": "waiting", "review_required": true,
+				"created_at": time.Now().UTC().Format(time.RFC3339), "updated_at": time.Now().UTC().Format(time.RFC3339),
+				"waiting_for": "explicit GREEN or RED choice", "notify": map[string]any{"enabled": true, "origin": "tui/original", "fallback_origin": "telegram/TG-7", "on": []any{"waiting"}},
+			}, Body: "## Progress\n\nAwaiting GREEN or RED.\n"}
+			if err := orchestrator.WriteDocument(waiting, doc); err != nil {
+				t.Fatal(err)
+			}
+			id, err := s.NotifyEscalation(context.Background(), "tui/original", "telegram/TG-7", "choice-green-or-red", "Needs your answer: GREEN or RED?")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if router.calls != 1 {
+				t.Fatal("failed initial send was not attempted")
+			}
+			// The associated original thread supplies an answer, and its agent settles the same wait.
+			answerChannel, answerConversation, _ := strings.Cut(answerOrigin, "/")
+			if _, err := s.History.Append(answerChannel, answerConversation, history.Entry{Role: "user", Content: "Any progress?"}); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(cfg.StatePath("runtime", "outbox", id+".json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var pending orchestrator.OutboxEntry
+			if err := json.Unmarshal(data, &pending); err != nil {
+				t.Fatal(err)
+			}
+			if pending.State != "pending" || pending.Attempts != 1 || pending.LastError == "" {
+				t.Fatal("unrelated reply retired the delivery or lost failure evidence")
+			}
+			if _, err := s.History.Append(answerChannel, answerConversation, history.Entry{Role: "user", Content: "I explicitly choose GREEN for choice."}); err != nil {
+				t.Fatal(err)
+			}
+			// The resolving agent uses ordinary delivery cancellation before its durable transition.
+			if state, err := s.CancelNotification(context.Background(), "tui/original", id); err != nil || state != "cancelled" {
+				t.Fatalf("settlement: %s %v", state, err)
+			}
+			doc.FrontMatter["status"] = "todo"
+			delete(doc.FrontMatter, "waiting_for")
+			doc.Body += "\nValidated explicit GREEN answer from original thread; resolved the decision and resumed this same task once.\n"
+			if err := orchestrator.WriteDocument(waiting, doc); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(waiting, cfg.StatePath("tasks", "todo", "choice.md")); err != nil {
+				t.Fatal(err)
+			}
+			// A normal later outbox pass after reconnect/controller restart must not ask again.
+			restarted := New(cfg, newServiceHarness())
+			t.Cleanup(func() { _ = restarted.Close() })
+			router.err = nil
+			restarted.DeliveryControl = router
+			restarted.Orchestrator.Outbox.Now = func() time.Time { return time.Now().Add(time.Minute) }
+			if err := restarted.Orchestrator.Outbox.Process(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			entries, _, err := restarted.History.RecentEntries("telegram", "TG-7", 20, 12000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if entry.EventID == id && entry.Role == "assistant" {
+					t.Fatalf("resolved question sent after answer and same-task resumption: router calls=%d", router.calls)
+				}
+			}
+			if state, err := restarted.CancelNotification(context.Background(), "tui/original", id); err != nil || state != "cancelled" {
+				t.Fatalf("repeated settlement: %s %v", state, err)
+			}
+			data, err = os.ReadFile(cfg.StatePath("runtime", "outbox", id+".json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var settled orchestrator.OutboxEntry
+			if err := json.Unmarshal(data, &settled); err != nil {
+				t.Fatal(err)
+			}
+			if settled.Attempts != pending.Attempts || settled.LastError != pending.LastError || router.calls != 1 {
+				t.Fatal("settlement lost failure evidence or sent again")
 			}
 		})
 	}

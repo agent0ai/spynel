@@ -44,6 +44,8 @@
 
 - Describe latest original and explicitly associated escalation-thread notification/heartbeat context using shared chat limits, distinct untrusted prompt inputs, normal successful/pending TUI history, stable retry identity, and honest queue/send/receipt boundaries. Document owner-established same-operator remote escalation and task-origin-first heartbeat judgment without claiming inferred ownership or adding reminder state.
 
+- Document exact-event ordinary retry cancellation and agent-owned answer settlement before task resumption, preserving failure evidence, terminal delivery truth, and the limits of already accepted external effects.
+
 ## Child DOX Index
 
 No child DOX files.

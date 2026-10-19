@@ -249,7 +249,7 @@ func TestCreationPromptsRetainFrameworkEvidenceGroundedHonestyWithCustomChatProm
 			t.Fatal(err)
 		}
 		prompt := harness.prompts["chat:cli:"+test.conversation][0]
-		if !strings.Contains(prompt, "preserved custom chat prompt") || strings.Count(prompt, instructions.EpistemicTrustGuidance) != 1 || !strings.Contains(prompt, "explicitly invoked `/"+test.kind+"`") || !strings.Contains(prompt, "notify.on: [done, failed, waiting, cancelled]") {
+		if !strings.Contains(prompt, "preserved custom chat prompt") || strings.Count(prompt, instructions.EpistemicTrustGuidance) != 1 || !strings.Contains(prompt, "explicitly invoked `/"+test.kind+"`") || !strings.Contains(prompt, "notify.on: [done, failed, waiting, cancelled]") || strings.Count(prompt, orchestrator.NotificationSettlementInstruction) != 1 {
 			t.Errorf("/%s prompt omitted custom content, creation directive, or exact-once trust contract:\n%s", test.kind, prompt)
 		}
 	}

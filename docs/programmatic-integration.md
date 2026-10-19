@@ -271,3 +271,5 @@ Final local test: use a disposable workspace with your intended harness, start
 reconnect with its prior cursor, and attach a separate terminal. Controlled
 fixtures verify the interface; real provider, terminal emulator and 80|20 sandbox
 topology still require your local test.
+
+The authenticated `POST /v1/notify` also accepts `{ "origin": "cli/adapter", "cancel_id": "<event-id>" }` without message or routing alternatives. It returns HTTP 200 with `id` and terminal `state` (`cancelled`, `delivered`, or `expired`). This retires future retries for the exact existing event, preserves failure/delivery evidence, and never retracts prior remote effects. Normal notification admission remains HTTP 202.

@@ -27,6 +27,7 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/localapi"
+	"github.com/agent0ai/spynel/internal/orchestrator"
 	"github.com/agent0ai/spynel/internal/updater"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
@@ -1871,5 +1872,39 @@ func TestNotifyEscalationCommandUsesOrdinaryOutbox(t *testing.T) {
 	}
 	if err := runNotifyCommand([]string{"--workdir", root, "--origin", "cli/original", "--escalation-key", "decision", "--message", "refused"}, "test"); err == nil {
 		t.Fatal("CLI accepted unassociated escalation")
+	}
+}
+
+func TestNotifyCancelCommandUsesOrdinaryOutbox(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	outbox := &orchestrator.Outbox{Directory: cfg.StatePath("runtime", "outbox")}
+	entry, err := outbox.EnqueueEscalation("pending", "tui/original", "telegram/TG-7", "question")
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--workdir", root, "--origin", entry.Origin, "--cancel", entry.ID}
+	for i := 0; i < 2; i++ {
+		if err := runNotifyCommand(args, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(outbox.Directory, entry.ID+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.State != "cancelled" || entry.Attempts != 0 {
+		t.Fatalf("CLI cancellation: %#v", entry)
+	}
+	for _, extra := range [][]string{{"--message", "send"}, {"--stdin"}, {"--recent-authorized"}, {"--fallback-origin", "cli/other"}, {"--escalation-key", "decision"}, {"positional"}} {
+		if err := runNotifyCommand(append(append([]string{}, args...), extra...), "test"); err == nil {
+			t.Fatal("mixed cancellation accepted")
+		}
 	}
 }

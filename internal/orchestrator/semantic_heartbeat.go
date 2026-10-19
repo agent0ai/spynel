@@ -400,7 +400,7 @@ func (m *Manager) semanticHeartbeatPrompt(executionID string, now time.Time) (st
 	prompt = strings.ReplaceAll(prompt, "{{SPYNEL_EXECUTABLE}}", filepath.ToSlash(executable))
 	prompt = appendTaskReviewModeInstruction(prompt, m.harnessSettings().Reviews)
 	prompt = strings.TrimRight(prompt, "\r\n") + "\n\n" + waitingReminderHeartbeatInstruction
-	prompt += "\n\n" + humanDecisionWaitInstruction + "\n\n" + associatedConversationInstruction
+	prompt += "\n\n" + humanDecisionWaitInstruction + "\n\n" + associatedConversationInstruction + "\n\n" + NotificationSettlementInstruction
 	const contextBoundary = "__SPYNEL_WAITING_CONVERSATIONS_BOUNDARY__"
 	prompt += "\n\n" + contextBoundary
 	prompt = instructions.InjectScopeDiscipline(prompt)

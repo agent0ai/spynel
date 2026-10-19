@@ -77,6 +77,8 @@
 
 - Both notification and heartbeat prompts share fresh bounded original/fallback history through the application reader, separate untrusted JSON boundaries, and targeted further-reading guidance. Heartbeat context is selected only from enabled waiting tasks and bounded within its full prompt; unavailable/omitted evidence is explicit. Agent judgment may escalate an unanswered delivered TUI question through ordinary `--escalation-key`, preserving original/fallback routes and live authorization. The stable pending-decision key deduplicates ordinary outbox admission across concurrent calls/restart; changed retry text refuses, failed sends retain retry evidence, and transport effects retain their existing at-least-once limits. Relevant answers in either associated thread settle the same task once through ordinary lifecycle; no new reminder scheduler or provider-output parser.
 
+- Exact-event notification cancellation uses the ordinary outbox/send mutex and existing cancelled terminal state, preserves attempts/errors and delivered/expired records, and never retracts external effects. Authenticated workspace operators can retire a recorded event by its exact original route and ID even after route revocation; it sends nothing and grants no delivery authority. Communication, notification and heartbeat prompts require confirmed cancellation of resolved-question deliveries before ordinary task resumption, leaving unrelated decisions pending. No runtime answer parser, reminder state or task transition belongs to this primitive.
+
 ## Child DOX Index
 
 No child DOX files.

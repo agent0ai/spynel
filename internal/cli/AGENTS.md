@@ -62,6 +62,8 @@
 
 - Ordinary notify carries optional `escalation_key` (`--escalation-key` on CLI) only with explicit original/fallback routes. It selects the owner-associated fallback without requiring primary delivery failure, preserving live route checks and ordinary outbox retry/deduplication. Reuse the same decision key/message; recent-authorized routing cannot be combined. Admission remains queue acceptance.
 
+- Ordinary notify cancellation accepts only exact original origin plus `--cancel EVENT_ID` / `cancel_id`; it rejects send/routing alternatives. Return confirmed terminal state without exposing delivery content or claiming a retraction. Keep client/server and CLI validation synchronized; older owners lacking confirmation must fail visibly.
+
 ## Child DOX Index
 
 No child DOX files.

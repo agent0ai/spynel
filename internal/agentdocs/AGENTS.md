@@ -24,6 +24,8 @@
 - Describe heartbeat root-dependency checks and first prerequisite requests separately from repeat reminders; privacy permits necessary private route/context inspection, and failed/absent sends or queue admission never establish a delivered question or relevant answer.
 - Document actionable human-wait questions and finite agent-owned follow-up plans in task Progress, while distinguishing local history commitment, presentation and human reading. Keep policy in notification/heartbeat agents and the existing scheduler.
 
+- Document exact-event ordinary retry cancellation and agent-owned answer settlement before task resumption, preserving failure evidence, terminal delivery truth, and the limits of already accepted external effects.
+
 ## Child DOX Index
 
 No child DOX files.

@@ -132,7 +132,7 @@ func (m *Manager) notificationAgentPrompt(taskFile, outcome string) (string, err
 		prompt += "For a contextual unanswered-question escalation, use the same exact routes with this ordinary outbox command (change only message text; retain this decision key for retries, and record it in Progress):\n\n```sh\n" + command + " --escalation-key " + shellQuote(key) + "\n```\n\n"
 	}
 	prompt += "You own the entire decision and durable record. If you send, obtain the current UTC clock and append the successful send result to this task's `## Progress`, distinguishing queue acceptance from transport send and receipt. If you skip, append the concise reason. If the ordinary CLI fails, append that failure. Edit the task directly under its applicable Markdown/AGENTS.md contract. Keep human-wait follow-through in that existing progress log for the scheduled heartbeat; do not create additional management state, response tracking, reminder schedulers, retries, or recovery data. Your final prose has no semantic authority and may be ignored."
-	prompt += "\n\n" + humanDecisionWaitInstruction + "\n\n" + associatedConversationInstruction
+	prompt += "\n\n" + humanDecisionWaitInstruction + "\n\n" + associatedConversationInstruction + "\n\n" + NotificationSettlementInstruction
 	prompt = agentdocs.InjectPromptGuidance(prompt)
 	prompt = instructions.InjectScopeDiscipline(prompt)
 	prompt, err = instructions.Append(prompt, m.Config.StatePath(), instructions.Notification)

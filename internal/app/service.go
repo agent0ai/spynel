@@ -387,6 +387,14 @@ func (s *Service) NotifyEscalation(ctx context.Context, originText, fallbackOrig
 	return s.notify(ctx, originText, fallbackOriginText, key, text)
 }
 
+func (s *Service) CancelNotification(ctx context.Context, originText, eventID string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	// Workspace operators may retire delivery even after its route is revoked.
+	return s.Orchestrator.Outbox.Cancel(originText, eventID)
+}
+
 func (s *Service) notify(ctx context.Context, originText, fallbackOriginText, key, text string) (string, error) {
 	origin, err := orchestrator.ParseOrigin(originText)
 	if err != nil {
@@ -811,6 +819,7 @@ func (s *Service) prepareChatHarnessPrompt(prompt string) (string, error) {
 	harnessSettings := s.Settings.Snapshot().Harness
 	prompt = strings.TrimRight(prompt, "\r\n") + "\n\n" + orchestrator.TaskReviewModeInstruction(harnessSettings.Reviews)
 	prompt += "\n\nFramework task notification metadata: select outcomes with `notify.on: [done, failed, waiting, cancelled]`, never a key named `outcomes`. Preserve the exact original `notify.origin`. Configure `notify.fallback_origin` only for an explicitly owner-established same-operator route; authorization or recency alone is not that association."
+	prompt += "\n\n" + orchestrator.NotificationSettlementInstruction
 	prompt = instructions.InjectScopeDiscipline(prompt)
 	prompt, err := instructions.Append(prompt, s.Config.StatePath(), instructions.Chat)
 	if err != nil {

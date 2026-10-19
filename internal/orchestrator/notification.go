@@ -372,6 +372,49 @@ func (o *Outbox) write(entry OutboxEntry) error {
 	return fsx.AtomicWriteFile(o.path(entry.ID), append(data, '\n'), 0o600)
 }
 
+// Cancel retires retries, not effects already accepted by a transport.
+func (o *Outbox) Cancel(origin, id string) (string, error) {
+	decoded, err := hex.DecodeString(id)
+	if err != nil || len(decoded) != 16 || hex.EncodeToString(decoded) != id {
+		return "", errors.New("invalid notification event ID")
+	}
+	if _, err := ParseOrigin(origin); err != nil {
+		return "", err
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	info, err := os.Lstat(o.path(id))
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("notification entry must be a regular file")
+	}
+	data, err := os.ReadFile(o.path(id))
+	if err != nil {
+		return "", err
+	}
+	var entry OutboxEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return "", err
+	}
+	if entry.ID != id || entry.Origin != origin {
+		return "", errors.New("notification event does not match the original route")
+	}
+	switch entry.State {
+	case "delivered", "cancelled", "expired":
+		return entry.State, nil
+	case "pending":
+		entry.State = "cancelled"
+		entry.UpdatedAt = o.now()
+		entry.NextAttemptAt = time.Time{}
+		// Keep attempts, errors and delivery evidence for honest inspection.
+		return entry.State, o.write(entry)
+	default:
+		return "", errors.New("invalid notification delivery state")
+	}
+}
+
 func (o *Outbox) Process(ctx context.Context) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()

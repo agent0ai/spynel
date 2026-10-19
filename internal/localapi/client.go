@@ -209,6 +209,29 @@ func (c *Client) NotifyEscalation(ctx context.Context, origin, fallbackOrigin, k
 	return c.notify(ctx, origin, fallbackOrigin, key, message)
 }
 
+func (c *Client) CancelNotification(ctx context.Context, origin, eventID string) (string, error) {
+	body, err := json.Marshal(notifyRequest{Origin: origin, CancelID: eventID})
+	if err != nil {
+		return "", err
+	}
+	response, err := c.request(ctx, http.MethodPost, "/v1/notify", body)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if err := responseError(response); err != nil {
+		return "", err
+	}
+	var result notifyResponse
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if result.ID != eventID || (result.State != "cancelled" && result.State != "delivered" && result.State != "expired") {
+		return "", errors.New("unconfirmed notification cancellation")
+	}
+	return result.State, nil
+}
+
 func (c *Client) notify(ctx context.Context, origin, fallbackOrigin, key, message string) (string, error) {
 	body, err := json.Marshal(notifyRequest{Origin: origin, FallbackOrigin: fallbackOrigin, EscalationKey: key, Message: message})
 	if err != nil {

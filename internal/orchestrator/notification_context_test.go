@@ -182,7 +182,7 @@ func TestHumanDecisionWaitGuidanceSurvivesCustomPromptsAndVaguePriorNotice(t *te
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, want := range []string{custom, "Needs your answer", "exact answerable question", "WHAT is missing", "WHY it blocks", "WHO must act", "next audit/follow-up", "implementation-session contact restrictions", "history commitment is not TUI presentation", "unrelated status", "provider-capacity", "never creates consent"} {
+		for _, want := range []string{custom, NotificationSettlementInstruction, "Needs your answer", "exact answerable question", "WHAT is missing", "WHY it blocks", "WHO must act", "next audit/follow-up", "implementation-session contact restrictions", "history commitment is not TUI presentation", "unrelated status", "provider-capacity", "never creates consent"} {
 			if !strings.Contains(prompt, want) {
 				t.Errorf("%s prompt omitted human-wait contract %q", name, want)
 			}

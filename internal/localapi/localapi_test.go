@@ -592,3 +592,45 @@ func TestEscalationCrossesAuthenticatedOwnerAndDeduplicates(t *testing.T) {
 		t.Fatal("API accepted missing association")
 	}
 }
+
+func TestCancelNotificationCrossesAuthenticatedOwner(t *testing.T) {
+	election, server, _, cancel, done := startTestServer(t, t.TempDir())
+	defer func() { cancel(); <-done; lease, _ := election.Current(); _ = election.Release(lease.Token) }()
+	client := NewClient(election)
+	outbox := server.Service.Orchestrator.Outbox
+	entry, err := outbox.EnqueueEscalation("pending", "tui/original", "telegram/TG-7", "question")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if state, err := client.CancelNotification(context.Background(), entry.Origin, entry.ID); err != nil || state != "cancelled" {
+			t.Fatalf("cancel: %s %v", state, err)
+		}
+	}
+	if _, err := client.CancelNotification(context.Background(), "tui/unrelated", entry.ID); err == nil {
+		t.Fatal("cancelled wrong original route")
+	}
+	for _, input := range []notifyRequest{
+		{Origin: entry.Origin, CancelID: entry.ID, Message: "not a send"},
+		{RecentAuthorized: true, CancelID: entry.ID},
+		{Origin: entry.Origin, CancelID: entry.ID, EscalationKey: "decision"},
+		{Origin: entry.Origin, CancelID: entry.ID, FallbackOrigin: "cli/other"},
+	} {
+		body, _ := json.Marshal(input)
+		response, err := client.request(context.Background(), http.MethodPost, "/v1/notify", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("mixed cancellation accepted: %d", response.StatusCode)
+		}
+	}
+	if err := outbox.Process(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := server.Service.History.RecentEntries("telegram", "TG-7", 20, 12000)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("cancel caused delivery: %#v %v", entries, err)
+	}
+}
