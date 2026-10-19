@@ -40,6 +40,10 @@ func newWorkerFixture(t *testing.T, name, mode string, configure ...func(*Harnes
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
 	provider, root, log := portableHarnessFixture(t, mode)
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	state := filepath.Join(root, ".spynel")
 	owner, err := instance.New(state)
 	if err != nil {

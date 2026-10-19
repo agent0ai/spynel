@@ -68,6 +68,8 @@
 
 - Worker endpoint allocation honors the native temporary root when the complete generated socket path fits the shared 103-byte Linux/macOS budget. A longer TMPDIR uses a fresh private `/tmp/spynel-worker-*` directory instead; caller workspaces and their temporary state need no path shortening. Authentication, native/election identity and owned directory cleanup remain unchanged.
 
+- Native worker fixtures retain canonical workspace paths and locate registrations through `os.UserConfigDir`, matching runtime ownership on Linux and macOS. Settings replacement tests exercise a symlinked temporary root without relaxing exact configuration checks.
+
 ## Child DOX Index
 
 No child DOX files.

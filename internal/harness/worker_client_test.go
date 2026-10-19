@@ -287,7 +287,11 @@ func TestWorkerDiscoveryFailsClosedOnUncertainIdentity(t *testing.T) {
 			}
 		})
 	}
-	registry := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "spynel", "processes", strconv.Itoa(record.Info.PID)+".json")
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := filepath.Join(configDir, "spynel", "processes", strconv.Itoa(record.Info.PID)+".json")
 	registration, err := os.ReadFile(registry)
 	if err != nil {
 		t.Fatal(err)
@@ -618,6 +622,11 @@ func TestWorkerConcurrentLaunchAndConfirmedDeadReplacement(t *testing.T) {
 }
 
 func TestWorkerConfigurationSurvivesNativeControllerReplacement(t *testing.T) {
+	alias := filepath.Join(t.TempDir(), "temporary alias λ")
+	if err := os.Symlink(t.TempDir(), alias); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", alias)
 	for _, scenario := range []struct{ name, mode string }{{"codex", "codex-worker"}, {"claude-code", "claude-interrupt"}, {"pi", "pi-interrupt"}, {"acp", "acp-interrupt"}} {
 		t.Run(scenario.name, func(t *testing.T) {
 			fixture := newWorkerFixture(t, scenario.name, scenario.mode)
