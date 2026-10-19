@@ -309,6 +309,9 @@ func runCommand(directory string, environment []string, name string, args ...str
 	command.Stdout = output
 	command.Stderr = output
 	err := command.Run()
+	if err != nil && output.buffer.Len() > 0 {
+		err = fmt.Errorf("%w\n%s", err, strings.TrimSpace(output.buffer.String()))
+	}
 	return output.buffer.String(), err
 }
 
