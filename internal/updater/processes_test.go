@@ -265,14 +265,14 @@ func TestStopWaitsForUnconfirmedImageExitWithoutSignalAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if processGone(errProcessImageUnavailable) {
+	if processGone(errProcessIdentityUnavailable) {
 		t.Fatal("missing live image became death evidence")
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
 	defer cancel()
 	past := time.Now().Add(-time.Second)
 	err = waitForStoppedProcess(ctx, record, past, time.Now().Add(time.Second), func(ProcessRegistration) error {
-		return errProcessImageUnavailable
+		return errProcessIdentityUnavailable
 	})
 	if !errors.Is(err, context.DeadlineExceeded) || VerifyProcess(record) != nil {
 		t.Fatalf("unconfirmed image wait = %v; fixture must remain live until timeout", err)
@@ -284,12 +284,44 @@ func TestStopWaitsForUnconfirmedImageExitWithoutSignalAuthority(t *testing.T) {
 	err = waitForStoppedProcess(t.Context(), record, time.Now().Add(time.Second), time.Now().Add(5*time.Second), func(r ProcessRegistration) error {
 		probes++
 		if probes <= 3 {
-			return errProcessImageUnavailable
+			return errProcessIdentityUnavailable
 		}
 		return VerifyProcess(r)
 	})
 	if err != nil || probes < 4 || !errors.Is(VerifyProcess(record), syscall.ESRCH) {
 		t.Fatalf("unconfirmed exit was not joined: probes %d, %v", probes, err)
+	}
+}
+
+func TestVerifyProcessNativeAbsenceNeedsConfirmedExit(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	fixture := lifecycleFixture(t, t.TempDir())
+	record, err := ProcessRecord(fixture.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Darwin may lose native identity before signal-zero confirms exit.
+	for _, missing := range []error{syscall.ESRCH, os.ErrNotExist} {
+		probe := func(r ProcessRegistration) error {
+			return verifyProcess(r, func(int) (bool, string, error) { return false, "", missing })
+		}
+		if err := probe(record); !unconfirmedProcessExit(err) || processGone(err) {
+			t.Fatalf("unconfirmed native absence must wait without signal authority: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+		err := waitForStoppedProcess(ctx, record, time.Now().Add(-time.Second), time.Now().Add(time.Second), probe)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) || VerifyProcess(record) != nil {
+			t.Fatalf("native absence must not signal a live fixture: %v", err)
+		}
+	}
+	if err := fixture.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = fixture.Wait()
+	if err := verifyProcess(record, func(int) (bool, string, error) { return false, "", syscall.ESRCH }); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("confirmed native exit must remain death evidence: %v", err)
 	}
 }
 

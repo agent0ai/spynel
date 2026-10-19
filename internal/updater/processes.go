@@ -400,7 +400,11 @@ func signalRegisteredProcess(record ProcessRegistration, signal os.Signal) error
 
 // VerifyProcess checks the same native identity used before signalling without
 // sending a signal. Only a confirmed dead/zombie process returns ESRCH.
-func VerifyProcess(record ProcessRegistration) (err error) {
+func VerifyProcess(record ProcessRegistration) error {
+	return verifyProcess(record, inspectProcess)
+}
+
+func verifyProcess(record ProcessRegistration, inspect func(int) (bool, string, error)) (err error) {
 	if record.PID <= 1 {
 		return errors.New("invalid Spynel process identity")
 	}
@@ -410,11 +414,11 @@ func VerifyProcess(record ProcessRegistration) (err error) {
 			if !processAlive(record.PID) {
 				err = syscall.ESRCH
 			} else if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
-				err = fmt.Errorf("cannot verify live Spynel process: %v", err)
+				err = fmt.Errorf("%w: %v", errProcessIdentityUnavailable, err)
 			}
 		}
 	}()
-	alive, start, err := inspectProcess(record.PID)
+	alive, start, err := inspect(record.PID)
 	if err != nil {
 		return err
 	}
@@ -427,7 +431,7 @@ func VerifyProcess(record ProcessRegistration) (err error) {
 	path, err := installationProcessPath(record.PID)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%w: %v", errProcessImageUnavailable, err)
+			return fmt.Errorf("%w: %v", errProcessIdentityUnavailable, err)
 		}
 		return err
 	}
@@ -450,10 +454,10 @@ func VerifyProcess(record ProcessRegistration) (err error) {
 }
 
 var errProcessUnregistered = errors.New("Spynel process registration is missing")
-var errProcessImageUnavailable = errors.New("Spynel process executable is unavailable")
+var errProcessIdentityUnavailable = errors.New("Spynel process native identity is unavailable")
 
 func unconfirmedProcessExit(err error) bool {
-	return errors.Is(err, errProcessUnregistered) || errors.Is(err, errProcessImageUnavailable)
+	return errors.Is(err, errProcessUnregistered) || errors.Is(err, errProcessIdentityUnavailable)
 }
 
 // KillAll stops verified Spynel processes, including older releases and

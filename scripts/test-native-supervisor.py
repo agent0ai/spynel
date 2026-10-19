@@ -178,7 +178,10 @@ func main() {
                 wait_for(lambda: b"Use parent workspace" in output, 15)
                 os.write(master, b"\r")
             screens = 2 if args == [] else 1
-            wait_for(lambda: child() is not None and output.count(b"\x1b[?1049h") >= screens)
+            try:
+                wait_for(lambda: child() is not None and output.count(b"\x1b[?1049h") >= screens)
+            except AssertionError:
+                raise AssertionError(("startup readiness", process.poll(), records(), bytes(output[-2500:]))) from None
             assert process.poll() is None
             current = application_records()
             assert len(current) == 2 and not any(r.get("diagnostic_reader") for r in current), "supervised capture spawned another reader/runtime"
