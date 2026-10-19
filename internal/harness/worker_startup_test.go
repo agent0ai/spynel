@@ -43,6 +43,14 @@ func testWorkerPendingProcessOwnership(t *testing.T, protocol int) {
 		t.Fatal(err)
 	}
 	record.Info.Protocol = protocol
+	// Shutdown deliberately removes its journals; model crash-left empty state
+	// separately so this fixture exercises pending ownership, not missing data.
+	previous, err := os.MkdirTemp("", "spynel-worker-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(previous) })
+	record.Info.Socket = filepath.Join(previous, "control.sock")
 	data, err = json.Marshal(record)
 	if err != nil {
 		t.Fatal(err)
@@ -64,7 +72,7 @@ func testWorkerPendingProcessOwnership(t *testing.T, protocol int) {
 			t.Fatal("malformed dead worker record was changed", err)
 		}
 	}
-	// Preserve an authentic crash-left dead identity while a cleanup owner still
+	// Preserve a verified dead identity while a modeled cleanup owner still
 	// holds the same OS lock. No PID-only or missing-record recovery is authorized.
 	if err := os.WriteFile(recordPath, data, 0600); err != nil {
 		t.Fatal(err)

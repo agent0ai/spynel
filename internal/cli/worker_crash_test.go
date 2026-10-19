@@ -118,8 +118,8 @@ func TestWorkerConversationCancellationSurvivesWorkerDeath(t *testing.T) {
 					t.Fatal("unexpected conversation cancellation response", response, err)
 				}
 			}
-			// No consumer has run: neither a saved terminal nor worker-local intent
-			// can protect the source after this verified worker/guardian death.
+			// No consumer has run: cancellation intent must already be durable,
+			// while a complete terminal remains available for crash recovery.
 			f.stop(t)
 			identity, guardian := f.client.Info(), workerCrashGuardian(t)
 			t.Logf("crash conversation worker pid=%d start=%s generation=%s; guardian pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation, guardian.PID, guardian.StartTime, guardian.Generation)
@@ -151,12 +151,20 @@ func TestWorkerConversationCancellationSurvivesWorkerDeath(t *testing.T) {
 				t.Fatal("dead conversation worker was adopted")
 			}
 			t.Logf("replacement conversation worker pid=%d start=%s generation=%s", f.client.Info().PID, f.client.Info().Process.StartTime, f.client.Info().Process.Generation)
+			if scenario == "stop" {
+				retained := f.inspect(t)
+				if len(retained) != 1 || !retained[0].Done || !retained[0].Cancelled || retained[0].ReceiptWorkerID != identity.ID || retained[0].Sequence != execution.Sequence {
+					t.Fatal("cancelled terminal lost its original delivery identity")
+				}
+			}
 			f.service.SetPrimaryInstanceID(f.owner.ID())
 			f.service.SetRecoveryOwnershipFence(func(action func() error) (bool, error) { return f.owner.RunWhileOwner(f.term, action) })
 			if err := f.service.Start(t.Context()); err != nil {
 				t.Fatal(err)
 			}
+			f.start(t) // The ordinary Manager scan owns retained terminal delivery.
 			waitWorkerAgent(t, func() bool { return !f.service.RecoveryStatus().ScannedAt.IsZero() })
+			waitWorkerAgent(t, func() bool { return (len(f.inspect(t)) > 0) == (scenario == "recover") })
 			want := 1
 			if scenario == "recover" {
 				want = 2
