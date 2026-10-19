@@ -198,7 +198,10 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 	// Unavailable selections still need a discoverable worker for inspection
 	// and explicit settings recovery; availability is checked by Service.Start.
 	runtimeConfig, _ := cfg.RuntimeHarness(harness.HarnessConfig{Version: version})
-	service.Orchestrator.Worker, err = harness.OpenWorker(ctx, runtimeConfig, election.ID(), token)
+	settings, err := cfg.WorkerSettings()
+	if err == nil {
+		service.Orchestrator.Worker, err = harness.OpenWorker(ctx, runtimeConfig, election.ID(), token, settings)
+	}
 	if err != nil {
 		cancel()
 		_ = service.Close()

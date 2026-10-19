@@ -38,6 +38,25 @@ func (cfg Config) RuntimeHarness(current harness.HarnessConfig) (harness.Harness
 	return current, nil
 }
 
+// WorkerSettings captures current canonical intent without rewriting comments or
+// unused keys when only executable discovery needs to be refreshed.
+func (cfg Config) WorkerSettings() (harness.WorkerSettings, error) {
+	original, err := readWorkerSettings(cfg.Path)
+	if err != nil || len(original) > 128*1024 {
+		return harness.WorkerSettings{}, errors.New("canonical worker settings are unavailable or oversized")
+	}
+	saved, err := decode(original, cfg.Path)
+	if err != nil {
+		return harness.WorkerSettings{}, errors.New("canonical worker settings are invalid")
+	}
+	expected, err := cfg.Encode()
+	actual, encodeErr := saved.Encode()
+	if err != nil || encodeErr != nil || !bytes.Equal(expected, actual) {
+		return harness.WorkerSettings{}, errors.New("canonical worker settings changed before binding")
+	}
+	return harness.WorkerSettings{Expected: sha256.Sum256(expected), YAML: original}, nil
+}
+
 // PrepareWorkerSettings runs under exact election ownership. The worker owns
 // persistence through dispatch publication, even if the requesting client exits.
 func PrepareWorkerSettings(root string, current, next harness.HarnessConfig, change harness.WorkerSettings) (plan harness.WorkerSettingsPlan, err error) {
@@ -79,6 +98,9 @@ func PrepareWorkerSettings(root string, current, next harness.HarnessConfig, cha
 		latest, err := readWorkerSettings(path)
 		if err != nil || !bytes.Equal(latest, original) {
 			return errors.New("canonical settings changed during commit")
+		}
+		if bytes.Equal(original, change.YAML) {
+			return nil
 		}
 		if err := fsx.AtomicWriteFile(path, encoded, 0600); err != nil {
 			return errors.New("canonical settings could not be saved")

@@ -3,9 +3,11 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +24,153 @@ import (
 	"github.com/agent0ai/spynel/internal/updater"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
+
+func TestPrimaryWorkerRecoversHarnessInstalledAfterFirstLaunch(t *testing.T) {
+	for _, scenario := range []struct{ name, initial, selected string }{
+		{"builtin", "codex", "codex"}, {"custom", "acp", "acp"}, {"changed-selection", "codex", "acp"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			t.Setenv("HOME", t.TempDir())
+			bin := t.TempDir()
+			t.Setenv("PATH", bin)
+			t.Setenv("SPYNEL_TEST_WORKER_PROVIDER", "1")
+			root, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(config.PathForRoot(root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := filepath.Join(bin, "codex")
+			if scenario.selected == "acp" {
+				command = filepath.Join(bin, "custom provider")
+			}
+			cfg.Harness.Name, cfg.Harness.ACPCommand = scenario.initial, command
+			cfg.Harness.ReasoningEffort = ""
+			cfg.Orchestrator.Enabled, cfg.Orchestrator.RetriggerUnrespondedMessages = false, false
+			cfg.Orchestrator.SemanticHeartbeatMinutes = 0
+			evidence := filepath.Join(root, "synthetic-methods")
+			t.Setenv("SPYNEL_TEST_WORKER_EVIDENCE", evidence)
+			var term *primaryTerm
+			var identity harness.WorkerInfo
+			expectedTurns := 0
+			t.Cleanup(func() {
+				if term != nil {
+					_ = term.stop()
+				}
+				// Only this fixture's native-verified independently surviving child.
+				if identity.PID != 0 && updater.VerifyProcess(identity.Process) == nil {
+					process, _ := os.FindProcess(identity.PID)
+					_ = process.Signal(syscall.SIGTERM)
+					waitWorkerAgent(t, func() bool { _, err := os.Stat(filepath.Dir(identity.Socket)); return os.IsNotExist(err) })
+				}
+			})
+			for stage := 0; stage < 3; stage++ {
+				if stage == 1 {
+					cfg.Harness.Name = scenario.selected
+				}
+				if stage < 2 {
+					if err := config.Save(cfg); err != nil {
+						t.Fatal(err)
+					}
+					file, err := os.OpenFile(cfg.Path, os.O_APPEND|os.O_WRONLY, 0600)
+					if err != nil {
+						t.Fatal(err)
+					}
+					_, _ = file.WriteString("\n# retain startup comments\nunused_setup_key: kept\n")
+					_ = file.Close()
+				} else {
+					executable, _ := os.Executable()
+					if err := os.Symlink(executable, command); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before, _ := os.ReadFile(cfg.Path)
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = listener.Close() })
+				owner, err := instance.New(cfg.StatePath())
+				if err != nil {
+					t.Fatal(err)
+				}
+				token, _ := owner.NewToken()
+				if _, acquired, err := owner.TryAcquire(listener.Addr().String(), token); err != nil || !acquired {
+					t.Fatal("setup primary ownership", err)
+				}
+				t.Cleanup(func() { _ = owner.Release(token) })
+				term, err = startPrimaryTerm(t.Context(), cfg, "synthetic-version", owner, listener, token, nil, nil)
+				if err != nil {
+					t.Fatalf("primary restart at setup stage %d: %v", stage, err)
+				}
+				worker := term.service.Orchestrator.Worker
+				if stage == 0 {
+					identity = worker.Info()
+				} else if worker.Info().Process != identity.Process || worker.Info().ID != identity.ID {
+					t.Fatal("onboarding replaced the independent worker")
+				}
+				inspection, err := worker.Call(t.Context(), harness.WorkerRequest{Action: "inspect"})
+				if err != nil || inspection.Availability == nil || inspection.Availability.Available != (stage == 2) || len(inspection.Executions) != 0 || inspection.NextSequence != 1 {
+					t.Fatal("setup lost availability, retained work, or admitted a provider turn", err)
+				}
+				api := localapi.NewClient(owner)
+				status, err := api.Status(t.Context(), "cli/setup")
+				api.HTTP.CloseIdleConnections()
+				expectedState := "unavailable"
+				if stage == 2 {
+					expectedState = "connected"
+				}
+				if err != nil || status.HarnessState != expectedState {
+					t.Fatal("configuration/status API did not reflect onboarding availability", err)
+				}
+				if after, _ := os.ReadFile(cfg.Path); !bytes.Equal(before, after) {
+					t.Fatal("onboarding rewrote canonical settings")
+				}
+				if stage == 2 && scenario.name == "builtin" {
+					if _, err := worker.Call(t.Context(), harness.WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/binding", Prompt: "explicit retained work"}); err != nil {
+						t.Fatal(err)
+					}
+					expectedTurns = 1
+					changed := cfg
+					changed.Harness.Sandbox = "read-only"
+					if err := config.Save(changed); err != nil {
+						t.Fatal(err)
+					}
+					settings, err := changed.WorkerSettings()
+					if err != nil {
+						t.Fatal(err)
+					}
+					runtime, _ := changed.RuntimeHarness(*inspection.Config)
+					if replacement, err := harness.OpenWorker(t.Context(), runtime, owner.ID(), token, settings); err == nil {
+						replacement.Close()
+						t.Fatal("automatic reconciliation replaced a retained harness")
+					}
+					retained, err := worker.Call(t.Context(), harness.WorkerRequest{Action: "inspect"})
+					if err != nil || retained.ConfigDigest != inspection.ConfigDigest || len(retained.Executions) != 1 || retained.Executions[0].Done || retained.NextSequence != 2 {
+						t.Fatal("refused reconciliation changed or replayed retained work", err)
+					}
+					if err := os.WriteFile(cfg.Path, before, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := term.stop(); err != nil {
+					t.Fatal(err)
+				}
+				term = nil
+			}
+			methods, _ := os.ReadFile(evidence)
+			if strings.Count(string(methods), "turn/start\n") != expectedTurns || strings.Contains(string(methods), "session/prompt") {
+				t.Fatal("onboarding dispatched an unsolicited provider turn")
+			}
+		})
+	}
+}
 
 func TestPrimaryWorkerSurvivesOrdinaryControllerReplacement(t *testing.T) {
 	testPrimaryWorkerContinuity(t, []string{"synthetic-version", "synthetic-version", "synthetic-version"})

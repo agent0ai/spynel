@@ -50,10 +50,12 @@ Use the supervisor PID or ordinary quit/stop commands for deliberate termination
 
 ## Installation or startup
 
+If Spynel was first started before its harness was installed, install the selected harness and relaunch. Spynel 0.14.1 refreshes the existing worker from the saved settings and discovers the newly available executable. You can also correct an unavailable selection in `/configure` or `.spynel/config.yaml` and relaunch. It does not guess a different harness, delete ownership records or replay work. A structural change while executions are retained is refused until that work is finished and consumed; an unverified live process or incompatible worker remains an explicit error.
+
 - The standalone public one-liner requires URL routing and a release containing standalone installer support. If it is unavailable, use npm or the development steps in [getting started](getting-started.md).
 - Run `spynel` from the directory that should own the workspace. Its private configuration and state live in that directory's fixed `.spynel/` folder.
 - If a development install is not found, follow the exact PATH guidance printed by `scripts/install-dev.sh`, or choose a writable directory already on PATH with `--bin-dir`.
-- The configuration must be `.spynel/config.yaml` and match the current schema. Unknown or obsolete fields fail validation with their source location.
+- The configuration must be `.spynel/config.yaml` and match the current schema. Recognized fields are validated; unused keys are ignored on load and removed on the next canonical save.
 - If startup says the workspace primary is active in another host/container environment, the shared workspace is advertising a loopback API that is reachable only inside the owner's environment. Stop that primary cleanly and start Spynel where you want ownership, or run both processes in the same host/container environment. This detection does not expose the API to the host and does not add a relay or port-forwarding mode.
 - Do not delete or overwrite a fresh primary lease to work around a foreign-loopback error. A known mismatch fails before dialing but retains the 30-second owner fence; an older lease with a missing/invalid environment ID receives a bounded compatibility attempt and remains fenced too. Upgrade or stop a live older primary; wait for stale takeover only after confirming its process is dead.
 - If an existing same-environment primary accepts no connection, startup reports a sanitized condition after ten seconds instead of waiting silently. Check the owner process and `/log`, then retry or exit it cleanly. The connection message appears only for an interactive TUI before alternate-screen rendering, not in headless services or automation output.

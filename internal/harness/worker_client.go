@@ -39,10 +39,11 @@ type WorkerClient struct {
 }
 
 // OpenWorker discovers a live worker before considering a new launch. Unknown
-// identity, inaccessible endpoints and incompatible config fail closed; only a
-// missing record or confirmed dead process permits a fresh worker. It must not
-// be called from inside an election ownership callback.
-func OpenWorker(ctx context.Context, cfg HarnessConfig, instanceID, termToken string) (*WorkerClient, error) {
+// identity and inaccessible endpoints fail closed. Supplied canonical settings
+// may reconcile configuration or retry an unavailable adapter through the owning
+// worker's fenced transaction. Only absence or confirmed death permits a launch.
+// It must not be called from inside an election ownership callback.
+func OpenWorker(ctx context.Context, cfg HarnessConfig, instanceID, termToken string, settings ...WorkerSettings) (*WorkerClient, error) {
 	root, err := filepath.EvalSymlinks(cfg.Cwd)
 	if err != nil || !filepath.IsAbs(root) {
 		return nil, errors.New("worker requires an absolute existing workspace")
@@ -78,8 +79,8 @@ func OpenWorker(ctx context.Context, cfg HarnessConfig, instanceID, termToken st
 		if err != nil {
 			return nil, err
 		}
-		if record.Info.EnvironmentID != election.EnvironmentID() || record.Info.WorkspaceID != filepath.Base(lockPath) || record.Info.ConfigDigest != ConfigDigest(cfg) {
-			return nil, errors.New("worker environment, workspace or configuration changed")
+		if record.Info.EnvironmentID != election.EnvironmentID() || record.Info.WorkspaceID != filepath.Base(lockPath) {
+			return nil, errors.New("worker environment or workspace changed")
 		}
 		client := newWorkerClient(record, instanceID, termToken, election)
 		inspection, err := client.Call(ctx, WorkerRequest{Action: "inspect"})
@@ -90,6 +91,30 @@ func OpenWorker(ctx context.Context, cfg HarnessConfig, instanceID, termToken st
 		if inspection.ConfigDigest != record.Info.ConfigDigest {
 			client.Close()
 			return nil, errors.New("worker configuration changed during discovery")
+		}
+		changed := record.Info.ConfigDigest != ConfigDigest(cfg)
+		unavailable := inspection.Availability != nil && !inspection.Availability.Available
+		if len(settings) == 1 && (changed || unavailable) {
+			if inspection.Config == nil || ConfigDigest(*inspection.Config) != inspection.ConfigDigest {
+				client.Close()
+				return nil, errors.New("worker configuration inspection is inconsistent")
+			}
+			next := cfg
+			next.Version = inspection.Config.Version
+			reply, err := client.Call(ctx, WorkerRequest{Action: "configure", Config: &next,
+				ExpectedConfig: inspection.ConfigDigest, Settings: &settings[0]})
+			if err != nil {
+				client.Close()
+				return nil, err
+			}
+			if reply.ConfigDigest != ConfigDigest(cfg) {
+				client.Close()
+				return nil, errors.New("worker configuration reconciliation is unconfirmed")
+			}
+			client.record.Info.ConfigDigest = reply.ConfigDigest
+		} else if changed {
+			client.Close()
+			return nil, errors.New("worker configuration changed; canonical settings are required to reconcile it")
 		}
 		return client, nil
 	}

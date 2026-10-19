@@ -26,6 +26,30 @@ func workerSettingsConfig(t *testing.T) (Config, harness.HarnessConfig) {
 	return cfg, runtime
 }
 
+func TestWorkerBindingSettingsPreserveRawCanonicalIntent(t *testing.T) {
+	cfg, runtime := workerSettingsConfig(t)
+	before, _ := os.ReadFile(cfg.Path)
+	before = append(before, []byte("\n# operator comment\nunused_binding_key: kept\n")...)
+	if err := os.WriteFile(cfg.Path, before, 0600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := cfg.WorkerSettings()
+	if err != nil || !bytes.Equal(settings.YAML, before) {
+		t.Fatal("binding did not capture the unchanged private settings", err)
+	}
+	plan, err := PrepareWorkerSettings(cfg.Root, runtime, runtime, settings)
+	if err != nil || plan.Commit() != nil || plan.Restore() != nil {
+		t.Fatal("unchanged binding transaction failed", err)
+	}
+	if after, _ := os.ReadFile(cfg.Path); !bytes.Equal(after, before) {
+		t.Fatal("runtime discovery rewrote comments or ignored keys")
+	}
+	cfg.Harness.Model = "stale snapshot"
+	if _, err := cfg.WorkerSettings(); err == nil {
+		t.Fatal("binding accepted a snapshot different from canonical settings")
+	}
+}
+
 func TestWorkerSettingsPersistenceConflictRetryAndRestore(t *testing.T) {
 	previous, runtime := workerSettingsConfig(t)
 	before, _ := previous.Encode()
