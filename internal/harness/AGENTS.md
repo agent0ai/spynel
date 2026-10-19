@@ -68,7 +68,7 @@
 
 - Worker endpoint allocation honors the native temporary root when the complete generated socket path fits the shared 103-byte Linux/macOS budget. A longer TMPDIR uses a fresh private `/tmp/spynel-worker-*` directory instead; caller workspaces and their temporary state need no path shortening. Authentication, native/election identity and owned directory cleanup remain unchanged.
 
-- Native worker fixtures retain canonical workspace paths and locate registrations through `os.UserConfigDir`, matching runtime ownership on Linux and macOS. Settings replacement tests exercise a symlinked temporary root without relaxing exact configuration checks. Terminal-settlement failures report completion and cursor state without extending deadlines or retrying failed tests.
+- Native worker fixtures retain canonical workspace paths and locate registrations through `os.UserConfigDir`, matching runtime ownership on Linux and macOS. Settings replacement tests exercise a symlinked temporary root without relaxing exact configuration checks. Controller-exit cancellation retains its five-second provider-completion deadline. Replay then traverses the frozen finite journal with strictly advancing pages, ordered callbacks, exact committed cursors and one terminal history result; native per-event ownership checks have no whole-backlog throughput deadline. Report completion/cursor failures without retrying failed tests.
 
 ## Child DOX Index
 

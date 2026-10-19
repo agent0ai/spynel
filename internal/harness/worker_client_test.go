@@ -487,9 +487,26 @@ func TestWorkerLaunchSurvivesActualControllerExit(t *testing.T) {
 				t.Fatal("new controller could not cancel original execution")
 			}
 			deadline = time.Now().Add(5 * time.Second)
+			var cancelled WorkerExecution
+			for {
+				state := workerClientCall(t, client, WorkerRequest{Action: "inspect"})
+				if len(state.Executions) != 1 {
+					t.Fatal("cancellation lost the retained execution")
+				}
+				cancelled = state.Executions[0]
+				if cancelled.Done {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("original execution did not finish cancellation")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			// Native ownership checks fence every replayed event; backlog size is not cancellation latency.
 			terminal := false
 			applied := uint64(1)
-			for {
+			for applied < cancelled.LastCursor {
+				previous := applied
 				state, err := client.Consume(t.Context(), 1, func(delivery WorkerDelivery) error {
 					if delivery.Cursor != applied+1 {
 						t.Fatal("terminal replay repeated or lost events")
@@ -506,13 +523,12 @@ func TestWorkerLaunchSurvivesActualControllerExit(t *testing.T) {
 					t.Fatal(err)
 				}
 				after = state.CommittedCursor
-				if terminal && state.Done && after == state.LastCursor {
-					break
+				if !state.Done || state.LastCursor != cancelled.LastCursor || after != applied || applied <= previous {
+					t.Fatalf("cancelled replay did not advance its fixed journal: done=%t produced=%d committed=%d applied=%d previous=%d", state.Done, state.LastCursor, after, applied, previous)
 				}
-				if time.Now().After(deadline) {
-					t.Fatalf("original execution did not settle cancellation: done=%t terminal=%t produced=%d committed=%d applied=%d", state.Done, terminal, state.LastCursor, state.CommittedCursor, applied)
-				}
-				time.Sleep(10 * time.Millisecond)
+			}
+			if !terminal {
+				t.Fatal("cancelled replay lost its terminal event")
 			}
 			entries, _, err = store.RecentEntries("cli", "owned", 10, 100000)
 			if err != nil || len(entries) != 3 || !entries[2].Terminal {
