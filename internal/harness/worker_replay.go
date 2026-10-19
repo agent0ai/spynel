@@ -3,7 +3,6 @@ package harness
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -125,8 +124,8 @@ func (h *workerHost) recoverPrevious(cfg HarnessConfig) (string, error) {
 			if event.ConversationTurns > execution.ConversationTurns {
 				execution.ConversationTurns = event.ConversationTurns
 			}
-			if terminal && (event.Event.Kind == core.EventFinal || event.Event.Kind == core.EventError) && execution.Error != context.DeadlineExceeded.Error() {
-				execution.Error = ""
+			if terminal {
+				execution.Error = event.TerminalError
 			}
 		}
 		if scanner.Err() != nil || offset != int64(len(journal)) || execution.LastCursor > uint64(len(execution.offsets)) {

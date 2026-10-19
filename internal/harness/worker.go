@@ -151,6 +151,7 @@ type WorkerWorkflowAction func(root, key string, work WorkerWorkflow, action str
 type WorkerEvent struct {
 	Cursor            uint64
 	Event             core.Event
+	TerminalError     string
 	Conversation      *WorkerConversation
 	RequestOnly       bool
 	Streamed          string
@@ -884,7 +885,19 @@ func (h *workerHost) captureLocked(execution *workerExecution, event core.Event,
 	if conversation != nil && source != "" {
 		conversation.SourceMessageID = source
 	}
-	data, err := json.Marshal(WorkerEvent{Cursor: uint64(len(execution.offsets)) + 1, Event: event, Conversation: conversation, RequestOnly: requestOnly, Streamed: streamed, ConversationTurns: execution.ConversationTurns})
+	terminal := event.Done && !event.Continues && !requestOnly
+	terminalError := ""
+	if terminal {
+		terminalError = execution.Error
+		if !execution.deadlineInterrupted && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+			terminalError = ""
+		}
+		if execution.Agent != nil && !time.Now().Before(execution.Agent.Deadline) {
+			terminalError = context.DeadlineExceeded.Error()
+		}
+	}
+	// Sync the terminal-time result with its event, before any later checkpoint.
+	data, err := json.Marshal(WorkerEvent{Cursor: uint64(len(execution.offsets)) + 1, Event: event, TerminalError: terminalError, Conversation: conversation, RequestOnly: requestOnly, Streamed: streamed, ConversationTurns: execution.ConversationTurns})
 	if err == nil && (len(data) > workerEventBytes || h.bytes+int64(len(data)+1) > workerJournalBytes || len(execution.offsets) >= workerMaxEvents) {
 		err = errors.New("worker event journal capacity exceeded")
 	}
@@ -908,15 +921,9 @@ func (h *workerHost) captureLocked(execution *workerExecution, event core.Event,
 	execution.LastCursor = uint64(len(execution.offsets))
 	execution.bytes += int64(len(data))
 	h.bytes += int64(len(data))
-	if event.Done && !event.Continues && !requestOnly {
+	if terminal {
 		execution.Done = true
-		// The provider's actual terminal resolves a previously uncertain Send.
-		if !execution.deadlineInterrupted && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
-			execution.Error = ""
-		}
-		if execution.Agent != nil && !time.Now().Before(execution.Agent.Deadline) {
-			execution.Error = context.DeadlineExceeded.Error()
-		}
+		execution.Error = terminalError
 		if execution.cancel != nil {
 			execution.cancel()
 		}

@@ -4,6 +4,7 @@ package harness
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -11,10 +12,88 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/updater"
 )
+
+func TestWorkerCrashReplayPreservesTerminalOutcome(t *testing.T) {
+	for _, kind := range []string{core.EventFinal, core.EventError} {
+		for _, late := range []bool{false, true} {
+			name := kind + "/on-time"
+			if late {
+				name = kind + "/late"
+			}
+			t.Run(name, func(t *testing.T) {
+				root := t.TempDir()
+				previous, err := os.MkdirTemp(root, "spynel-worker-")
+				if err != nil {
+					t.Fatal(err)
+				}
+				current := filepath.Join(root, "current")
+				if err := os.Mkdir(current, 0700); err != nil {
+					t.Fatal(err)
+				}
+				cfg := HarnessConfig{Cwd: root}
+				executable, err := os.Executable()
+				if err != nil {
+					t.Fatal(err)
+				}
+				// File-level crash modeling; the CLI test kills a real worker.
+				native := updater.ProcessRegistration{PID: 1 << 30, StartTime: "absent-fixture", Generation: strings.Repeat("a", 32), Executable: executable, HarnessWorker: true}
+				if !errors.Is(updater.VerifyProcess(native), syscall.ESRCH) {
+					t.Fatal("fixture PID is not confirmed absent")
+				}
+				prior := workerRecord{Token: strings.Repeat("b", 32), Info: WorkerInfo{Protocol: WorkerProtocol, ID: strings.Repeat("c", 32), PID: native.PID, Socket: filepath.Join(previous, "control.sock"), EnvironmentID: "environment", WorkspaceID: "workspace", ConfigDigest: ConfigDigest(cfg), Process: native}}
+				file, err := os.OpenFile(filepath.Join(previous, "1.jsonl"), os.O_CREATE|os.O_RDWR, 0600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer file.Close()
+				now := time.Now().UTC()
+				execution := &workerExecution{WorkerExecution: WorkerExecution{ReceiptWorkerID: prior.Info.ID, Sequence: 1, Key: "orchestrator:semantic-heartbeat", Error: "uncertain admission", Agent: &WorkerAgent{ID: "synthetic-replay-agent", Kind: "heartbeat", StartedAt: now, Deadline: now.Add(time.Second)}}, file: file}
+				original := &workerHost{executions: map[uint64]*workerExecution{1: execution}, stop: make(chan struct{})}
+				if err := original.saveAdmissionLocked(execution); err != nil {
+					t.Fatal(err)
+				}
+				if late {
+					time.Sleep(time.Until(execution.Agent.Deadline) + time.Millisecond)
+				}
+				original.captureLocked(execution, core.Event{Kind: kind, Text: "synthetic terminal", Done: true}, false, "")
+				want := ""
+				if late {
+					want = context.DeadlineExceeded.Error()
+				}
+				if original.failure != nil || !execution.Done || execution.Error != want {
+					t.Fatalf("terminal outcome = %q, want %q; failure %v", execution.Error, want, original.failure)
+				}
+				// Crash before another admission checkpoint. Replay both cases
+				// after their deadline, using only the original terminal record.
+				time.Sleep(time.Until(execution.Agent.Deadline) + time.Millisecond)
+				host := &workerHost{directory: current, recordPath: filepath.Join(root, "worker.json"), next: 1, executions: map[uint64]*workerExecution{}, info: WorkerInfo{EnvironmentID: "environment", WorkspaceID: "workspace"}}
+				record, err := json.Marshal(prior)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(host.recordPath, record, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := host.recoverPrevious(cfg); err != nil {
+					t.Fatal(err)
+				}
+				replay := host.executions[1]
+				if replay == nil {
+					t.Fatal("terminal lost")
+				}
+				defer replay.file.Close()
+				if !replay.Done || replay.Error != want || replay.LastCursor != 1 || replay.CommittedCursor != 0 || replay.ReceiptWorkerID != prior.Info.ID {
+					t.Fatalf("terminal result changed during replay: %+v", replay.WorkerExecution)
+				}
+			})
+		}
+	}
+}
 
 func TestWorkerCrashJournalValidation(t *testing.T) {
 	for _, scenario := range []string{"terminal", "unfinished", "truncated", "future-cursor", "rewound-cursor", "invalid-utf8", "unsafe-file", "symlink", "missing-directory", "changed-config", "unverified-process"} {
