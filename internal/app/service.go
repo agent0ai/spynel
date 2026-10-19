@@ -214,7 +214,9 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	}
 	manager.SetNotificationDelivery(service.deliverNotification)
 	manager.NotificationContext = service.notificationContext
-	manager.Outbox.FallbackAllowed = func(_ context.Context, origin orchestrator.Origin) error { return service.validateOrigin(origin) }
+	manager.Outbox.FallbackAllowed = func(_ context.Context, origin orchestrator.Origin) error {
+		return service.validateNotificationOrigin(origin)
+	}
 	manager.Outbox.PrimaryAvailable = func(_ context.Context, origin orchestrator.Origin) error {
 		if origin.Channel == "tui" && !service.hasLiveTUIPresentation(origin.Conversation, time.Now().UTC()) {
 			return errors.New("original TUI conversation has no live presentation")
@@ -244,6 +246,30 @@ func (s *Service) validateOrigin(origin orchestrator.Origin) error {
 	return validateOrigin(s.Settings.Snapshot(), s.History, s.telegramIdentity, origin)
 }
 
+// Missing local history does not establish whether a provider permits delivery.
+func (s *Service) validateNotificationOrigin(origin orchestrator.Origin) error {
+	cfg := s.Settings.Snapshot()
+	if err := validateOriginAuthorization(cfg, s.telegramIdentity, origin); err != nil {
+		return err
+	}
+	_, err := os.Stat(s.History.Path(origin.Channel, origin.Conversation))
+	if !os.IsNotExist(err) {
+		return err
+	}
+	remote := (origin.Channel == "telegram" && cfg.Channels.Telegram.Enabled) ||
+		(origin.Channel == "whatsapp" && cfg.Channels.WhatsApp.Enabled)
+	if !remote || strings.Contains(origin.Conversation, "-group-") {
+		return errors.New("notification origin is not a known conversation")
+	}
+	if origin.Channel == "whatsapp" && origin.Conversation != "WA-"+config.NormalizeAllowedWhatsAppNumber(strings.TrimPrefix(origin.Conversation, "WA-")) {
+		return errors.New("new WhatsApp origin requires a canonical phone number")
+	}
+	if s.DeliveryControl == nil || s.connectionStatus(origin.Channel).State != channel.ConnectionConnected {
+		return fmt.Errorf("%s must be connected to initiate a conversation", origin.Channel)
+	}
+	return nil
+}
+
 func validateOrigin(cfg config.Config, store *history.Store, identity *telegram.IdentityStore, origin orchestrator.Origin) error {
 	if err := ValidateConversationName(origin.Conversation); err != nil {
 		return err
@@ -252,6 +278,13 @@ func validateOrigin(cfg config.Config, store *history.Store, identity *telegram.
 		if os.IsNotExist(err) {
 			return fmt.Errorf("origin %s/%s is not a known conversation", origin.Channel, origin.Conversation)
 		}
+		return err
+	}
+	return validateOriginAuthorization(cfg, identity, origin)
+}
+
+func validateOriginAuthorization(cfg config.Config, identity *telegram.IdentityStore, origin orchestrator.Origin) error {
+	if err := ValidateConversationName(origin.Conversation); err != nil {
 		return err
 	}
 	switch origin.Channel {
@@ -317,7 +350,7 @@ func (s *Service) deliverNotification(ctx context.Context, origin orchestrator.O
 }
 
 func (s *Service) deliverNotificationEffect(ctx context.Context, origin orchestrator.Origin, eventID, text string, active bool) error {
-	if err := s.validateOrigin(origin); err != nil {
+	if err := s.validateNotificationOrigin(origin); err != nil {
 		return err
 	}
 	state, err := s.History.DeliveryState(origin.Channel, origin.Conversation, eventID)
@@ -403,7 +436,7 @@ func (s *Service) notify(ctx context.Context, originText, fallbackOriginText, ke
 	if strings.TrimSpace(text) == "" {
 		return "", errors.New("notification message is required")
 	}
-	if err := s.validateOrigin(origin); err != nil {
+	if err := s.validateNotificationOrigin(origin); err != nil {
 		return "", err
 	}
 	if fallbackOriginText != "" {
@@ -411,7 +444,7 @@ func (s *Service) notify(ctx context.Context, originText, fallbackOriginText, ke
 		if err != nil {
 			return "", err
 		}
-		if err := s.validateOrigin(fallback); err != nil {
+		if err := s.validateNotificationOrigin(fallback); err != nil {
 			return "", err
 		}
 	}
@@ -863,14 +896,14 @@ func (s *Service) recentConversation(channel, conversation string) (string, stri
 }
 
 func (s *Service) notificationContext(origin orchestrator.Origin) (string, error) {
-	if err := s.validateOrigin(origin); err != nil {
+	if err := s.validateNotificationOrigin(origin); err != nil {
 		return "", err
 	}
 	recent, _, err := s.recentConversation(origin.Channel, origin.Conversation)
 	if err != nil {
 		return "", err
 	}
-	if err := s.validateOrigin(origin); err != nil {
+	if err := s.validateNotificationOrigin(origin); err != nil {
 		return "", err
 	}
 	return recent, nil
