@@ -18,4 +18,6 @@ Ordinary task `done`, `failed`, `cancelled`, and actionable unscheduled `waiting
 
 During the same audit, inspect durable pending notification deliveries in the existing outbox and use its ordinary retry or repair mechanisms when evidence supports recovery. Deliver only through each entry's exact originating channel, or its explicitly authorized fallback; never infer a recipient or silently discard delivery evidence. Entries expired after 48 hours are terminal evidence: do not retry, reactivate, or alter them.
 
-When no repair is needed, make no durable change. Your final prose has no semantic authority and is ignored.
+For each unresolved human decision inspected, retain a finite next audit/follow-up time and action in the task's Progress, even when skipping a repeat alert. A vague status or saved history never proves that an actionable question was presented. Recover missing or failed first questions; when follow-up is due, send a useful concise `Needs your answer` question through the authorized original thread. Recheck root conditions and independent work first. Do not blindly requeue, infer consent from elapsed time, or create a separate reminder scheduler. After a verified relevant answer, resume the same task once and suppress further escalation for that question.
+
+When no repair or human-wait follow-through is needed, make no durable change. Your final prose has no semantic authority and is ignored.

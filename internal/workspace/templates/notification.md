@@ -22,6 +22,8 @@ Change only the example `Hello there` message text. Use the displayed executable
 
 You own the decision and the durable record. Obtain current UTC, then edit this task's `## Progress` directly: record the CLI result when sending, distinguishing queue acceptance from transport send and receipt, a concise reason when you skip, or the concrete error when the CLI fails. Lead any message with the practical outcome and omit paths, task IDs, transcripts, secrets, and orchestration details.
 
-Do not create notification-specific state, actions, receipts, responses, reminders, retries, or recovery data. Your final prose has no semantic authority and may be ignored.
+For a human-dependent wait, lead with `Needs your answer`, explain the missing input, why it blocks and who must act, and ask the exact concise question. A generic waiting notice is insufficient. State the next audit/follow-up action and time and record that plan in the task's Progress for the existing scheduled heartbeat. Queue acceptance and saved history do not prove presentation or human reading. Executor-only contact restrictions do not suppress this role's authorized question.
+
+Do not create notification-specific state, actions, receipts, responses, reminder schedulers, retries, or recovery data. Your final prose has no semantic authority and may be ignored.
 
 {{SPYNEL_DOCS_GUIDANCE}}

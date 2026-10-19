@@ -399,6 +399,7 @@ func (m *Manager) semanticHeartbeatPrompt(executionID string, now time.Time) (st
 	prompt = strings.ReplaceAll(prompt, "{{SPYNEL_EXECUTABLE}}", filepath.ToSlash(executable))
 	prompt = appendTaskReviewModeInstruction(prompt, m.harnessSettings().Reviews)
 	prompt = strings.TrimRight(prompt, "\r\n") + "\n\n" + waitingReminderHeartbeatInstruction
+	prompt += "\n\n" + humanDecisionWaitInstruction
 	prompt = instructions.InjectScopeDiscipline(prompt)
 	prompt, err = instructions.Append(prompt, m.Config.StatePath(), instructions.Heartbeat)
 	if err != nil {

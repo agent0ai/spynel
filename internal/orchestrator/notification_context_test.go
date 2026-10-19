@@ -1,11 +1,13 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/agent0ai/spynel/internal/config"
@@ -148,5 +150,97 @@ func TestHeartbeatOverrideGetsOriginalThreadAndUnansweredQuestionGuidance(t *tes
 	}
 	if strings.Contains(prompt, "When useful, call the ordinary notification CLI with `--recent-authorized`") {
 		t.Fatal("preserved override still forces recent-user routing for a known task")
+	}
+}
+
+func TestHumanDecisionWaitGuidanceSurvivesCustomPromptsAndVaguePriorNotice(t *testing.T) {
+	manager, path := notificationTestManager(t, config.TaskNotificationsDecide, &notificationActionHarness{})
+	doc, err := ReadDocument(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc.FrontMatter["status"] = "waiting"
+	doc.FrontMatter["notify"].(map[string]any)["on"] = []any{"waiting"}
+	doc.Body = "## Progress\n\nRelease is waiting for confirmation. Notification queued. Do not contact the user in this implementation session."
+	if err := WriteDocument(path, doc); err != nil {
+		t.Fatal(err)
+	}
+	manager.NotificationContext = func(Origin) (string, error) {
+		return "assistant (Spy): Release is waiting for confirmation.\nuser: Any progress?", nil
+	}
+	for _, name := range []string{"notification", "heartbeat"} {
+		custom := "Keep custom " + name + " wording."
+		if err := os.WriteFile(manager.Config.StatePath("prompts", name+".md"), []byte(custom), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var prompt string
+		if name == "notification" {
+			prompt, err = manager.notificationAgentPrompt(path, "waiting")
+		} else {
+			prompt, err = manager.semanticHeartbeatPrompt("wait-audit", manager.Outbox.now())
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{custom, "Needs your answer", "exact answerable question", "WHAT is missing", "WHY it blocks", "WHO must act", "next audit/follow-up", "implementation-session contact restrictions", "history commitment is not TUI presentation", "unrelated status", "provider-capacity", "never creates consent"} {
+			if !strings.Contains(prompt, want) {
+				t.Errorf("%s prompt omitted human-wait contract %q", name, want)
+			}
+		}
+		stored, err := os.ReadFile(manager.Config.StatePath("prompts", name+".md"))
+		if err != nil || string(stored) != custom {
+			t.Fatal("rendering changed workspace customization")
+		}
+	}
+}
+
+func TestFailedWaitNotificationDoesNotPreventLaterScheduledAudit(t *testing.T) {
+	manager, path := notificationTestManager(t, config.TaskNotificationsDecide, &notificationActionHarness{})
+	doc, err := ReadDocument(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc.FrontMatter["status"] = "waiting"
+	doc.FrontMatter["notify"].(map[string]any)["on"] = []any{"waiting"}
+	if err := WriteDocument(path, doc); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(path)
+	target := &heartbeatHarness{err: errors.New("controlled provider-capacity error")}
+	manager.Harness = target
+	recorder := newOrdinaryJobRecorder(manager)
+	manager.runTaskNotificationAgent(context.Background(), Lease{ID: "wait", Route: "tasks", ClaimAttempt: 1}, "waiting", path)
+	started, finished, _ := recorder.snapshot()
+	if started != 1 || finished != 1 {
+		t.Fatalf("failed notification ownership: started=%d finished=%d", started, finished)
+	}
+	<-recorder.done
+	target.err = nil
+	manager.SetPrimaryOwned(true)
+	ticks := make(chan time.Time, 1)
+	manager.heartbeatTicks = ticks
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); manager.runSemanticHeartbeat(ctx) }()
+	defer func() { cancel(); <-done; manager.jobs.Wait() }()
+	ticks <- time.Now()
+	select {
+	case <-recorder.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("failed notification blocked later scheduled audit")
+	}
+	target.mu.Lock()
+	prompt := target.prompt
+	target.mu.Unlock()
+	if !strings.Contains(prompt, "Recover a missing first question even after a failed notification turn or provider-capacity error") {
+		t.Fatal("scheduled audit lost failure recovery guidance")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(before) != string(after) {
+		t.Fatal("provider admission/error/prose became a durable wait decision")
+	}
+	started, finished, _ = recorder.snapshot()
+	if started != 2 || finished != 2 {
+		t.Fatalf("ordinary jobs did not settle once: started=%d finished=%d", started, finished)
 	}
 }
