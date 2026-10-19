@@ -126,6 +126,7 @@ type OutboxEntry struct {
 	ID             string    `json:"id"`
 	Origin         string    `json:"origin"`
 	FallbackOrigin string    `json:"fallback_origin,omitempty"`
+	Escalate       bool      `json:"escalate,omitempty"`
 	Message        string    `json:"message"`
 	State          string    `json:"state"`
 	Attempts       int       `json:"attempts"`
@@ -306,6 +307,20 @@ func (o *Outbox) Enqueue(deliveryKey, class, origin, message string) (OutboxEntr
 }
 
 func (o *Outbox) EnqueueWithFallback(deliveryKey, class, origin, fallbackOrigin, message string) (OutboxEntry, error) {
+	return o.enqueue(deliveryKey, class, origin, fallbackOrigin, message, false)
+}
+
+func (o *Outbox) EnqueueEscalation(key, origin, fallbackOrigin, message string) (OutboxEntry, error) {
+	if strings.TrimSpace(key) == "" || len(key) > 256 || strings.ContainsAny(key, "\r\n\x00") {
+		return OutboxEntry{}, errors.New("escalation key must be a nonempty bounded decision reference")
+	}
+	if fallbackOrigin == "" || fallbackOrigin == origin {
+		return OutboxEntry{}, errors.New("escalation requires a distinct explicit same-operator fallback")
+	}
+	return o.enqueue(key+"\x00"+origin+"\x00"+fallbackOrigin, "escalation", origin, fallbackOrigin, message, true)
+}
+
+func (o *Outbox) enqueue(deliveryKey, class, origin, fallbackOrigin, message string, escalate bool) (OutboxEntry, error) {
 	if _, err := ParseOrigin(origin); err != nil {
 		return OutboxEntry{}, err
 	}
@@ -324,6 +339,9 @@ func (o *Outbox) EnqueueWithFallback(deliveryKey, class, origin, fallbackOrigin,
 	if data, err := os.ReadFile(o.path(id)); err == nil {
 		var existing OutboxEntry
 		if json.Unmarshal(data, &existing) == nil {
+			if escalate && (existing.Origin != origin || existing.FallbackOrigin != fallbackOrigin || !existing.Escalate || existing.Message != message) {
+				return OutboxEntry{}, errors.New("escalation key already has different delivery content; inspect its existing result")
+			}
 			normalized, normalizeErr := NormalizeNotificationText(existing.Message)
 			if normalizeErr != nil {
 				return OutboxEntry{}, normalizeErr
@@ -339,7 +357,7 @@ func (o *Outbox) EnqueueWithFallback(deliveryKey, class, origin, fallbackOrigin,
 		}
 	}
 	now := o.now()
-	entry := OutboxEntry{ID: id, Origin: origin, FallbackOrigin: fallbackOrigin, Message: message, State: "pending", CreatedAt: now, UpdatedAt: now, NextAttemptAt: now}
+	entry := OutboxEntry{ID: id, Origin: origin, FallbackOrigin: fallbackOrigin, Escalate: escalate, Message: message, State: "pending", CreatedAt: now, UpdatedAt: now, NextAttemptAt: now}
 	return entry, o.write(entry)
 }
 
@@ -428,13 +446,27 @@ func (o *Outbox) Process(ctx context.Context) error {
 			}
 		}
 		deliveryErr := parseErr
-		if deliveryErr == nil && !alreadyDelivered && entry.FallbackOrigin != "" && o.PrimaryAvailable != nil {
+		if entry.Escalate && deliveryErr == nil && !alreadyDelivered {
+			if o.FallbackAllowed == nil {
+				deliveryErr = errors.New("escalation authorization is unavailable")
+			} else {
+				deliveryErr = o.FallbackAllowed(ctx, origin)
+			}
+			fallback, err := ParseFallbackOrigin(entry.FallbackOrigin)
+			if err != nil {
+				deliveryErr = errors.Join(deliveryErr, err)
+			}
+			if deliveryErr == nil {
+				deliveryErr = o.Deliver(ctx, fallback, entry.ID, entry.Message)
+			}
+		}
+		if !entry.Escalate && deliveryErr == nil && !alreadyDelivered && entry.FallbackOrigin != "" && o.PrimaryAvailable != nil {
 			deliveryErr = o.PrimaryAvailable(ctx, origin)
 		}
-		if deliveryErr == nil && !alreadyDelivered {
+		if !entry.Escalate && deliveryErr == nil && !alreadyDelivered {
 			deliveryErr = o.Deliver(ctx, origin, entry.ID, entry.Message)
 		}
-		if deliveryErr != nil && entry.FallbackOrigin != "" && parseErr == nil && (o.FallbackAllowed == nil || o.FallbackAllowed(ctx, origin) == nil) {
+		if !entry.Escalate && deliveryErr != nil && entry.FallbackOrigin != "" && parseErr == nil && (o.FallbackAllowed == nil || o.FallbackAllowed(ctx, origin) == nil) {
 			fallback, fallbackParseErr := ParseFallbackOrigin(entry.FallbackOrigin)
 			if fallbackParseErr != nil {
 				deliveryErr = errors.Join(deliveryErr, fallbackParseErr)

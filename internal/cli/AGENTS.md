@@ -60,6 +60,8 @@
 
 - Protocol 16 preserves complete crash-left terminal journals at the shared harness owner before new admissions. Native/election ownership and matching current configuration gate bounded private copying; consumers retain the original delivery receipts across worker generations. Unfinished prefixes remain available for ordinary source/claim reconciliation without invented completion. Corrupt or uncertain current-schema state refuses replacement; unexpected failures preserve discovery, while explicit stop/orphan cleanup remains destructive. The owning harness contract defines the exact limits and unsupported previous-schema boundary.
 
+- Ordinary notify carries optional `escalation_key` (`--escalation-key` on CLI) only with explicit original/fallback routes. It selects the owner-associated fallback without requiring primary delivery failure, preserving live route checks and ordinary outbox retry/deduplication. Reuse the same decision key/message; recent-authorized routing cannot be combined. Admission remains queue acceptance.
+
 ## Child DOX Index
 
 No child DOX files.

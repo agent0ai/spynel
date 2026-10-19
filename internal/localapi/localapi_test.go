@@ -558,3 +558,37 @@ func TestScreenActionReturnsRefreshedStateWithFailure(t *testing.T) {
 		t.Fatalf("error state crossed API incorrectly: %#v, %v", screen, err)
 	}
 }
+
+func TestEscalationCrossesAuthenticatedOwnerAndDeduplicates(t *testing.T) {
+	election, server, _, cancel, done := startTestServer(t, t.TempDir())
+	defer func() { cancel(); <-done; lease, _ := election.Current(); _ = election.Release(lease.Token) }()
+	client := NewClient(election)
+	ctx := context.Background()
+	for _, name := range []string{"original", "fallback"} {
+		if _, err := server.Service.History.Ensure("cli", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var first string
+	for i := 0; i < 2; i++ {
+		id, err := client.NotifyEscalation(ctx, "cli/original", "cli/fallback", "decision", "Needs your answer: choose a color.")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i > 0 && id != first {
+			t.Fatal("API changed stable identity")
+		}
+		first = id
+	}
+	entries, _, err := server.Service.History.RecentEntries("cli", "fallback", 20, 12000)
+	if err != nil || len(entries) != 1 || entries[0].EventID != first {
+		t.Fatalf("escalation history %#v %v", entries, err)
+	}
+	original, _, _ := server.Service.History.RecentEntries("cli", "original", 20, 12000)
+	if len(original) != 0 {
+		t.Fatal("API escalation repeated original")
+	}
+	if _, err := client.NotifyEscalation(ctx, "cli/original", "", "bad", "must not send"); err == nil {
+		t.Fatal("API accepted missing association")
+	}
+}

@@ -377,6 +377,17 @@ func (s *Service) Notify(ctx context.Context, originText, text string) (string, 
 }
 
 func (s *Service) NotifyWithFallback(ctx context.Context, originText, fallbackOriginText, text string) (string, error) {
+	return s.notify(ctx, originText, fallbackOriginText, "", text)
+}
+
+func (s *Service) NotifyEscalation(ctx context.Context, originText, fallbackOriginText, key, text string) (string, error) {
+	if strings.TrimSpace(key) == "" {
+		return "", errors.New("escalation key is required")
+	}
+	return s.notify(ctx, originText, fallbackOriginText, key, text)
+}
+
+func (s *Service) notify(ctx context.Context, originText, fallbackOriginText, key, text string) (string, error) {
 	origin, err := orchestrator.ParseOrigin(originText)
 	if err != nil {
 		return "", err
@@ -397,7 +408,12 @@ func (s *Service) NotifyWithFallback(ctx context.Context, originText, fallbackOr
 		}
 	}
 	deliveryKey := fmt.Sprintf("manual-%d", time.Now().UTC().UnixNano())
-	entry, err := s.Orchestrator.Outbox.EnqueueWithFallback(deliveryKey, "manual", originText, fallbackOriginText, text)
+	var entry orchestrator.OutboxEntry
+	if key != "" {
+		entry, err = s.Orchestrator.Outbox.EnqueueEscalation(key, originText, fallbackOriginText, text)
+	} else {
+		entry, err = s.Orchestrator.Outbox.EnqueueWithFallback(deliveryKey, "manual", originText, fallbackOriginText, text)
+	}
 	if err != nil {
 		return "", err
 	}

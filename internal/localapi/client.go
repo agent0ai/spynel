@@ -199,7 +199,18 @@ func (c *Client) Notify(ctx context.Context, origin, message string) (string, er
 }
 
 func (c *Client) NotifyWithFallback(ctx context.Context, origin, fallbackOrigin, message string) (string, error) {
-	body, err := json.Marshal(notifyRequest{Origin: origin, FallbackOrigin: fallbackOrigin, Message: message})
+	return c.notify(ctx, origin, fallbackOrigin, "", message)
+}
+
+func (c *Client) NotifyEscalation(ctx context.Context, origin, fallbackOrigin, key, message string) (string, error) {
+	if strings.TrimSpace(key) == "" {
+		return "", errors.New("escalation key is required")
+	}
+	return c.notify(ctx, origin, fallbackOrigin, key, message)
+}
+
+func (c *Client) notify(ctx context.Context, origin, fallbackOrigin, key, message string) (string, error) {
+	body, err := json.Marshal(notifyRequest{Origin: origin, FallbackOrigin: fallbackOrigin, EscalationKey: key, Message: message})
 	if err != nil {
 		return "", err
 	}

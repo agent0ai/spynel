@@ -245,3 +245,114 @@ func TestSwitchedTUIFallbackRequiresAnActuallySelectedOriginal(t *testing.T) {
 		})
 	}
 }
+
+func TestUnansweredEscalationUsesAssociatedRouteAndDeduplicates(t *testing.T) {
+	for _, fallback := range []string{"telegram/TG-7", "whatsapp/WA-15557654321"} {
+		t.Run(fallback, func(t *testing.T) {
+			root := t.TempDir()
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, _ := config.Load(config.PathForRoot(root))
+			cfg.Channels.Telegram.AllowedUsers = []string{"7"}
+			cfg.Channels.WhatsApp.AllowedNumbers = []string{"15557654321"}
+			s := New(cfg, newServiceHarness())
+			t.Cleanup(func() { _ = s.Close() })
+			router := &fallibleNotificationRouter{}
+			s.DeliveryControl = router
+			_, _ = s.History.Ensure("tui", "original")
+			channel, conversation, _ := strings.Cut(fallback, "/")
+			_, _ = s.History.Ensure(channel, conversation)
+			if err := s.RegisterLiveTUI("fixture", "original", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 3; i++ {
+				if _, err := s.Notify(context.Background(), "tui/original", "Needs your answer: GREEN or RED?"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ids := make(chan string, 8)
+			errs := make(chan error, 8)
+			for i := 0; i < 8; i++ {
+				go func() {
+					id, err := s.NotifyEscalation(context.Background(), "tui/original", fallback, "choice:green-or-red", "Needs your answer: choose GREEN or RED to resume the task.")
+					ids <- id
+					errs <- err
+				}()
+			}
+			var id string
+			for i := 0; i < 8; i++ {
+				got := <-ids
+				if err := <-errs; err != nil {
+					t.Fatal(err)
+				}
+				if id != "" && id != got {
+					t.Fatal("duplicate escalation identities")
+				}
+				id = got
+			}
+			if router.calls != 1 {
+				t.Fatalf("simultaneous sends=%d", router.calls)
+			}
+			local, _, _ := s.History.RecentEntries("tui", "original", 20, 12000)
+			if len(local) != 3 {
+				t.Fatal("escalation repeated the unattended TUI")
+			}
+			restarted := New(cfg, newServiceHarness())
+			t.Cleanup(func() { _ = restarted.Close() })
+			restarted.DeliveryControl = router
+			if got, err := restarted.NotifyEscalation(context.Background(), "tui/original", fallback, "choice:green-or-red", "Needs your answer: choose GREEN or RED to resume the task."); err != nil || got != id {
+				t.Fatalf("restart replay %q %v", got, err)
+			}
+			if router.calls != 1 {
+				t.Fatal("restart duplicated send")
+			}
+			remote, _, _ := s.History.RecentEntries(channel, conversation, 20, 12000)
+			if len(remote) != 1 || remote[0].EventID != id {
+				t.Fatal("escalation missing from destination history")
+			}
+			if _, err := s.NotifyEscalation(context.Background(), "tui/original", fallback, "choice:green-or-red", "changed retry"); err == nil {
+				t.Fatal("changed delivery reused a decision key")
+			}
+			for _, bad := range []string{"", "telegram/TG-8", "telegram/TG-group-7", "whatsapp/WA-group-7"} {
+				if _, err := s.NotifyEscalation(context.Background(), "tui/original", bad, "bad-route", "must not leak"); err == nil {
+					t.Fatal("invalid/unassociated escalation accepted")
+				}
+			}
+			router.err = errors.New("synthetic unavailable transport")
+			failedID, err := s.NotifyEscalation(context.Background(), "tui/original", fallback, "second-decision", "another question")
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(cfg.StatePath("runtime", "outbox", failedID+".json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var pending orchestrator.OutboxEntry
+			if err := json.Unmarshal(data, &pending); err != nil {
+				t.Fatal(err)
+			}
+			if pending.State != "pending" || !strings.Contains(pending.LastError, "unavailable") {
+				t.Fatal("failed send lost retry evidence")
+			}
+			// Revocation after admission must prevent the scheduled retry from sending.
+			_, err = s.Settings.Update(func(next *config.Config) error {
+				next.Channels.Telegram.AllowedUsers = []string{"8"}
+				next.Channels.WhatsApp.AllowedNumbers = []string{"15557654322"}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			router.err = nil
+			before := router.calls
+			s.Orchestrator.Outbox.Now = func() time.Time { return time.Now().Add(time.Minute) }
+			if err := s.Orchestrator.Outbox.Process(context.Background()); err == nil {
+				t.Fatal("revoked queued escalation succeeded")
+			}
+			if router.calls != before {
+				t.Fatal("revoked route leaked at retry")
+			}
+		})
+	}
+}

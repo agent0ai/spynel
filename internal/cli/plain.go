@@ -133,6 +133,7 @@ func runNotifyCommand(args []string, version string) error {
 	workdir := flags.String("workdir", "", "absolute Spynel workspace path")
 	origin := flags.String("origin", "", "stable channel/conversation origin")
 	fallbackOrigin := flags.String("fallback-origin", "", "explicit owner-established same-operator fallback origin")
+	escalationKey := flags.String("escalation-key", "", "send to the explicit fallback for this stable unanswered-decision reference")
 	recentAuthorized := flags.Bool("recent-authorized", false, "route to the most recently active unambiguous authorized conversation")
 	message := flags.String("message", "", "notification message")
 	stdin := flags.Bool("stdin", false, "read the notification from standard input")
@@ -151,6 +152,9 @@ func runNotifyCommand(args []string, version string) error {
 	}
 	if (strings.TrimSpace(*origin) == "") == !*recentAuthorized {
 		return errors.New("exactly one of --origin or --recent-authorized is required")
+	}
+	if *escalationKey != "" && (*recentAuthorized || strings.TrimSpace(*fallbackOrigin) == "") {
+		return errors.New("--escalation-key requires --origin and --fallback-origin")
 	}
 	if *workdir != "" && *configPath != "" {
 		return errors.New("--workdir and --config are mutually exclusive")
@@ -183,6 +187,8 @@ func runNotifyCommand(args []string, version string) error {
 				return errors.New("--fallback-origin requires --origin")
 			}
 			id, err = client.NotifyRecentAuthorized(ctx, text)
+		} else if *escalationKey != "" {
+			id, err = client.NotifyEscalation(ctx, *origin, *fallbackOrigin, *escalationKey, text)
 		} else {
 			id, err = client.NotifyWithFallback(ctx, *origin, *fallbackOrigin, text)
 		}
@@ -197,6 +203,8 @@ func runNotifyCommand(args []string, version string) error {
 				return errors.New("--fallback-origin requires --origin")
 			}
 			id, err = service.NotifyRecentAuthorized(ctx, text)
+		} else if *escalationKey != "" {
+			id, err = service.NotifyEscalation(ctx, *origin, *fallbackOrigin, *escalationKey, text)
 		} else {
 			id, err = service.NotifyWithFallback(ctx, *origin, *fallbackOrigin, text)
 		}

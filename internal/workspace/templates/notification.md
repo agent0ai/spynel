@@ -27,3 +27,5 @@ For a human-dependent wait, lead with `Needs your answer`, explain the missing i
 Do not create notification-specific state, actions, receipts, responses, reminder schedulers, retries, or recovery data. Your final prose has no semantic authority and may be ignored.
 
 {{SPYNEL_DOCS_GUIDANCE}}
+
+Inspect both associated threads before another alert or answer settlement. A delivered but unanswered TUI question may justify contextual escalation through the explicit same-operator fallback with `--escalation-key`; retain the same decision key and message for ordinary outbox retries. Do not infer attention, ownership or consent. A meaningful answer in either thread resolves only that pending decision and resumes the same task once; unrelated replies do not.

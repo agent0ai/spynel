@@ -29,6 +29,8 @@
 - Explicit fallback association may name a private Telegram/WhatsApp route established by the operator as the same operator; current authorization is checked independently at admission and delivery. No recipient is inferred from global activity. Existing request/response fields and queue-admission semantics are unchanged.
 - Forward the authenticated caller instance for `/new`; the application owns selection registration before exposing its screen, as it does for resume actions. Do not duplicate outgoing-screen registration or ignore its errors in the transport.
 
+- Ordinary notify carries optional `escalation_key` (`--escalation-key` on CLI) only with explicit original/fallback routes. It selects the owner-associated fallback without requiring primary delivery failure, preserving live route checks and ordinary outbox retry/deduplication. Reuse the same decision key/message; recent-authorized routing cannot be combined. Admission remains queue acceptance.
+
 ## Child DOX Index
 
 No child DOX files.

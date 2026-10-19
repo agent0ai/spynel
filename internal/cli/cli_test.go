@@ -1846,3 +1846,30 @@ func TestStandaloneUpdateRestartAndProactiveEligibility(t *testing.T) {
 		t.Fatal("ignored check suppression")
 	}
 }
+
+func TestNotifyEscalationCommandUsesOrdinaryOutbox(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	store := history.New(cfg.StatePath("history"))
+	for _, name := range []string{"original", "fallback"} {
+		if _, err := store.Ensure("cli", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := []string{"--workdir", root, "--origin", "cli/original", "--fallback-origin", "cli/fallback", "--escalation-key", "decision", "--message", "Needs your answer: choose a color."}
+	for i := 0; i < 2; i++ {
+		if err := runNotifyCommand(args, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, _, err := store.RecentEntries("cli", "fallback", 10, 1000)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("CLI duplicate %#v %v", entries, err)
+	}
+	if err := runNotifyCommand([]string{"--workdir", root, "--origin", "cli/original", "--escalation-key", "decision", "--message", "refused"}, "test"); err == nil {
+		t.Fatal("CLI accepted unassociated escalation")
+	}
+}

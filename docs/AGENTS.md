@@ -42,7 +42,7 @@
 
 - Document native supervision for manual runtime launches, direct externally managed executors, verified supervisor/executor update generations, finite retries, kernel-held provider ownership, guarded direct-provider cleanup and automatic retry when prior cleanup completes. Never promise frozen-child recovery, arbitrary orphan cleanup or an incident root-cause fix.
 
-- Describe latest original-thread notification context using shared chat limits, distinct untrusted prompt inputs, normal successful/pending TUI history, stable retry identity, and honest queue/send/receipt boundaries. Document owner-established same-operator remote escalation and task-origin-first heartbeat judgment without claiming inferred ownership or adding reminder state.
+- Describe latest original and explicitly associated escalation-thread notification/heartbeat context using shared chat limits, distinct untrusted prompt inputs, normal successful/pending TUI history, stable retry identity, and honest queue/send/receipt boundaries. Document owner-established same-operator remote escalation and task-origin-first heartbeat judgment without claiming inferred ownership or adding reminder state.
 
 ## Child DOX Index
 

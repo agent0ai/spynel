@@ -20,7 +20,7 @@
 
 - Describe native supervisor/manual versus external service ownership, explicit stop/update and finite recovery limits, shared 40-second readiness, and live provider ownership that prevents overlap while automatically retrying after confirmed cleanup; stale file presence never blocks startup.
 
-- Keep notification-context, explicit same-operator fallback, live TUI presentation and heartbeat original-thread/unanswered-question guidance synchronized with the ordinary application/history contract. Never imply a configured association or real transport proof from static examples.
+- Keep notification-context, explicit same-operator fallback, live TUI presentation and heartbeat associated-thread/unanswered-question guidance synchronized with the ordinary application/history contract. Never imply a configured association or real transport proof from static examples.
 - Describe heartbeat root-dependency checks and first prerequisite requests separately from repeat reminders; privacy permits necessary private route/context inspection, and failed/absent sends or queue admission never establish a delivered question or relevant answer.
 - Document actionable human-wait questions and finite agent-owned follow-up plans in task Progress, while distinguishing local history commitment, presentation and human reading. Keep policy in notification/heartbeat agents and the existing scheduler.
 
