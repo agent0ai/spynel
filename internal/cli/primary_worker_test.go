@@ -28,6 +28,7 @@ import (
 func TestPrimaryWorkerRecoversHarnessInstalledAfterFirstLaunch(t *testing.T) {
 	for _, scenario := range []struct{ name, initial, selected string }{
 		{"builtin", "codex", "codex"}, {"custom", "acp", "acp"}, {"changed-selection", "codex", "acp"},
+		{"broken-provider", "codex", "codex"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -74,6 +75,11 @@ func TestPrimaryWorkerRecoversHarnessInstalledAfterFirstLaunch(t *testing.T) {
 				if stage == 1 {
 					cfg.Harness.Name = scenario.selected
 				}
+				if scenario.name == "broken-provider" && stage < 2 {
+					if err := os.WriteFile(command, []byte("#!/bin/sh\nexit 1\n"), 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
 				if stage < 2 {
 					if err := config.Save(cfg); err != nil {
 						t.Fatal(err)
@@ -86,6 +92,11 @@ func TestPrimaryWorkerRecoversHarnessInstalledAfterFirstLaunch(t *testing.T) {
 					_ = file.Close()
 				} else {
 					executable, _ := os.Executable()
+					if scenario.name == "broken-provider" {
+						if err := os.Remove(command); err != nil {
+							t.Fatal(err)
+						}
+					}
 					if err := os.Symlink(executable, command); err != nil {
 						t.Fatal(err)
 					}

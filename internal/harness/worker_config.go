@@ -80,7 +80,12 @@ func (h *workerHost) configure(request WorkerRequest) WorkerReply {
 		}
 		if unavailable != nil {
 			err = h.supervisor.CommitUnavailable(next, unavailable, publish)
-		} else if err = h.supervisor.Reconfigure(next); err == nil {
+		} else if err = h.supervisor.Reconfigure(next); err != nil {
+			// Failed initial startup is unavailable intent after confirmed cleanup.
+			if !available && request.Settings != nil {
+				err = h.supervisor.CommitUnavailable(next, err, publish)
+			}
+		} else {
 			if err = publish(); err != nil {
 				if rollback := h.supervisor.Reconfigure(previous); rollback != nil {
 					h.mu.Lock()
