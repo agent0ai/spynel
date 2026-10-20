@@ -176,7 +176,7 @@ func runWorkerControllerFixture() error {
 }
 
 func TestManualInferenceReachesProvidersWithoutCatalogDiscovery(t *testing.T) {
-	for name, mode := range map[string]string{"codex": "codex-lifecycle", "claude-code": "claude-stream", "pi": "pi-lifecycle"} {
+	for name, mode := range map[string]string{"codex": "codex-lifecycle", "claude-code": "claude-stream", "pi": "pi-lifecycle", "oh-my-pi": "omp-lifecycle"} {
 		t.Run(name, func(t *testing.T) {
 			command, root, logPath := portableHarnessFixture(t, mode)
 			definition, _ := Lookup(name)
@@ -305,7 +305,8 @@ func runHarnessFixture(mode string) int {
 		return runCodexFixture(mode)
 	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero":
 		return runClaudeFixture(mode)
-	case "pi-lifecycle", "pi-steer", "pi-interrupt", "pi-state-missing-session", "pi-model-capabilities", "pi-off-default":
+	case "pi-lifecycle", "pi-steer", "pi-interrupt", "pi-state-missing-session", "pi-model-capabilities", "pi-off-default",
+		"omp-lifecycle", "omp-model-capabilities":
 		return runPiFixture(mode)
 	case "acp-lifecycle", "acp-interrupt", "acp-version-mismatch", "acp-session-error":
 		return runACPFixture(mode)
@@ -316,8 +317,13 @@ func runHarnessFixture(mode string) int {
 }
 
 func runPiFixture(mode string) int {
+	omp := strings.HasPrefix(mode, "omp-")
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
-		_, _ = fmt.Fprintln(os.Stdout, "pi 0.fixture")
+		version := "pi 0.fixture"
+		if omp {
+			version = "omp 0.fixture"
+		}
+		_, _ = fmt.Fprintln(os.Stdout, version)
 		return 0
 	}
 	type request struct {
@@ -354,6 +360,11 @@ func runPiFixture(mode string) int {
 	messageEnd := func(text, reason string) {
 		write(map[string]any{"type": "message_end", "message": map[string]any{"role": "assistant", "stopReason": reason, "content": []any{map[string]any{"type": "text", "text": text}}}})
 	}
+	if omp {
+		// Oh My Pi announces itself with frames upstream Pi never emits.
+		write(map[string]any{"type": "ready", "protocolVersion": 1})
+		write(map[string]any{"type": "available_commands_update", "commands": []any{}})
+	}
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		var message request
@@ -389,8 +400,26 @@ func runPiFixture(mode string) int {
 					map[string]any{"id": "model-max", "name": "Model Max", "provider": "fixture", "reasoning": false},
 				)
 			}
+			if omp {
+				// Oh My Pi embeds each model's thinking efforts in the catalog
+				// and omits thinking entirely for models without reasoning.
+				models = []any{map[string]any{"id": "model-a", "name": "Model A", "provider": "fixture", "reasoning": true,
+					"thinking": map[string]any{"efforts": []string{"off", "low", "medium", "high"}}}}
+				if mode == "omp-model-capabilities" {
+					models = append(models,
+						map[string]any{"id": "model-off", "name": "Model Off", "provider": "fixture", "reasoning": false},
+						map[string]any{"id": "model-max", "name": "Model Max", "provider": "fixture", "reasoning": false,
+							"thinking": map[string]any{"efforts": []string{"off", "medium", "xhigh", "max"}}},
+					)
+				}
+			}
 			respond(message, map[string]any{"models": models})
 		case "get_available_thinking_levels":
+			if omp {
+				// Oh My Pi rejects upstream Pi's per-model capability command.
+				write(map[string]any{"id": message.ID, "type": "response", "command": message.Type, "success": false, "error": "Unknown command: get_available_thinking_levels"})
+				continue
+			}
 			levels := []string{"off", "low", "medium", "high"}
 			switch currentModel {
 			case "model-off":
@@ -401,6 +430,9 @@ func runPiFixture(mode string) int {
 			respond(message, map[string]any{"levels": levels})
 		case "prompt":
 			respond(message, map[string]any{})
+			if omp {
+				write(map[string]any{"type": "agent_start"})
+			}
 			messageStart()
 			if mode == "pi-steer" {
 				delta("first")
@@ -410,11 +442,23 @@ func runPiFixture(mode string) int {
 				delta("hello ")
 				delta("world")
 				messageEnd("hello world", "stop")
-				write(map[string]any{"type": "agent_end"})
-				go func() {
-					time.Sleep(80 * time.Millisecond)
-					write(map[string]any{"type": "agent_settled"})
-				}()
+				if omp {
+					// Oh My Pi emits an intermediate agent_end first; only the
+					// terminal frame with both flags true completes the turn.
+					write(map[string]any{"type": "prompt_result", "success": true})
+					write(map[string]any{"type": "agent_end", "isTerminal": false, "yielded": false})
+					go func() {
+						time.Sleep(80 * time.Millisecond)
+						write(map[string]any{"type": "agent_end", "isTerminal": true, "yielded": true})
+						write(map[string]any{"type": "session_settled"})
+					}()
+				} else {
+					write(map[string]any{"type": "agent_end"})
+					go func() {
+						time.Sleep(80 * time.Millisecond)
+						write(map[string]any{"type": "agent_settled"})
+					}()
+				}
 			}
 		case "steer":
 			respond(message, map[string]any{})
