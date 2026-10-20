@@ -111,6 +111,38 @@ func receiveEnvelope(t *testing.T, events <-chan EventEnvelope) EventEnvelope {
 
 type burstHarness struct{ *apiHarness }
 
+type acknowledgedHarness struct {
+	*apiHarness
+	rendered <-chan struct{}
+}
+
+func (h acknowledgedHarness) Send(ctx context.Context, _, _ string, emit core.Emit) (string, bool, error) {
+	emit(core.Event{Kind: core.EventFinal, Text: "acknowledged", Done: true})
+	select {
+	case <-h.rendered:
+		return "", false, errors.New("handler failed after acknowledgement")
+	case <-ctx.Done():
+		return "", false, ctx.Err()
+	}
+}
+
+func TestMessageWaitsForHandlerAfterTerminalReply(t *testing.T) {
+	election, server, target, cancel, done := startTestServer(t, t.TempDir())
+	defer func() { cancel(); <-done; _ = server.Service.Close() }()
+	rendered := make(chan struct{})
+	server.Service.Harness = acknowledgedHarness{target, rendered}
+	ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	err := NewClient(election).Handle(ctx, core.Message{Channel: "cli", Conversation: "completion", Text: "synthetic"}, func(event core.Event) {
+		if event.Kind == core.EventFinal && event.Done {
+			close(rendered)
+		}
+	})
+	if err == nil || !strings.Contains(err.Error(), "handler failed after acknowledgement") {
+		t.Fatalf("handler completion = %v", err)
+	}
+}
+
 func TestReturnedCommandErrorIsDurableAcrossTUIClientReconnect(t *testing.T) {
 	election, server, _, stop, done := startTestServer(t, t.TempDir())
 	defer func() { stop(); <-done; _ = server.Service.Close(); _ = election.Release(server.Token) }()

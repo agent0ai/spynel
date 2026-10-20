@@ -299,13 +299,13 @@ func (c *Claude) SendWithModel(ctx context.Context, key, prompt, model string, e
 
 func (c *Claude) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", false, errors.New("harness prompt is empty")
+		return "", false, &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	if selection.ServiceMode != "" {
-		return "", false, errors.New("Claude Code does not support a Spynel service mode; reset harness.service_mode to inherit")
+		return "", false, &SendNotAdmittedError{Err: errors.New("Claude Code does not support a Spynel service mode; reset harness.service_mode to inherit")}
 	}
 	if err := ValidateInferenceSelection(nil, selection); err != nil {
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	lock := c.lockForKey(key)
 	lock.Lock()
@@ -315,7 +315,7 @@ func (c *Claude) SendWithInference(ctx context.Context, key, prompt string, sele
 		c.mu.Lock()
 		if c.closed || c.ctx == nil {
 			c.mu.Unlock()
-			return "", false, errors.New("Claude Code harness is not running")
+			return "", false, &SendNotAdmittedError{Err: errors.New("Claude Code harness is not running")}
 		}
 		active := c.active[key]
 		session := c.sessions[key]
@@ -328,7 +328,7 @@ func (c *Claude) SendWithInference(ctx context.Context, key, prompt string, sele
 				case <-active.done:
 					continue
 				case <-ctx.Done():
-					return threadID, true, ctx.Err()
+					return threadID, true, &SendNotAdmittedError{Err: ctx.Err()}
 				}
 			}
 			if err != nil {
@@ -354,9 +354,17 @@ func (c *Claude) SendWithInference(ctx context.Context, key, prompt string, sele
 
 // Steer writes only to an active streaming-input turn. Closing or absent
 // turns are refused instead of being resumed as a new process.
-func (c *Claude) Steer(_ context.Context, key, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+func (c *Claude) Steer(_ context.Context, key, prompt string, beforeDelivery func() bool) (string, error) {
+	return c.steer(key, prompt, nil, false, beforeDelivery)
+}
+
+func (c *Claude) SteerConversation(_ context.Context, key, prompt string, emit core.Emit) (string, error) {
+	return c.steer(key, prompt, emit, true, nil)
+}
+
+func (c *Claude) steer(key, prompt string, emit core.Emit, replace bool, beforeDelivery func() bool) (string, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", errors.New("harness prompt is empty")
+		return "", &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	lock := c.lockForKey(key)
 	lock.Lock()
@@ -368,19 +376,17 @@ func (c *Claude) Steer(_ context.Context, key, prompt string, emit core.Emit, be
 	if active == nil {
 		return threadID, fmt.Errorf("Claude Code turn is no longer active: %w", errNativeTurnInactive)
 	}
-	previous, err := active.writePromptPrepared(prompt, emit, true, beforeDelivery)
+	previous, err := active.writePromptPrepared(prompt, emit, replace, beforeDelivery)
 	if err != nil {
 		if errors.Is(err, errClaudeTurnClosing) {
 			err = fmt.Errorf("%w: %v", errNativeTurnInactive, err)
 		}
 		return threadID, fmt.Errorf("steer active Claude Code turn: %w", err)
 	}
-	if previous != nil {
+	if replace && previous != nil {
 		previous(core.Event{Kind: core.EventStatus, Text: "Response continued on a newer message", ThreadID: threadID, Done: true})
 	}
-	if emit != nil {
-		emit(core.Event{Kind: core.EventStatus, Text: "Steering active Claude Code turn", ThreadID: threadID})
-	}
+	active.emitEvent(core.Event{Kind: core.EventStatus, Text: "Steering active Claude Code turn", ThreadID: threadID})
 	return threadID, nil
 }
 
@@ -416,10 +422,10 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 	var stdin io.WriteCloser
 	if streamingInput {
 		var err error
-		stdin, err = cmd.StdinPipe()
+		stdin, err = providerStdin(cmd)
 		if err != nil {
 			cancel()
-			return "", false, err
+			return "", false, &SendNotAdmittedError{Err: err}
 		}
 	} else {
 		cmd.Stdin = strings.NewReader(prompt)
@@ -427,7 +433,7 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	stderr := newTailBuffer(64 * 1024)
 	turn := &claudeTurn{
@@ -443,12 +449,12 @@ func (c *Claude) startTurn(ctx, baseContext context.Context, key, prompt, previo
 	if c.closed {
 		c.mu.Unlock()
 		cancel()
-		return "", false, errors.New("Claude Code harness is closed")
+		return "", false, &SendNotAdmittedError{Err: errors.New("Claude Code harness is closed")}
 	}
 	if err := startProvider(cmd, cfg.processOwner); err != nil {
 		c.mu.Unlock()
 		cancel()
-		return "", false, fmt.Errorf("start Claude Code: %w", err)
+		return "", false, &SendNotAdmittedError{Err: fmt.Errorf("start Claude Code: %w", err)}
 	}
 	c.processWait.Add(1)
 	c.active[key] = turn

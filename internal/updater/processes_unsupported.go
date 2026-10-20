@@ -9,6 +9,10 @@ import (
 
 func processAlive(int) bool { return false }
 
+func inspectProcess(int) (bool, string, error) {
+	return false, "", errors.New("unsupported process inspection")
+}
+
 func RestartSignal() os.Signal                   { return os.Interrupt }
 func terminationSignal() os.Signal               { return os.Interrupt }
 func processImagePath(_ int, path string) string { return path }

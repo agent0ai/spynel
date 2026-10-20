@@ -200,18 +200,14 @@ func (m *Manager) ownsProcessPath(root, path string) bool {
 }
 
 func (m *Manager) stopProcesses(ctx context.Context, root string) error {
-	ids, err := installationProcessIDs()
+	live, err := liveProcesses()
 	if err != nil {
 		return err
 	}
 	var records []ProcessRegistration
-	for _, pid := range ids {
-		if pid <= 1 || pid == os.Getpid() {
-			continue
-		}
-		path, err := installationProcessPath(pid)
-		if err == nil && m.ownsProcessPath(root, path) {
-			records = append(records, ProcessRegistration{PID: pid, Executable: strings.TrimSuffix(path, " (deleted)")})
+	for _, record := range live {
+		if m.ownsProcessPath(root, record.Executable) {
+			records = append(records, record)
 		}
 	}
 	return stopProcessRecords(ctx, records)

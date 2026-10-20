@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"unsafe"
 
@@ -62,4 +63,17 @@ func processParentID(pid int) (int, error) {
 		return 0, err
 	}
 	return int(info.Eproc.Ppid), nil
+}
+
+func inspectProcess(pid int) (bool, string, error) {
+	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return false, "", err
+	}
+	if info.Proc.P_pid != int32(pid) {
+		return false, "", syscall.ESRCH
+	}
+	// Darwin's SZOMB is 5; kern.proc.pid does not depend on /proc or argv.
+	start := info.Proc.P_starttime
+	return info.Proc.P_stat != 5, strconv.FormatInt(start.Sec, 10) + ":" + strconv.FormatInt(int64(start.Usec), 10), nil
 }

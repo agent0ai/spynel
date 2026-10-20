@@ -43,14 +43,19 @@ type titleEvent struct{ title string }
 type runtimeEvent struct{ status core.RuntimeStatus }
 type durableWorkEvent struct{ counts core.DurableWorkCounts }
 type themeEvent struct{ theme theme.Theme }
-type taskNotificationEvent struct{ notification channel.Notification }
+type taskNotificationEvent struct {
+	conversation string
+	notification channel.Notification
+	closed       bool
+}
 type notificationPauseMsg struct{ sequence uint64 }
 type notificationAckMsg struct {
-	ids   []string
-	after int
-	err   error
+	conversation string
+	ids          []string
+	after        int
+	err          error
 }
-type notificationAckRetryMsg struct{}
+type notificationAckRetryMsg struct{ conversation string }
 type notificationBoundaryMsg struct {
 	sequence uint64
 	safe     bool
@@ -132,9 +137,10 @@ type Options struct {
 	ConnectionEvents   <-chan channel.ConnectionStatus
 	PairingEvents      <-chan channel.PairingEvent
 	NoticeEvents       <-chan channel.Notice
-	NotificationEvents <-chan channel.Notification
+	HistoryDirectory   string
+	HistoryOffset      int64
 	ConversationEvents <-chan core.Event
-	AckNotification    func(string, int) error
+	AckNotification    func(string, string, int) error
 	InitialConnections []channel.ConnectionStatus
 	TitleEvents        <-chan string
 	Themes             []theme.Theme
@@ -158,8 +164,10 @@ type Options struct {
 }
 
 type transcriptEntry struct {
-	role string
-	text string
+	role       string
+	text       string
+	requestID  string
+	responseID string
 }
 
 type liveConversationTracker struct {
@@ -209,6 +217,11 @@ type model struct {
 	streaming                string
 	responseText             string
 	responseCommit           int
+	responseRequestID        string
+	requests                 map[string]requestPresentation
+	finishedRequests         []string
+	presentedResponses       []string
+	pendingRecovery          []channel.Notification
 	working                  bool
 	mainAgentActivity        int
 	recoveryActivity         int
@@ -237,8 +250,10 @@ type model struct {
 	pairings                 <-chan channel.PairingEvent
 	notices                  <-chan channel.Notice
 	notifications            <-chan channel.Notification
+	historyDirectory         string
+	cancelNotifications      context.CancelFunc
 	conversationEvents       <-chan core.Event
-	ackNotification          func(string, int) error
+	ackNotification          func(string, string, int) error
 	titles                   <-chan string
 	runtimeEvents            <-chan core.RuntimeStatus
 	runtimeStatus            core.RuntimeStatus
@@ -481,7 +496,7 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 	}
 	initialTranscript := transcriptFromHistory(initialHistory)
 	m := model{
-		ctx: ctx, handler: handler, title: resolvedTitle, version: headerVersion(options.Version), input: input,
+		ctx: liveCtx, handler: handler, title: resolvedTitle, version: headerVersion(options.Version), input: input,
 		viewport: viewport.New(80, 20), events: make(chan core.Event, 256), composerRows: minComposerHeight,
 		logoSpinner:          newLogoSpinner(),
 		logoTick:             scheduleLogoTick,
@@ -498,7 +513,7 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 		connections:          options.ConnectionEvents,
 		pairings:             options.PairingEvents,
 		notices:              options.NoticeEvents,
-		notifications:        options.NotificationEvents,
+		historyDirectory:     options.HistoryDirectory,
 		conversationEvents:   options.ConversationEvents,
 		ackNotification:      options.AckNotification,
 		titles:               options.TitleEvents,
@@ -521,6 +536,7 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 		status:               "Ready", conversation: conversation, liveConversation: liveConversation,
 		initialHistoryScroll: len(initialTranscript) > 0,
 	}
+	m.watchConversationNotifications(options.HistoryOffset)
 	if options.InitialScreen != nil {
 		m.openScreen(*options.InitialScreen)
 	}
@@ -756,8 +772,8 @@ func (m model) waitEvent() tea.Cmd {
 			return pairingEvent{event: event}
 		case notice := <-m.notices:
 			return noticeEvent{notice: notice}
-		case notification := <-m.notifications:
-			return taskNotificationEvent{notification: notification}
+		case notification, ok := <-m.notifications:
+			return taskNotificationEvent{conversation: m.conversation, notification: notification, closed: !ok}
 		case event := <-m.conversationEvents:
 			return uiEvent{event: event, conversation: true}
 		case title := <-m.titles:
@@ -1046,8 +1062,16 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case uiEvent:
 		event := value.event
+		if event.RequestID != "" {
+			if _, known := m.requests[event.RequestID]; !known {
+				if !value.replay {
+					commands = append(commands, m.waitEvent())
+				}
+				break
+			}
+		}
 		refreshEvent := true
-		terminal := !event.Local && (event.Kind == core.EventFinal || event.Kind == core.EventError)
+		terminal := event.Kind == requestFinished || !event.Local && (event.Kind == core.EventFinal || event.Kind == core.EventError)
 		if m.notificationAckBusy && (terminal || len(m.deferredUIEvents) > 0) {
 			m.deferredUIEvents = append(m.deferredUIEvents, event)
 			m.refresh()
@@ -1056,7 +1080,18 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			break
 		}
+		if event.ResponseID != "" && event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+			m.rememberResponse(event.ResponseID)
+		}
+		if event.RequestID != "" {
+			m.observeRequest(event)
+		}
+		if event.RequestID != "" && (event.Kind == core.EventDelta || event.ResponseID != "") {
+			m.responseRequestID = event.RequestID
+		}
 		switch event.Kind {
+		case requestFinished:
+			m.finishRequest(event.RequestID)
 		case core.EventDelta:
 			refreshEvent = false
 			m.deltaSequence++
@@ -1166,6 +1201,9 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 				commands = append(commands, command)
 			}
 		}
+		if event.ResponseID != "" {
+			m.tagResponse(event.RequestID, event.ResponseID)
+		}
 		if command := m.syncLogoAnimation(); command != nil {
 			commands = append(commands, command)
 		}
@@ -1181,8 +1219,12 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			commands = append(commands, func() tea.Msg { return uiEvent{event: event, replay: true} })
 		}
 	case taskNotificationEvent:
+		if value.closed || value.conversation != m.conversation {
+			commands = append(commands, m.waitEvent())
+			break
+		}
 		if value.notification.Recovery {
-			m.appendRecoveredResponse(value.notification)
+			m.receiveRecoveredResponse(value.notification)
 			m.refresh()
 			commands = append(commands, m.waitEvent())
 			break
@@ -1213,11 +1255,12 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			commands = append(commands, m.beginNotificationAckAt(value.after))
 		}
 	case notificationAckMsg:
-		if !m.notificationAckBusy {
+		if value.conversation != m.conversation || !m.notificationAckBusy {
 			break
 		}
 		if value.err != nil {
-			commands = append(commands, tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return notificationAckRetryMsg{} }))
+			conversation := m.conversation
+			commands = append(commands, tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg { return notificationAckRetryMsg{conversation: conversation} }))
 			break
 		}
 		m.commitStreamingPrefix(value.after)
@@ -1234,7 +1277,7 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			commands = append(commands, notificationPause(m.deltaSequence))
 		}
 	case notificationAckRetryMsg:
-		if m.notificationAckBusy {
+		if value.conversation == m.conversation && m.notificationAckBusy {
 			commands = append(commands, m.ackPendingNotifications())
 		}
 	case bubblespinner.TickMsg:
@@ -1743,13 +1786,14 @@ func (m *model) ackPendingNotifications() tea.Cmd {
 	ids := append([]string(nil), m.notificationAckIDs...)
 	after := m.notificationAckAfter
 	ack := m.ackNotification
+	conversation := m.conversation
 	return func() tea.Msg {
 		for _, id := range ids {
-			if err := ack(id, after); err != nil {
-				return notificationAckMsg{ids: ids, after: after, err: err}
+			if err := ack(conversation, id, after); err != nil {
+				return notificationAckMsg{conversation: conversation, ids: ids, after: after, err: err}
 			}
 		}
-		return notificationAckMsg{ids: ids, after: after}
+		return notificationAckMsg{conversation: conversation, ids: ids, after: after}
 	}
 }
 
@@ -1776,8 +1820,8 @@ func (m *model) flushNotificationPrefix(count int) {
 	m.pendingNotifications = m.pendingNotifications[count:]
 }
 
-// appendRecoveredResponse reconciles a durable recovery terminal without
-// touching the response buffer of a newer foreground turn. Recovery entries
+// appendRecoveredResponse displays a durable recovered response without
+// touching the response buffer of a newer foreground turn. Recovered entries
 // are not task notifications and therefore never enter the acknowledgement
 // protocol.
 func (m *model) appendRecoveredResponse(notification channel.Notification) {
@@ -1788,7 +1832,7 @@ func (m *model) appendRecoveredResponse(notification channel.Notification) {
 	// retain the authoritative observed count and credit its later inactive
 	// edge. Otherwise overlapping recoveries would both be settled by one
 	// terminal followed by that terminal's delayed inactive edge.
-	if m.recoveryActivity > m.recoveryTerminalAhead {
+	if !notification.Continues && m.recoveryActivity > m.recoveryTerminalAhead {
 		m.recoveryTerminalAhead++
 		if m.mainAgentActivity > 0 {
 			m.mainAgentActivity--
@@ -1799,7 +1843,30 @@ func (m *model) appendRecoveredResponse(notification channel.Notification) {
 	if notification.Error {
 		role = "error"
 	}
-	m.appendTranscript(transcriptEntry{role: role, text: notification.Text})
+	if notification.RequestID != "" && notification.RequestID == m.responseRequestID {
+		if notification.Error {
+			m.commitStreamingResponse()
+			m.resetResponse()
+			m.appendTranscript(transcriptEntry{role: role, text: notification.Text})
+		} else {
+			m.finishRecipientResponse(notification.Text)
+		}
+	} else {
+		text := notification.Text
+		if notification.RequestID != "" && !notification.Error {
+			var shown strings.Builder
+			for _, entry := range m.transcript {
+				if entry.requestID == notification.RequestID && entry.responseID == "" && entry.role == "assistant" {
+					shown.WriteString(entry.text)
+				}
+			}
+			text = strings.TrimPrefix(text, shown.String())
+		}
+		if text != "" {
+			m.appendTranscript(transcriptEntry{role: role, text: text, requestID: notification.RequestID})
+		}
+	}
+	m.tagResponse(notification.RequestID, notification.ResponseID)
 	if !followingTail {
 		m.newMessages++
 		m.status = newMessageStatus(m.newMessages)
@@ -1839,17 +1906,24 @@ func (m *model) dispatchMessage(displayText, messageText string) []tea.Cmd {
 	m.resizeComposer()
 	m.refresh()
 	sourceMessageID, _ := core.NewSourceMessageID()
+	if m.requests == nil {
+		m.requests = make(map[string]requestPresentation)
+	}
+	m.requests[sourceMessageID] = requestPresentation{active: true}
+	m.responseRequestID = sourceMessageID
 	msg := core.Message{Channel: "tui", Conversation: m.conversation, Sender: "local", SourceMessageID: sourceMessageID, Text: messageText, ReceivedAt: time.Now().UTC()}
 	handler := m.handler
 	events := m.events
 	ctx := m.ctx
 	commands := []tea.Cmd{func() tea.Msg {
 		emit := func(event core.Event) {
+			event.RequestID = sourceMessageID
 			select {
 			case events <- event:
 			case <-ctx.Done():
 			}
 		}
+		defer emit(core.Event{Kind: requestFinished})
 		if err := handler(ctx, msg, emit); err != nil {
 			emit(core.Event{Kind: core.EventError, Text: err.Error(), Done: true, Local: isCommand})
 		}
@@ -1866,7 +1940,7 @@ func (m *model) dispatchMessage(displayText, messageText string) []tea.Cmd {
 
 func (m *model) commitStreamingResponse() {
 	if m.streaming != "" {
-		m.appendTranscript(transcriptEntry{role: "assistant", text: m.streaming})
+		m.appendTranscript(transcriptEntry{role: "assistant", text: m.streaming, requestID: m.responseRequestID})
 	}
 	m.responseCommit = len(m.responseText)
 	m.streaming = ""
@@ -1877,7 +1951,7 @@ func (m *model) commitStreamingPrefix(afterChars int) {
 	afterChars = min(max(afterChars, 0), len(response))
 	committedChars := len([]rune(m.responseText[:m.responseCommit]))
 	if afterChars > committedChars {
-		m.appendTranscript(transcriptEntry{role: "assistant", text: string(response[committedChars:afterChars])})
+		m.appendTranscript(transcriptEntry{role: "assistant", text: string(response[committedChars:afterChars]), requestID: m.responseRequestID})
 	}
 	m.responseCommit = len(string(response[:afterChars]))
 	m.streaming = string(response[afterChars:])
@@ -1897,7 +1971,7 @@ func (m *model) finishRecipientResponse(final string) {
 		}
 	}
 	if text != "" {
-		m.appendTranscript(transcriptEntry{role: "assistant", text: text})
+		m.appendTranscript(transcriptEntry{role: "assistant", text: text, requestID: m.responseRequestID})
 	}
 	m.resetResponse()
 }
@@ -3546,16 +3620,46 @@ func trueColorBackgroundSGR(background lipgloss.TerminalColor) string {
 	return fmt.Sprintf("\x1b[48;2;%d;%d;%dm", red>>8, green>>8, blue>>8)
 }
 
+func (m *model) watchConversationNotifications(offset int64) {
+	if m.cancelNotifications != nil {
+		m.cancelNotifications()
+	}
+	m.notifications = nil
+	if m.historyDirectory != "" {
+		ctx, cancel := context.WithCancel(m.ctx)
+		m.cancelNotifications = cancel
+		path := history.New(m.historyDirectory).Path("tui", m.conversation)
+		m.notifications = watchTaskNotifications(ctx, path, offset)
+	}
+}
+
+func (m *model) selectConversation(conversation string, offset int64) {
+	m.conversation = conversation
+	m.requests = nil
+	m.finishedRequests = nil
+	m.presentedResponses = nil
+	m.pendingRecovery = nil
+	m.responseRequestID = ""
+	if m.liveConversation != nil {
+		m.liveConversation.Set(conversation)
+	}
+	m.pendingNotifications = nil
+	m.notificationAckBusy = false
+	m.notificationAckIDs = nil
+	m.notificationAckAfter = 0
+	m.notificationBoundaryBusy = false
+	m.deltaSequence++
+	m.deferredUIEvents = nil
+	m.watchConversationNotifications(offset)
+}
+
 func (m *model) openScreen(screen core.Screen) {
 	m.clearSelections()
 	m.dialog = nil
 	if screen.ID == "welcome" {
 		if screen.Conversation != "" {
 			m.resetComposer()
-			m.conversation = screen.Conversation
-			if m.liveConversation != nil {
-				m.liveConversation.Set(screen.Conversation)
-			}
+			m.selectConversation(screen.Conversation, screen.HistoryOffset)
 			m.transcript = nil
 			m.initialHistoryScroll = false
 			m.resetResponse()
@@ -3580,10 +3684,7 @@ func (m *model) openScreen(screen core.Screen) {
 	}
 	if screen.ID == "chat" && screen.Conversation != "" {
 		m.resetComposer()
-		m.conversation = screen.Conversation
-		if m.liveConversation != nil {
-			m.liveConversation.Set(screen.Conversation)
-		}
+		m.selectConversation(screen.Conversation, screen.HistoryOffset)
 		m.welcome = nil
 		m.welcomeFocus = false
 		m.transcript = make([]transcriptEntry, 0, len(screen.Transcript))

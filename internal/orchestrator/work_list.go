@@ -1,7 +1,11 @@
 package orchestrator
 
 import (
+	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -95,15 +99,13 @@ func (m *Manager) WorkflowItems(kind string) WorkflowInventory {
 					result.Items = append(result.Items, item)
 					continue
 				}
-				data, readErr := readStatusDocument(path)
+				document, readErr := readStatusDocument(path, true)
 				if readErr != nil {
-					addStatusDiagnostic(&result.Diagnostics, fmt.Sprintf("%s/%s is unreadable", status, entry.Name()))
-					result.Items = append(result.Items, item)
-					continue
-				}
-				document, parseErr := ParseDocument(data)
-				if parseErr != nil {
-					addStatusDiagnostic(&result.Diagnostics, fmt.Sprintf("%s/%s has invalid front matter", status, entry.Name()))
+					reason := "is unreadable"
+					if errors.Is(readErr, errStatusMetadata) {
+						reason = "has invalid front matter"
+					}
+					addStatusDiagnostic(&result.Diagnostics, fmt.Sprintf("%s/%s %s", status, entry.Name(), reason))
 					result.Items = append(result.Items, item)
 					continue
 				}
@@ -165,31 +167,63 @@ func workflowRouteStatuses(source, working string, allowed []string) []string {
 }
 
 func latestWorkflowProgress(body string) string {
-	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+	step, _ := readWorkflowProgress(strings.NewReader(body))
+	return step
+}
+
+func readWorkflowProgress(input io.Reader) (string, error) {
+	reader := bufio.NewReader(input)
 	inProgress := false
-	entries := make([]string, 0)
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.EqualFold(trimmed, "## Progress") {
+	latest := ""
+	for {
+		// Keep a display prefix, draining complete lines even beyond Scanner limits.
+		line := make([]byte, 0, 4*(maxWorkflowStepRunes+4))
+		indented, started, omitted := false, false, false
+		for {
+			fragment, more, err := reader.ReadLine()
+			if err != nil {
+				if err == io.EOF {
+					return latest, nil
+				}
+				return "", err
+			}
+			if !started {
+				indented = len(fragment) > 0 && unicode.IsSpace(rune(fragment[0]))
+				started = true
+			}
+			if len(line) == 0 {
+				fragment = bytes.TrimLeftFunc(fragment, unicode.IsSpace)
+			}
+			n := min(len(fragment), cap(line)-len(line))
+			line = append(line, fragment[:n]...)
+			omitted = omitted || n < len(fragment)
+			if !more {
+				break
+			}
+		}
+		trimmed := strings.TrimSpace(string(bytes.ToValidUTF8(line, nil)))
+		if !omitted && strings.EqualFold(trimmed, "## Progress") {
 			inProgress = true
 			continue
 		}
 		if inProgress && strings.HasPrefix(trimmed, "## ") {
-			break
+			return latest, nil
 		}
 		if !inProgress || trimmed == "" {
 			continue
 		}
 		if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
-			entries = append(entries, strings.TrimSpace(trimmed[2:]))
-		} else if len(entries) > 0 && len(line) > 0 && unicode.IsSpace(rune(line[0])) {
-			entries[len(entries)-1] += " " + trimmed
+			trimmed = trimmed[2:]
+		} else if latest != "" && indented {
+			trimmed = latest + " " + trimmed
+		} else {
+			continue
 		}
+		if omitted {
+			trimmed += "…"
+		}
+		latest = boundedWorkflowText(trimmed, maxWorkflowStepRunes)
 	}
-	if len(entries) == 0 {
-		return ""
-	}
-	return boundedWorkflowText(entries[len(entries)-1], maxWorkflowStepRunes)
 }
 
 func boundedWorkflowText(value string, limit int) string {

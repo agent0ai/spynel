@@ -36,6 +36,19 @@ func ParseOrigin(value string) (Origin, error) {
 	return Origin{Channel: channel, Conversation: conversation}, nil
 }
 
+// A remote fallback is an explicit owner-established same-operator route;
+// authorization or recent activity alone never establishes that association.
+func ParseFallbackOrigin(value string) (Origin, error) {
+	origin, err := ParseOrigin(value)
+	if err != nil {
+		return Origin{}, err
+	}
+	if (origin.Channel == "telegram" && strings.HasPrefix(origin.Conversation, "TG-group-")) || (origin.Channel == "whatsapp" && strings.HasPrefix(origin.Conversation, "WA-group-")) {
+		return Origin{}, errors.New("fallback origin must be a private conversation")
+	}
+	return origin, nil
+}
+
 type NotificationPolicy struct {
 	Enabled        bool
 	Origin         Origin
@@ -75,14 +88,9 @@ func NotificationFromDocument(document Document) (NotificationPolicy, error) {
 		if !ok {
 			return policy, errors.New("notify.fallback_origin must be a string")
 		}
-		fallback, err := ParseOrigin(fallbackValue)
+		fallback, err := ParseFallbackOrigin(fallbackValue)
 		if err != nil {
 			return policy, fmt.Errorf("notify.fallback_origin: %w", err)
-		}
-		// Remote identities cannot be linked safely. Only local workspace
-		// conversations can be an explicitly configured fallback.
-		if fallback.Channel != "tui" && fallback.Channel != "cli" {
-			return policy, errors.New("notify.fallback_origin must be a local tui or cli origin")
 		}
 		policy.FallbackOrigin = fallback
 	}
@@ -118,6 +126,7 @@ type OutboxEntry struct {
 	ID             string    `json:"id"`
 	Origin         string    `json:"origin"`
 	FallbackOrigin string    `json:"fallback_origin,omitempty"`
+	Escalate       bool      `json:"escalate,omitempty"`
 	Message        string    `json:"message"`
 	State          string    `json:"state"`
 	Attempts       int       `json:"attempts"`
@@ -134,10 +143,12 @@ type Outbox struct {
 	Directory string
 	Deliver   func(context.Context, Origin, string, string) error
 	// FallbackAllowed rechecks that the primary origin remains authorized
-	// before an unavailable direct delivery can use a local fallback.
-	FallbackAllowed func(context.Context, Origin) error
-	Now             func() time.Time
-	mu              sync.Mutex
+	// before an unavailable direct delivery can use its explicit fallback.
+	FallbackAllowed  func(context.Context, Origin) error
+	PrimaryAvailable func(context.Context, Origin) error
+	DeliveryState    func(Origin, string) (string, error)
+	Now              func() time.Time
+	mu               sync.Mutex
 }
 
 func (o *Outbox) now() time.Time {
@@ -296,16 +307,26 @@ func (o *Outbox) Enqueue(deliveryKey, class, origin, message string) (OutboxEntr
 }
 
 func (o *Outbox) EnqueueWithFallback(deliveryKey, class, origin, fallbackOrigin, message string) (OutboxEntry, error) {
+	return o.enqueue(deliveryKey, class, origin, fallbackOrigin, message, false)
+}
+
+func (o *Outbox) EnqueueEscalation(key, origin, fallbackOrigin, message string) (OutboxEntry, error) {
+	if strings.TrimSpace(key) == "" || len(key) > 256 || strings.ContainsAny(key, "\r\n\x00") {
+		return OutboxEntry{}, errors.New("escalation key must be a nonempty bounded decision reference")
+	}
+	if fallbackOrigin == "" || fallbackOrigin == origin {
+		return OutboxEntry{}, errors.New("escalation requires a distinct explicit same-operator fallback")
+	}
+	return o.enqueue(key+"\x00"+origin+"\x00"+fallbackOrigin, "escalation", origin, fallbackOrigin, message, true)
+}
+
+func (o *Outbox) enqueue(deliveryKey, class, origin, fallbackOrigin, message string, escalate bool) (OutboxEntry, error) {
 	if _, err := ParseOrigin(origin); err != nil {
 		return OutboxEntry{}, err
 	}
 	if fallbackOrigin != "" {
-		fallback, err := ParseOrigin(fallbackOrigin)
-		if err != nil {
+		if _, err := ParseFallbackOrigin(fallbackOrigin); err != nil {
 			return OutboxEntry{}, err
-		}
-		if fallback.Channel != "tui" && fallback.Channel != "cli" {
-			return OutboxEntry{}, errors.New("fallback origin must be a local tui or cli origin")
 		}
 	}
 	message, err := NormalizeNotificationText(message)
@@ -318,6 +339,9 @@ func (o *Outbox) EnqueueWithFallback(deliveryKey, class, origin, fallbackOrigin,
 	if data, err := os.ReadFile(o.path(id)); err == nil {
 		var existing OutboxEntry
 		if json.Unmarshal(data, &existing) == nil {
+			if escalate && (existing.Origin != origin || existing.FallbackOrigin != fallbackOrigin || !existing.Escalate || existing.Message != message) {
+				return OutboxEntry{}, errors.New("escalation key already has different delivery content; inspect its existing result")
+			}
 			normalized, normalizeErr := NormalizeNotificationText(existing.Message)
 			if normalizeErr != nil {
 				return OutboxEntry{}, normalizeErr
@@ -333,7 +357,7 @@ func (o *Outbox) EnqueueWithFallback(deliveryKey, class, origin, fallbackOrigin,
 		}
 	}
 	now := o.now()
-	entry := OutboxEntry{ID: id, Origin: origin, FallbackOrigin: fallbackOrigin, Message: message, State: "pending", CreatedAt: now, UpdatedAt: now, NextAttemptAt: now}
+	entry := OutboxEntry{ID: id, Origin: origin, FallbackOrigin: fallbackOrigin, Escalate: escalate, Message: message, State: "pending", CreatedAt: now, UpdatedAt: now, NextAttemptAt: now}
 	return entry, o.write(entry)
 }
 
@@ -346,6 +370,49 @@ func (o *Outbox) write(entry OutboxEntry) error {
 		return err
 	}
 	return fsx.AtomicWriteFile(o.path(entry.ID), append(data, '\n'), 0o600)
+}
+
+// Cancel retires retries, not effects already accepted by a transport.
+func (o *Outbox) Cancel(origin, id string) (string, error) {
+	decoded, err := hex.DecodeString(id)
+	if err != nil || len(decoded) != 16 || hex.EncodeToString(decoded) != id {
+		return "", errors.New("invalid notification event ID")
+	}
+	if _, err := ParseOrigin(origin); err != nil {
+		return "", err
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	info, err := os.Lstat(o.path(id))
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("notification entry must be a regular file")
+	}
+	data, err := os.ReadFile(o.path(id))
+	if err != nil {
+		return "", err
+	}
+	var entry OutboxEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return "", err
+	}
+	if entry.ID != id || entry.Origin != origin {
+		return "", errors.New("notification event does not match the original route")
+	}
+	switch entry.State {
+	case "delivered", "cancelled", "expired":
+		return entry.State, nil
+	case "pending":
+		entry.State = "cancelled"
+		entry.UpdatedAt = o.now()
+		entry.NextAttemptAt = time.Time{}
+		// Keep attempts, errors and delivery evidence for honest inspection.
+		return entry.State, o.write(entry)
+	default:
+		return "", errors.New("invalid notification delivery state")
+	}
 }
 
 func (o *Outbox) Process(ctx context.Context) error {
@@ -404,12 +471,46 @@ func (o *Outbox) Process(ctx context.Context) error {
 		}
 		entry.Message = normalized
 		origin, parseErr := ParseOrigin(entry.Origin)
+		alreadyDelivered := false
+		if parseErr == nil && entry.FallbackOrigin != "" && o.DeliveryState != nil {
+			fallback, err := ParseFallbackOrigin(entry.FallbackOrigin)
+			parseErr = err
+			// A retry must not switch destinations after either history commits.
+			for _, destination := range []Origin{origin, fallback} {
+				if parseErr != nil {
+					break
+				}
+				state, err := o.DeliveryState(destination, entry.ID)
+				parseErr = err
+				if state == "sent" && err == nil {
+					alreadyDelivered = true
+					break
+				}
+			}
+		}
 		deliveryErr := parseErr
-		if deliveryErr == nil {
+		if entry.Escalate && deliveryErr == nil && !alreadyDelivered {
+			if o.FallbackAllowed == nil {
+				deliveryErr = errors.New("escalation authorization is unavailable")
+			} else {
+				deliveryErr = o.FallbackAllowed(ctx, origin)
+			}
+			fallback, err := ParseFallbackOrigin(entry.FallbackOrigin)
+			if err != nil {
+				deliveryErr = errors.Join(deliveryErr, err)
+			}
+			if deliveryErr == nil {
+				deliveryErr = o.Deliver(ctx, fallback, entry.ID, entry.Message)
+			}
+		}
+		if !entry.Escalate && deliveryErr == nil && !alreadyDelivered && entry.FallbackOrigin != "" && o.PrimaryAvailable != nil {
+			deliveryErr = o.PrimaryAvailable(ctx, origin)
+		}
+		if !entry.Escalate && deliveryErr == nil && !alreadyDelivered {
 			deliveryErr = o.Deliver(ctx, origin, entry.ID, entry.Message)
 		}
-		if deliveryErr != nil && entry.FallbackOrigin != "" && parseErr == nil && (o.FallbackAllowed == nil || o.FallbackAllowed(ctx, origin) == nil) {
-			fallback, fallbackParseErr := ParseOrigin(entry.FallbackOrigin)
+		if !entry.Escalate && deliveryErr != nil && entry.FallbackOrigin != "" && parseErr == nil && (o.FallbackAllowed == nil || o.FallbackAllowed(ctx, origin) == nil) {
+			fallback, fallbackParseErr := ParseFallbackOrigin(entry.FallbackOrigin)
 			if fallbackParseErr != nil {
 				deliveryErr = errors.Join(deliveryErr, fallbackParseErr)
 			} else if fallbackErr := o.Deliver(ctx, fallback, entry.ID, entry.Message); fallbackErr != nil {

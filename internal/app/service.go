@@ -79,7 +79,7 @@ type Service struct {
 	admissionMu            sync.Mutex
 	admissions             map[string]bool
 	liveTUIMu              sync.Mutex
-	liveTUI                map[string]map[string]time.Time
+	liveTUI                map[string]liveTUILease
 	chatActivityMu         sync.Mutex
 	chatActivity           map[int]map[*chatActivityEmitter]struct{}
 	cleanupHistoryStep     func(string)
@@ -100,6 +100,7 @@ type Service struct {
 	recoveryExecution      map[string]*recoveryExecution
 	recoveryIntake         map[string]int
 	recoveryStatus         RecoveryStatus
+	recoveryAfter          string
 	recoveryOwnershipFence func(func() error) (bool, error)
 }
 
@@ -144,7 +145,7 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 		updateRequests:        make(chan updater.Result, 1),
 		primaryRequests:       make(chan string, 1),
 		streamText:            map[string]string{},
-		liveTUI:               map[string]map[string]time.Time{},
+		liveTUI:               map[string]liveTUILease{},
 		chatActivity:          map[int]map[*chatActivityEmitter]struct{}{},
 		telegramIdentity:      telegram.NewIdentityStore(cfg.StatePath("runtime", "telegram-identities.json")),
 		readJobDocument:       readBoundedJobDocument,
@@ -163,10 +164,13 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 		if kind == "" {
 			kind = "markdown"
 		}
-		workID, parentID := "", ""
-		if lease.File != "" {
+		workID, parentID := lease.WorkID, ""
+		if lease.File != "" && kind != "heartbeat" && kind != "notification" {
 			if document, err := orchestrator.ReadDocument(lease.File); err == nil {
 				if value, ok := document.FrontMatter["id"].(string); ok {
+					if workID != "" && workID != value {
+						return 0, errors.New("workflow job identity changed")
+					}
 					workID = value
 				}
 				if value, ok := document.FrontMatter["goal_id"].(string); ok {
@@ -193,9 +197,35 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 	}
 	manager.JobExecutionUpdated = func(id int, status core.ExecutionStatus) { runtime.UpdateJob(id, status) }
 	manager.JobEvent = runtime.RecordJobEvent
+	manager.JobDelivery = runtime.RecordJobDelivery
 	manager.JobFinished = runtime.EndJob
+	manager.ConversationAttached = service.attachWorkerConversation
+	manager.ConversationStarted = service.startWorkerConversation
+	manager.ConversationDelivery = service.deliverWorkerConversation
+	manager.ConversationCancellation = func(c harness.WorkerConversation, intent string, restore bool) error {
+		if err := c.Validate(); err != nil {
+			return err
+		}
+		if err := store.SetConversationCancellation(c.Channel, c.Conversation, c.ExecutionID, intent, c.Sources, restore); err != nil {
+			runtime.LogEvent("error", "history", "conversation_cancellation_failed", fmt.Sprintf("Persist conversation cancellation failed (%T)", err))
+			return errors.New("conversation cancellation could not be saved")
+		}
+		return nil
+	}
 	manager.SetNotificationDelivery(service.deliverNotification)
-	manager.Outbox.FallbackAllowed = func(_ context.Context, origin orchestrator.Origin) error { return service.validateOrigin(origin) }
+	manager.NotificationContext = service.notificationContext
+	manager.Outbox.FallbackAllowed = func(_ context.Context, origin orchestrator.Origin) error {
+		return service.validateNotificationOrigin(origin)
+	}
+	manager.Outbox.PrimaryAvailable = func(_ context.Context, origin orchestrator.Origin) error {
+		if origin.Channel == "tui" && !service.hasLiveTUIPresentation(origin.Conversation, time.Now().UTC()) {
+			return errors.New("original TUI conversation has no live presentation")
+		}
+		return nil
+	}
+	manager.Outbox.DeliveryState = func(origin orchestrator.Origin, eventID string) (string, error) {
+		return service.History.DeliveryState(origin.Channel, origin.Conversation, eventID)
+	}
 	return service
 }
 
@@ -204,19 +234,59 @@ func NewWithRuntime(cfg config.Config, target harness.Harness, runtime *Runtime)
 func (s *Service) Close() error {
 	s.stopRecoveryScanner()
 	err := s.Harness.Close()
+	if s.Orchestrator.Worker != nil {
+		s.Orchestrator.Worker.Close()
+	}
 	s.stopAllChatActivity()
 	s.Runtime.Close()
 	return err
 }
 
 func (s *Service) validateOrigin(origin orchestrator.Origin) error {
-	if _, err := os.Stat(s.History.Path(origin.Channel, origin.Conversation)); err != nil {
+	return validateOrigin(s.Settings.Snapshot(), s.History, s.telegramIdentity, origin)
+}
+
+// Missing local history does not establish whether a provider permits delivery.
+func (s *Service) validateNotificationOrigin(origin orchestrator.Origin) error {
+	cfg := s.Settings.Snapshot()
+	if err := validateOriginAuthorization(cfg, s.telegramIdentity, origin); err != nil {
+		return err
+	}
+	_, err := os.Stat(s.History.Path(origin.Channel, origin.Conversation))
+	if !os.IsNotExist(err) {
+		return err
+	}
+	remote := (origin.Channel == "telegram" && cfg.Channels.Telegram.Enabled) ||
+		(origin.Channel == "whatsapp" && cfg.Channels.WhatsApp.Enabled)
+	if !remote || strings.Contains(origin.Conversation, "-group-") {
+		return errors.New("notification origin is not a known conversation")
+	}
+	if origin.Channel == "whatsapp" && origin.Conversation != "WA-"+config.NormalizeAllowedWhatsAppNumber(strings.TrimPrefix(origin.Conversation, "WA-")) {
+		return errors.New("new WhatsApp origin requires a canonical phone number")
+	}
+	if s.DeliveryControl == nil || s.connectionStatus(origin.Channel).State != channel.ConnectionConnected {
+		return fmt.Errorf("%s must be connected to initiate a conversation", origin.Channel)
+	}
+	return nil
+}
+
+func validateOrigin(cfg config.Config, store *history.Store, identity *telegram.IdentityStore, origin orchestrator.Origin) error {
+	if err := ValidateConversationName(origin.Conversation); err != nil {
+		return err
+	}
+	if _, err := os.Stat(store.Path(origin.Channel, origin.Conversation)); err != nil {
 		if os.IsNotExist(err) {
 			return fmt.Errorf("origin %s/%s is not a known conversation", origin.Channel, origin.Conversation)
 		}
 		return err
 	}
-	cfg := s.Settings.Snapshot()
+	return validateOriginAuthorization(cfg, identity, origin)
+}
+
+func validateOriginAuthorization(cfg config.Config, identity *telegram.IdentityStore, origin orchestrator.Origin) error {
+	if err := ValidateConversationName(origin.Conversation); err != nil {
+		return err
+	}
 	switch origin.Channel {
 	case "telegram":
 		if strings.HasPrefix(origin.Conversation, "TG-group-") {
@@ -229,7 +299,7 @@ func (s *Service) validateOrigin(origin orchestrator.Origin) error {
 			return errors.New("invalid Telegram origin")
 		}
 		id := strings.TrimPrefix(origin.Conversation, "TG-")
-		if s.telegramIdentity.AuthorizedPrivate(cfg.Channels.Telegram.AllowedUsers, id) {
+		if identity.AuthorizedPrivate(cfg.Channels.Telegram.AllowedUsers, id) {
 			return nil
 		}
 		return errors.New("Telegram origin is not authorized by allowed_users")
@@ -257,17 +327,40 @@ func (s *Service) validateOrigin(origin orchestrator.Origin) error {
 }
 
 func (s *Service) deliverNotification(ctx context.Context, origin orchestrator.Origin, eventID, text string) error {
-	if err := s.validateOrigin(origin); err != nil {
-		return err
-	}
-	if origin.Channel == "telegram" || origin.Channel == "whatsapp" {
-		state, stateErr := s.History.DeliveryState(origin.Channel, origin.Conversation, eventID)
-		if stateErr != nil {
-			return stateErr
+	active := false
+	if origin.Channel == "tui" {
+		state, err := s.History.DeliveryState(origin.Channel, origin.Conversation, eventID)
+		if err != nil {
+			return err
 		}
 		if state == "sent" {
-			return nil
+			return s.validateOrigin(origin)
 		}
+		session, err := s.Orchestrator.Session(ctx, sessionKey(core.Message{Channel: origin.Channel, Conversation: origin.Conversation}))
+		if err != nil {
+			return errors.New("notification session state unavailable")
+		}
+		active = session.Active
+	}
+	deliver := func() error { return s.deliverNotificationEffect(ctx, origin, eventID, text, active) }
+	if s.Orchestrator.Worker != nil {
+		return s.Orchestrator.Worker.RunOwned(ctx, deliver)
+	}
+	return deliver()
+}
+
+func (s *Service) deliverNotificationEffect(ctx context.Context, origin orchestrator.Origin, eventID, text string, active bool) error {
+	if err := s.validateNotificationOrigin(origin); err != nil {
+		return err
+	}
+	state, err := s.History.DeliveryState(origin.Channel, origin.Conversation, eventID)
+	if err != nil {
+		return err
+	}
+	if state == "sent" {
+		return nil
+	}
+	if origin.Channel == "telegram" || origin.Channel == "whatsapp" {
 		if s.DeliveryControl == nil {
 			return fmt.Errorf("%s is disconnected", origin.Channel)
 		}
@@ -290,10 +383,10 @@ func (s *Service) deliverNotification(ctx context.Context, origin orchestrator.O
 		}
 	}
 	role := "assistant"
-	if origin.Channel == "tui" && s.Harness.IsActive(sessionKey(core.Message{Channel: origin.Channel, Conversation: origin.Conversation})) {
+	if origin.Channel == "tui" && active {
 		role = "notification_pending"
 	}
-	_, err := s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: role, Sender: "Spy", Content: text, EventID: eventID})
+	_, err = s.History.Append(origin.Channel, origin.Conversation, history.Entry{Role: role, Sender: "Spy", Content: text, EventID: eventID})
 	return err
 }
 
@@ -317,6 +410,25 @@ func (s *Service) Notify(ctx context.Context, originText, text string) (string, 
 }
 
 func (s *Service) NotifyWithFallback(ctx context.Context, originText, fallbackOriginText, text string) (string, error) {
+	return s.notify(ctx, originText, fallbackOriginText, "", text)
+}
+
+func (s *Service) NotifyEscalation(ctx context.Context, originText, fallbackOriginText, key, text string) (string, error) {
+	if strings.TrimSpace(key) == "" {
+		return "", errors.New("escalation key is required")
+	}
+	return s.notify(ctx, originText, fallbackOriginText, key, text)
+}
+
+func (s *Service) CancelNotification(ctx context.Context, originText, eventID string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	// Workspace operators may retire delivery even after its route is revoked.
+	return s.Orchestrator.Outbox.Cancel(originText, eventID)
+}
+
+func (s *Service) notify(ctx context.Context, originText, fallbackOriginText, key, text string) (string, error) {
 	origin, err := orchestrator.ParseOrigin(originText)
 	if err != nil {
 		return "", err
@@ -324,23 +436,25 @@ func (s *Service) NotifyWithFallback(ctx context.Context, originText, fallbackOr
 	if strings.TrimSpace(text) == "" {
 		return "", errors.New("notification message is required")
 	}
-	if err := s.validateOrigin(origin); err != nil {
+	if err := s.validateNotificationOrigin(origin); err != nil {
 		return "", err
 	}
 	if fallbackOriginText != "" {
-		fallback, err := orchestrator.ParseOrigin(fallbackOriginText)
+		fallback, err := orchestrator.ParseFallbackOrigin(fallbackOriginText)
 		if err != nil {
 			return "", err
 		}
-		if fallback.Channel != "tui" && fallback.Channel != "cli" {
-			return "", errors.New("fallback origin must be a local tui or cli origin")
-		}
-		if err := s.validateOrigin(fallback); err != nil {
+		if err := s.validateNotificationOrigin(fallback); err != nil {
 			return "", err
 		}
 	}
 	deliveryKey := fmt.Sprintf("manual-%d", time.Now().UTC().UnixNano())
-	entry, err := s.Orchestrator.Outbox.EnqueueWithFallback(deliveryKey, "manual", originText, fallbackOriginText, text)
+	var entry orchestrator.OutboxEntry
+	if key != "" {
+		entry, err = s.Orchestrator.Outbox.EnqueueEscalation(key, originText, fallbackOriginText, text)
+	} else {
+		entry, err = s.Orchestrator.Outbox.EnqueueWithFallback(deliveryKey, "manual", originText, fallbackOriginText, text)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -424,7 +538,16 @@ func remoteAuthorizedPrincipalCount(cfg config.Config) int {
 }
 
 func (s *Service) Start(ctx context.Context) error {
-	err := s.Harness.Start(ctx)
+	var err error
+	if s.Orchestrator.Worker == nil {
+		err = s.Harness.Start(ctx)
+	} else {
+		ready, detail, inspectErr := s.Orchestrator.Availability(ctx)
+		err = inspectErr
+		if err == nil && !ready {
+			err = fmt.Errorf("worker harness unavailable: %s", detail)
+		}
+	}
 	s.recoveryMu.Lock()
 	s.serviceStarted = true
 	s.recoveryMu.Unlock()
@@ -544,8 +667,14 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 		}
 		return ErrDuplicateMessage
 	}
-	if message.FollowupOnly && !s.Harness.IsActive(sessionKey(message)) {
-		return errors.New("there is no active execution for this conversation")
+	if message.FollowupOnly {
+		session, err := s.Orchestrator.Session(ctx, sessionKey(message))
+		if err != nil {
+			return fmt.Errorf("inspect active conversation: %w", err)
+		}
+		if !session.Active {
+			return errors.New("there is no active execution for this conversation")
+		}
 	}
 	recorded := false
 	var recordErr error
@@ -561,6 +690,9 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 	// and the next agent prompt include the same error the user saw.
 	defer func() {
 		if resultErr != nil {
+			if errors.Is(resultErr, orchestrator.ErrConversationPending) {
+				return
+			}
 			if recordErr != nil {
 				s.Runtime.LogEvent("error", "history", "append_failed", fmt.Sprintf("Persist incoming history failed (%T)", recordErr))
 				return
@@ -618,32 +750,20 @@ func messageHookPayload(message core.Message) map[string]any {
 	}
 }
 
-func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Message, prompt string, emit core.Emit) error {
-	if s.Config.Extensions.Enabled {
-		output, err := s.Hooks.Run(ctx, "harness.before", map[string]any{
-			"session_key": sessionKey(message), "prompt": prompt, "channel": message.Channel,
-		})
-		if err != nil {
-			return err
-		}
-		if output.Cancel {
-			return s.localReply(message, output.Message, emit)
-		}
-		if value, ok := output.Payload["prompt"].(string); ok {
-			prompt = value
-		}
-	}
-	preparedPrompt, err := s.prepareChatHarnessPrompt(prompt)
-	if err != nil {
+func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Message, prompt string, emit core.Emit, additionalSourceIDs ...string) error {
+	prompt, handled, err := s.prepareConversationPrompt(ctx, message, prompt, emit)
+	if err != nil || handled {
 		return err
 	}
-	prompt = preparedPrompt
+	if s.Orchestrator.Worker != nil {
+		return s.dispatchWorkerConversation(ctx, message, prompt, emit, additionalSourceIDs)
+	}
 	key := sessionKey(message)
 	jobID, jobCreated, err := s.Runtime.tryBeginJobWithDetails(key, message.Channel, message.Conversation, message.Text, JobDetails{Kind: "conversation", Provider: s.Settings.Snapshot().Harness.Name})
 	if err != nil {
 		return fmt.Errorf("start job: %w", err)
 	}
-	reservation, admission, err := s.reserveRecoveryExecution(message)
+	reservation, admission, err := s.reserveRecoveryExecution(message, additionalSourceIDs...)
 	if err != nil {
 		if jobCreated {
 			s.Runtime.EndJob(jobID)
@@ -665,6 +785,17 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	}
 	if err != nil {
 		activity.stop()
+		var rejected *harness.SendNotAdmittedError
+		if !errors.As(err, &rejected) {
+			// A missing acknowledgement cannot release a source the provider
+			// may already have acted on. Its terminal still owns exact coverage.
+			s.Runtime.LogEvent("error", "harness", "admission_unconfirmed", "Harness message admission was not confirmed ("+harnessFailureEvidence(err)+")")
+			s.Runtime.RecordJobEvent(jobID, core.Event{Kind: core.EventStatus, Text: "Message admission requires reconciliation"})
+			if !s.Harness.IsActive(key) {
+				s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobDegraded), Detail: "Message admission requires reconciliation"})
+			}
+			return fmt.Errorf("%w: %w", orchestrator.ErrConversationPending, err)
+		}
 		s.rollbackRecoveryReservation(message, reservation)
 		s.Runtime.RecordJobEvent(jobID, core.Event{Kind: core.EventError, Text: err.Error(), Done: true})
 		s.Runtime.LogEvent("error", "harness", "start_failed", "Harness turn failed to start ("+harnessFailureEvidence(err)+")")
@@ -680,7 +811,9 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 		actualAdmission = "steered"
 	}
 	if admission == "followup" && admission != actualAdmission {
-		_, _ = s.History.Append(message.Channel, message.Conversation, history.Entry{Role: "correlation", SourceMessageID: message.SourceMessageID, ExecutionID: executionID, Admission: actualAdmission})
+		for _, source := range append([]string{message.SourceMessageID}, additionalSourceIDs...) {
+			_, _ = s.History.Append(message.Channel, message.Conversation, history.Entry{Role: "correlation", SourceMessageID: source, ExecutionID: executionID, Admission: actualAdmission})
+		}
 	}
 	s.Runtime.SetJobRunningIfStarting(jobID)
 	if emit != nil {
@@ -693,9 +826,33 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	return nil
 }
 
+func (s *Service) prepareConversationPrompt(ctx context.Context, message core.Message, prompt string, emit core.Emit) (string, bool, error) {
+	if s.Config.Extensions.Enabled {
+		output, err := s.Hooks.Run(ctx, "harness.before", map[string]any{
+			"session_key": sessionKey(message), "prompt": prompt, "channel": message.Channel,
+		})
+		if err != nil {
+			return "", false, err
+		}
+		if output.Cancel {
+			return "", true, s.localReply(message, output.Message, emit)
+		}
+		if value, ok := output.Payload["prompt"].(string); ok {
+			prompt = value
+		}
+	}
+	preparedPrompt, err := s.prepareChatHarnessPrompt(prompt)
+	if err != nil {
+		return "", false, err
+	}
+	return preparedPrompt, false, nil
+}
+
 func (s *Service) prepareChatHarnessPrompt(prompt string) (string, error) {
 	harnessSettings := s.Settings.Snapshot().Harness
 	prompt = strings.TrimRight(prompt, "\r\n") + "\n\n" + orchestrator.TaskReviewModeInstruction(harnessSettings.Reviews)
+	prompt += "\n\nFramework task notification metadata: select outcomes with `notify.on: [done, failed, waiting, cancelled]`, never a key named `outcomes`. Preserve the exact original `notify.origin`. Configure `notify.fallback_origin` only for an explicitly owner-established same-operator route; authorization or recency alone is not that association."
+	prompt += "\n\n" + orchestrator.NotificationSettlementInstruction
 	prompt = instructions.InjectScopeDiscipline(prompt)
 	prompt, err := instructions.Append(prompt, s.Config.StatePath(), instructions.Chat)
 	if err != nil {
@@ -733,9 +890,27 @@ func (s *Service) creationCommandPrompt(message core.Message, kind, userMessage 
 	return base + "\n\n---\n\n" + directive, nil
 }
 
-func (s *Service) chatPrompt(message core.Message) (string, error) {
+func (s *Service) recentConversation(channel, conversation string) (string, string, error) {
 	cfg := s.Settings.Snapshot()
-	recent, fullPath, err := s.History.RecentBounded(message.Channel, message.Conversation, cfg.Workspace.HistoryMaxMessages, cfg.Workspace.HistoryCharLimit)
+	return s.History.RecentBounded(channel, conversation, cfg.Workspace.HistoryMaxMessages, cfg.Workspace.HistoryCharLimit)
+}
+
+func (s *Service) notificationContext(origin orchestrator.Origin) (string, error) {
+	if err := s.validateNotificationOrigin(origin); err != nil {
+		return "", err
+	}
+	recent, _, err := s.recentConversation(origin.Channel, origin.Conversation)
+	if err != nil {
+		return "", err
+	}
+	if err := s.validateNotificationOrigin(origin); err != nil {
+		return "", err
+	}
+	return recent, nil
+}
+
+func (s *Service) chatPrompt(message core.Message) (string, error) {
+	recent, fullPath, err := s.recentConversation(message.Channel, message.Conversation)
 	if err != nil {
 		return "", err
 	}
@@ -761,46 +936,81 @@ func (s *Service) chatPrompt(message core.Message) (string, error) {
 }
 
 func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit) core.Emit {
+	consume := s.conversationConsumer(message, jobID, downstream)
+	return func(event core.Event) {
+		if err := consume(event); err != nil {
+			s.Runtime.LogEvent("error", "history", "conversation_settlement_failed", fmt.Sprintf("Persist conversation result failed (%T)", err))
+			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobDegraded), Detail: "Conversation result could not be saved"})
+			if downstream != nil {
+				downstream(core.Event{Kind: core.EventError, Text: "Conversation result could not be saved; execution settlement remains pending", Done: true})
+			}
+		}
+	}
+}
+
+func (s *Service) conversationConsumer(message core.Message, jobID int, downstream core.Emit) func(core.Event) error {
+	return s.conversationEventConsumer(message, jobID, func(event core.Event) error {
+		if downstream != nil {
+			downstream(event)
+		}
+		return nil
+	}, nil)
+}
+
+func (s *Service) conversationEventConsumer(message core.Message, jobID int, downstream func(core.Event) error, worker *harness.WorkerDelivery) func(core.Event) error {
+	var consumerID string
+	var setupErr error
+	if worker == nil {
+		consumerID, setupErr = shortid.New()
+	}
 	var terminalMu sync.Mutex
 	terminalDelivered := false
-	return func(event core.Event) {
+	var cursor uint64
+	process := func(event core.Event) (core.Event, bool, bool, error) {
+		terminalMu.Lock()
+		defer terminalMu.Unlock()
+		if setupErr != nil {
+			return event, false, false, setupErr
+		}
+		if terminalDelivered {
+			return event, false, false, nil
+		}
 		terminal := event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError)
-		if terminal {
-			terminalMu.Lock()
-			if terminalDelivered {
-				terminalMu.Unlock()
-				return
+		receipt := fmt.Sprintf("conversation:%s:%d", consumerID, cursor+1)
+		if worker != nil {
+			receipt = worker.ReceiptID()
+			if message.Channel == "tui" {
+				event.RequestID = message.SourceMessageID
+				if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+					event.ResponseID = receipt
+				}
 			}
-			terminalDelivered = true
-			terminalMu.Unlock()
 		}
 		key := sessionKey(message)
 		// A queued request can be cancelled while the shared provider turn is
 		// still active. Persist and deliver its result without settling that turn.
-		requestOnly := terminal && s.Harness.IsActive(key)
-		if event.Execution != nil {
-			s.Runtime.UpdateJob(jobID, *event.Execution)
-		} else if event.Kind == core.EventDelta {
-			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobRunning)})
+		requestOnly := false
+		if worker != nil {
+			requestOnly = worker.RequestOnly
+		} else {
+			requestOnly = terminal && s.Harness.IsActive(key)
 		}
-		if terminal && !requestOnly {
-			state := JobFinishing
-			if event.Kind == core.EventError {
-				state = JobError
-			}
-			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(state), Detail: map[bool]string{true: event.Text, false: ""}[event.Kind == core.EventError]})
+		if terminal && !requestOnly && worker == nil {
+			s.beginConversationSettlement(key)
 		}
-		if event.Kind == core.EventDelta {
+		if event.Kind == core.EventDelta && worker == nil {
 			s.streamMu.Lock()
 			s.streamText[key] += event.Text
 			s.streamMu.Unlock()
 		}
 		if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+			localReplay := worker != nil && message.Channel == "tui" && !requestOnly
 			var streamed string
-			if !requestOnly {
+			if worker != nil {
+				streamed = worker.Streamed
+			} else if !requestOnly {
 				s.streamMu.Lock()
 				streamed = s.streamText[key]
-				delete(s.streamText, key)
 				s.streamMu.Unlock()
 			}
 			text := event.Text
@@ -811,7 +1021,7 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 			}
 			if s.Config.Extensions.Enabled {
 				output, err := s.Hooks.Run(context.Background(), "harness.after", map[string]any{
-					"session_key": sessionKey(message), "text": hookText, "kind": event.Kind,
+					"session_key": sessionKey(message), "text": hookText, "kind": event.Kind, "event_id": receipt,
 				})
 				if err != nil {
 					event.Kind = core.EventError
@@ -865,29 +1075,90 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 				historyText = strings.TrimSpace(historyText + "\n\n[Sent " + attachment.Kind + " " + attachment.Name + "]")
 			}
 			if event.Kind == core.EventError && streamed != "" {
-				if _, err := s.History.Append(message.Channel, message.Conversation, history.Entry{At: time.Now().UTC(), Role: "assistant", Content: streamed}); err != nil {
-					s.Runtime.LogEvent("error", "history", "partial_append_failed", fmt.Sprintf("Persist partial history failed (%T)", err))
+				partial := history.Entry{Role: "assistant", Content: streamed}
+				if localReplay {
+					partial.Sender, partial.Recovery, partial.Continues = "Spy", true, true
+					partial.SourceMessageID = message.SourceMessageID
+				}
+				if _, err := s.History.AppendOnce(message.Channel, message.Conversation, receipt+":partial", partial); err != nil {
+					return event, false, requestOnly, fmt.Errorf("save partial conversation result: %w", err)
 				}
 			}
 			entry := history.Entry{At: time.Now().UTC(), Role: map[bool]string{true: "error", false: "assistant"}[event.Kind == core.EventError], Content: historyText, Terminal: true, SourceMessageID: message.SourceMessageID, FinalText: event.FinalText, Continues: event.Continues}
-			if message.Sender == "recovery" {
+			if message.Sender == "recovery" || localReplay {
 				entry.Sender = "Spy"
 				entry.Recovery = true
 			}
-			if _, err := s.History.Append(message.Channel, message.Conversation, entry); err != nil {
-				s.Runtime.LogEvent("error", "history", "terminal_append_failed", fmt.Sprintf("Persist terminal history failed (%T)", err))
+			var saveErr error
+			if worker != nil {
+				if !event.Continues && !requestOnly {
+					entry.ExecutionID = worker.Conversation.ExecutionID
+					entry.Covers = worker.Conversation.Sources
+					entry.Outcome = "terminal_assistant"
+					if entry.Role == "error" {
+						entry.Outcome = "terminal_error"
+					}
+				}
+				_, saveErr = s.History.AppendOnce(message.Channel, message.Conversation, receipt+":result", entry)
+			} else {
+				saveErr = s.appendConversationResult(message, entry, receipt+":result", !event.Continues && !requestOnly)
 			}
-			if !event.Continues && !requestOnly {
-				s.finishRecoveryExecution(message, map[bool]string{true: "terminal_error", false: "terminal_assistant"}[event.Kind == core.EventError])
+			if saveErr != nil {
+				return event, false, requestOnly, fmt.Errorf("save terminal conversation result: %w", saveErr)
+			}
+			if !requestOnly && worker == nil {
+				s.streamMu.Lock()
+				delete(s.streamText, key)
+				s.streamMu.Unlock()
 			}
 		}
+		if event.Execution != nil && (worker == nil || !terminal) {
+			s.Runtime.UpdateJob(jobID, *event.Execution)
+		} else if event.Kind == core.EventDelta {
+			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobRunning)})
+		}
+		if terminal && !requestOnly && worker == nil {
+			state := JobFinishing
+			if event.Kind == core.EventError {
+				state = JobError
+			}
+			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(state), Detail: map[bool]string{true: event.Text, false: ""}[event.Kind == core.EventError]})
+		}
+		cursor++
+		terminalDelivered = terminal
+		return event, true, requestOnly, nil
+	}
+	return func(event core.Event) error {
+		event, deliver, requestOnly, err := process(event)
+		if err != nil || !deliver {
+			return err
+		}
+		terminal := event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError)
+
 		// Capture after extension and outbound-media processing so validated
 		// attachment paths and objects never enter the archive.
-		s.Runtime.RecordJobEvent(jobID, event)
+		if worker != nil {
+			delivery := *worker
+			delivery.Event = event
+			if err := s.Runtime.RecordJobDelivery(jobID, delivery); err != nil {
+				return err
+			}
+		} else {
+			s.Runtime.RecordJobEvent(jobID, event)
+		}
 		if downstream != nil {
-			downstream(event)
+			if err := downstream(event); err != nil {
+				return err
+			}
 		}
 		if terminal && !requestOnly {
+			if worker != nil {
+				state, detail := JobFinishing, ""
+				if event.Kind == core.EventError {
+					state, detail = JobError, event.Text
+				}
+				s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(state), Detail: detail})
+			}
 			level, outcome := "info", "completed"
 			if event.Kind == core.EventError {
 				level, outcome = "error", "failed"
@@ -895,6 +1166,7 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 			s.Runtime.LogEvent(level, "harness", "turn_"+outcome, "Harness turn "+outcome)
 			s.Runtime.EndJob(jobID)
 		}
+		return nil
 	}
 }
 
@@ -933,12 +1205,21 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		if message.Channel != "tui" {
 			return s.localReply(message, "Starting a separate conversation with /new is available in the TUI; this channel keeps its stable conversation identity.", emit)
 		}
+		if err := validateLiveTUIIdentity(message.InstanceID, message.Conversation); err != nil {
+			return fmt.Errorf("register new TUI conversation: %w", err)
+		}
 		id, err := shortid.New()
 		if err != nil {
 			return fmt.Errorf("allocate new conversation: %w", err)
 		}
 		conversation := "new-" + id
-		if _, err := s.History.Ensure("tui", conversation); err != nil {
+		s.liveTUIMu.Lock()
+		_, err = s.History.Ensure("tui", conversation)
+		if err == nil {
+			s.registerLiveTUILocked(message.InstanceID, conversation, time.Now().UTC())
+		}
+		s.liveTUIMu.Unlock()
+		if err != nil {
 			return fmt.Errorf("create new conversation: %w", err)
 		}
 		screen := s.WelcomeScreen()
@@ -1012,11 +1293,8 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 	case "job":
 		return s.jobCommand(ctx, message, remainder, emit)
 	case "clear":
-		if err := s.Harness.ResetSession(sessionKey(message)); err != nil {
+		if err := s.clearConversation(ctx, message); err != nil {
 			return s.localReply(message, "Cannot clear this conversation: "+err.Error(), emit)
-		}
-		if err := s.History.Clear(message.Channel, message.Conversation); err != nil {
-			return err
 		}
 		if emit != nil {
 			emit(core.Event{Kind: core.EventFinal, Text: "Conversation history and harness thread cleared.", Clear: true, Done: true, Local: true})
@@ -1029,7 +1307,11 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		if hasJob {
 			job, hasJob = s.Runtime.ReserveJobCancellation(job.ID)
 		}
-		stopped, err := s.Harness.Interrupt(ctx, key)
+		interrupt := s.Harness.Interrupt
+		if s.Orchestrator.Worker != nil {
+			interrupt = s.Orchestrator.Interrupt
+		}
+		stopped, err := interrupt(ctx, key)
 		if err != nil {
 			if hasJob {
 				s.Runtime.RestoreJobAfterFailedCancellation(job)
@@ -1101,6 +1383,12 @@ func (s *Service) finishCancelledJobAfterGrace(job Job) {
 }
 
 func (s *Service) trackChatActivity(jobID int, activity *chatActivityEmitter) {
+	s.chatActivityMu.Lock()
+	defer s.chatActivityMu.Unlock()
+	s.trackChatActivityLocked(jobID, activity)
+}
+
+func (s *Service) trackChatActivityLocked(jobID int, activity *chatActivityEmitter) {
 	activity.onStop = func() {
 		s.chatActivityMu.Lock()
 		delete(s.chatActivity[jobID], activity)
@@ -1109,12 +1397,10 @@ func (s *Service) trackChatActivity(jobID int, activity *chatActivityEmitter) {
 		}
 		s.chatActivityMu.Unlock()
 	}
-	s.chatActivityMu.Lock()
 	if s.chatActivity[jobID] == nil {
 		s.chatActivity[jobID] = map[*chatActivityEmitter]struct{}{}
 	}
 	s.chatActivity[jobID][activity] = struct{}{}
-	s.chatActivityMu.Unlock()
 }
 
 func (s *Service) stopJobChatActivity(jobID int) {
@@ -1361,7 +1647,11 @@ func (s *Service) jobCommand(ctx context.Context, message core.Message, remainde
 	}
 	cancellationLeaseID := s.Orchestrator.MarkControlCancellation(job.SessionKey)
 	correlationCancellation := s.recoveryCancellationSnapshot(job.SessionKey)
-	stopped, err := s.Harness.Interrupt(ctx, job.SessionKey)
+	interrupt := s.Harness.Interrupt
+	if s.Orchestrator.Worker != nil {
+		interrupt = s.Orchestrator.Interrupt
+	}
+	stopped, err := interrupt(ctx, job.SessionKey)
 	if err != nil {
 		s.Runtime.RestoreJobAfterFailedCancellation(job)
 		s.Orchestrator.RestoreControlCancellation(cancellationLeaseID)
@@ -1370,8 +1660,15 @@ func (s *Service) jobCommand(ctx context.Context, message core.Message, remainde
 	if !stopped {
 		s.Runtime.RestoreJobAfterFailedCancellation(job)
 		s.Orchestrator.RestoreControlCancellation(cancellationLeaseID)
-		if s.Harness.IsActive(job.SessionKey) {
+		session, inspectErr := s.Orchestrator.Session(ctx, job.SessionKey)
+		if inspectErr != nil {
+			return s.localReply(message, fmt.Sprintf("Cannot confirm completion of job %d: session state unavailable.", id), emit)
+		}
+		if session.Active {
 			return s.localReply(message, fmt.Sprintf("Cannot kill job %d: the provider did not accept the interrupt request.", id), emit)
+		}
+		if session.Retained {
+			return s.localReply(message, fmt.Sprintf("Job %d provider is finished; delivery is still pending.", id), emit)
 		}
 		s.stopJobChatActivity(job.ID)
 		s.Runtime.EndJob(job.ID)
@@ -1409,6 +1706,9 @@ func (s *Service) jobControlCommand(ctx context.Context, message core.Message, i
 		return s.localReply(message, fmt.Sprintf("Job %d has no stable durable document identity for steering.", id), emit)
 	}
 	controller, ok := s.Harness.(harness.ControlSender)
+	if s.Orchestrator.Worker != nil {
+		controller, ok = s.Orchestrator, true
+	}
 	if !ok {
 		return s.localReply(message, fmt.Sprintf("Job %d uses a harness that does not expose safe job steering.", id), emit)
 	}
@@ -1615,6 +1915,7 @@ func (s *Service) conversationDelivery() channel.DeliveryRouter {
 // plain CLI clients and rendered by /status on every channel.
 type StatusSnapshot struct {
 	Title                string                             `json:"title"`
+	Version              string                             `json:"version"`
 	Instance             string                             `json:"instance,omitempty"`
 	PrimaryInstance      string                             `json:"primary_instance,omitempty"`
 	Connections          []channel.ConnectionStatus         `json:"connections"`
@@ -1667,19 +1968,30 @@ func (s *Service) Status(message core.Message) (StatusSnapshot, error) {
 	}
 	harnessState := "connected"
 	harnessDetail := ""
-	if availability, ok := s.Harness.(harness.Availability); ok {
-		if ready, detail := availability.Available(); !ready {
-			harnessState = "unavailable"
-			harnessDetail = detail
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ready, detail, err := s.Orchestrator.Availability(ctx)
+	if err != nil {
+		return StatusSnapshot{}, err
+	}
+	if !ready {
+		harnessState, harnessDetail = "unavailable", detail
+	}
+	session, err := s.Orchestrator.Session(ctx, sessionKey(message))
+	if err != nil {
+		return StatusSnapshot{}, errors.New("harness session state unavailable")
+	}
+	version := ""
+	if s.Updates != nil {
+		version = s.Updates.CurrentVersion
 	}
 	return StatusSnapshot{
-		Title:    s.currentTitle(),
+		Title: s.currentTitle(), Version: version,
 		Instance: shortid.Display(instanceID), PrimaryInstance: shortid.Display(primaryInstanceID),
 		Connections: []channel.ConnectionStatus{s.connectionStatus("telegram"), s.connectionStatus("whatsapp")},
 		Runtime:     s.Runtime.Status(), Harness: cfg.Harness.Name, HarnessState: harnessState,
 		HarnessDetail: harnessDetail, Model: cfg.Harness.Model, ReasoningEffort: cfg.Harness.ReasoningEffort, ServiceMode: cfg.Harness.ServiceMode, Sandbox: cfg.Harness.Sandbox,
-		StartupEnabled: cfg.Startup.Enabled, TurnActive: s.Harness.IsActive(sessionKey(message)),
+		StartupEnabled: cfg.Startup.Enabled, TurnActive: session.Active,
 		OrchestratorLease: leases, OrchestratorRuns: dispatches,
 		TasksActive: work.TasksActive, TasksWaiting: work.TasksWaiting, GoalsActive: work.GoalsActive, WorkDiagnostics: work.CountDiagnostics,
 		HeartbeatState: work.HeartbeatState, NextHeartbeatAt: nextHeartbeatAt,
@@ -1720,6 +2032,7 @@ func FormatStatus(status StatusSnapshot) string {
 		"# Status",
 		"",
 		"- Title: " + status.Title,
+		"- Version: " + emptyAs(status.Version, "not available"),
 		"- Instance ID: " + statusID(status.Instance),
 		"- Primary instance ID: " + statusID(status.PrimaryInstance),
 		fmt.Sprintf("- Jobs: %d — `/jobs`", status.Runtime.Jobs),

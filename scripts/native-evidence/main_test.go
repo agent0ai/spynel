@@ -2,11 +2,32 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestRunCommandRetainsBoundedFailureDiagnostics(t *testing.T) {
+	for _, script := range []string{
+		"printf 'synthetic native failure\\n' >&2; exit 7",
+		"printf 'synthetic native failure\\n' >&2; printf '%070000d' 1; exit 7",
+	} {
+		output, err := runCommand(t.TempDir(), []string{}, "sh", "-c", script)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+			t.Fatalf("command exit = %v, want status 7", err)
+		}
+		if !strings.Contains(output, "synthetic native failure") || !strings.Contains(err.Error(), "synthetic native failure") {
+			t.Fatal("failed command discarded its captured diagnostic")
+		}
+		if len(output) > maxCommandOutput || len(err.Error()) > maxCommandOutput+256 {
+			t.Fatal("failed command diagnostic exceeded its bound")
+		}
+	}
+}
 
 func TestEvidenceSerializationIsBoundedAndPathMinimal(t *testing.T) {
 	privatePath := filepath.Join(t.TempDir(), "private workspace", "archive.tar.gz")

@@ -17,11 +17,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/fsx"
 )
 
-// ProcessRegistration identifies a server/TUI or its diagnostic reader,
-// including other workspaces. It contains no workspace credentials.
+// ProcessRegistration identifies an application, client or helper, including
+// other workspaces. It contains no workspace credentials.
 type ProcessRegistration struct {
 	PID                  int    `json:"pid"`
 	Generation           string `json:"generation"`
@@ -32,12 +33,28 @@ type ProcessRegistration struct {
 	CoordinatedUpdates   bool   `json:"coordinated_updates"`
 	DiagnosticReader     bool   `json:"diagnostic_reader,omitempty"`
 	ProviderGuardian     bool   `json:"provider_guardian,omitempty"`
+	HarnessWorker        bool   `json:"harness_worker,omitempty"`
+	WorkerProtocol       int    `json:"-"`
+	ApplicationClient    bool   `json:"application_client,omitempty"`
 	Supervisor           bool   `json:"supervisor,omitempty"`
 	SupervisorPID        int    `json:"supervisor_pid,omitempty"`
 	SupervisorGeneration string `json:"supervisor_generation,omitempty"`
 	ExecutorPID          int    `json:"executor_pid,omitempty"`
 	ExecutorGeneration   string `json:"executor_generation,omitempty"`
 	Stopping             bool   `json:"stopping,omitempty"`
+	StartTime            string `json:"start_time,omitempty"`
+	start                string
+}
+
+// Registry-only coordination metadata must not change the strict worker wire
+// schema, which also embeds ProcessRegistration as native identity evidence.
+type processRecord struct {
+	ProcessRegistration
+	WorkerProtocol int `json:"worker_protocol,omitempty"`
+}
+
+func (r ProcessRegistration) registryJSON() ([]byte, error) {
+	return json.Marshal(processRecord{ProcessRegistration: r, WorkerProtocol: r.WorkerProtocol})
 }
 
 func processDirectory() (string, error) {
@@ -78,6 +95,16 @@ func (m *Manager) RegisterProviderGuardian() (func(), error) {
 	return m.registerProcess(ProcessRegistration{ProviderGuardian: true})
 }
 
+func (m *Manager) RegisterHarnessWorker() (func(), error) {
+	return m.registerProcess(ProcessRegistration{HarnessWorker: true, WorkerProtocol: core.WorkerProtocol})
+}
+
+// RegisterApplicationClient retains stop/uninstall visibility without making a
+// finite request or event subscription an application restart target.
+func (m *Manager) RegisterApplicationClient() (func(), error) {
+	return m.registerProcess(ProcessRegistration{ApplicationClient: true})
+}
+
 func (m *Manager) registerProcess(role ProcessRegistration) (func(), error) {
 	directory, err := processDirectory()
 	if err != nil {
@@ -91,12 +118,20 @@ func (m *Manager) registerProcess(role ProcessRegistration) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	alive, start, err := inspectProcess(os.Getpid())
+	if err != nil {
+		return nil, err
+	}
+	if !alive || start == "" {
+		return nil, errors.New("cannot verify own process start time")
+	}
 	record := role
 	record.PID, record.Generation, record.Executable = os.Getpid(), hex.EncodeToString(nonce[:]), executable
+	record.StartTime = start
 	record.Installation, record.Version = m.InstallationRoot(), m.CurrentVersion
 	record.CoordinatedUpdates = m.PackageRoot == "" || m.CoordinatedUpdates
 	path := filepath.Join(directory, strconv.Itoa(record.PID)+".json")
-	data, err := json.Marshal(record)
+	data, err := record.registryJSON()
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +157,7 @@ func MarkProcessReady() error {
 		return err
 	}
 	record.Ready = true
-	data, err := json.Marshal(record)
+	data, err := record.registryJSON()
 	if err != nil {
 		return err
 	}
@@ -143,7 +178,10 @@ func readProcess(path string) (ProcessRegistration, error) {
 		return record, err
 	}
 	defer file.Close()
-	err = json.NewDecoder(io.LimitReader(file, 4097)).Decode(&record)
+	var stored processRecord
+	err = json.NewDecoder(io.LimitReader(file, 4097)).Decode(&stored)
+	record = stored.ProcessRegistration
+	record.WorkerProtocol = stored.WorkerProtocol
 	if err != nil || record.PID <= 1 || len(record.Generation) != 32 || !filepath.IsAbs(record.Executable) || record.Installation != "" && !filepath.IsAbs(record.Installation) || filepath.Base(path) != strconv.Itoa(record.PID)+".json" {
 		return record, errors.New("invalid Spynel process identity")
 	}
@@ -171,6 +209,21 @@ func liveProcesses() ([]ProcessRegistration, error) {
 }
 
 func processRecords(ids []int) ([]ProcessRegistration, error) {
+	records, err := collectProcessRecords(ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, record := range records {
+		if record.Generation == "" {
+			// Kernel PIDs and atomic registration files can straddle startup or exit.
+			time.Sleep(2 * time.Second)
+			return collectProcessRecords(ids)
+		}
+	}
+	return records, nil
+}
+
+func collectProcessRecords(ids []int) ([]ProcessRegistration, error) {
 	directory, err := processDirectory()
 	if err != nil {
 		return nil, err
@@ -184,6 +237,10 @@ func processRecords(ids []int) ([]ProcessRegistration, error) {
 		if pid <= 1 || pid == os.Getpid() {
 			continue
 		}
+		alive, start, stateErr := inspectProcess(pid)
+		if stateErr == nil && !alive || stateErr != nil && !processAlive(pid) {
+			continue
+		}
 		path, err := installationProcessPath(pid)
 		if err != nil {
 			if _, recordErr := readProcess(filepath.Join(directory, strconv.Itoa(pid)+".json")); recordErr == nil && processAlive(pid) {
@@ -193,11 +250,18 @@ func processRecords(ids []int) ([]ProcessRegistration, error) {
 		}
 		record, err := readProcess(filepath.Join(directory, strconv.Itoa(pid)+".json"))
 		if err == nil && processMatches(record, path) {
+			if stateErr != nil {
+				return nil, fmt.Errorf("cannot verify start time of registered Spynel process %d: %w", pid, stateErr)
+			}
+			if record.StartTime != "" && record.StartTime != start {
+				return nil, fmt.Errorf("registered Spynel process %d start time changed", pid)
+			}
 			info, err := buildinfo.ReadFile(processImagePath(pid, path))
 			if err != nil {
 				info, err = buildinfo.ReadFile(record.Executable)
 			}
 			if err == nil && info.Path == own.Path {
+				record.start = start
 				records = append(records, record)
 				continue
 			}
@@ -206,7 +270,7 @@ func processRecords(ids []int) ([]ProcessRegistration, error) {
 			continue
 		}
 		info, err := buildinfo.ReadFile(processImagePath(pid, path))
-		if err == nil && info.Path == own.Path {
+		if err == nil && info.Path == own.Path && processAlive(pid) {
 			executable := strings.TrimSuffix(path, " (deleted)")
 			root := npmRootFromExecutable(executable)
 			if strings.HasPrefix(filepath.Base(root), ".spynel-") {
@@ -215,7 +279,10 @@ func processRecords(ids []int) ([]ProcessRegistration, error) {
 			if !validNPMRoot(root, "") {
 				root = ""
 			}
-			records = append(records, ProcessRegistration{PID: pid, Executable: executable, Installation: root})
+			if stateErr != nil {
+				return nil, fmt.Errorf("cannot verify start time of Spynel process %d: %w", pid, stateErr)
+			}
+			records = append(records, ProcessRegistration{PID: pid, Executable: executable, Installation: root, start: start})
 		}
 	}
 	return records, nil
@@ -223,6 +290,12 @@ func processRecords(ids []int) ([]ProcessRegistration, error) {
 
 // CheckRestartable refuses to strand an older, unregistered process silently.
 func (m *Manager) CheckRestartable() error {
+	return m.CheckRestartableFor(core.WorkerProtocol)
+}
+
+// CheckRestartableFor also fences publication against a target worker protocol.
+// Zero means unknown; only installations without live workers may proceed.
+func (m *Manager) CheckRestartableFor(workerProtocol int) error {
 	root := m.InstallationRoot()
 	if root == "" {
 		return errors.New("updates require a managed Spynel installation")
@@ -235,7 +308,11 @@ func (m *Manager) CheckRestartable() error {
 		return err
 	}
 	for _, record := range records {
-		if record.DiagnosticReader || record.ProviderGuardian {
+		owned := record.Installation == root || m.ownsProcessPath(root, record.Executable)
+		if record.HarnessWorker && owned && (workerProtocol <= 0 || record.WorkerProtocol <= 0 || record.WorkerProtocol != workerProtocol) {
+			return errors.New("update cannot preserve a live worker with incompatible or unknown compatibility; let its jobs and pending delivery finish, then explicitly stop Spynel with spynel killall, update and relaunch")
+		}
+		if record.DiagnosticReader || record.ProviderGuardian || record.HarnessWorker || record.ApplicationClient {
 			continue
 		}
 		if record.SupervisorPID != 0 && (record.Installation == root || m.ownsProcessPath(root, record.Executable)) {
@@ -290,7 +367,8 @@ func (m *Manager) RestartInstances(ctx context.Context, version string) (int, er
 			before := pending[index]
 			after, err := readProcess(filepath.Join(directory, strconv.Itoa(before.PID)+".json"))
 			path, pathErr := installationProcessPath(before.PID)
-			if err == nil && pathErr == nil && after.Ready && processMatches(after, path) && after.Installation == before.Installation && after.Generation != before.Generation && after.Version == version && (!before.Supervisor || verifiedExecutor(after, version)) {
+			alive, start, stateErr := inspectProcess(before.PID)
+			if err == nil && pathErr == nil && stateErr == nil && alive && start == before.start && (after.StartTime == "" || after.StartTime == start) && after.Ready && processMatches(after, path) && after.Installation == before.Installation && after.Generation != before.Generation && after.Version == version && (!before.Supervisor || verifiedExecutor(after, version)) {
 				pending = append(pending[:index], pending[index+1:]...)
 			}
 		}
@@ -314,20 +392,72 @@ func signalRegisteredProcess(record ProcessRegistration, signal os.Signal) error
 		return err
 	}
 	defer process.Release()
-	path, err := installationProcessPath(record.PID)
+	if err := VerifyProcess(record); err != nil {
+		return err
+	}
+	return process.Signal(signal)
+}
+
+// VerifyProcess checks the same native identity used before signalling without
+// sending a signal. Only a confirmed dead/zombie process returns ESRCH.
+func VerifyProcess(record ProcessRegistration) error {
+	return verifyProcess(record, inspectProcess)
+}
+
+func verifyProcess(record ProcessRegistration, inspect func(int) (bool, string, error)) (err error) {
+	if record.PID <= 1 {
+		return errors.New("invalid Spynel process identity")
+	}
+	defer func() {
+		if err != nil {
+			// Graceful exit can race any of the identity/registration reads.
+			if !processAlive(record.PID) {
+				err = syscall.ESRCH
+			} else if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+				err = fmt.Errorf("%w: %v", errProcessIdentityUnavailable, err)
+			}
+		}
+	}()
+	alive, start, err := inspect(record.PID)
 	if err != nil {
 		return err
 	}
+	if !alive {
+		return syscall.ESRCH
+	}
+	if record.start != "" && record.start != start || record.StartTime != "" && record.StartTime != start {
+		return errors.New("Spynel process start time changed")
+	}
+	path, err := installationProcessPath(record.PID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %v", errProcessIdentityUnavailable, err)
+		}
+		return err
+	}
 	if !processMatches(record, path) {
-		return errors.New("Spynel process identity changed before signal delivery")
+		return errors.New("Spynel process identity changed")
 	}
 	if record.Generation != "" {
 		current, err := ProcessRecord(record.PID)
-		if err != nil || current.Generation != record.Generation {
-			return errors.New("Spynel generation changed before signal delivery")
+		if errors.Is(err, os.ErrNotExist) {
+			return errProcessUnregistered
+		}
+		if err != nil {
+			return fmt.Errorf("cannot read Spynel process registration: %v", err)
+		}
+		if current.Generation != record.Generation {
+			return errors.New("Spynel generation changed")
 		}
 	}
-	return process.Signal(signal)
+	return nil
+}
+
+var errProcessUnregistered = errors.New("Spynel process registration is missing")
+var errProcessIdentityUnavailable = errors.New("Spynel process native identity is unavailable")
+
+func unconfirmedProcessExit(err error) bool {
+	return errors.Is(err, errProcessUnregistered) || errors.Is(err, errProcessIdentityUnavailable)
 }
 
 // KillAll stops verified Spynel processes, including older releases and
@@ -351,8 +481,8 @@ func stopProcessRecords(ctx context.Context, records []ProcessRegistration) erro
 		if !record.Supervisor {
 			continue
 		}
-		if err := signalRegisteredProcess(record, terminationSignal()); !processGone(err) {
-			return err
+		if err := signalRegisteredProcess(record, terminationSignal()); !processGone(err) && !unconfirmedProcessExit(err) {
+			return fmt.Errorf("cannot stop Spynel process %d: %w", record.PID, err)
 		}
 		deadline := time.NewTimer(2 * time.Second)
 		for {
@@ -381,34 +511,47 @@ func stopProcessRecords(ctx context.Context, records []ProcessRegistration) erro
 		if record.Supervisor {
 			continue
 		}
-		if err := signalRegisteredProcess(record, terminationSignal()); !processGone(err) {
-			return err
+		if err := signalRegisteredProcess(record, terminationSignal()); !processGone(err) && !unconfirmedProcessExit(err) {
+			return fmt.Errorf("cannot stop Spynel process %d: %w", record.PID, err)
 		}
 	}
 	killAt := time.Now().Add(10 * time.Second)
 	deadline := killAt.Add(5 * time.Second)
 	for _, record := range records {
-		for {
-			path, err := installationProcessPath(record.PID)
-			if err != nil || !processMatches(record, path) {
-				break
-			}
-			if time.Now().After(deadline) {
-				return fmt.Errorf("Spynel process %d did not stop", record.PID)
-			}
-			if time.Now().After(killAt) && (!record.Supervisor || time.Now().After(killAt.Add(2*time.Second))) {
-				if err := signalRegisteredProcess(record, os.Kill); !processGone(err) {
-					return err
-				}
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(50 * time.Millisecond):
-			}
+		if err := waitForStoppedProcess(ctx, record, killAt, deadline, VerifyProcess); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func waitForStoppedProcess(ctx context.Context, record ProcessRegistration, killAt, deadline time.Time, verify func(ProcessRegistration) error) error {
+	for {
+		err := verify(record)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		// Missing registration/image never authorizes a signal or proves exit.
+		if err != nil && !unconfirmedProcessExit(err) {
+			return fmt.Errorf("cannot verify stopping Spynel process %d: %w", record.PID, err)
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("cannot verify stopping Spynel process %d: %w", record.PID, err)
+			}
+			return fmt.Errorf("Spynel process %d did not stop", record.PID)
+		}
+		if err == nil && time.Now().After(killAt) && (!record.Supervisor || time.Now().After(killAt.Add(2*time.Second))) {
+			if err := signalRegisteredProcess(record, os.Kill); !processGone(err) {
+				return err
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 func processGone(err error) bool {

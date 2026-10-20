@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +27,7 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/localapi"
+	"github.com/agent0ai/spynel/internal/orchestrator"
 	"github.com/agent0ai/spynel/internal/updater"
 	"github.com/agent0ai/spynel/internal/workspace"
 )
@@ -711,8 +713,9 @@ func TestCompleteRunPreservesOrdinaryErrors(t *testing.T) {
 }
 
 func TestNPMUpdateRequestReturnsLauncherExitCodeWithoutReplacingProcess(t *testing.T) {
+	testNPMUpdateChannel(t)
 	called := false
-	err := completeRun(&updateRequest{}, func([]string) error {
+	err := completeRun(&updateRequest{args: []string{"version"}, result: updater.Result{Latest: "1.3.0"}}, func([]string) error {
 		called = true
 		return nil
 	})
@@ -722,7 +725,8 @@ func TestNPMUpdateRequestReturnsLauncherExitCodeWithoutReplacingProcess(t *testi
 	}
 }
 
-func TestNPMUpdateRequestPublishesInitContinuationArguments(t *testing.T) {
+func testNPMUpdateChannel(t *testing.T) string {
+	t.Helper()
 	placeholder, err := os.CreateTemp(os.TempDir(), "spynel-update-")
 	if err != nil {
 		t.Fatal(err)
@@ -731,25 +735,73 @@ func TestNPMUpdateRequestPublishesInitContinuationArguments(t *testing.T) {
 	if err := placeholder.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(statePath); err != nil {
-		t.Fatal(err)
-	}
 	t.Cleanup(func() { _ = os.Remove(statePath) })
 	t.Setenv("SPYNEL_NPM_UPDATE_STATE", statePath)
+	return statePath
+}
+
+func TestNPMUpdateRequestPublishesInitContinuationArguments(t *testing.T) {
+	statePath := testNPMUpdateChannel(t)
+	// A prior interrupted publication must not poison this launcher's channel.
+	if err := os.WriteFile(statePath, []byte(`{"args":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	want := []string{"serve", "--tui", "--config", "/tmp/project/.spynel/config.yaml"}
-	request := &updateRequest{args: want}
-	if code := request.ExitCode(); code != npmUpdateExitCode {
-		t.Fatalf("update exit code = %d", code)
+	request := &updateRequest{args: want, result: updater.Result{Latest: "1.3.0"}}
+	if got := completeRun(request, func([]string) error { t.Fatal("unexpected exec"); return nil }); got != request {
+		t.Fatalf("update completion = %v", got)
 	}
 	data, err := os.ReadFile(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var state struct {
-		Args []string `json:"args"`
+		Args    []string `json:"args"`
+		Version string   `json:"version"`
 	}
-	if err := json.Unmarshal(data, &state); err != nil || strings.Join(state.Args, "\x00") != strings.Join(want, "\x00") {
+	if err := json.Unmarshal(data, &state); err != nil || strings.Join(state.Args, "\x00") != strings.Join(want, "\x00") || state.Version != "1.3.0" {
 		t.Fatalf("update state = %#v, %v", state, err)
+	}
+	info, err := os.Stat(statePath)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("update channel is not private: %v", err)
+	}
+}
+
+func TestNPMUpdateHandoffFailureNeverReturnsUpdateExitCode(t *testing.T) {
+	for _, kind := range []string{"missing", "directory", "public", "symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			path := testNPMUpdateChannel(t)
+			switch kind {
+			case "missing":
+				t.Setenv("SPYNEL_NPM_UPDATE_STATE", "")
+			case "directory":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "public":
+				if err := os.Chmod(path, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filepath.Join(t.TempDir(), "unrelated"), path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := completeRun(&updateRequest{args: []string{"version"}, result: updater.Result{Latest: "1.3.0"}}, func([]string) error { t.Fatal("unexpected exec"); return nil })
+			if err == nil || !strings.Contains(err.Error(), "publish npm update handoff") {
+				t.Fatalf("publication failure was hidden: %v", err)
+			}
+			if _, ok := err.(interface{ ExitCode() int }); ok {
+				t.Fatal("failed publication authorized an update exit")
+			}
+		})
 	}
 }
 
@@ -989,7 +1041,7 @@ func TestStatusCLIEmitsStructuredNonSecretState(t *testing.T) {
 	if err := json.Unmarshal(output.Bytes(), &status); err != nil {
 		t.Fatal(err)
 	}
-	if status.Title == "" || status.Sandbox == "" || status.HarnessState == "" || len(status.Connections) != 2 {
+	if status.Version != "test" || status.Title == "" || status.Sandbox == "" || status.HarnessState == "" || len(status.Connections) != 2 {
 		t.Fatalf("CLI status = %#v", status)
 	}
 	if status.TasksActive != 1 || status.TasksWaiting != 1 {
@@ -1008,10 +1060,17 @@ func TestStatusCLIEmitsStructuredNonSecretState(t *testing.T) {
 	if _, ok := fields["thread"]; ok {
 		t.Fatalf("structured CLI status retained thread: %s", output.String())
 	}
-	for _, field := range []string{"tasks_active", "tasks_waiting", "goals_active", "heartbeat_state"} {
+	for _, field := range []string{"version", "tasks_active", "tasks_waiting", "goals_active", "heartbeat_state"} {
 		if _, ok := fields[field]; !ok {
 			t.Fatalf("structured CLI status is missing %q: %s", field, output.String())
 		}
+	}
+	output.Reset()
+	if err := runStatusCLICommand([]string{"--config", cfg.Path}, "dev", &output); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(output.String(), "\n- Version:") != 1 || !strings.Contains(output.String(), "\n- Version: dev\n- Instance ID:") {
+		t.Fatalf("CLI text status lost the running version or its placement:\n%s", output.String())
 	}
 }
 
@@ -1095,6 +1154,7 @@ func TestCLIJoinsWorkspaceOwnerAndStrictlySteersActiveConversation(t *testing.T)
 	}
 	target := newHeldCLIHarness()
 	service := app.New(cfg, target)
+	service.Updates = &updater.Manager{CurrentVersion: "1.2.3"}
 	election, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)
@@ -1127,6 +1187,14 @@ func TestCLIJoinsWorkspaceOwnerAndStrictlySteersActiveConversation(t *testing.T)
 	defer stopWaiting()
 	if _, err := localapi.NewClient(election).WaitReady(readyContext); err != nil {
 		t.Fatal(err)
+	}
+	var statusOutput bytes.Buffer
+	if err := runStatusCLICommand([]string{"--config", cfg.Path, "--json"}, "9.9.9", &statusOutput); err != nil {
+		t.Fatal(err)
+	}
+	var status app.StatusSnapshot
+	if err := json.Unmarshal(statusOutput.Bytes(), &status); err != nil || status.Version != "1.2.3" {
+		t.Fatalf("CLI must report the serving owner's version, not the newer client's: %#v, %v", status, err)
 	}
 	if runtime.GOOS != "windows" {
 		var toolOutput bytes.Buffer
@@ -1354,6 +1422,38 @@ func TestRunMessageCompletesWhenFollowUpReleasesItsEmitter(t *testing.T) {
 	}
 }
 
+func TestRunMessageWaitsForHandlerAfterTerminalReply(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	rendered := make(chan struct{}, 1)
+	defer close(rendered)
+	want := errors.New("handler failed after acknowledgement")
+	handler := func(ctx context.Context, _ core.Message, emit core.Emit) error {
+		emit(core.Event{Kind: core.EventFinal, Text: "acknowledged", Done: true})
+		select {
+		case <-rendered:
+			return want
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- runMessageWithOutput(ctx, handler, "completion", "message", messageRunOptions{Output: writer})
+	}()
+	ack := make([]byte, len("acknowledged\n"))
+	if _, err := io.ReadFull(reader, ack); err != nil {
+		t.Fatal(err)
+	}
+	rendered <- struct{}{}
+	if err := <-result; !errors.Is(err, want) {
+		t.Fatalf("handler completion = %v, want %v", err, want)
+	}
+}
+
 func TestRunMessageCompletesWhenExtensionCancelsWithoutReply(t *testing.T) {
 	handler := func(context.Context, core.Message, core.Emit) error { return nil }
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -1467,6 +1567,7 @@ func TestOwnerElectionRunsOneServerAndHandsOffOnExit(t *testing.T) {
 	cfg.Channels.WhatsApp.Enabled = false
 	cfg.Orchestrator.Enabled = false
 	cfg.Extensions.Enabled = false
+	isolatePrimaryWorker(t, cfg, "test")
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -1558,6 +1659,7 @@ func TestOwnerElectionPromotesAfterObservedPrimaryBecomesStale(t *testing.T) {
 	cfg.Channels.WhatsApp.Enabled = false
 	cfg.Orchestrator.Enabled = false
 	cfg.Extensions.Enabled = false
+	isolatePrimaryWorker(t, cfg, "test")
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -1620,6 +1722,7 @@ func TestPrimaryCommandHandsOwnershipToRequestingTUI(t *testing.T) {
 	cfg.Channels.WhatsApp.Enabled = false
 	cfg.Orchestrator.Enabled = false
 	cfg.Extensions.Enabled = false
+	isolatePrimaryWorker(t, cfg, "test")
 	if err := config.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -1742,5 +1845,66 @@ func TestStandaloneUpdateRestartAndProactiveEligibility(t *testing.T) {
 	t.Setenv("SPYNEL_SKIP_UPDATE_CHECK", "1")
 	if standaloneChecksEligible(nil, true) {
 		t.Fatal("ignored check suppression")
+	}
+}
+
+func TestNotifyEscalationCommandUsesOrdinaryOutbox(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	store := history.New(cfg.StatePath("history"))
+	for _, name := range []string{"original", "fallback"} {
+		if _, err := store.Ensure("cli", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := []string{"--workdir", root, "--origin", "cli/original", "--fallback-origin", "cli/fallback", "--escalation-key", "decision", "--message", "Needs your answer: choose a color."}
+	for i := 0; i < 2; i++ {
+		if err := runNotifyCommand(args, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, _, err := store.RecentEntries("cli", "fallback", 10, 1000)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("CLI duplicate %#v %v", entries, err)
+	}
+	if err := runNotifyCommand([]string{"--workdir", root, "--origin", "cli/original", "--escalation-key", "decision", "--message", "refused"}, "test"); err == nil {
+		t.Fatal("CLI accepted unassociated escalation")
+	}
+}
+
+func TestNotifyCancelCommandUsesOrdinaryOutbox(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.Load(config.PathForRoot(root))
+	outbox := &orchestrator.Outbox{Directory: cfg.StatePath("runtime", "outbox")}
+	entry, err := outbox.EnqueueEscalation("pending", "tui/original", "telegram/TG-7", "question")
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"--workdir", root, "--origin", entry.Origin, "--cancel", entry.ID}
+	for i := 0; i < 2; i++ {
+		if err := runNotifyCommand(args, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(outbox.Directory, entry.ID+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry.State != "cancelled" || entry.Attempts != 0 {
+		t.Fatalf("CLI cancellation: %#v", entry)
+	}
+	for _, extra := range [][]string{{"--message", "send"}, {"--stdin"}, {"--recent-authorized"}, {"--fallback-origin", "cli/other"}, {"--escalation-key", "decision"}, {"positional"}} {
+		if err := runNotifyCommand(append(append([]string{}, args...), extra...), "test"); err == nil {
+			t.Fatal("mixed cancellation accepted")
+		}
 	}
 }

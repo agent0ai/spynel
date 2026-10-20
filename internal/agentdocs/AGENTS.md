@@ -14,11 +14,17 @@
 - Keep notification guidance on the concrete `--workdir`, exact `--origin`, and `--message` form used by task agents; do not teach task agents destination placeholders or stdin composition.
 - Keep the primary-election topic explicit about environment-identity detection, bounded legacy readiness, fresh-owner fencing, and the limits of explicit Unix socket access across compatible same-kernel containers.
 
-- The integration topic documents committed conversation subscriptions, honest retry/completion boundaries, optional private Unix sockets, and content-free headless stderr. Distinguish explicit same-kernel socket access from unchanged foreign-loopback discovery/election fences.
+- The integration topic documents committed conversation subscriptions, honest retry/completion boundaries, optional private Unix sockets, optional opaque local response correlation, and content-free headless stderr. Distinguish explicit same-kernel socket access from unchanged foreign-loopback discovery/election fences.
 
 - Keep compiled update guidance explicit about update-by-default, `update check`, all-instance restart within the selected installation, shell `killall`, and older-instance restart limitations.
 
 - Describe native supervisor/manual versus external service ownership, explicit stop/update and finite recovery limits, shared 40-second readiness, and live provider ownership that prevents overlap while automatically retrying after confirmed cleanup; stale file presence never blocks startup.
+
+- Keep notification-context, explicit same-operator fallback, live TUI presentation and heartbeat associated-thread/unanswered-question guidance synchronized with the ordinary application/history contract. Never imply a configured association or real transport proof from static examples.
+- Describe heartbeat root-dependency checks and first prerequisite requests separately from repeat reminders; privacy permits necessary private route/context inspection, and failed/absent sends or queue admission never establish a delivered question or relevant answer.
+- Document actionable human-wait questions and finite agent-owned follow-up plans in task Progress, while distinguishing local history commitment, presentation and human reading. Keep policy in notification/heartbeat agents and the existing scheduler.
+
+- Document exact-event ordinary retry cancellation and agent-owned answer settlement before task resumption, preserving failure evidence, terminal delivery truth, and the limits of already accepted external effects.
 
 ## Child DOX Index
 

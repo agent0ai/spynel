@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/agent0ai/spynel/internal/core"
 )
 
 const (
@@ -32,6 +34,16 @@ type Result struct {
 	Available       bool
 	CanAutoInstall  bool
 	Command         string
+	WorkerProtocol  int
+}
+
+// TargetWorkerProtocol is known locally for a current-version restart. New
+// releases must advertise compatibility; a version number alone proves none.
+func (r Result) TargetWorkerProtocol() int {
+	if !r.Available {
+		return core.WorkerProtocol
+	}
+	return r.WorkerProtocol
 }
 
 // PrepareUpdate owns validation and publication shared by the CLI and channels.
@@ -40,7 +52,7 @@ func (m *Manager) PrepareUpdate(ctx context.Context, result Result) error {
 	if !result.CanAutoInstall {
 		return errors.New("this installation cannot update itself; use its original installation method")
 	}
-	if err := m.CheckRestartable(); err != nil {
+	if err := m.CheckRestartableFor(result.TargetWorkerProtocol()); err != nil {
 		return err
 	}
 	if result.Source == "GitHub" {
@@ -92,8 +104,9 @@ type Manager struct {
 }
 
 type packageMetadata struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
+	Name           string `json:"name"`
+	Version        string `json:"version"`
+	WorkerProtocol int    `json:"workerProtocol"`
 }
 
 type installedMarker struct {
@@ -259,7 +272,11 @@ func (m *Manager) Check(ctx context.Context) (Result, error) {
 	if _, ok := parseVersion(metadata.Version); !ok {
 		return result, fmt.Errorf("npm returned invalid version %q", metadata.Version)
 	}
+	if metadata.WorkerProtocol < 0 || metadata.WorkerProtocol > 2147483647 {
+		return result, errors.New("npm returned invalid worker compatibility")
+	}
 	result.Latest = metadata.Version
+	result.WorkerProtocol = metadata.WorkerProtocol
 	result.Available = compareVersions(metadata.Version, m.CurrentVersion) > 0
 	return result, nil
 }

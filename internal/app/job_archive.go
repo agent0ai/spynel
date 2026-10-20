@@ -51,6 +51,7 @@ type archivedJob struct {
 	LastWriteAt           time.Time
 	path                  string
 	owner                 *os.File
+	workerReceipt         *jobWorkerReceipt
 }
 
 var stableJobFallback atomic.Uint64
@@ -88,7 +89,7 @@ func (a *JobArchive) allocate(now time.Time, workID, kind, phase string, phaseAt
 	}
 	defer unlockJobCounter(lock)
 
-	if workID != "" && phase != "" && phaseAttempt > 0 {
+	if workID != "" && (phase != "" && phaseAttempt > 0 || kind == "conversation" && phase == "" && phaseAttempt == 0) {
 		if item, ok := a.newestDispatchLocked(workID, kind, phase, phaseAttempt); ok {
 			claimed, claimErr := a.claimOwnershipLocked(item.ID)
 			if claimErr != nil {
@@ -274,6 +275,7 @@ func (a *JobArchive) begin(job Job) (string, error) {
 	}
 	if existing, output, err := a.readByStableIDLocked(record.StableID); err == nil && existing.WorkID == record.WorkID && existing.Number == record.LiveID && existing.Generation == record.Generation {
 		record.StartedAt = existing.StartedAt
+		record.workerReceipt = existing.workerReceipt
 		record.Output.WriteString(output)
 		record.Sequence = strings.Count(output, "\n## ")
 		if err := a.writeLocked(record); err != nil {
@@ -342,6 +344,10 @@ func (a *JobArchive) event(stableID string, at time.Time, event core.Event) erro
 	if record == nil {
 		return nil
 	}
+	return a.eventLocked(record, at, event, false)
+}
+
+func (a *JobArchive) eventLocked(record *archivedJob, at time.Time, event core.Event, force bool) error {
 	kind := archiveField(event.Kind, 40)
 	if kind == "" {
 		kind = "event"
@@ -356,6 +362,9 @@ func (a *JobArchive) event(stableID string, at time.Time, event core.Event) erro
 		}
 	}
 	if text == "" {
+		if force {
+			return a.writeLocked(record)
+		}
 		return nil
 	}
 	if len(text) > maxJobArchiveEventBytes {
@@ -373,7 +382,7 @@ func (a *JobArchive) event(stableID string, at time.Time, event core.Event) erro
 		record.Truncated = true
 	}
 	record.Output.WriteString(entry)
-	if !event.Done && time.Since(record.LastWriteAt) < jobArchiveSnapshotEvery && !record.Truncated {
+	if !force && !event.Done && time.Since(record.LastWriteAt) < jobArchiveSnapshotEvery && !record.Truncated {
 		return nil
 	}
 	return a.writeLocked(record)
@@ -471,6 +480,10 @@ func (a *JobArchive) renderLocked(record *archivedJob) []byte {
 	writeArchiveField(&body, "phase_attempt", strconv.Itoa(record.PhaseAttempt))
 	writeArchiveField(&body, "recovery_count", strconv.Itoa(record.RecoveryCount))
 	writeArchiveField(&body, "truncated", strconv.FormatBool(record.Truncated))
+	if record.workerReceipt != nil {
+		data, _ := json.Marshal(record.workerReceipt)
+		writeArchiveField(&body, "worker_delivery", string(data))
+	}
 	body.WriteString("---\n\n# Output\n")
 	body.WriteString(record.Output.String())
 	return []byte(body.String())
@@ -492,21 +505,22 @@ func archiveField(value string, limit int) string {
 }
 
 type JobArchiveSummary struct {
-	ID           string
-	Number       int
-	Generation   uint64
-	Title        string
-	Kind         string
-	Origin       string
-	Provider     string
-	WorkID       string
-	ParentID     string
-	Phase        string
-	PhaseAttempt int
-	State        string
-	StartedAt    time.Time
-	EndedAt      time.Time
-	Path         string
+	ID            string
+	Number        int
+	Generation    uint64
+	Title         string
+	Kind          string
+	Origin        string
+	Provider      string
+	WorkID        string
+	ParentID      string
+	Phase         string
+	PhaseAttempt  int
+	State         string
+	StartedAt     time.Time
+	EndedAt       time.Time
+	Path          string
+	workerReceipt *jobWorkerReceipt
 }
 
 func (a *JobArchive) recent(limit int) ([]JobArchiveSummary, error) {
@@ -674,7 +688,14 @@ func readJobArchive(path string, active bool) (JobArchiveSummary, error) {
 			continue
 		}
 		if decoded, decodeErr := strconv.Unquote(value); decodeErr == nil {
+			if key == "worker_delivery" {
+				if _, exists := fields[key]; exists {
+					return JobArchiveSummary{}, errors.New("duplicate job worker receipt")
+				}
+			}
 			fields[key] = decoded
+		} else if key == "worker_delivery" {
+			return JobArchiveSummary{}, errors.New("invalid job worker receipt")
 		}
 	}
 	started, err := time.Parse(time.RFC3339Nano, fields["started_at"])
@@ -694,8 +715,14 @@ func readJobArchive(path string, active bool) (JobArchiveSummary, error) {
 	if ended.IsZero() && !active {
 		state = "interrupted"
 	}
+	var receipt *jobWorkerReceipt
+	if raw, ok := fields["worker_delivery"]; ok {
+		if json.Unmarshal([]byte(raw), &receipt) != nil || receipt == nil || !receipt.valid() || receipt.Iterations < 1 {
+			return JobArchiveSummary{}, errors.New("invalid job worker receipt")
+		}
+	}
 	phaseAttempt, _ := strconv.Atoi(fields["phase_attempt"])
-	return JobArchiveSummary{ID: fields["id"], Number: number, Generation: generation, Title: fields["title"], Kind: fields["type"], Origin: fields["origin"], Provider: fields["provider"], WorkID: fields["work_id"], ParentID: fields["parent"], Phase: fields["phase"], PhaseAttempt: phaseAttempt, State: state, StartedAt: started, EndedAt: ended, Path: path}, nil
+	return JobArchiveSummary{ID: fields["id"], Number: number, Generation: generation, Title: fields["title"], Kind: fields["type"], Origin: fields["origin"], Provider: fields["provider"], WorkID: fields["work_id"], ParentID: fields["parent"], Phase: fields["phase"], PhaseAttempt: phaseAttempt, State: state, StartedAt: started, EndedAt: ended, Path: path, workerReceipt: receipt}, nil
 }
 
 func (a *JobArchive) cleanup(cutoff time.Time, live map[string]bool) (removed int, bytes int64, protected int, failed int) {

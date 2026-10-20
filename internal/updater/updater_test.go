@@ -5,14 +5,28 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/agent0ai/spynel/internal/core"
 )
+
+func TestPublishedWorkerProtocolMatchesRuntime(t *testing.T) {
+	data, err := os.ReadFile("../../package.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata packageMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil || metadata.WorkerProtocol != core.WorkerProtocol {
+		t.Fatalf("published compatibility differs from runtime: %d, %v", metadata.WorkerProtocol, err)
+	}
+}
 
 func TestCheckFindsNewerNPMVersion(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(writer).Encode(map[string]string{"name": "spynel", "version": "1.3.0"})
+		_ = json.NewEncoder(writer).Encode(map[string]any{"name": "spynel", "version": "1.3.0", "workerProtocol": core.WorkerProtocol})
 	}))
 	defer server.Close()
 	manager := &Manager{
@@ -23,7 +37,7 @@ func TestCheckFindsNewerNPMVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.InstalledViaNPM || !result.Available || !result.CanAutoInstall || result.Latest != "1.3.0" {
+	if !result.InstalledViaNPM || !result.Available || !result.CanAutoInstall || result.Latest != "1.3.0" || result.TargetWorkerProtocol() != core.WorkerProtocol {
 		t.Fatalf("result = %#v", result)
 	}
 }

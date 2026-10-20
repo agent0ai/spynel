@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// WorkerProtocol binds harness adoption and installation update compatibility.
+// Bump whenever a successor cannot safely consume or control a prior worker.
+const WorkerProtocol = 16
+
 const SpynelASCII = `    ████     ████     ███████ ██████  ██    ██ ███    ██ ███████ ██
   ██    ██ ██    ██   ██      ██   ██  ██  ██  ████   ██ ██      ██
  ██      ███      ██  ███████ ██████    ████   ██ ██  ██ █████   ██
@@ -52,7 +56,9 @@ func NewSourceMessageID() (string, error) {
 type Event struct {
 	Kind      string `json:"kind"`
 	RequestID string `json:"request_id,omitempty"`
-	Text      string `json:"text,omitempty"`
+	// ResponseID correlates a local durable reply with its request-stream copy.
+	ResponseID string `json:"response_id,omitempty"`
+	Text       string `json:"text,omitempty"`
 	// Active is meaningful only for EventActivity. The application emits true
 	// exactly when a main communication-agent turn takes ownership of this
 	// response stream and false before its terminal event is delivered.
@@ -124,6 +130,7 @@ type Screen struct {
 	ExitOnAction   bool
 	Conversation   string
 	Transcript     []ChatEntry
+	HistoryOffset  int64
 }
 
 // ScreenHint describes one context-sensitive TUI footer binding. Screens own

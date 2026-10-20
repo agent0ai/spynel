@@ -61,11 +61,14 @@ type settingsRequest struct {
 type notifyRequest struct {
 	Origin           string `json:"origin,omitempty"`
 	FallbackOrigin   string `json:"fallback_origin,omitempty"`
+	EscalationKey    string `json:"escalation_key,omitempty"`
+	CancelID         string `json:"cancel_id,omitempty"`
 	RecentAuthorized bool   `json:"recent_authorized,omitempty"`
 	Message          string `json:"message"`
 }
 type notifyResponse struct {
-	ID string `json:"id"`
+	ID    string `json:"id"`
+	State string `json:"state,omitempty"`
 }
 type notificationAckRequest struct {
 	Origin     string `json:"origin"`
@@ -198,13 +201,23 @@ func (s *Server) notify(response http.ResponseWriter, request *http.Request) {
 		return
 	}
 	var id string
+	var state string
 	var err error
-	if input.RecentAuthorized {
-		if strings.TrimSpace(input.FallbackOrigin) != "" {
+	if input.CancelID != "" {
+		if input.RecentAuthorized || input.FallbackOrigin != "" || input.EscalationKey != "" || input.Message != "" {
+			http.Error(response, "cancel_id requires only origin and an event ID", http.StatusBadRequest)
+			return
+		}
+		id = input.CancelID
+		state, err = s.Service.CancelNotification(request.Context(), input.Origin, id)
+	} else if input.RecentAuthorized {
+		if strings.TrimSpace(input.FallbackOrigin) != "" || input.EscalationKey != "" {
 			http.Error(response, "fallback_origin requires origin", http.StatusBadRequest)
 			return
 		}
 		id, err = s.Service.NotifyRecentAuthorized(request.Context(), input.Message)
+	} else if input.EscalationKey != "" {
+		id, err = s.Service.NotifyEscalation(request.Context(), input.Origin, input.FallbackOrigin, input.EscalationKey, input.Message)
 	} else {
 		id, err = s.Service.NotifyWithFallback(request.Context(), input.Origin, input.FallbackOrigin, input.Message)
 	}
@@ -212,7 +225,11 @@ func (s *Server) notify(response http.ResponseWriter, request *http.Request) {
 		writeError(response, err)
 		return
 	}
-	writeJSON(response, http.StatusAccepted, notifyResponse{ID: id})
+	status := http.StatusAccepted
+	if input.CancelID != "" {
+		status = http.StatusOK
+	}
+	writeJSON(response, status, notifyResponse{ID: id, State: state})
 }
 
 func (s *Server) authorize(next http.HandlerFunc) http.HandlerFunc {
@@ -310,9 +327,6 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 	events := make(chan core.Event, 64)
 	emit := func(event core.Event) {
 		event.RequestID = message.SourceMessageID
-		if message.Channel == "tui" && event.Screen != nil && event.Screen.Conversation != "" {
-			_ = s.Service.RegisterLiveTUI(message.InstanceID, event.Screen.Conversation, time.Now().UTC())
-		}
 		select {
 		case events <- event:
 		case <-ctx.Done():
@@ -325,6 +339,7 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 	encoder := json.NewEncoder(response)
 	awaitTerminal := false
 	handlerDone := false
+	terminalSeen := false
 	writeEvent := func(event core.Event) bool {
 		// Service.Handle returns after starting a harness turn. Remember that
 		// synchronous start/delta event instead of polling IsActive: providers
@@ -343,6 +358,10 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 		return true
 	}
 	for {
+		// Commands may publish control requests after emitting their reply.
+		if handlerDone && terminalSeen {
+			return
+		}
 		if handlerDone && !awaitTerminal {
 			select {
 			case event := <-events:
@@ -379,8 +398,11 @@ func (s *Server) message(response http.ResponseWriter, request *http.Request) {
 				return
 			}
 		case event := <-events:
-			if !writeEvent(event) || event.Done && !event.Continues {
+			if !writeEvent(event) {
 				return
+			}
+			if event.Done && !event.Continues {
+				terminalSeen = true
 			}
 		case <-ctx.Done():
 			return

@@ -134,7 +134,7 @@ Record findings with {{HEARTBEAT_ACTION_COMMAND}} and finish with exactly one au
 	if !strings.Contains(prompt, "Keep this workspace-specific inspection rule.") {
 		t.Fatalf("heartbeat sanitizer removed unrelated customization: %q", prompt)
 	}
-	for _, obsolete := range []string{"This audit is read-only", "primary runtime\u2014not this agent", "notify.origin", "HEARTBEAT_ACTION_COMMAND", "exactly one audit outcome", "Absence of an audit action"} {
+	for _, obsolete := range []string{"This audit is read-only", "primary runtime\u2014not this agent", "only to the affected workflow's authorized", "HEARTBEAT_ACTION_COMMAND", "exactly one audit outcome", "Absence of an audit action"} {
 		if strings.Contains(prompt, obsolete) {
 			t.Fatalf("heartbeat prompt retained obsolete rule %q: %q", obsolete, prompt)
 		}
@@ -259,5 +259,151 @@ func TestSemanticHeartbeatPromptUsesHeartbeatPrefixAndInstructions(t *testing.T)
 	target.mu.Unlock()
 	if !strings.HasPrefix(prompt, "/audit ") || !strings.Contains(prompt, "heartbeat-only-rule") {
 		t.Fatalf("heartbeat prefix/instructions missing: %q", prompt)
+	}
+}
+
+func TestScheduledHeartbeatSelectsCustomPromptAndRepairsStaleInspectionRule(t *testing.T) {
+	target := &heartbeatHarness{asyncRelease: make(chan struct{})}
+	manager := newHeartbeatManager(t, target)
+	const legacy = "Keep the custom workspace inspection rule.\n\nInspect only bounded, relevant evidence and body-free state for notification triage. Never read question/message bodies, recipient or native message identifiers, secrets, full conversation histories, unrelated repositories, or unbounded logs."
+	if err := os.WriteFile(manager.Config.StatePath("prompts", "heartbeat.md"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ticks := make(chan time.Time, 1)
+	manager.heartbeatTicks = ticks
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); manager.runSemanticHeartbeat(ctx) }()
+	defer func() { cancel(); <-done; manager.jobs.Wait() }()
+	ticks <- time.Now()
+	deadline := time.After(5 * time.Second)
+	var prompt string
+	for prompt == "" {
+		target.mu.Lock()
+		prompt = target.prompt
+		target.mu.Unlock()
+		select {
+		case <-deadline:
+			t.Fatal("scheduled heartbeat did not reach provider")
+		default:
+		}
+		if prompt == "" {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	for _, obsolete := range []string{"Never read question/message bodies", "body-free state for notification triage"} {
+		if strings.Contains(prompt, obsolete) {
+			t.Errorf("scheduled prompt retains %q", obsolete)
+		}
+	}
+	for _, want := range []string{
+		"Keep the custom workspace inspection rule.", "Inspect only bounded, relevant evidence and bounded original-thread evidence for notification triage.",
+		"privately", "first prerequisite question", "freshness", "existing authorization", "independent work",
+		"failed or absent attempt", "relevant answer", "unrelated later message", "exact enabled notify.origin",
+		"explicitly owner-established same-operator route", "queue acceptance from send and receipt",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("scheduled custom prompt omitted %q", want)
+		}
+	}
+	data, err := os.ReadFile(manager.Config.StatePath("prompts", "heartbeat.md"))
+	if err != nil || string(data) != legacy {
+		t.Fatal("rendering rewrote the workspace override")
+	}
+	close(target.asyncRelease)
+}
+
+func TestSemanticHeartbeatBlockedAdmissionWaitsForRelease(t *testing.T) {
+	for _, manual := range []bool{false, true} {
+		for _, change := range []string{"unchanged", "interval", "disabled"} {
+			name := "scheduled/" + change
+			if manual {
+				name = "manual/" + change
+			}
+			t.Run(name, func(t *testing.T) {
+				target := &heartbeatHarness{asyncRelease: make(chan struct{}), ignoreCancellation: true}
+				manager := newHeartbeatManager(t, target)
+				recorder := newOrdinaryJobRecorder(manager)
+				ticks := make(chan time.Time, 1)
+				manager.heartbeatTicks = ticks
+				ctx, cancel := context.WithCancel(t.Context())
+				done := make(chan struct{})
+				go func() { defer close(done); manager.runSemanticHeartbeat(ctx) }()
+				var release sync.Once
+				defer func() {
+					release.Do(func() { close(target.asyncRelease) })
+					cancel()
+					<-done
+					manager.jobs.Wait()
+				}()
+				wait := func(predicate func() bool) {
+					t.Helper()
+					deadline := time.Now().Add(3 * time.Second)
+					for !predicate() {
+						if time.Now().After(deadline) {
+							t.Fatal("heartbeat scheduler did not progress")
+						}
+						time.Sleep(time.Millisecond)
+					}
+				}
+				wait(func() bool { return !manager.WorkStatus().NextHeartbeatAt.IsZero() })
+				// Another retained provider becomes active after the timer is armed.
+				providerDone := make(chan struct{})
+				manager.heartbeatCommit.Lock()
+				term := manager.heartbeatTerm
+				manager.heartbeatCommit.Unlock()
+				go func() { defer close(providerDone); manager.runSemanticHeartbeatOnceForTerm(ctx, term) }()
+				defer func() {
+					release.Do(func() { close(target.asyncRelease) })
+					<-providerDone
+				}()
+				wait(func() bool { return target.active.Load() })
+				if manual {
+					if started, err := manager.TriggerSemanticHeartbeat(ctx); err != nil || started {
+						t.Fatalf("overlapping manual admission = %v, %v", started, err)
+					}
+				} else {
+					ticks <- time.Now()
+				}
+				// WorkStatus also hides the deadline while a provider is active.
+				wait(func() bool {
+					manager.heartbeatStatusMu.RLock()
+					defer manager.heartbeatStatusMu.RUnlock()
+					return manager.heartbeatNext.IsZero()
+				})
+				cfg := manager.runtimeSnapshot()
+				if change == "interval" {
+					cfg.Orchestrator.SemanticHeartbeatMinutes = 2
+				} else if change == "disabled" {
+					cfg.Orchestrator.SemanticHeartbeatMinutes = 0
+				}
+				if change != "unchanged" {
+					manager.ApplyRuntimeConfig(cfg)
+					wait(func() bool {
+						return manager.heartbeatAppliedGeneration.Load() == manager.heartbeatConfigGeneration.Load()
+					})
+				}
+				releasedAt := time.Now()
+				release.Do(func() { close(target.asyncRelease) })
+				<-providerDone
+				if change == "disabled" {
+					cancel()
+					<-done
+					if status := manager.WorkStatus(); status.HeartbeatState != "disabled" || !status.NextHeartbeatAt.IsZero() {
+						t.Fatal("release rearmed a disabled heartbeat")
+					}
+				} else {
+					wait(func() bool { return manager.WorkStatus().NextHeartbeatAt.After(releasedAt) })
+					delay := time.Duration(cfg.Orchestrator.SemanticHeartbeatMinutes) * time.Minute
+					next := manager.WorkStatus().NextHeartbeatAt
+					if next.Before(releasedAt.Add(delay)) || next.After(time.Now().Add(delay)) {
+						t.Fatalf("release did not preserve the configured fixed delay: released=%s next=%s now=%s delay=%s", releasedAt.Format(time.RFC3339Nano), next.Format(time.RFC3339Nano), time.Now().Format(time.RFC3339Nano), delay)
+					}
+				}
+				if started, finished, _ := recorder.snapshot(); started != 1 || finished != 1 {
+					t.Fatalf("blocked admission duplicated work: started=%d finished=%d", started, finished)
+				}
+			})
+		}
 	}
 }

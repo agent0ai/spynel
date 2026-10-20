@@ -143,7 +143,7 @@ func (s *Service) screenAction(ctx context.Context, instanceID, screenID, action
 			}
 			s.registerLiveTUILocked(instanceID, branch, time.Now().UTC())
 		}
-		entries, _, err := s.History.RecentEntries("tui", branch, resumeDisplayMessages, resumeDisplayCharacter)
+		entries, _, offset, err := s.History.RecentEntriesSnapshot("tui", branch, resumeDisplayMessages, resumeDisplayCharacter)
 		if err != nil {
 			return nil, err
 		}
@@ -156,7 +156,7 @@ func (s *Service) screenAction(ctx context.Context, instanceID, screenID, action
 			}
 			transcript = append(transcript, core.ChatEntry{Role: role, Text: entry.Content})
 		}
-		screen := core.Screen{ID: "chat", Conversation: branch, Transcript: transcript, Subtitle: fmt.Sprintf("Branched from %s/%s at %s", channelName, conversation, time.Now().Format(time.RFC3339))}
+		screen := core.Screen{ID: "chat", Conversation: branch, Transcript: transcript, HistoryOffset: offset, Subtitle: fmt.Sprintf("Branched from %s/%s at %s", channelName, conversation, time.Now().Format(time.RFC3339))}
 		return &screen, nil
 	}
 	if screenID == "resume" && strings.HasPrefix(action, "delete:") {
@@ -164,11 +164,8 @@ func (s *Service) screenAction(ctx context.Context, instanceID, screenID, action
 		if err != nil {
 			return nil, err
 		}
-		if err := s.Harness.ResetSession(sessionKey(core.Message{Channel: channelName, Conversation: conversation})); err != nil {
+		if err := s.clearConversation(ctx, core.Message{Channel: channelName, Conversation: conversation}); err != nil {
 			return nil, fmt.Errorf("cannot discard the conversation's harness thread: %w", err)
-		}
-		if err := s.History.Clear(channelName, conversation); err != nil {
-			return nil, err
 		}
 		screen, err := s.resumeScreen()
 		return &screen, err

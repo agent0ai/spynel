@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -52,7 +53,7 @@ func (s *Service) archivedJobInfoCommand(message core.Message, number int, emit 
 	if item.Provider != "" {
 		lines = append(lines, "- Provider: "+safeJobText(item.Provider, 80))
 	}
-	if item.WorkID != "" {
+	if item.WorkID != "" && item.Kind != "conversation" {
 		lines = append(lines, "- Work ID: "+safeJobText(item.WorkID, maxJobMetadataRunes))
 	}
 	if item.ParentID != "" {
@@ -166,7 +167,12 @@ func (s *Service) formatJobInfo(job Job, lease orchestrator.Lease, hasLease bool
 	if job.StatusDetail != "" {
 		lines = append(lines, "- Detail: "+safeJobText(boundJobStatusDetail(job.StatusDetail), maxJobMetadataRunes))
 	}
-	if thread := shortid.Display(s.Harness.ThreadID(job.SessionKey)); thread != "" {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	session, sessionErr := s.Orchestrator.Session(ctx, job.SessionKey)
+	if sessionErr != nil {
+		lines = append(lines, "- Execution: unavailable")
+	} else if thread := shortid.Display(session.ThreadID); thread != "" {
 		lines = append(lines, "- Execution: `"+safeJobText(thread, maxJobMetadataRunes)+"`")
 	}
 	leaseState, leasePhase, leaseHeartbeat := job.LeaseState, job.LeasePhase, job.LeaseHeartbeatAt

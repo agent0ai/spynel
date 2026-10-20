@@ -2,12 +2,92 @@ package cli
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/app"
+	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/harness"
+	"github.com/agent0ai/spynel/internal/instance"
 )
+
+// Election fixtures must not leave independently surviving workers behind.
+func isolatePrimaryWorker(t *testing.T, cfg config.Config, version string) {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Cleanup(func() {
+		lock, err := harness.ProcessOwnershipPath(cfg.Root)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := os.Stat(lock + ".worker.json"); os.IsNotExist(err) {
+			return
+		}
+		owner, err := instance.New(cfg.StatePath())
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		token, err := owner.NewToken()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if _, ok, err := owner.TryAcquire("127.0.0.1:10001", token); err != nil || !ok {
+			t.Error("fixture cleanup ownership", err)
+			return
+		}
+		defer owner.Release(token)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		runtime, _ := cfg.RuntimeHarness(harness.HarnessConfig{Version: version})
+		worker, err := harness.OpenWorker(ctx, runtime, owner.ID(), token)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer worker.Close()
+		t.Logf("cleanup ordinary worker pid=%d start=%s generation=%s", worker.Info().PID, worker.Info().Process.StartTime, worker.Info().Process.Generation)
+		if _, err := worker.Call(ctx, harness.WorkerRequest{Action: "shutdown"}); err != nil {
+			t.Error(err)
+			return
+		}
+		for {
+			if _, err := os.Stat(filepath.Dir(worker.Info().Socket)); os.IsNotExist(err) {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				t.Error("fixture worker did not remove its endpoint")
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	})
+}
+
+func TestElectionDiagnosticsSeparateDelayAndOwnershipWithoutLeaseSecrets(t *testing.T) {
+	runtime := app.NewRuntime()
+	defer runtime.Close()
+	logElectionObservation(runtime, "synthetic-instance", instance.Observation{Operation: "renew", Reason: "renewed"})
+	logElectionObservation(runtime, "synthetic-instance", instance.Observation{Operation: "renew", LockWait: time.Millisecond})
+	if len(runtime.Logs()) != 0 {
+		t.Fatal("routine renewals generated diagnostic noise")
+	}
+	logElectionObservation(runtime, "synthetic-instance", instance.Observation{Operation: "owner_action", LockHeld: 31 * time.Second})
+	logElectionObservation(runtime, "synthetic-instance", instance.Observation{Operation: "renew", Reason: "renewed_unchanged_stale_term", LeaseAge: 35 * time.Second})
+	logElectionObservation(runtime, "synthetic-instance", instance.Observation{Operation: "renew", Reason: "different_term", LeaseAge: time.Second})
+	logs := runtime.Logs()
+	if len(logs) != 3 || logs[0].Event != "election_lock_delay" || !strings.Contains(logs[0].Text, "operation=owner_action") || !strings.Contains(logs[0].Text, "held_ms=31000") || logs[1].Event != "lease_renewal" || !strings.Contains(logs[1].Text, "reason=renewed_unchanged_stale_term") || !strings.Contains(logs[2].Text, "reason=different_term") {
+		t.Fatalf("ownership diagnostics = %#v", logs)
+	}
+}
 
 func TestPublishTUIStateChangesCarriesLatestDurableCounts(t *testing.T) {
 	events := tuiStateEvents{durableWork: make(chan core.DurableWorkCounts, 1)}

@@ -95,6 +95,9 @@ letters/digits/dots/underscores/colons/hyphens, beginning with a letter/digit.
 The server generates one when omitted. Keep explicit IDs if retry correlation
 matters. Each streamed HTTP line wraps a core response in `event`, with
 `request_id` on the envelope and event. CLI JSON exposes the core event directly.
+Local reply events may also carry an opaque `response_id` to correlate a durable
+reply with its request-stream copy; it is not provider identity, admission or a
+delivery acknowledgement, and clients must not require its presence.
 Provider thread/turn fields are opaque optional diagnostic data, not stable
 adapter identifiers. HTTP envelopes can instead contain `error`, `code` and
 `request_id`; codes include `request_failed`, `duplicate_request` and
@@ -268,3 +271,5 @@ Final local test: use a disposable workspace with your intended harness, start
 reconnect with its prior cursor, and attach a separate terminal. Controlled
 fixtures verify the interface; real provider, terminal emulator and 80|20 sandbox
 topology still require your local test.
+
+The authenticated `POST /v1/notify` also accepts `{ "origin": "cli/adapter", "cancel_id": "<event-id>" }` without message or routing alternatives. It returns HTTP 200 with `id` and terminal `state` (`cancelled`, `delivered`, or `expired`). This retires future retries for the exact existing event, preserves failure/delivery evidence, and never retracts prior remote effects. Normal notification admission remains HTTP 202.

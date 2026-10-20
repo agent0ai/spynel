@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,6 +60,7 @@ func TestOrphanedClaimedTaskReceivesRecoveryLease(t *testing.T) {
 
 func TestOrphanedNotifiedTaskKeepsTransitionIdentityThroughReconciliation(t *testing.T) {
 	cfg, fake, manager := workflowTestManager(t)
+	manager.NotificationContext = func(Origin) (string, error) { return "", nil }
 	cfg.Orchestrator.TaskNotifications = config.TaskNotificationsAlways
 	manager.ApplyRuntimeConfig(cfg)
 	task, err := Create(cfg, "tasks", "recover and notify an interrupted claim", "")
@@ -864,5 +866,46 @@ func TestGoalDoneRequiresReviewProof(t *testing.T) {
 	queued := filepath.Join(base, "review", filepath.Base(path))
 	if _, err := os.Stat(queued); err != nil {
 		t.Fatalf("unproven goal completion was not rejected: %v", err)
+	}
+}
+
+func TestGoalHandoffTrimsContextWithoutLosingCohort(t *testing.T) {
+	cfg, _, manager := workflowTestManager(t)
+	goalPath := cfg.StatePath("goals", "active", "goal.md")
+	if err := WriteDocument(goalPath, Document{FrontMatter: map[string]any{"id": "goal", "round": 1}}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 300; i++ {
+		name := strings.Repeat("task-", 30) + fmt.Sprintf("%03d.md", i)
+		path := cfg.StatePath("tasks", "done", name)
+		if err := WriteDocument(path, Document{FrontMatter: map[string]any{"id": name, "goal_id": "goal", "goal_round": 1}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	context := manager.relatedTasksForGoal(goalPath)
+	if len(context) > 34*1024 || !strings.Contains(context, "omitted from prompt context only") || !strings.Contains(context, goalPath) || !strings.Contains(context, "299.md") {
+		t.Fatalf("unbounded or unexplained handoff: %d bytes", len(context))
+	}
+	document, _ := ReadDocument(goalPath)
+	tasks, err := manager.goalRoundTasks(document)
+	if err != nil || len(tasks) != 300 {
+		t.Fatalf("trimmed context lost workflow evidence: %d %v", len(tasks), err)
+	}
+}
+
+func TestDocumentMetadataIgnoresLargeProgressAndValidatesHeader(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "task.md")
+	for _, header := range []string{"---\nid: task\nsource_message_ids: [request]\n---\n", "---\nid: [invalid\n---\n", "---\n" + strings.Repeat("x", 1<<20)} {
+		if err := os.WriteFile(path, []byte(header+strings.Repeat("progress\n", 1<<18)), 0600); err != nil {
+			t.Fatal(err)
+		}
+		document, err := ReadDocumentMetadata(path)
+		if strings.Contains(header, "source_message_ids") {
+			if err != nil || documentID(document) != "task" || document.Body != "" {
+				t.Fatalf("metadata depends on progress length: %#v %v", document, err)
+			}
+		} else if err == nil {
+			t.Fatal("invalid metadata accepted")
+		}
 	}
 }

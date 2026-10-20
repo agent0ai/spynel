@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,11 +13,12 @@ import (
 	"unicode"
 )
 
+var errStatusMetadata = errors.New("invalid workflow metadata")
+
 const (
 	maxStatusFolders          = 32
 	maxStatusDocuments        = 4096
 	maxStatusDirectoryEntries = 8192
-	maxStatusDocumentSize     = 1 << 20
 	maxStatusDiagnostics      = 8
 )
 
@@ -130,14 +133,13 @@ func (m *Manager) countActiveRoute(route workflowRoute, terminal map[string]bool
 				addStatusDiagnostic(diagnostics, fmt.Sprintf("%s/%s counts active but is not a readable regular file", statusName, entry.Name()))
 				continue
 			}
-			data, err := readStatusDocument(path)
+			document, err := readStatusDocument(path, false)
 			if err != nil {
-				addStatusDiagnostic(diagnostics, fmt.Sprintf("%s/%s counts active but is unreadable", statusName, entry.Name()))
-				continue
-			}
-			document, err := ParseDocument(data)
-			if err != nil {
-				addStatusDiagnostic(diagnostics, fmt.Sprintf("%s/%s counts active but has invalid front matter", statusName, entry.Name()))
+				reason := "is unreadable"
+				if errors.Is(err, errStatusMetadata) {
+					reason = "has invalid front matter"
+				}
+				addStatusDiagnostic(diagnostics, fmt.Sprintf("%s/%s counts active but %s", statusName, entry.Name(), reason))
 				continue
 			}
 			if durable, _ := document.FrontMatter["status"].(string); durable != statusName {
@@ -173,27 +175,34 @@ func readDirectoryEntries(path string, limit int) ([]os.DirEntry, bool, error) {
 	return entries, truncated, nil
 }
 
-func readStatusDocument(path string) ([]byte, error) {
+// readStatusDocument projects metadata and optionally the latest progress;
+// accumulated evidence is never a whole-document admission limit.
+func readStatusDocument(path string, withProgress bool) (Document, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return nil, err
+		return Document{}, err
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("document is not a regular file")
+		return Document{}, fmt.Errorf("document is not a regular file")
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return Document{}, err
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, maxStatusDocumentSize+1))
+	reader := bufio.NewReader(file)
+	document, err := readDocumentMetadata(reader)
 	if err != nil {
-		return nil, err
+		return Document{}, fmt.Errorf("%w: %w", errStatusMetadata, err)
 	}
-	if len(data) > maxStatusDocumentSize {
-		return nil, fmt.Errorf("document exceeds %d bytes", maxStatusDocumentSize)
+	if !withProgress {
+		return document, err
 	}
-	return data, nil
+	step, err := readWorkflowProgress(reader)
+	if step != "" {
+		document.Body = "## Progress\n- " + step + "\n"
+	}
+	return document, err
 }
 
 func addStatusDiagnostic(diagnostics *[]string, value string) {

@@ -260,9 +260,6 @@ func TestStaleTakeoverFencesFormerOwner(t *testing.T) {
 		t.Fatalf("takeover before stale acquired = %t, err = %v", acquired, err)
 	}
 	now = now.Add(StaleAfter)
-	if _, owned, err := first.Renew(firstToken); err != nil || owned {
-		t.Fatalf("owner renewed an already stale term = %t, err = %v", owned, err)
-	}
 	secondLease, acquired, err := second.TryAcquire("127.0.0.1:10002", secondToken)
 	if err != nil || !acquired {
 		t.Fatalf("stale takeover = %#v, %t, %v", secondLease, acquired, err)
@@ -279,6 +276,80 @@ func TestStaleTakeoverFencesFormerOwner(t *testing.T) {
 	}
 	if current.InstanceID != second.ID() || current.Token != secondToken {
 		t.Fatalf("former owner disturbed successor: %#v", current)
+	}
+}
+
+func TestRenewRetainsUnchangedExpiredTermAndRejectsReplacement(t *testing.T) {
+	owner, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	owner.now = func() time.Time { return now }
+	token, _ := owner.NewToken()
+	original, acquired, err := owner.TryAcquire("127.0.0.1:10001", token)
+	if err != nil || !acquired {
+		t.Fatalf("acquire = %t, %v", acquired, err)
+	}
+	var observations []Observation
+	owner.SetObserver(func(observation Observation) { observations = append(observations, observation) })
+	now = now.Add(2 * StaleAfter)
+	if _, owned, err := owner.Renew("wrong-term"); err != nil || owned {
+		t.Fatalf("wrong term renewal = %t, %v", owned, err)
+	}
+	renewed, owned, err := owner.Renew(token)
+	if err != nil || !owned || renewed.Token != original.Token || !renewed.StartedAt.Equal(original.StartedAt) || !renewed.HeartbeatAt.Equal(now) {
+		t.Fatalf("unchanged expired term was not retained: owned=%t err=%v", owned, err)
+	}
+	last := observations[len(observations)-1]
+	if last.Reason != "renewed_unchanged_stale_term" || last.LeaseAge != 2*StaleAfter {
+		t.Fatalf("stale-self observation = %#v", last)
+	}
+	replacement := renewed
+	replacement.Token = "replacement-term"
+	if err := owner.writeLease(replacement); err != nil {
+		t.Fatal(err)
+	}
+	if _, owned, err := owner.Renew(token); err != nil || owned {
+		t.Fatalf("obsolete same-instance term renewed = %t, %v", owned, err)
+	}
+	if last := observations[len(observations)-1]; last.Reason != "different_term" {
+		t.Fatalf("replacement observation = %#v", last)
+	}
+}
+
+func TestOwnerActionRefreshesLeaseEvenWhenAdmissionFails(t *testing.T) {
+	owner, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	owner.now = func() time.Time { return now }
+	token, _ := owner.NewToken()
+	if _, acquired, err := owner.TryAcquire("127.0.0.1:10001", token); err != nil || !acquired {
+		t.Fatalf("acquire = %t, %v", acquired, err)
+	}
+	failedAdmission := errors.New("synthetic admission failure")
+	ran, err := owner.RunWhileOwner(token, func() error {
+		now = now.Add(2 * StaleAfter)
+		return failedAdmission
+	})
+	if !ran || !errors.Is(err, failedAdmission) {
+		t.Fatalf("admission result = %t, %v", ran, err)
+	}
+	current, err := owner.Current()
+	if err != nil || owner.IsStale(current) || !current.HeartbeatAt.Equal(now) || current.Token != token {
+		t.Fatalf("long admission left its own term stale: err=%v", err)
+	}
+	// Diagnostics can inspect/mutate election state without holding its lock.
+	owner.SetObserver(func(Observation) {
+		owner.SetObserver(nil)
+		if _, owned, err := owner.Renew(token); err != nil || !owned {
+			t.Errorf("diagnostic callback renewal = %t, %v", owned, err)
+		}
+	})
+	if _, owned, err := owner.Renew(token); err != nil || !owned {
+		t.Fatalf("renewal = %t, %v", owned, err)
 	}
 }
 

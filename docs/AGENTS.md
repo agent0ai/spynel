@@ -31,14 +31,20 @@
 - Document npm release triggering, native asset coverage, first-publication credentials versus OIDC trusted publishing, bounded interactive update checks, automatic-startup suppression, and `/update`.
 - Document Linux amd64/arm64 and macOS amd64/arm64 as the only current distribution targets, with Windows explicitly and temporarily unsupported by both native packaging and npm.
 - Keep authenticated provider canaries gated by the reviewed threat model: synthetic repositories only, disposable identities and homes, verified artifacts, bounded egress/cost/time, sanitized evidence, and per-run authorization. A plan or CI definition is not evidence that a provider was executed.
+- Heartbeat guidance checks root dependencies, policy applicability, existing authorization and independent work before requesting external assets. Distinguish first prerequisite questions from repeat reminders, necessary private route/context inspection from disclosure, and actual delivery/relevant answers from failed attempts, unrelated chat or queue admission.
 
-- `programmatic-integration.md` owns the supported v1 HTTP/NDJSON contract, request admission/retry limits, committed subscription/replay semantics, snapshot resynchronization, private Unix socket topology/limits, and runnable adapter/local-test examples. Keep the compiled integration topic and CLI help synchronized.
+- `programmatic-integration.md` owns the supported v1 HTTP/NDJSON contract, request admission/retry limits, committed subscription/replay semantics, snapshot resynchronization, private Unix socket topology/limits, and runnable adapter/local-test examples. Optional response_id is opaque local reply correlation, not provider identity or a delivery acknowledgement. Keep the compiled integration topic and CLI help synchronized.
 
 - Keep the README install and uninstall examples short. The plain install pipe must support an immediate `spynel` command for root and regular users; detailed permission and override behavior belongs in getting started. Public `uninstall.sh` automatically stops matching processes, removes startup registrations, and removes both standalone and npm installations while keeping workspace data.
 
 - Document update-by-default, explicit read-only `update check`, caller-installation versus channel-primary selection, cross-workspace instance restart, and shell `killall` with preserved future autostart registrations. State per-user process discovery and the one-time stop/relaunch requirement for older releases without coordinated restart.
+- Explain that npm package replacement cannot refresh an immutable running old Node wrapper. Recovery must distinguish manual and externally managed launchers, stop external respawn first, state killall's cross-installation scope and work interruption, preserve ownership safeguards, and verify a subsequent ready restart rather than only installed-version equality. Source handoff improvements do not imply a published release or live host diagnosis.
 
 - Document native supervision for manual runtime launches, direct externally managed executors, verified supervisor/executor update generations, finite retries, kernel-held provider ownership, guarded direct-provider cleanup and automatic retry when prior cleanup completes. Never promise frozen-child recovery, arbitrary orphan cleanup or an incident root-cause fix.
+
+- Describe latest original and explicitly associated escalation-thread notification/heartbeat context using shared chat limits, distinct untrusted prompt inputs, normal successful/pending TUI history, stable retry identity, and honest queue/send/receipt boundaries. Document owner-established same-operator remote escalation and task-origin-first heartbeat judgment without claiming inferred ownership or adding reminder state.
+
+- Document exact-event ordinary retry cancellation and agent-owned answer settlement before task resumption, preserving failure evidence, terminal delivery truth, and the limits of already accepted external effects.
 
 ## Child DOX Index
 

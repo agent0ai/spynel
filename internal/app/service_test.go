@@ -222,7 +222,7 @@ func TestTaskCommandDelegatesCreationPolicyToCommunicationAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	prompts := harness.prompts["chat:cli:deploy"]
-	if len(prompts) != 1 || !strings.Contains(prompts[0], "explicitly invoked `/task`") || !strings.Contains(prompts[0], "ship it") || !strings.Contains(prompts[0], "origin `cli/deploy`") || !strings.Contains(prompts[0], "review_required") || !strings.Contains(prompts[0], "cancelled") {
+	if len(prompts) != 1 || !strings.Contains(prompts[0], "explicitly invoked `/task`") || !strings.Contains(prompts[0], "ship it") || !strings.Contains(prompts[0], `origin: "cli/deploy", on: [done, failed, waiting, cancelled]`) || !strings.Contains(prompts[0], "review_required") || !strings.Contains(prompts[0], "cancelled") {
 		t.Fatalf("task creation prompt = %#v", prompts)
 	}
 }
@@ -249,7 +249,7 @@ func TestCreationPromptsRetainFrameworkEvidenceGroundedHonestyWithCustomChatProm
 			t.Fatal(err)
 		}
 		prompt := harness.prompts["chat:cli:"+test.conversation][0]
-		if !strings.Contains(prompt, "preserved custom chat prompt") || strings.Count(prompt, instructions.EpistemicTrustGuidance) != 1 || !strings.Contains(prompt, "explicitly invoked `/"+test.kind+"`") {
+		if !strings.Contains(prompt, "preserved custom chat prompt") || strings.Count(prompt, instructions.EpistemicTrustGuidance) != 1 || !strings.Contains(prompt, "explicitly invoked `/"+test.kind+"`") || !strings.Contains(prompt, "notify.on: [done, failed, waiting, cancelled]") || strings.Count(prompt, orchestrator.NotificationSettlementInstruction) != 1 {
 			t.Errorf("/%s prompt omitted custom content, creation directive, or exact-once trust contract:\n%s", test.kind, prompt)
 		}
 	}
@@ -517,7 +517,7 @@ func (r *failingServiceHarness) Send(_ context.Context, key, prompt string, _ co
 	r.mu.Lock()
 	r.prompts[key] = append(r.prompts[key], prompt)
 	r.mu.Unlock()
-	return "", false, r.err
+	return "", false, &harness.SendNotAdmittedError{Err: r.err}
 }
 
 func (r *heldServiceHarness) finish(key string) {
@@ -1586,6 +1586,7 @@ func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	target := newServiceHarness()
 	service := New(cfg, target)
 	service.SetPrimaryInstanceID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	service.Updates = &updater.Manager{CurrentVersion: "1.2.3"}
 	key := "chat:telegram:42"
 	target.threads[key] = "019c9f42-a3b1-7ced-9e10-123456789abc"
 	target.active[key] = true
@@ -1601,7 +1602,7 @@ func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "42", InstanceID: "11111111-2222-3333-4444-555555555555", Text: "/status"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"# Status", "Title: Production", "Instance ID: `11111111`", "Primary instance ID: `aaaaaaaa`", "Jobs: 1", "Tasks: 0 active (0 waiting)", "Goals: 0 active", "Orchestrator:", "Next heartbeat: unavailable", "Telegram: ● connected", "WhatsApp: ▲ error — offline", "Logs: 2", "Agent filesystem access: danger-full-access", "Turn: active"} {
+	for _, want := range []string{"# Status", "Title: Production", "Version: 1.2.3\n- Instance ID: `11111111`\n- Primary instance ID: `aaaaaaaa`", "Jobs: 1", "Tasks: 0 active (0 waiting)", "Goals: 0 active", "Orchestrator:", "Next heartbeat: unavailable", "Telegram: ● connected", "WhatsApp: ▲ error — offline", "Logs: 2", "Agent filesystem access: danger-full-access", "Turn: active"} {
 		if !strings.Contains(response.Text, want) {
 			t.Fatalf("status response does not contain %q:\n%s", want, response.Text)
 		}
@@ -1629,10 +1630,46 @@ func TestStatusShowsSharedIndicatorsAndShortThreadID(t *testing.T) {
 	}
 }
 
+func TestStatusUsesRunningVersion(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(cfg, newServiceHarness())
+	for _, test := range []struct {
+		name    string
+		updates *updater.Manager
+		version string
+		display string
+	}{
+		{"release", &updater.Manager{CurrentVersion: "1.2.3"}, "1.2.3", "1.2.3"},
+		{"prerelease", &updater.Manager{CurrentVersion: "v1.2.3-rc.1+build"}, "v1.2.3-rc.1+build", "v1.2.3-rc.1+build"},
+		{"development", &updater.Manager{CurrentVersion: "dev"}, "dev", "dev"},
+		{"empty", &updater.Manager{}, "", "not available"},
+		{"unavailable", nil, "", "not available"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service.Updates = test.updates
+			status, err := service.Status(core.Message{Channel: "cli", Conversation: "local"})
+			if err != nil || status.Version != test.version {
+				t.Fatalf("status version = %q, %v; want %q", status.Version, err, test.version)
+			}
+			text := FormatStatus(status)
+			if strings.Count(text, "\n- Version:") != 1 || !strings.Contains(text, "\n- Version: "+test.display+"\n- Instance ID:") {
+				t.Fatalf("running version missing, repeated, or misplaced:\n%s", text)
+			}
+		})
+	}
+}
+
 func TestFormatStatusGroupsWorkAndRoundsHeartbeatUp(t *testing.T) {
 	now := time.Date(2026, 8, 8, 14, 0, 0, 0, time.UTC)
 	status := StatusSnapshot{
-		Title: "Production", Instance: "instance", PrimaryInstance: "primary",
+		Title: "Production", Version: "1.2.3", Instance: "instance", PrimaryInstance: "primary",
 		Runtime: core.RuntimeStatus{Jobs: 3, Logs: 4}, TasksActive: 5, TasksWaiting: 2, GoalsActive: 2,
 		OrchestratorLease: 6, OrchestratorRuns: 1, HeartbeatState: "scheduled", NextHeartbeatAt: timePointer(now.Add(time.Second)),
 	}
@@ -1668,6 +1705,7 @@ func TestFormatStatusGroupsWorkAndRoundsHeartbeatUp(t *testing.T) {
 	text := FormatStatus(status)
 	want := "# Status\n\n" + strings.Join([]string{
 		"- Title: Production",
+		"- Version: 1.2.3",
 		"- Instance ID: `instance`",
 		"- Primary instance ID: `primary`",
 		"- Jobs: 3 — `/jobs`",
@@ -1689,7 +1727,7 @@ func TestFormatStatusGroupsWorkAndRoundsHeartbeatUp(t *testing.T) {
 	if text != want {
 		t.Fatalf("exact status changed:\ngot:\n%s\nwant:\n%s", text, want)
 	}
-	ordered := []string{"Title:", "Instance ID:", "Primary instance ID:", "Jobs:", "Tasks:", "Goals:", "Orchestrator:", "Next heartbeat:", "Telegram:", "Coding harness:", "Agent filesystem access:", "Autostart preference:", "Logs:", "Turn:"}
+	ordered := []string{"Title:", "Version:", "Instance ID:", "Primary instance ID:", "Jobs:", "Tasks:", "Goals:", "Orchestrator:", "Next heartbeat:", "Telegram:", "Coding harness:", "Agent filesystem access:", "Autostart preference:", "Logs:", "Turn:"}
 	previous := -1
 	for _, row := range ordered {
 		index := strings.Index(text, row)
@@ -4032,9 +4070,20 @@ func TestNewCommandCreatesDistinctTUIConversationAndPreservesPriorHistory(t *tes
 	if _, err := service.History.Append("tui", "prior", history.Entry{Role: "assistant", Content: "keep this"}); err != nil {
 		t.Fatal(err)
 	}
-	var response core.Event
-	if err := service.Handle(context.Background(), core.Message{Channel: "tui", Conversation: "prior", Text: "/new"}, func(event core.Event) { response = event }); err != nil {
+	if err := service.RegisterLiveTUI("client", "prior", time.Now().UTC()); err != nil {
 		t.Fatal(err)
+	}
+	var response core.Event
+	if err := service.Handle(context.Background(), core.Message{Channel: "tui", InstanceID: "client", Conversation: "prior", Text: "/new"}, func(event core.Event) {
+		response = event
+		if event.Screen != nil && service.liveTUIConversation("client", time.Now().UTC()) != event.Screen.Conversation {
+			t.Error("new screen exposed before its owner-side selection")
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !service.liveTUIConversations(time.Now().UTC())["prior"] {
+		t.Fatal("new selection lost prior conversation cleanup protection")
 	}
 	if response.Kind != core.EventScreen || response.Screen == nil || response.Screen.ID != "welcome" || !strings.HasPrefix(response.Screen.Conversation, "new-") || response.Screen.Conversation == "prior" {
 		t.Fatalf("new conversation response = %#v", response)
@@ -4052,6 +4101,38 @@ func TestNewCommandCreatesDistinctTUIConversationAndPreservesPriorHistory(t *tes
 	}
 	if !strings.Contains(response.Text, "available in the TUI") {
 		t.Fatalf("remote /new response = %#v", response)
+	}
+}
+
+func TestNewCommandPreservesSelectionOnAdmissionFailure(t *testing.T) {
+	for _, mode := range []string{"missing-instance", "invalid-instance", "history-failure"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Root = t.TempDir()
+			service := New(cfg, newServiceHarness())
+			t.Cleanup(service.Runtime.Close)
+			if err := service.RegisterLiveTUI("client", "prior", time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+			instanceID := "client"
+			switch mode {
+			case "missing-instance":
+				instanceID = ""
+			case "invalid-instance":
+				instanceID = "cli\nent"
+			case "history-failure":
+				path := filepath.Join(t.TempDir(), "file")
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				service.History = history.New(path)
+			}
+			emitted := false
+			err := service.handleCommand(context.Background(), core.Message{Channel: "tui", InstanceID: instanceID, Conversation: "prior", Text: "/new"}, func(core.Event) { emitted = true })
+			if err == nil || emitted || service.liveTUIConversation("client", time.Now().UTC()) != "prior" {
+				t.Fatalf("failed selection err=%v emitted=%t", err, emitted)
+			}
+		})
 	}
 }
 

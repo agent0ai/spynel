@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,9 @@ import (
 	"time"
 
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/history"
+	"github.com/agent0ai/spynel/internal/instance"
+	"github.com/agent0ai/spynel/internal/updater"
 )
 
 const (
@@ -23,6 +27,7 @@ const (
 )
 
 type fixtureRecord struct {
+	PID        int             `json:"pid"`
 	Kind       string          `json:"kind"`
 	Args       []string        `json:"args"`
 	Cwd        string          `json:"cwd"`
@@ -32,7 +37,45 @@ type fixtureRecord struct {
 	Params     json.RawMessage `json:"params"`
 }
 
+func reserveWorkerFixture(root, key string, work WorkerWorkflow, action string) (WorkerReservation, error) {
+	if work.WorkID == "reject" {
+		return WorkerReservation{}, errors.New("synthetic rejected claim")
+	}
+	if action == "validate" || action == "continue" {
+		return WorkerReservation{}, nil
+	}
+	path := filepath.Join(root, "fixture-reservations")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return WorkerReservation{}, err
+	}
+	_, err = file.WriteString(key + "\n")
+	err = errors.Join(err, file.Close())
+	return WorkerReservation{FirstAssignedAt: time.Unix(100, 0).UTC(), ProviderIterations: 7, ImplementationAttempts: work.ClaimAttempt}, err
+}
+
 func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == "__worker-controller" {
+		if err := runWorkerControllerFixture(); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	if len(os.Args) == 2 && os.Args[1] == "__worker" {
+		unregister, err := updater.Detect("fixture").RegisterHarnessWorker()
+		if err != nil {
+			os.Exit(1)
+		}
+		// Protocol fixtures trust synthetic sources; native CLI tests exercise history admission.
+		if err := RunWorker(context.Background(), os.Stdin, os.Stdout, NewBuiltinRegistry(), reserveWorkerFixture, nil, func(string, string, WorkerConversation, string, error) error { return nil }); err != nil {
+			unregister()
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		unregister()
+		os.Exit(0)
+	}
 	if len(os.Args) > 1 && os.Args[1] == "__provider" {
 		if err := RunProvider(os.Args[2:]); err != nil {
 			os.Exit(1)
@@ -43,6 +86,93 @@ func TestMain(m *testing.M) {
 		os.Exit(runHarnessFixture(mode))
 	}
 	os.Exit(m.Run())
+}
+
+func runWorkerControllerFixture() error {
+	var cfg HarnessConfig
+	decoder := json.NewDecoder(os.Stdin)
+	if err := decoder.Decode(&cfg); err != nil {
+		return err
+	}
+	owner, err := instance.New(filepath.Join(cfg.Cwd, ".spynel"))
+	if err != nil {
+		return err
+	}
+	term, err := owner.NewToken()
+	if err != nil {
+		return err
+	}
+	if _, acquired, err := owner.TryAcquire("127.0.0.1:10001", term); err != nil || !acquired {
+		return fmt.Errorf("controller fixture did not acquire ownership")
+	}
+	defer owner.Release(term)
+	client, err := OpenWorker(context.Background(), cfg, owner.ID(), term)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	store := history.New(filepath.Join(cfg.Cwd, "consumer-history"))
+	sink := func(delivery WorkerDelivery) error {
+		_, err := store.AppendOnce("cli", "owned", delivery.ReceiptID(), history.Entry{Role: "assistant", Content: delivery.Event.Text, Terminal: delivery.Event.Done})
+		return err
+	}
+	if _, err := client.Call(context.Background(), WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/controller", Prompt: "synthetic useful work"}); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		page, err := client.Call(context.Background(), WorkerRequest{Action: "events", Sequence: 1})
+		if err != nil {
+			return err
+		}
+		if len(page.Events) > 0 {
+			ran, err := owner.RunForOwner(owner.ID(), term, func() error {
+				return sink(WorkerDelivery{WorkerID: client.Info().ID, Sequence: 1, WorkerEvent: page.Events[0]})
+			})
+			if err != nil || !ran {
+				if err == nil {
+					err = errors.New("controller fixture lost effect ownership")
+				}
+				return err
+			}
+			if _, err := client.Call(context.Background(), WorkerRequest{Action: "commit", Sequence: 1, After: page.Events[0].Cursor}); err != nil {
+				return err
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("controller fixture did not consume an event")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Leave a real history effect durable in the effect-before-commit window.
+	interrupted := errors.New("synthetic controller interrupted before cursor commit")
+	for {
+		_, err := client.Consume(context.Background(), 1, func(delivery WorkerDelivery) error {
+			if err := sink(delivery); err != nil {
+				return err
+			}
+			return interrupted
+		})
+		if errors.Is(err, interrupted) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return errors.New("controller fixture did not reach uncommitted effect")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(client.Info()); err != nil {
+		return err
+	}
+	_, err = io.Copy(io.Discard, decoder.Buffered())
+	if err == nil {
+		_, err = io.Copy(io.Discard, os.Stdin)
+	}
+	return err
 }
 
 func TestManualInferenceReachesProvidersWithoutCatalogDiscovery(t *testing.T) {
@@ -169,9 +299,9 @@ func readFixtureRecords(t *testing.T, path string) []fixtureRecord {
 
 func runHarnessFixture(mode string) int {
 	executable, _ := os.Executable()
-	appendFixtureLog(map[string]any{"kind": "invocation", "args": os.Args[1:], "cwd": mustGetwd(), "executable": executable})
+	appendFixtureLog(map[string]any{"kind": "invocation", "pid": os.Getpid(), "args": os.Args[1:], "cwd": mustGetwd(), "executable": executable})
 	switch mode {
-	case "codex-lifecycle", "codex-interrupt", "codex-models", "codex-init-missing-method", "codex-resume-missing-method", "codex-resume-error", "codex-stream-overflow", "codex-thread-changed-field", "codex-terminal-changed-status":
+	case "codex-lifecycle", "codex-interrupt", "codex-worker", "codex-followup-refusal", "codex-models", "codex-init-missing-method", "codex-resume-missing-method", "codex-resume-error", "codex-stream-overflow", "codex-thread-changed-field", "codex-terminal-changed-status":
 		return runCodexFixture(mode)
 	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero":
 		return runClaudeFixture(mode)
@@ -333,8 +463,10 @@ func runPiFixture(mode string) int {
 		case "steer":
 			respond(message, map[string]any{})
 			delta(" second")
-			messageEnd("first second", "stop")
-			write(map[string]any{"type": "agent_settled"})
+			if mode != "pi-interrupt" {
+				messageEnd("first second", "stop")
+				write(map[string]any{"type": "agent_settled"})
+			}
 		case "abort":
 			respond(message, map[string]any{})
 			messageEnd("working", "aborted")
@@ -509,7 +641,7 @@ func runCodexFixture(mode string) int {
 				continue
 			}
 			threadID := "thr_test"
-			if mode == "codex-interrupt" {
+			if mode == "codex-interrupt" || mode == "codex-worker" || mode == "codex-followup-refusal" {
 				threadID = "thr_stop"
 			}
 			if mode == "codex-lifecycle" && message.Method == "thread/resume" {
@@ -525,10 +657,28 @@ func runCodexFixture(mode string) int {
 			write(map[string]any{"id": message.ID, "result": map[string]any{"thread": map[string]any{"id": threadID}}})
 		case "turn/start":
 			threadID, turnID := "thr_test", "turn_test"
-			if mode == "codex-interrupt" {
+			if mode == "codex-interrupt" || mode == "codex-worker" || mode == "codex-followup-refusal" {
 				threadID, turnID = "thr_stop", "turn_stop"
 			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{"turn": map[string]any{"id": turnID, "status": "inProgress"}}})
+			if mode == "codex-worker" {
+				appendFixtureLog(map[string]any{"kind": "effect", "pid": os.Getpid()})
+				go func() {
+					for tick := 0; tick < 3000; tick++ {
+						time.Sleep(20 * time.Millisecond)
+						write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": threadID, "turnId": turnID, "delta": "."}})
+					}
+				}()
+				if release := os.Getenv("SPYNEL_TEST_CODEX_PAUSE_INPUT"); release != "" {
+					appendFixtureLog(map[string]any{"kind": "input-paused", "pid": os.Getpid()})
+					for {
+						if _, err := os.Stat(release); err == nil {
+							break
+						}
+						time.Sleep(10 * time.Millisecond)
+					}
+				}
+			}
 			if mode == "codex-terminal-changed-status" {
 				write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": threadID, "turn": map[string]any{"id": turnID, "status": "done"}}})
 			}
@@ -542,8 +692,38 @@ func runCodexFixture(mode string) int {
 				}()
 			}
 		case "turn/steer":
+			if mode == "codex-followup-refusal" {
+				var params struct {
+					Input []struct{ Text string }
+				}
+				_ = json.Unmarshal(message.Params, &params)
+				if len(params.Input) == 1 && params.Input[0].Text == "completed-before-error" {
+					appendFixtureLog(map[string]any{"kind": "effect", "pid": os.Getpid()})
+					write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thr_stop", "turn": map[string]any{"id": "turn_stop", "status": "completed"}}})
+					write(map[string]any{"id": message.ID, "error": map[string]any{"code": -32000, "message": "synthetic acknowledgement failed after effect"}})
+					continue
+				}
+				if len(params.Input) == 1 && params.Input[0].Text == "rejected" {
+					write(map[string]any{"id": message.ID, "error": map[string]any{"code": -32000, "message": "synthetic follow-up refused"}})
+					continue
+				}
+			}
+			if os.Getenv("SPYNEL_TEST_CODEX_STALL_CONTROL") != "" {
+				continue
+			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{"turnId": "turn_test"}})
 		case "turn/interrupt":
+			if os.Getenv("SPYNEL_TEST_CODEX_DISCONNECT_INTERRUPT") == "1" {
+				return 0
+			}
+			if release := os.Getenv("SPYNEL_TEST_CODEX_DELAY_INTERRUPT"); release != "" {
+				for {
+					if _, err := os.Stat(release); err == nil {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{}})
 			write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thr_stop", "turn": map[string]any{"id": "turn_stop", "status": "interrupted"}}})
 		case "model/list":

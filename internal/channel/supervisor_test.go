@@ -40,6 +40,37 @@ type statusFixture struct {
 	report StatusReporter
 }
 
+func TestSupervisorRefusesCancelledReconciliation(t *testing.T) {
+	for _, duringBuild := range []bool{false, true} {
+		t.Run(map[bool]string{false: "before-build", true: "during-build"}[duringBuild], func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			target := &runtimeAuthorizationFixture{valid: true}
+			builds := 0
+			supervisor := NewSupervisor(nil, nil, []Managed{{
+				Name: "telegram", Enabled: func(config.Config) bool { return true },
+				Fingerprint: func(config.Config) string { return "synthetic" },
+				Build: func(config.Config) (Channel, error) {
+					builds++
+					cancel()
+					return target, nil
+				},
+			}}, nil, nil)
+			if !duringBuild {
+				cancel()
+			}
+			err := supervisor.reconcile(ctx, config.Config{})
+			supervisor.wait.Wait()
+			if !errors.Is(err, context.Canceled) || target.started.Load() != 0 || len(supervisor.running) != 0 || !duringBuild && builds != 0 {
+				t.Fatalf("cancelled reconciliation admitted channel: err=%v builds=%d starts=%d retained=%d", err, builds, target.started.Load(), len(supervisor.running))
+			}
+			if duringBuild && !target.revoked.Load() {
+				t.Fatal("cancelled replacement retained runtime authority")
+			}
+		})
+	}
+}
+
 func (c *statusFixture) Name() string { return "whatsapp" }
 
 func (c *statusFixture) Run(ctx context.Context, _ Handler) error {

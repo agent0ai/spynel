@@ -68,6 +68,31 @@ Only interactive TUI starts perform proactive checks, bounded to ten seconds and
 
 Standalone updates stage a complete verified bundle before switching the stable launcher; failed downloads or validation leave the previous bundle usable. Older bundles and any interrupted temporary stages are retained so running processes keep their libraries. If reclaiming that space manually, stop every process using that installation first and preserve the bundle targeted by `current`. A concurrent installer returns a retry message; a crashed install automatically releases its lock. Development builds and manually extracted archives remain unmanaged and must be replaced using their original installation method.
 
+### npm launcher recovery
+
+The installed version and a running npm launcher can differ. A Node launcher started from 0.12.14 keeps its loaded JavaScript and protocol 1 even after npm installs 0.13.0. The new native executable requires protocol 2 and refuses coordinated updates under that old launcher. A version check showing 0.13.0 does not establish that the surviving launcher was refreshed.
+
+After replacement, the launcher hands off to the newly installed JavaScript and its dependencies in the same Node process, then coordinates native restarts. It retains normalized launch arguments and shutdown signals without adding a restart owner. Failed replacement or coordination stops explicitly; npm finishing alone is insufficient. This source change cannot retrofit an already-running old wrapper, which needs one fresh launch:
+
+1. Wait for any npm installation/update to finish. Allow active work to finish, or arrange its interruption. Recovery stops channels, servers, TUIs and active agent work; saved workspace data is retained. It does not establish that arbitrary escaped provider processes or external effects have finished. Keep ownership safeguards intact.
+2. If PM2 or a custom service owns the launcher, stop that application through its manager first so it cannot respawn during cleanup. Spynel's built-in service cleanup covers its generated registrations, not arbitrary external managers.
+3. From a separate shell, use the newly installed `spynel` command for the intended npm prefix, with the same account and configuration home: `spynel killall`. This stops verified Spynel processes across installations and workspaces that the caller can control, not just the affected workspace. Resolve any reported stop failure before relaunching; do not override the protocol environment variable or delete ownership files.
+4. For a manual launch, return to the original workspace and run `spynel` or the original `spynel serve` arguments once. For a managed launch, start the existing registration instead: for example, `systemctl --user start <unit>`, `systemctl start <unit>` for a system service with appropriate privileges, or `pm2 restart <app>`. Use the installed npm launcher and `--automatic-startup` for externally managed servers. Do not also start a foreground copy. A launchd registration unloaded by cleanup must be loaded from its saved plist again; future boot/login registrations remain intact.
+
+Confirm the expected primary is available with `/status`, then request `/update`. Even when already current it should restart through fresh native registrations without the launcher refusal. `/update check` only compares versions and does not verify restart readiness. The affected host's actual launch method, account, npm prefix and service identity must be established locally before selecting these commands.
+
+### Registered zombies blocking an older npm updater
+
+The fixed process inspector distinguishes confirmed dead/zombie processes from live targets on Linux and macOS. Permission errors or unknown state remain conservative; a live registration with unverifiable executable identity still blocks updates. Registry files and workspace leases must remain intact.
+
+An already running 0.13.3 updater cannot acquire this correction before it installs the new package: its preflight can refuse an unreaped registered zombie even though `kill(pid, 0)` succeeds. Repeating that old `/update` cannot bootstrap the fix. Once a release containing the correction has passed its release gates, use the ordinary external npm installation followed by a fresh updater, under the same account and configuration home:
+
+1. Establish the intended npm prefix, launcher protocol and service ownership. Arrange a quiet intake window and allow active jobs to reach their normal terminal boundary before replacement/restart. This procedure does not automatically wait for active work or guarantee completion of arbitrary external effects.
+2. Install the **complete released package** with `npm install --global --prefix <verified-prefix> spynel@<fixed-version>`. This uses npm and the checksum-verified native installer; do not replace individual vendor files. Resolve any installation failure and verify the installed command before proceeding. The native regression covers npm rollback after a failed archive download; it is not a guarantee for every npm version, filesystem or interrupted transaction.
+3. Run `<verified-prefix>/bin/spynel update` from a fresh shell command using the newly installed launcher. The candidate's preflight and all-instance coordination now own liveness. With the already-current version it skips package replacement, keeps stable supervisor PIDs and requires new ready executor generations. Verify the serving version with `/status`, as well as the installed version. Leave registered zombies for their actual parent to reap; upgrade must not depend on removing their records or signaling that parent.
+
+This bridge applies to the verified protocol-2 0.13.3 launcher. An older protocol-1 wrapper still requires the separate stop/relaunch recovery above. Source tests or an unpublished local candidate do not establish that a fixed release is available or that a production installation has been activated.
+
 ## Run from a development checkout
 
 The development helper can download a pinned Go toolchain into the ignored, disposable repository-level `.tmp-toolchains/` directory when Go is unavailable:

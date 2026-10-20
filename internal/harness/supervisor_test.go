@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -76,7 +77,7 @@ func waitSupervisorState(t *testing.T, predicate func() bool) {
 
 func (r *supervisorHarness) FollowUpMode() FollowUpMode { return r.followUp }
 
-func (r *supervisorHarness) Steer(_ context.Context, key, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+func (r *supervisorHarness) Steer(_ context.Context, key, prompt string, beforeDelivery func() bool) (string, error) {
 	if !r.IsActive(key) {
 		return r.name + "-thread", errNativeTurnInactive
 	}
@@ -92,7 +93,6 @@ func (r *supervisorHarness) Steer(_ context.Context, key, prompt string, emit co
 		r.prompts = map[string][]string{}
 	}
 	r.prompts[key] = append(r.prompts[key], prompt)
-	r.emits[key] = emit
 	r.mu.Unlock()
 	return r.name + "-thread", nil
 }
@@ -773,6 +773,207 @@ func TestSupervisorControlRetainsEmitterAndContinuesOnlyOnce(t *testing.T) {
 	}
 }
 
+func TestSupervisorRejectedFollowupRetainsControlEmitter(t *testing.T) {
+	target := &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}}
+	registry := NewRegistry()
+	registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+	supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+	if err := supervisor.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = supervisor.Close() })
+	checkRejectedFollowupControlEmitter(t, supervisor, func() { target.finish("job") }, func(refuse bool) {
+		target.mu.Lock()
+		target.refuseSteer = refuse
+		target.mu.Unlock()
+	})
+}
+
+type completedFollowupHarness struct {
+	*supervisorHarness
+	sends int
+	err   error
+}
+
+func (h *completedFollowupHarness) SendWithModel(ctx context.Context, key, prompt, model string, emit core.Emit) (string, bool, error) {
+	h.sends++
+	if h.sends == 2 {
+		h.finish(key)
+		return h.name + "-thread", true, h.err
+	}
+	return h.supervisorHarness.SendWithModel(ctx, key, prompt, model, emit)
+}
+
+func TestSupervisorCompletedFollowupErrorNeverRedispatches(t *testing.T) {
+	for _, sendErr := range []error{errors.New("acknowledgement unavailable"), context.DeadlineExceeded, errNativeTurnInactive} {
+		t.Run(sendErr.Error(), func(t *testing.T) {
+			target := &completedFollowupHarness{
+				supervisorHarness: &supervisorHarness{name: "codex", followUp: FollowUpSteer, active: map[string]bool{}, emits: map[string]core.Emit{}},
+				err:               sendErr,
+			}
+			registry := NewRegistry()
+			registry.Register("codex", func(HarnessConfig) (Harness, error) { return target, nil })
+			supervisor := NewSupervisor(registry, HarnessConfig{Name: "codex"})
+			if err := supervisor.Start(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = supervisor.Close() })
+			if _, _, err := supervisor.SendConversation(t.Context(), "job", "original", "original", nil); err != nil {
+				t.Fatal(err)
+			}
+			_, steered, err := supervisor.SendConversation(t.Context(), "job", "follow-up", "follow-up", nil)
+			if !errors.Is(err, sendErr) || !steered || target.sends != 2 || supervisor.IsActive("job") || target.IsActive("job") {
+				t.Fatalf("completed follow-up redispatched: err=%v steered=%t sends=%d active=%t", err, steered, target.sends, supervisor.IsActive("job"))
+			}
+			if _, steered, err := supervisor.SendConversation(t.Context(), "job", "explicit next request", "explicit next request", nil); err != nil || steered || target.sends != 3 {
+				t.Fatalf("explicit next request failed: err=%v steered=%t sends=%d", err, steered, target.sends)
+			}
+		})
+	}
+}
+
+func TestSupervisorNativeCompletedFollowupErrorNeverRedispatches(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "codex-followup-refusal")
+	supervisor := NewSupervisor(NewBuiltinRegistry(), HarnessConfig{Name: "codex", Command: command, Cwd: root, Sandbox: "read-only", ApprovalPolicy: "never"})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := supervisor.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := supervisor.Close(); err != nil {
+			t.Error("native provider cleanup", err)
+		}
+	})
+	if _, _, err := supervisor.SendConversation(ctx, "job", "original", "original", nil); err != nil {
+		t.Fatal(err)
+	}
+	var terminal atomic.Int32
+	_, steered, err := supervisor.SendConversation(ctx, "job", "completed-before-error", "completed-before-error", func(event core.Event) {
+		if event.Kind == core.EventFinal && event.Done && !event.Continues {
+			terminal.Add(1)
+		}
+	})
+	starts, steers, effects, processes := 0, 0, 0, 0
+	for _, record := range readFixtureRecords(t, logPath) {
+		switch record.Kind {
+		case "invocation":
+			processes++
+			t.Logf("synthetic native provider pid=%d", record.PID)
+		case "effect":
+			effects++
+		case "request":
+			if record.Method == "turn/start" {
+				starts++
+			}
+			if record.Method == "turn/steer" {
+				steers++
+			}
+		}
+	}
+	t.Logf("provider work: processes=%d starts=%d steers=%d effects=%d", processes, starts, steers, effects)
+	if err == nil || !strings.Contains(err.Error(), "synthetic acknowledgement failed after effect") || !steered || supervisor.IsActive("job") || terminal.Load() != 1 || processes != 1 || starts != 1 || steers != 1 || effects != 1 {
+		t.Fatalf("completed native follow-up redispatched: err=%v steered=%t active=%t terminal=%d starts=%d", err, steered, supervisor.IsActive("job"), terminal.Load(), starts)
+	}
+}
+
+func TestSupervisorNativeRejectedFollowupRetainsControlEmitter(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "codex-followup-refusal")
+	supervisor := NewSupervisor(NewBuiltinRegistry(), HarnessConfig{Name: "codex", Command: command, Cwd: root, Sandbox: "read-only", ApprovalPolicy: "never"})
+	if err := supervisor.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = supervisor.Close() })
+	target := supervisor.current.(*Codex)
+	checkRejectedFollowupControlEmitter(t, supervisor, func() {
+		if ok, err := target.Interrupt(t.Context(), "job"); err != nil || !ok {
+			t.Fatal("synthetic provider completion injection", ok, err)
+		}
+	}, func(bool) {})
+	starts, steers, processes := 0, 0, 0
+	for _, record := range readFixtureRecords(t, logPath) {
+		switch record.Kind {
+		case "invocation":
+			processes++
+			t.Logf("synthetic native provider pid=%d", record.PID)
+		case "request":
+			if record.Method == "turn/start" {
+				starts++
+			}
+			if record.Method == "turn/steer" {
+				steers++
+			}
+		}
+	}
+	if processes != 1 || starts != 2 || steers != 2 {
+		t.Fatalf("unexpected provider work: processes=%d starts=%d steers=%d", processes, starts, steers)
+	}
+}
+
+func checkRejectedFollowupControlEmitter(t *testing.T, supervisor *Supervisor, finish func(), refuse func(bool)) {
+	t.Helper()
+	var mu sync.Mutex
+	var original, rejected []core.Event
+	if _, _, err := supervisor.SendConversation(t.Context(), "job", "original", "original", func(event core.Event) {
+		mu.Lock()
+		original = append(original, event)
+		mu.Unlock()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	refuse(true)
+	if _, _, err := supervisor.SendConversation(t.Context(), "job", "rejected", "rejected", func(event core.Event) {
+		mu.Lock()
+		rejected = append(rejected, event)
+		mu.Unlock()
+	}); err == nil || !supervisor.IsActive("job") {
+		t.Fatal("follow-up did not fail while preserving the original turn", err)
+	}
+	refuse(false)
+	if _, err := supervisor.SendControl(t.Context(), "job", ControlRequest{
+		ID: "control", Prompt: "guidance", ContinuationPrompt: "continue original",
+		Validate: func() bool { return true },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	finish()
+	waitSupervisorState(t, func() bool {
+		supervisor.mu.RLock()
+		target := supervisor.current
+		supervisor.mu.RUnlock()
+		return target.IsActive("job")
+	})
+	finish()
+	waitSupervisorState(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, event := range append(append([]core.Event(nil), original...), rejected...) {
+			if event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+				return true
+			}
+		}
+		return false
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if len(rejected) != 0 {
+		t.Fatalf("control continuation reached the rejected follow-up: %#v", rejected)
+	}
+	continuing, terminal := 0, 0
+	for _, event := range original {
+		if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+			if event.Continues {
+				continuing++
+			} else {
+				terminal++
+			}
+		}
+	}
+	if continuing != 1 || terminal != 1 || supervisor.IsActive("job") {
+		t.Fatalf("original execution lost ownership: continuing=%d terminal=%d active=%t", continuing, terminal, supervisor.IsActive("job"))
+	}
+}
+
 func TestSupervisorQueuesControlsInOrderDeduplicatesAndBoundsBackpressure(t *testing.T) {
 	target := &supervisorHarness{name: "claude-code", followUp: FollowUpQueue, active: map[string]bool{}, emits: map[string]core.Emit{}}
 	registry := NewRegistry()
@@ -839,6 +1040,76 @@ func TestSupervisorDropsQueuedControlAfterDurableTransition(t *testing.T) {
 	target.mu.Unlock()
 	if len(prompts) != 1 || supervisor.IsActive("job") {
 		t.Fatalf("stale queued control executed: prompts=%#v active=%t", prompts, supervisor.IsActive("job"))
+	}
+}
+
+func TestSupervisorControlContinuationUsesOwnerFenceAndReleasesOriginalTerminal(t *testing.T) {
+	for _, mode := range []FollowUpMode{FollowUpSteer, FollowUpQueue} {
+		for _, outcome := range []string{"accepted", "refused", "error-after-admission"} {
+			t.Run(fmt.Sprintf("%s/%s", mode, outcome), func(t *testing.T) {
+				refused := outcome == "refused"
+				target := &supervisorHarness{name: "synthetic", followUp: mode, active: map[string]bool{}, emits: map[string]core.Emit{}}
+				registry := NewRegistry()
+				registry.Register("synthetic", func(HarnessConfig) (Harness, error) { return target, nil })
+				supervisor := NewSupervisor(registry, HarnessConfig{Name: "synthetic"})
+				if err := supervisor.Start(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				defer supervisor.Close()
+				var owned, prepared atomic.Bool
+				var terminals atomic.Int32
+				if _, _, err := supervisor.Send(t.Context(), "job", "original", func(event core.Event) {
+					if event.Kind == core.EventFinal && event.Done && !event.Continues {
+						terminals.Add(1)
+					}
+				}); err != nil {
+					t.Fatal(err)
+				}
+				continuation := ""
+				if mode == FollowUpSteer {
+					continuation = "continue original"
+				}
+				if _, err := supervisor.SendControl(t.Context(), "job", ControlRequest{
+					ID: "control", Prompt: "guidance", ContinuationPrompt: continuation,
+					RunContinuation: func(action func()) error {
+						if refused {
+							return errors.New("owner changed")
+						}
+						owned.Store(true)
+						defer owned.Store(false)
+						action()
+						if outcome == "error-after-admission" {
+							return errors.New("refresh failed after admission")
+						}
+						return nil
+					},
+					PrepareContinuation: func() bool {
+						if !owned.Load() {
+							t.Error("continuation preparation escaped owner fence")
+						}
+						prepared.Store(true)
+						return true
+					},
+					ReserveProviderTurn: func() bool {
+						if prepared.Load() && !owned.Load() {
+							t.Error("continuation reservation escaped owner fence")
+						}
+						return true
+					},
+				}); err != nil {
+					t.Fatal(err)
+				}
+				target.finish("job")
+				if !refused {
+					waitSupervisorState(t, func() bool { return target.IsActive("job") && !owned.Load() })
+					target.finish("job")
+				}
+				waitSupervisorState(t, func() bool { return !supervisor.IsActive("job") && terminals.Load() == 1 })
+				if prepared.Load() == refused {
+					t.Fatal("owner fence did not control continuation admission")
+				}
+			})
+		}
 	}
 }
 

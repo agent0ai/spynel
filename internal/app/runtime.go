@@ -385,7 +385,7 @@ func (r *Runtime) tryBeginJobWithDetails(sessionKey, channel, conversation, desc
 		firstAssignedAt = now
 	}
 	iterations := details.ProviderIterations
-	if iterations < 1 {
+	if iterations < 1 && !durable {
 		iterations = 1
 	}
 	job := Job{
@@ -415,13 +415,13 @@ func (r *Runtime) tryBeginJobWithDetails(sessionKey, channel, conversation, desc
 	return job.ID, true, nil
 }
 
-// UpdateJobDurableTiming applies only non-regressing durable observations to
-// an active job, allowing controls and guarded continuations to refresh the
+// UpdateJobDurableTiming applies non-regressing workflow and worker-conversation
+// observations, allowing controls and guarded continuations to refresh the
 // same process-local execution handle without resetting its current execution age.
 func (r *Runtime) UpdateJobDurableTiming(id int, firstAssignedAt time.Time, providerIterations int) bool {
 	r.mu.Lock()
 	job, ok := r.jobs[id]
-	if !ok || !job.Durable {
+	if !ok || !job.Durable && (job.Kind != "conversation" || job.WorkID == "") {
 		r.mu.Unlock()
 		return false
 	}
@@ -911,6 +911,12 @@ func (r *Runtime) ClearLogsResult() (int, error) {
 // Close marks a clean boundary and flushes the current session file.
 func (r *Runtime) Close() {
 	r.closeOnce.Do(func() {
+		r.mu.Lock()
+		archive := r.archive
+		r.mu.Unlock()
+		if archive != nil {
+			archive.close()
+		}
 		r.writerMu.Lock()
 		partial := append([]byte(nil), r.partial...)
 		partials := r.partials

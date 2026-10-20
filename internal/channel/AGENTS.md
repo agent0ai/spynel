@@ -8,9 +8,12 @@
 
 - Adapters translate messages and screens through `core` and the application service; they never invoke harness implementations directly.
 - The supervisor consumes refreshed shared configuration snapshots, replaces only changed adapters, revokes stale adapter authority before cancellation, isolates failures, publishes lifecycle state, and retries only eligible unchanged configurations.
+- Reconciliation checks owner cancellation before construction and again after construction/authorization before admitting a replacement. A cancelled build revokes its replacement authority without starting or retaining it; selected configuration/retry events cannot rebuild channels after shutdown is already observed.
 - Activity references must be balanced and overlap-safe so an older turn cannot clear a newer turn's visible activity.
 - Route proactive canonical conversation events only through the currently connected channel generation and bind their activity references to that generation's cancellation context so disconnect, replacement, and shutdown clean up safely.
 - The proactive delivery contract carries validated attachments as well as text without communication activity. Canonical terminal events forward the same payload through it. Adapters upload files before the caption and return native upload/send failures; the outbox retries the whole message under each transport's existing identity contract.
+
+- Local history-followed conversation responses carry `Notification.Continues` plus private request/response correlation through the existing recovery presentation path. ResponseID reuses the existing application history receipt, pairing its partial and result records; EventID remains reserved for ordinary notification acknowledgement. Partial/intermediate output never settles activity and never enters task-notification acknowledgement.
 
 ## Child DOX Index
 

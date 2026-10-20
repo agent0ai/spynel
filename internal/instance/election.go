@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/fsx"
@@ -53,6 +54,33 @@ type Election struct {
 	pid              int
 	now              func() time.Time
 	environmentID    string
+	observerMu       sync.RWMutex
+	observer         func(Observation)
+}
+
+// Observation contains only ownership reasons and timings, never lease secrets.
+type Observation struct {
+	Operation string
+	Reason    string
+	LockWait  time.Duration
+	LockHeld  time.Duration
+	LeaseAge  time.Duration
+}
+
+// SetObserver installs a diagnostic sink. It is called outside the election lock.
+func (e *Election) SetObserver(observer func(Observation)) {
+	e.observerMu.Lock()
+	e.observer = observer
+	e.observerMu.Unlock()
+}
+
+func (e *Election) observe(observation Observation) {
+	e.observerMu.RLock()
+	observer := e.observer
+	e.observerMu.RUnlock()
+	if observer != nil {
+		observer(observation)
+	}
 }
 
 type releaseFence struct {
@@ -174,7 +202,7 @@ func (e *Election) TryAcquire(endpoint, token string) (Lease, bool, error) {
 	}
 	var result Lease
 	var acquired bool
-	err := e.withLock(func() error {
+	err := e.withLock("acquire", func() error {
 		now := e.now()
 		current, err := e.readLease()
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -209,21 +237,37 @@ func (e *Election) TryAcquire(endpoint, token string) (Lease, bool, error) {
 func (e *Election) Renew(token string) (Lease, bool, error) {
 	var result Lease
 	var owned bool
-	err := e.withLock(func() error {
+	observation := Observation{Operation: "renew", Reason: "lock_failed"}
+	err := e.withLock("renew", func() error {
+		observation.Reason = "read_failed"
 		current, err := e.readLease()
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
+				observation.Reason = "lease_missing"
 				return nil
 			}
 			return err
 		}
 		result = current
-		if current.InstanceID != e.id || current.Token != token || current.HandoffTo != "" {
+		observation.LeaseAge = e.now().Sub(current.HeartbeatAt)
+		if current.InstanceID != e.id {
+			observation.Reason = "different_instance"
+			return nil
+		}
+		if current.Token != token {
+			observation.Reason = "different_term"
+			return nil
+		}
+		if current.HandoffTo != "" {
+			observation.Reason = "handoff"
 			return nil
 		}
 		now := e.now()
+		observation.Reason = "renewed"
 		if stale(current, now) {
-			return nil
+			// Expiry permits takeover, but only a serialized replacement revokes
+			// this exact term. Never tear down healthy work just for a local delay.
+			observation.Reason = "renewed_unchanged_stale_term"
 		}
 		// A matching owner term is authoritative for this process. Restore the
 		// validated local identifier if an older or externally damaged record was
@@ -231,12 +275,14 @@ func (e *Election) Renew(token string) (Lease, bool, error) {
 		current.EnvironmentID = e.environmentID
 		current.HeartbeatAt = now
 		if err := e.writeLease(current); err != nil {
+			observation.Reason = "write_failed"
 			return err
 		}
 		result = current
 		owned = true
 		return nil
 	})
+	e.observe(observation)
 	return result, owned, err
 }
 
@@ -250,7 +296,7 @@ func (e *Election) Handoff(token, targetID string) (Lease, bool, error) {
 	}
 	var result Lease
 	var handedOff bool
-	err := e.withLock(func() error {
+	err := e.withLock("handoff", func() error {
 		current, err := e.readLease()
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -286,7 +332,7 @@ func (e *Election) Handoff(token, targetID string) (Lease, bool, error) {
 // protection. It is safe to call after a takeover because it cannot delete the
 // successor's record.
 func (e *Election) Release(token string) error {
-	return e.withLock(func() error {
+	return e.withLock("release", func() error {
 		current, err := e.readLease()
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -320,8 +366,14 @@ func (e *Election) Current() (Lease, error) {
 // only while the caller's exact ownership term remains current. This lets an
 // owner make a short durable admission indivisible with respect to takeover.
 func (e *Election) RunWhileOwner(token string, action func() error) (bool, error) {
+	return e.RunForOwner(e.id, token, action)
+}
+
+// RunForOwner lets a separate local worker fence a request from the exact
+// elected controller. Possession of an old token never authorizes a new term.
+func (e *Election) RunForOwner(instanceID, token string, action func() error) (bool, error) {
 	ran := false
-	err := e.withLock(func() error {
+	err := e.withLock("owner_action", func() error {
 		current, err := e.readLease()
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -329,11 +381,15 @@ func (e *Election) RunWhileOwner(token string, action func() error) (bool, error
 			}
 			return err
 		}
-		if current.InstanceID != e.id || current.Token != token || current.HandoffTo != "" || stale(current, e.now()) {
+		if instanceID == "" || token == "" || current.InstanceID != instanceID || current.Token != token || current.EnvironmentID != e.environmentID || current.HandoffTo != "" || stale(current, e.now()) {
 			return nil
 		}
 		ran = true
-		return action()
+		actionErr := action()
+		// Provider admission may outlast a heartbeat. No contender can replace
+		// this term while locked; publish fresh expiry before letting one enter.
+		current.HeartbeatAt = e.now()
+		return errors.Join(actionErr, e.writeLease(current))
 	})
 	return ran, err
 }
@@ -353,7 +409,7 @@ func (e *Election) IsStale(lease Lease) bool { return stale(lease, e.now()) }
 // reports whether action ran.
 func (e *Election) RunWhileNoPrimaryLease(action func() error) (bool, error) {
 	ran := false
-	err := e.withLock(func() error {
+	err := e.withLock("ownerless_cleanup", func() error {
 		_, err := e.readLease()
 		if err == nil {
 			return nil
@@ -388,7 +444,7 @@ func stale(lease Lease, now time.Time) bool {
 	return lease.InstanceID == "" || lease.HeartbeatAt.IsZero() || !now.Before(lease.HeartbeatAt.Add(StaleAfter))
 }
 
-func (e *Election) withLock(action func() error) error {
+func (e *Election) withLock(operation string, action func() error) error {
 	if err := os.MkdirAll(filepath.Dir(e.lockPath), 0o700); err != nil {
 		return err
 	}
@@ -397,10 +453,16 @@ func (e *Election) withLock(action func() error) error {
 		return err
 	}
 	defer file.Close()
+	waiting := time.Now()
 	if err := lockFile(file); err != nil {
 		return err
 	}
-	defer unlockFile(file)
+	locked := time.Now()
+	defer func() {
+		held := time.Since(locked)
+		unlockFile(file)
+		e.observe(Observation{Operation: operation, LockWait: locked.Sub(waiting), LockHeld: held})
+	}()
 	return action()
 }
 

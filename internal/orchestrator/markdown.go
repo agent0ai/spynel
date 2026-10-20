@@ -1,9 +1,11 @@
 package orchestrator
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +45,47 @@ func ReadDocument(path string) (Document, error) {
 		return Document{}, err
 	}
 	return ParseDocument(data)
+}
+
+// ReadDocumentMetadata streams only the bounded YAML header, independently of
+// a document's accumulated progress/body size.
+func ReadDocumentMetadata(path string) (Document, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return Document{}, err
+	}
+	defer file.Close()
+	return readDocumentMetadata(bufio.NewReader(file))
+}
+
+func readDocumentMetadata(reader *bufio.Reader) (Document, error) {
+	var header strings.Builder
+	lineStart := 0
+	for {
+		line, more, err := reader.ReadLine()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return Document{}, errors.New("markdown front matter is not terminated within read limit")
+			}
+			return Document{}, err
+		}
+		if header.Len()+len(line)+1 > 1<<20 {
+			return Document{}, errors.New("workflow metadata exceeds read limit")
+		}
+		header.Write(line)
+		if more {
+			continue
+		}
+		delimiter := header.Len()-lineStart == 3 && string(line) == "---"
+		header.WriteByte('\n')
+		if lineStart == 0 && !delimiter {
+			return Document{}, errors.New("markdown document must begin with YAML front matter")
+		}
+		if delimiter && lineStart > 0 {
+			return ParseDocument([]byte(header.String()))
+		}
+		lineStart = header.Len()
+	}
 }
 
 func ParseDocument(data []byte) (Document, error) {
@@ -167,6 +210,10 @@ func reserveProviderTurn(path string, now time.Time, afterRead func()) (time.Tim
 	if afterRead != nil {
 		afterRead()
 	}
+	return reserveProviderTurnLocked(path, now, document)
+}
+
+func reserveProviderTurnLocked(path string, now time.Time, document Document) (time.Time, int, error) {
 	first, ok := frontMatterTime(document.FrontMatter["first_assigned_at"])
 	if !ok || first.After(now) {
 		first = now.UTC()

@@ -144,6 +144,7 @@ func notificationTestManager(t *testing.T, mode string, target *notificationActi
 	}
 	cfg.Orchestrator.TaskNotifications = mode
 	manager := New(cfg, target, extensions.Runner{})
+	manager.NotificationContext = func(Origin) (string, error) { return "", nil }
 	path := filepath.Join(cfg.StatePath("tasks", "done"), "task.md")
 	doc := Document{FrontMatter: map[string]any{
 		"id": "task-1", "title": "Publish report", "status": "done", "attempt": 1,

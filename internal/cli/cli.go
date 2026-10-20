@@ -25,6 +25,7 @@ import (
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/extensions"
+	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
@@ -46,6 +47,16 @@ const (
 )
 
 func Run(args []string, version string) (runErr error) {
+	if len(args) == 1 && args[0] == "__worker" {
+		unregister, err := updater.Detect(version).RegisterHarnessWorker()
+		if err != nil {
+			return err
+		}
+		defer unregister()
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer cancel()
+		return harness.RunWorker(ctx, os.Stdin, os.Stdout, harness.NewBuiltinRegistry(), orchestrator.ApplyWorkerWorkflow, config.PrepareWorkerSettings, app.ApplyWorkerConversation)
+	}
 	if len(args) > 0 && args[0] == "__provider" {
 		unregister, err := updater.Detect(version).RegisterProviderGuardian()
 		if err != nil {
@@ -60,11 +71,14 @@ func Run(args []string, version string) (runErr error) {
 		if err != nil {
 			return err
 		}
-	} else if supervisorEligible(args) {
-		return runSupervisor(args, version)
 	}
 
 	if len(args) == 2 && args[0] == "__diagnostics" {
+		unregister, err := updater.Detect(version).RegisterDiagnosticReader()
+		if err != nil {
+			return errors.New("diagnostic process registration unavailable")
+		}
+		defer unregister()
 		return runProcessDiagnostics(args[1], os.Stdin)
 	}
 	defer func() {
@@ -87,6 +101,8 @@ func Run(args []string, version string) (runErr error) {
 	if executor != nil {
 		defer executor.unregister()
 		runErr = completeExecutorRun(run(args, version))
+	} else if supervisorEligible(args) {
+		runErr = completeRun(runSupervisor(args, version), replaceCurrentProcess)
 	} else {
 		runErr = completeRun(run(args, version), replaceCurrentProcess)
 	}
@@ -140,6 +156,16 @@ func run(args []string, version string) error {
 		return runBareInteractive(version)
 	}
 	switch args[0] {
+	case "send", "followup", "events", "notify", "command", "status", "run",
+		"jobs", "tasks", "goals", "job", "log", "logs", "stop", "new", "clear", "history",
+		"harness", "model", "effort", "speed", "telegram", "restart", "config", "whatsapp":
+		unregister, err := updater.Detect(version).RegisterApplicationClient()
+		if err != nil {
+			return err
+		}
+		defer unregister()
+	}
+	switch args[0] {
 	case "help", "--help", "-h":
 		fmt.Print(helpText)
 		return nil
@@ -187,10 +213,15 @@ func run(args []string, version string) error {
 	case "update":
 		return runUpdateCommand(args[1:], version)
 	case "check-restartable":
-		if len(args) != 1 {
-			return errors.New("usage: spynel check-restartable")
+		flags := flag.NewFlagSet("check-restartable", flag.ContinueOnError)
+		protocol := flags.Int("worker-protocol", core.WorkerProtocol, "target worker protocol (0 if unknown)")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
 		}
-		return updater.Detect(version).CheckRestartable()
+		if flags.NArg() != 0 || *protocol < 0 {
+			return errors.New("usage: spynel check-restartable [--worker-protocol N]")
+		}
+		return updater.Detect(version).CheckRestartableFor(*protocol)
 	case "restart-instances":
 		if len(args) != 1 {
 			return errors.New("usage: spynel restart-instances")
@@ -529,30 +560,30 @@ type updateRequest struct {
 }
 
 func (*updateRequest) Error() string { return "update and restart Spynel" }
-func (r *updateRequest) ExitCode() int {
-	r.writeRestartArgs()
-	return npmUpdateExitCode
-}
+func (*updateRequest) ExitCode() int { return npmUpdateExitCode }
 
-func (r *updateRequest) writeRestartArgs() {
+func (r *updateRequest) writeRestartArgs() error {
 	requestPath := strings.TrimSpace(os.Getenv("SPYNEL_NPM_UPDATE_STATE"))
 	if requestPath == "" || filepath.Clean(filepath.Dir(requestPath)) != filepath.Clean(os.TempDir()) || !strings.HasPrefix(filepath.Base(requestPath), "spynel-update-") {
-		return
+		return errors.New("npm update handoff channel is unavailable")
 	}
 	data, err := json.Marshal(struct {
-		Args    []string `json:"args"`
-		Install bool     `json:"install"`
-		Version string   `json:"version"`
-	}{Args: append([]string(nil), r.args...), Install: r.result.Available, Version: r.result.Latest})
+		Args           []string `json:"args"`
+		Install        bool     `json:"install"`
+		Version        string   `json:"version"`
+		WorkerProtocol int      `json:"worker_protocol"`
+	}{Args: append([]string(nil), r.args...), Install: r.result.Available, Version: r.result.Latest, WorkerProtocol: r.result.TargetWorkerProtocol()})
 	if err != nil {
-		return
+		return err
 	}
-	file, err := os.OpenFile(requestPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return
+	if info, err := os.Lstat(requestPath); err == nil {
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return errors.New("npm update handoff must be a private regular file")
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
-	_, _ = file.Write(append(data, '\n'))
-	_ = file.Close()
+	return fsx.AtomicWriteFile(requestPath, append(data, '\n'), 0o600)
 }
 
 func completeRun(err error, restart func([]string) error) error {
@@ -561,6 +592,12 @@ func completeRun(err error, restart func([]string) error) error {
 
 func completeRunContext(parent context.Context, err error, restart func([]string) error) error {
 	var update *updateRequest
+	if errors.As(err, &update) && !update.standalone {
+		if publishErr := update.writeRestartArgs(); publishErr != nil {
+			return fmt.Errorf("publish npm update handoff: %w", publishErr)
+		}
+		return update
+	}
 	if errors.As(err, &update) && update.standalone {
 		if update.manager == nil {
 			return errors.New("update lost its installation owner")
@@ -825,7 +862,7 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			defer cancel()
 			_ = client.UnregisterLiveTUI(cleanupCtx)
 		}()
-		initialHistory, historyPath, historyOffset, err := histories.RecentEntriesSnapshot("tui", conversation, initialTUIHistoryMessages, initialTUIHistoryChars)
+		initialHistory, _, historyOffset, err := histories.RecentEntriesSnapshot("tui", conversation, initialTUIHistoryMessages, initialTUIHistoryChars)
 		if err != nil {
 			return serverResult(fmt.Errorf("load TUI history: %w", err))
 		}
@@ -838,7 +875,6 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			return serverResult(fmt.Errorf("load initial TUI screen: %w", err))
 		}
 		stateEvents := startTUIStatePolling(ctx, client, shared, cfg.StatePath("themes"), conversation)
-		notificationEvents := watchTaskNotifications(ctx, historyPath, historyOffset)
 		updateManager := updater.Detect(version)
 		if updateManager.InstallRoot != "" {
 			updateManager.PeriodicChecks = standaloneChecksEligible(restartArgs, interactiveTerminal())
@@ -874,9 +910,12 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			ConnectionEvents:   stateEvents.connections,
 			PairingEvents:      stateEvents.pairings,
 			NoticeEvents:       stateEvents.notices,
-			NotificationEvents: notificationEvents,
+			HistoryOffset:      historyOffset,
+			HistoryDirectory:   cfg.StatePath("history"),
 			ConversationEvents: stateEvents.activity,
-			AckNotification:    func(id string, after int) error { return client.AckNotification(ctx, "tui/"+conversation, id, after) },
+			AckNotification: func(selected, id string, after int) error {
+				return client.AckNotification(ctx, "tui/"+selected, id, after)
+			},
 			InitialConnections: shared.Connections,
 			RuntimeEvents:      stateEvents.runtime,
 			InitialRuntime:     shared.Runtime,
@@ -1121,8 +1160,13 @@ func runMessageWithOutput(ctx context.Context, handler channel.Handler, conversa
 
 	var streamed strings.Builder
 	handlerDone := false
+	terminalSeen := false
 	awaitTerminal := false
 	for {
+		// Commands may publish control requests after emitting their reply.
+		if handlerDone && terminalSeen {
+			return nil
+		}
 		if handlerDone && !awaitTerminal {
 			// Framework hooks may intentionally cancel a message without a
 			// visible reply. Drain an event already emitted before Handle
@@ -1157,8 +1201,10 @@ func runMessageWithOutput(ctx context.Context, handler channel.Handler, conversa
 			if !event.Done {
 				awaitTerminal = true
 			}
-			if done, err := writeCLIEvent(output, &streamed, event, options); done || err != nil {
+			if done, err := writeCLIEvent(output, &streamed, event, options); err != nil {
 				return err
+			} else if done {
+				terminalSeen = true
 			}
 		case <-ctx.Done():
 			return ctx.Err()

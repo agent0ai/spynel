@@ -20,7 +20,6 @@ import (
 
 	"github.com/agent0ai/spynel/internal/app"
 	"github.com/agent0ai/spynel/internal/config"
-	"github.com/agent0ai/spynel/internal/updater"
 )
 
 const maxCrashBytes = 64 << 10
@@ -239,11 +238,6 @@ func runProcessDiagnostics(mode string, input io.Reader) error {
 		return errors.New("invalid diagnostic identity")
 	}
 	if mode == "crash" {
-		unregister, err := updater.Detect(d.Version).RegisterDiagnosticReader()
-		if err != nil {
-			return errors.New("diagnostic reader registration unavailable")
-		}
-		defer unregister()
 		if _, err := os.Stdout.Write([]byte{'R'}); err != nil {
 			return errors.New("diagnostic reader readiness failed")
 		}

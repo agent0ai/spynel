@@ -1,7 +1,6 @@
 package updater
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -55,7 +54,7 @@ func SetExecutor(pid int, ready, stopping bool) error {
 		}
 		record.ExecutorPID, record.ExecutorGeneration = pid, child.Generation
 	}
-	data, err := json.Marshal(record)
+	data, err := record.registryJSON()
 	if err != nil {
 		return err
 	}
@@ -67,7 +66,7 @@ func SetExecutor(pid int, ready, stopping bool) error {
 }
 
 func restartTarget(record ProcessRegistration) bool {
-	return !record.DiagnosticReader && !record.ProviderGuardian && record.SupervisorPID == 0
+	return !record.DiagnosticReader && !record.ProviderGuardian && !record.HarnessWorker && !record.ApplicationClient && record.SupervisorPID == 0
 }
 
 // RetireExecutor is called by its supervisor only after direct-child Wait.
@@ -96,7 +95,8 @@ func RetireExecutor(pid int) error {
 func relatedProcesses(parent, child ProcessRegistration) bool {
 	pid, err := processParentID(child.PID)
 	path, pathErr := installationProcessPath(child.PID)
-	return err == nil && pid == parent.PID && pathErr == nil && processMatches(child, path) && child.Installation == parent.Installation
+	alive, start, stateErr := inspectProcess(child.PID)
+	return err == nil && pid == parent.PID && pathErr == nil && stateErr == nil && alive && (child.StartTime == "" || child.StartTime == start) && processMatches(child, path) && child.Installation == parent.Installation
 }
 
 func sameProcessImage(first, second int) bool {

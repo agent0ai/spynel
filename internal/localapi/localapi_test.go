@@ -23,6 +23,7 @@ import (
 	"github.com/agent0ai/spynel/internal/history"
 	"github.com/agent0ai/spynel/internal/instance"
 	"github.com/agent0ai/spynel/internal/shortid"
+	"github.com/agent0ai/spynel/internal/updater"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -109,6 +110,7 @@ func TestUnknownEnvironmentReadinessIsBoundedAndRedacted(t *testing.T) {
 
 type apiHarness struct {
 	mu      sync.Mutex
+	workers sync.WaitGroup
 	active  map[string]bool
 	threads map[string]string
 	keys    []string
@@ -129,8 +131,10 @@ func (h *apiHarness) Send(_ context.Context, key, _ string, emit core.Emit) (str
 		h.threads[key] = thread
 	}
 	h.active[key] = true
+	h.workers.Add(1)
 	h.mu.Unlock()
 	go func() {
+		defer h.workers.Done()
 		time.Sleep(5 * time.Millisecond)
 		h.mu.Lock()
 		delete(h.active, key)
@@ -157,7 +161,26 @@ func (h *apiHarness) IsActive(key string) bool {
 	defer h.mu.Unlock()
 	return h.active[key]
 }
-func (h *apiHarness) Close() error { return nil }
+func (h *apiHarness) Close() error { h.workers.Wait(); return nil }
+
+func TestAPIHarnessCloseJoinsTerminalCallback(t *testing.T) {
+	target := newAPIHarness()
+	emitting, release, closed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	if _, _, err := target.Send(context.Background(), "fixture", "", func(core.Event) {
+		close(emitting)
+		<-release
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-emitting
+	go func() { _ = target.Close(); close(closed) }()
+	defer func() { close(release); <-closed }()
+	select {
+	case <-closed:
+		t.Fatal("fixture closed while its terminal callback was still writing")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
 
 func TestClientStreamsIndependentTUIConversationsThroughOwner(t *testing.T) {
 	state := t.TempDir()
@@ -277,6 +300,34 @@ func TestResumeScreenActionRegistersBranchThroughOwner(t *testing.T) {
 	}
 	if _, err := os.Stat(server.Service.History.Path("tui", chat.Conversation)); err != nil {
 		t.Fatalf("owner-admitted resume branch was removed: %v", err)
+	}
+}
+
+func TestNewCommandSelectsThreadBeforeExposingScreenThroughOwner(t *testing.T) {
+	election, server, _, cancel, done := startTestServer(t, t.TempDir())
+	defer func() { cancel(); <-done; lease, _ := election.Current(); _ = election.Release(lease.Token) }()
+	client := NewClient(election)
+	ctx := context.Background()
+	if _, err := server.Service.History.Ensure("cli", "fallback"); err != nil {
+		t.Fatal(err)
+	}
+	var screen *core.Screen
+	if err := client.Handle(ctx, core.Message{Channel: "tui", Conversation: "original", Text: "/new"}, func(event core.Event) {
+		if event.Screen != nil {
+			screen = event.Screen
+			if _, err := client.NotifyWithFallback(ctx, "tui/original", "cli/fallback", "result after switch"); err != nil {
+				t.Error(err)
+			}
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if screen == nil || screen.Conversation == "original" {
+		t.Fatal("new screen did not cross the API")
+	}
+	entries, _, err := server.Service.History.RecentEntries("cli", "fallback", 20, 12000)
+	if err != nil || len(entries) != 1 || entries[0].Content != "result after switch" {
+		t.Fatalf("post-screen fallback=%#v err=%v", entries, err)
 	}
 }
 
@@ -422,7 +473,7 @@ func TestClientStatusIdentifiesCallerAndPrimaryInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Instance != shortid.Display(secondary.ID()) || snapshot.PrimaryInstance != shortid.Display(primary.ID()) || len(snapshot.Connections) != 2 {
+	if snapshot.Version != "primary-version" || snapshot.Instance != shortid.Display(secondary.ID()) || snapshot.PrimaryInstance != shortid.Display(primary.ID()) || len(snapshot.Connections) != 2 {
 		t.Fatalf("structured status = %#v", snapshot)
 	}
 	var final core.Event
@@ -434,7 +485,7 @@ func TestClientStatusIdentifiesCallerAndPrimaryInstances(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"Instance ID: `" + shortid.Display(secondary.ID()) + "`",
+		"Version: primary-version\n- Instance ID: `" + shortid.Display(secondary.ID()) + "`",
 		"Primary instance ID: `" + shortid.Display(primary.ID()) + "`",
 	} {
 		if !strings.Contains(final.Text, want) {
@@ -458,6 +509,8 @@ func startTestServer(t *testing.T, state string) (*instance.Election, *Server, *
 	}
 	target := newAPIHarness()
 	service := app.New(cfg, target)
+	t.Cleanup(func() { _ = service.Close() })
+	service.Updates = &updater.Manager{CurrentVersion: "primary-version"}
 	election, err := instance.New(cfg.StatePath())
 	if err != nil {
 		t.Fatal(err)
@@ -503,5 +556,81 @@ func TestScreenActionReturnsRefreshedStateWithFailure(t *testing.T) {
 	screen, err := client.ScreenAction(context.Background(), "config", "autostart:enable", nil)
 	if err == nil || screen == nil || screen.SavedControl == nil || screen.SavedControl.Key != "autostart:check" || !strings.Contains(screen.SavedControl.Description, "state unavailable") {
 		t.Fatalf("error state crossed API incorrectly: %#v, %v", screen, err)
+	}
+}
+
+func TestEscalationCrossesAuthenticatedOwnerAndDeduplicates(t *testing.T) {
+	election, server, _, cancel, done := startTestServer(t, t.TempDir())
+	defer func() { cancel(); <-done; lease, _ := election.Current(); _ = election.Release(lease.Token) }()
+	client := NewClient(election)
+	ctx := context.Background()
+	for _, name := range []string{"original", "fallback"} {
+		if _, err := server.Service.History.Ensure("cli", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var first string
+	for i := 0; i < 2; i++ {
+		id, err := client.NotifyEscalation(ctx, "cli/original", "cli/fallback", "decision", "Needs your answer: choose a color.")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i > 0 && id != first {
+			t.Fatal("API changed stable identity")
+		}
+		first = id
+	}
+	entries, _, err := server.Service.History.RecentEntries("cli", "fallback", 20, 12000)
+	if err != nil || len(entries) != 1 || entries[0].EventID != first {
+		t.Fatalf("escalation history %#v %v", entries, err)
+	}
+	original, _, _ := server.Service.History.RecentEntries("cli", "original", 20, 12000)
+	if len(original) != 0 {
+		t.Fatal("API escalation repeated original")
+	}
+	if _, err := client.NotifyEscalation(ctx, "cli/original", "", "bad", "must not send"); err == nil {
+		t.Fatal("API accepted missing association")
+	}
+}
+
+func TestCancelNotificationCrossesAuthenticatedOwner(t *testing.T) {
+	election, server, _, cancel, done := startTestServer(t, t.TempDir())
+	defer func() { cancel(); <-done; lease, _ := election.Current(); _ = election.Release(lease.Token) }()
+	client := NewClient(election)
+	outbox := server.Service.Orchestrator.Outbox
+	entry, err := outbox.EnqueueEscalation("pending", "tui/original", "telegram/TG-7", "question")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if state, err := client.CancelNotification(context.Background(), entry.Origin, entry.ID); err != nil || state != "cancelled" {
+			t.Fatalf("cancel: %s %v", state, err)
+		}
+	}
+	if _, err := client.CancelNotification(context.Background(), "tui/unrelated", entry.ID); err == nil {
+		t.Fatal("cancelled wrong original route")
+	}
+	for _, input := range []notifyRequest{
+		{Origin: entry.Origin, CancelID: entry.ID, Message: "not a send"},
+		{RecentAuthorized: true, CancelID: entry.ID},
+		{Origin: entry.Origin, CancelID: entry.ID, EscalationKey: "decision"},
+		{Origin: entry.Origin, CancelID: entry.ID, FallbackOrigin: "cli/other"},
+	} {
+		body, _ := json.Marshal(input)
+		response, err := client.request(context.Background(), http.MethodPost, "/v1/notify", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("mixed cancellation accepted: %d", response.StatusCode)
+		}
+	}
+	if err := outbox.Process(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := server.Service.History.RecentEntries("telegram", "TG-7", 20, 12000)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("cancel caused delivery: %#v %v", entries, err)
 	}
 }

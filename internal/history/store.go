@@ -25,26 +25,31 @@ const (
 )
 
 type Entry struct {
-	At               time.Time `json:"at"`
-	Role             string    `json:"role"`
-	Sender           string    `json:"sender,omitempty"`
-	ReplyTo          string    `json:"reply_to,omitempty"`
-	Content          string    `json:"content"`
-	EventID          string    `json:"event_id,omitempty"`
-	AfterChars       int       `json:"after_chars,omitempty"`
-	Terminal         bool      `json:"terminal,omitempty"`
-	FinalText        *string   `json:"final_text,omitempty"`
-	Continues        bool      `json:"continues,omitempty"`
-	SourceMessageID  string    `json:"source_message_id,omitempty"`
-	AcceptedAt       time.Time `json:"accepted_at,omitempty"`
-	ExecutionID      string    `json:"execution_id,omitempty"`
-	Admission        string    `json:"admission,omitempty"`
-	Covers           []string  `json:"covers,omitempty"`
-	Outcome          string    `json:"outcome,omitempty"`
-	RetriggerOf      []string  `json:"retrigger_of,omitempty"`
-	Recovery         bool      `json:"recovery,omitempty"`
-	RecoveryBaseline bool      `json:"recovery_baseline,omitempty"`
-	compact          bool
+	At                time.Time `json:"at"`
+	Role              string    `json:"role"`
+	Sender            string    `json:"sender,omitempty"`
+	ReplyTo           string    `json:"reply_to,omitempty"`
+	Content           string    `json:"content"`
+	EventID           string    `json:"event_id,omitempty"`
+	ReceiptID         string    `json:"receipt_id,omitempty"`
+	ReceiptHash       string    `json:"receipt_hash,omitempty"`
+	AfterChars        int       `json:"after_chars,omitempty"`
+	Terminal          bool      `json:"terminal,omitempty"`
+	FinalText         *string   `json:"final_text,omitempty"`
+	Continues         bool      `json:"continues,omitempty"`
+	SourceMessageID   string    `json:"source_message_id,omitempty"`
+	AcceptedAt        time.Time `json:"accepted_at,omitempty"`
+	ExecutionID       string    `json:"execution_id,omitempty"`
+	Admission         string    `json:"admission,omitempty"`
+	AdmittedSources   []string  `json:"admitted_sources,omitempty"`
+	RestoresAdmission string    `json:"restores_admission,omitempty"`
+	Covers            []string  `json:"covers,omitempty"`
+	Outcome           string    `json:"outcome,omitempty"`
+	CancellationID    string    `json:"cancellation_id,omitempty"`
+	RetriggerOf       []string  `json:"retrigger_of,omitempty"`
+	Recovery          bool      `json:"recovery,omitempty"`
+	RecoveryBaseline  bool      `json:"recovery_baseline,omitempty"`
+	compact           bool
 }
 
 // ActivateRecovery establishes the forward-only correlation boundary. The
@@ -183,61 +188,25 @@ func (s *Store) appendLocked(channel, conversation string, entry Entry) (string,
 func (s *Store) ReserveRetrigger(channel, conversation string, requested []string, activation, cutoff time.Time, max int) ([]Entry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	path := s.Path(channel, conversation)
-	file, err := os.Open(path)
+	snapshot, err := s.recoveryWindowLocked(channel, conversation, cutoff, 0, max, requested)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 	wanted := map[string]bool{}
 	for _, id := range requested {
 		if id != "" {
 			wanted[id] = true
 		}
 	}
-	covered := map[string]bool{}
-	admitted := map[string]bool{}
 	users := map[string]Entry{}
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
-	count := 0
-	for scanner.Scan() {
-		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
-			continue
-		}
-		count++
-		if max > 0 && count > max {
-			return nil, fmt.Errorf("conversation history exceeds recovery bound of %d entries", max)
-		}
-		var entry Entry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			return nil, errors.New("conversation history contains corrupt correlation data")
-		}
-		if entry.RecoveryBaseline {
-			covered = map[string]bool{}
-			admitted = map[string]bool{}
-			users = map[string]Entry{}
-			continue
-		}
-		for _, id := range entry.Covers {
-			covered[id] = true
-		}
-		for _, id := range entry.RetriggerOf {
-			covered[id] = true
-		}
-		if wanted[entry.SourceMessageID] && entry.Admission != "" {
-			admitted[entry.SourceMessageID] = true
-		}
-		if entry.Role == "user" && wanted[entry.SourceMessageID] && !entry.AcceptedAt.IsZero() && !entry.AcceptedAt.Before(activation) && !entry.At.Before(cutoff) {
+	for _, entry := range snapshot.Entries {
+		if wanted[entry.SourceMessageID] && !entry.AcceptedAt.IsZero() && !entry.AcceptedAt.Before(activation) {
 			users[entry.SourceMessageID] = entry
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
 	ids := make([]string, 0, len(users))
 	for id := range users {
-		if !covered[id] {
+		if snapshot.Covered[id] == "" {
 			ids = append(ids, id)
 		}
 	}
@@ -251,7 +220,7 @@ func (s *Store) ReserveRetrigger(channel, conversation string, requested []strin
 	result := make([]Entry, 0, len(ids))
 	for _, id := range ids {
 		entry := users[id]
-		if admitted[id] {
+		if snapshot.Admitted[id] {
 			entry.Admission = "admitted"
 		}
 		result = append(result, entry)
@@ -289,25 +258,29 @@ func (s *Store) DeliveryState(channel, conversation, eventID string) (string, er
 		return "", err
 	}
 	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
+	reader := bufio.NewReaderSize(file, historyReadChunk)
 	state := ""
-	for scanner.Scan() {
-		var entry Entry
-		if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.EventID == eventID {
+	for {
+		entry, _, err := readCorrelationEntry(reader)
+		if err == io.EOF {
+			return state, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if entry.EventID == eventID {
 			switch entry.Role {
 			case "notification_sending":
 				state = "sending"
 			case "notification_failed":
 				state = "failed"
-			case "assistant":
+			case "assistant", "notification_pending":
 				if entry.Sender == "Spy" {
 					state = "sent"
 				}
 			}
 		}
 	}
-	return state, scanner.Err()
 }
 
 func (s *Store) Recent(channel, conversation string, characterLimit int) (string, string, error) {
@@ -466,11 +439,39 @@ func readRecentEntriesThroughFile(file *os.File, messageLimit, characterLimit in
 		block = append(block, carry...)
 		parts := bytes.Split(block, []byte{'\n'})
 		carry = append(carry[:0], parts[0]...)
-		if len(carry) > maxHistoryEntryBytes {
-			return nil, fmt.Errorf("history entry exceeds %d bytes", maxHistoryEntryBytes)
-		}
 		for index := len(parts) - 1; index >= 1 && !stopped; index-- {
 			consume(parts[index])
+		}
+		if len(carry) > maxHistoryEntryBytes && !stopped {
+			// Locate the oversized record without retaining its growing body.
+			end := position + int64(len(carry))
+			carry = nil
+			for position > 0 {
+				length := min(position, int64(historyReadChunk))
+				position -= length
+				chunk := make([]byte, length)
+				if _, err := file.ReadAt(chunk, position); err != nil {
+					return nil, err
+				}
+				if newline := bytes.LastIndexByte(chunk, '\n'); newline >= 0 {
+					position += int64(newline + 1)
+					break
+				}
+			}
+			reader := bufio.NewReader(io.NewSectionReader(file, position, end-position))
+			entry, _, err := readCorrelationEntry(reader)
+			if err == nil {
+				if entry.IsContentExcerpt() {
+					entry.Content += "\n[Body excerpt; inspect the full history file for complete text.]"
+				}
+				raw, marshalErr := json.Marshal(entry)
+				if marshalErr != nil {
+					return nil, marshalErr
+				}
+				consume(raw)
+			} else if !errors.Is(err, ErrRecoveryCorrupt) && !errors.Is(err, ErrRecoveryByteBound) {
+				return nil, err
+			}
 		}
 	}
 	if position == 0 && !stopped {
@@ -637,7 +638,19 @@ func (s *Store) HasEntries(channel, conversation string) (bool, error) {
 // HasUserSourceID strictly checks retained history with bounded memory.
 // Recovery's entry limit must not prevent new messages in long conversations.
 func (s *Store) HasUserSourceID(channel, conversation, sourceID string) (bool, error) {
-	if sourceID == "" {
+	return s.HasUserSourceIDs(channel, conversation, []string{sourceID})
+}
+
+// HasUserSourceIDs validates a retained source set in one complete bounded-memory scan.
+func (s *Store) HasUserSourceIDs(channel, conversation string, sourceIDs []string) (bool, error) {
+	wanted := make(map[string]bool, len(sourceIDs))
+	for _, source := range sourceIDs {
+		if source == "" {
+			return false, nil
+		}
+		wanted[source] = false
+	}
+	if len(wanted) == 0 {
 		return false, nil
 	}
 	s.mu.Lock()
@@ -650,26 +663,22 @@ func (s *Store) HasUserSourceID(channel, conversation, sourceID string) (bool, e
 		return false, err
 	}
 	defer file.Close()
-	// ponytail: linear scan; add a durable source-ID index if admission gets slow.
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, historyReadChunk), maxHistoryEntryBytes)
-	found := false
-	for scanner.Scan() {
-		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
-			continue
+	// shortcut: linear validation, add an index if admission latency requires it.
+	reader := bufio.NewReaderSize(file, historyReadChunk)
+	found := 0
+	for {
+		entry, _, err := readCorrelationEntry(reader)
+		if err == io.EOF {
+			return found == len(wanted), nil
 		}
-		var entry Entry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			return false, errors.New("conversation history contains corrupt correlation data")
+		if err != nil {
+			return false, err
 		}
-		if entry.Role == "user" && entry.SourceMessageID == sourceID {
-			found = true
+		if seen, exists := wanted[entry.SourceMessageID]; entry.Role == "user" && exists && !seen {
+			wanted[entry.SourceMessageID] = true
+			found++
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return false, err
-	}
-	return found, nil
 }
 
 // RecoveryEntries strictly reads at most max append-only entries. Recovery
@@ -708,50 +717,210 @@ func (s *Store) RecoveryEntries(channel, conversation string, max int) ([]Entry,
 	return entries, path, nil
 }
 
-// RecoveryTail strictly validates a bounded file prefix while retaining only
-// the newest tailMax entries. It never treats omitted overflow as handled.
-func (s *Store) RecoveryTail(channel, conversation string, tailMax, scanMax int) ([]Entry, bool, string, error) {
+var (
+	ErrRecoveryByteBound = errors.New("conversation correlation metadata exceeds byte bound")
+	ErrRecoveryCorrupt   = errors.New("conversation history contains corrupt correlation data")
+)
+
+const maxRecoveryWindowBytes = 8 * 1024 * 1024
+
+// RecoverySnapshot retains recent user bodies and only their exact correlation.
+// Records counts recent records in this page, including replies and ledgers.
+type RecoverySnapshot struct {
+	Entries          []Entry
+	Covered          map[string]string
+	Admitted         map[string]bool
+	Records          int
+	Next             int
+	More             bool
+	recoveryAdmitted map[string]bool
+	admissions       map[string]conversationAdmission
+}
+
+type conversationAdmission struct {
+	execution, receipt string
+	batchSize          int
+}
+
+// RecoveryWindow returns the first bounded page of recent history. Callers
+// continue with RecoveryPage while More is true; corruption fails closed.
+func (s *Store) RecoveryWindow(channel, conversation string, cutoff time.Time, max int) (RecoverySnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	path := s.Path(channel, conversation)
-	file, err := os.Open(path)
+	return s.recoveryWindowLocked(channel, conversation, cutoff, 0, max, nil)
+}
+
+// RecoveryPage returns a bounded page, after a validated record position. Each
+// page validates the entire file and resolves exact coverage before returning.
+func (s *Store) RecoveryPage(channel, conversation string, cutoff time.Time, after, max int) (RecoverySnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recoveryWindowLocked(channel, conversation, cutoff, after, max, nil)
+}
+
+func (s *Store) recoveryWindowLocked(channel, conversation string, cutoff time.Time, after, max int, requested []string) (RecoverySnapshot, error) {
+	result := RecoverySnapshot{Covered: map[string]string{}, Admitted: map[string]bool{}, recoveryAdmitted: map[string]bool{}, admissions: map[string]conversationAdmission{}}
+	if max <= 0 || after < 0 {
+		return result, errors.New("invalid recovery page bounds")
+	}
+	file, err := os.Open(s.Path(channel, conversation))
 	if os.IsNotExist(err) {
-		return nil, false, path, nil
+		return result, nil
 	}
 	if err != nil {
-		return nil, false, path, err
+		return RecoverySnapshot{}, err
 	}
 	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), maxHistoryEntryBytes)
-	entries := make([]Entry, 0, min(tailMax, 128))
-	count := 0
-	for scanner.Scan() {
-		if len(bytes.TrimSpace(scanner.Bytes())) == 0 {
-			continue
-		}
-		count++
-		if scanMax > 0 && count > scanMax {
-			return nil, true, path, fmt.Errorf("conversation history exceeds recovery scan bound of %d entries", scanMax)
-		}
-		var entry Entry
-		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
-			return nil, false, path, errors.New("conversation history contains corrupt correlation data")
-		}
-		if tailMax <= 0 {
-			continue
-		}
-		if len(entries) == tailMax {
-			copy(entries, entries[1:])
-			entries[len(entries)-1] = entry
-		} else {
-			entries = append(entries, entry)
+	// Two passes keep correlation exact even with out-of-order timestamps while
+	// retaining no lifetime-sized source index or old message bodies.
+	scan := func(visit func(Entry, int) error) error {
+		reader := bufio.NewReaderSize(file, historyReadChunk)
+		for {
+			entry, size, err := readCorrelationEntry(reader)
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := visit(entry, size); err != nil {
+				return err
+			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, false, path, err
+	retainedBytes, position := 0, 0
+	wanted := map[string]bool{}
+	for _, id := range requested {
+		wanted[id] = true
 	}
-	return entries, tailMax > 0 && count > tailMax, path, nil
+	err = scan(func(entry Entry, size int) error {
+		position++
+		if entry.RecoveryBaseline {
+			result.Entries = nil
+		}
+		if requested != nil {
+			if entry.Role == "user" && !entry.At.Before(cutoff) && wanted[entry.SourceMessageID] {
+				for i, previous := range result.Entries {
+					if previous.SourceMessageID == entry.SourceMessageID {
+						result.Entries[i] = entry
+						return nil
+					}
+				}
+				result.Entries = append(result.Entries, entry)
+			}
+			return nil
+		}
+		if position <= after || result.More {
+			return nil
+		}
+		if !entry.At.Before(cutoff) {
+			if result.Records >= max || result.Records > 0 && retainedBytes+size > maxRecoveryWindowBytes {
+				result.More = true
+				return nil
+			}
+			result.Records++
+			retainedBytes += size
+			if entry.Role == "user" {
+				result.Entries = append(result.Entries, entry)
+			}
+		}
+		result.Next = position
+		return nil
+	})
+	if err != nil {
+		return RecoverySnapshot{}, err
+	}
+	clear(wanted)
+	for _, entry := range result.Entries {
+		wanted[entry.SourceMessageID] = true
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return RecoverySnapshot{}, err
+	}
+	cancellation := map[string]string{}
+	err = scan(func(entry Entry, _ int) error {
+		if entry.RecoveryBaseline {
+			clear(result.Covered)
+			clear(result.Admitted)
+			clear(result.recoveryAdmitted)
+			clear(result.admissions)
+			clear(cancellation)
+		}
+		if entry.RestoresAdmission != "" || entry.Outcome == "admission_restored" {
+			if entry.Role != "correlation" || entry.Outcome != "admission_restored" ||
+				validateReceiptIdentity(entry.RestoresAdmission) != nil || validateConversationSources(entry.ExecutionID, entry.AdmittedSources) != nil ||
+				entry.Admission != "" || entry.SourceMessageID != "" || len(entry.Covers) != 0 || len(entry.RetriggerOf) != 0 || entry.CancellationID != "" || entry.Recovery || entry.RecoveryBaseline {
+				return ErrRecoveryCorrupt
+			}
+			for _, id := range entry.AdmittedSources {
+				if !wanted[id] {
+					continue
+				}
+				if result.recoveryAdmitted[id] || result.admissions[id] != (conversationAdmission{execution: entry.ExecutionID, receipt: entry.RestoresAdmission, batchSize: len(entry.AdmittedSources)}) {
+					return ErrRecoveryCorrupt
+				}
+				delete(result.Admitted, id)
+				delete(result.admissions, id)
+				delete(result.recoveryAdmitted, id)
+			}
+			return nil
+		}
+		if entry.CancellationID != "" || entry.Outcome == "cancellation_requested" || entry.Outcome == "cancellation_restored" {
+			if !validConversationIdentity(entry.CancellationID) || entry.Role != "correlation" || (entry.Outcome != "cancellation_requested" && entry.Outcome != "cancellation_restored") || validateConversationSources(entry.ExecutionID, entry.Covers) != nil {
+				return ErrRecoveryCorrupt
+			}
+			for _, id := range entry.Covers {
+				if !wanted[id] {
+					continue
+				}
+				if entry.Outcome == "cancellation_requested" && cancellation[id] == "" {
+					cancellation[id] = entry.CancellationID
+				} else if entry.Outcome == "cancellation_restored" && cancellation[id] == entry.CancellationID {
+					delete(cancellation, id)
+				}
+			}
+			return nil
+		}
+		for _, id := range entry.Covers {
+			if wanted[id] {
+				reason := "terminal_coverage"
+				if entry.Outcome == "intentional_cancellation" {
+					reason = "intentional_cancellation"
+				}
+				result.Covered[id] = reason
+			}
+		}
+		for _, id := range entry.RetriggerOf {
+			if wanted[id] {
+				if result.Covered[id] == "" {
+					result.Covered[id] = "prior_reservation"
+				}
+			}
+		}
+		if wanted[entry.SourceMessageID] && entry.Admission != "" {
+			result.Admitted[entry.SourceMessageID] = true
+			result.admissions[entry.SourceMessageID] = conversationAdmission{execution: entry.ExecutionID, receipt: entry.ReceiptID, batchSize: 1}
+		}
+		for _, id := range entry.AdmittedSources {
+			if wanted[id] {
+				result.Admitted[id] = true
+				result.admissions[id] = conversationAdmission{execution: entry.ExecutionID, receipt: entry.ReceiptID, batchSize: len(entry.AdmittedSources)}
+				if entry.Recovery {
+					result.recoveryAdmitted[id] = true
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return RecoverySnapshot{}, err
+	}
+	for id := range cancellation {
+		if result.Covered[id] == "" || result.Covered[id] == "prior_reservation" {
+			result.Covered[id] = "cancellation_requested"
+		}
+	}
+	return result, nil
 }
 
 // List discovers conversations from disk and reads only one bounded tail entry
@@ -806,6 +975,59 @@ func (s *Store) List(limit int) ([]Conversation, error) {
 		}
 	}
 	return newestConversations(conversations, limit), nil
+}
+
+// RecoveryConversations pages stable lexical keys instead of repeatedly taking
+// the newest conversations. Directory reads and retained metadata stay bounded.
+func (s *Store) RecoveryConversations(after string, limit int) ([]Conversation, bool, error) {
+	channels, err := os.ReadDir(s.root)
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var result []Conversation
+	for _, channel := range channels {
+		if !channel.IsDir() {
+			continue
+		}
+		directory, err := os.Open(filepath.Join(s.root, channel.Name()))
+		if err != nil {
+			return nil, false, err
+		}
+		for {
+			entries, readErr := directory.ReadDir(100)
+			if readErr != nil && readErr != io.EOF {
+				directory.Close()
+				return nil, false, readErr
+			}
+			for _, entry := range entries {
+				if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || filepath.Ext(entry.Name()) != ".jsonl" {
+					continue
+				}
+				path := filepath.Join(s.root, channel.Name(), entry.Name())
+				if path <= after {
+					continue
+				}
+				result = append(result, Conversation{Channel: channel.Name(), Conversation: strings.TrimSuffix(entry.Name(), ".jsonl"), Path: path})
+				if len(result) > 2*(limit+1) {
+					sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+					result = result[:limit+1]
+				}
+			}
+			if readErr == io.EOF {
+				break
+			}
+		}
+		directory.Close()
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	more := len(result) > limit
+	if more {
+		result = result[:limit]
+	}
+	return result, more, nil
 }
 
 // ListUserActivity returns the newest accepted user activity per conversation.

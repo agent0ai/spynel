@@ -31,7 +31,7 @@ type HarnessConfig struct {
 	Network        bool
 	SessionsFile   string
 	Version        string
-	Stderr         io.Writer
+	Stderr         io.Writer `json:"-"`
 	processOwner   *processOwnership
 }
 
@@ -155,8 +155,16 @@ type FollowUpProvider interface {
 // beforeDelivery callback is the atomic durable reservation boundary: the
 // adapter calls it exactly once after fencing completion and immediately
 // before provider delivery, or not at all when the turn is already inactive.
+// Coordination preserves the existing emitter; it never hands off its stream.
 type NativeSteerer interface {
-	Steer(context.Context, string, string, core.Emit, func() bool) (threadID string, err error)
+	Steer(context.Context, string, string, func() bool) (threadID string, err error)
+}
+
+// ConversationSteerer transfers the response stream only within an existing
+// native turn. Completion and emitter replacement share the adapter's delivery
+// fence; an inactive turn is refused before delivery, never started again.
+type ConversationSteerer interface {
+	SteerConversation(context.Context, string, string, core.Emit) (threadID string, err error)
 }
 
 var (
@@ -174,6 +182,8 @@ type ControlRequest struct {
 	Validate            func() bool
 	PrepareContinuation func() bool
 	ReserveProviderTurn func() bool
+	// RunContinuation fences a queued delivery and its callbacks together.
+	RunContinuation func(func()) error
 }
 
 type ControlResult struct {
@@ -196,9 +206,18 @@ type ConversationSender interface {
 	SendConversation(context.Context, string, string, string, core.Emit) (threadID string, steered bool, err error)
 }
 
+// SendNotAdmittedError proves this request reached neither the provider nor
+// its continuation queue. Other Send errors leave delivery uncertain.
+type SendNotAdmittedError struct{ Err error }
+
+func (e *SendNotAdmittedError) Error() string { return e.Err.Error() }
+func (e *SendNotAdmittedError) Unwrap() error { return e.Err }
+
 type Harness interface {
 	Start(context.Context) error
+	// Only SendNotAdmittedError permits rollback of source admission.
 	Send(context.Context, string, string, core.Emit) (threadID string, steered bool, err error)
+	// Errors leave interruption uncertain; false with nil error means no interruption was needed.
 	Interrupt(context.Context, string) (bool, error)
 	ResetSession(string) error
 	ThreadID(string) string

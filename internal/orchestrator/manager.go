@@ -28,6 +28,7 @@ import (
 type Lease struct {
 	ID                     string          `json:"id"`
 	ClaimID                string          `json:"claim_id,omitempty"`
+	WorkID                 string          `json:"work_id,omitempty"`
 	DocumentType           string          `json:"document_type,omitempty"`
 	OwnerID                string          `json:"owner_id,omitempty"`
 	Route                  string          `json:"route"`
@@ -36,6 +37,7 @@ type Lease struct {
 	SessionKey             string          `json:"session_key"`
 	ThreadID               string          `json:"thread_id,omitempty"`
 	State                  string          `json:"state"`
+	CancellationRequested  bool            `json:"cancellation_requested,omitempty"`
 	StartedAt              time.Time       `json:"started_at"`
 	HeartbeatAt            time.Time       `json:"heartbeat_at"`
 	RecoveryCount          int             `json:"recovery_count"`
@@ -56,6 +58,7 @@ type ScheduledCheckpoint struct {
 type Manager struct {
 	Config                   config.Config
 	Harness                  harness.Harness
+	Worker                   *harness.WorkerClient
 	Hooks                    extensions.Runner
 	Log                      func(string)
 	JobStarted               func(lease Lease, description string, firstAssignedAt time.Time, providerIterations, implementationAttempts int) (int, error)
@@ -63,8 +66,14 @@ type Manager struct {
 	JobTimingUpdated         func(id int, firstAssignedAt time.Time, providerIterations int)
 	JobExecutionUpdated      func(id int, status core.ExecutionStatus)
 	JobEvent                 func(id int, event core.Event)
+	JobDelivery              func(id int, delivery harness.WorkerDelivery) error
 	JobFinished              func(id int)
+	ConversationAttached     func(harness.WorkerExecution) (int, error)
+	ConversationStarted      func(harness.WorkerConversation) (int, error)
+	ConversationDelivery     func(context.Context, int, harness.WorkerDelivery) error
+	ConversationCancellation func(harness.WorkerConversation, string, bool) error
 	Cleanup                  func(context.Context, int) (string, error)
+	NotificationContext      func(Origin) (string, error)
 	notificationAgentTimeout time.Duration
 	runtimeConfigMu          sync.RWMutex
 	runtimeConfig            config.Config
@@ -115,6 +124,9 @@ type Manager struct {
 	heartbeatNext               time.Time
 	cleanupDays                 atomic.Int64
 	cleanupTicks                <-chan time.Time
+	workerAdmissionMu           sync.Mutex
+	conversationRequests        map[uint64]map[string]*conversationRequest
+	workerConsumerContext       context.Context
 	claimDocument               func(source, target, status, attemptField string, now time.Time) (Document, error)
 }
 
@@ -237,6 +249,9 @@ func (m *Manager) SetNotificationDelivery(deliver func(context.Context, Origin, 
 }
 
 func (m *Manager) Run(ctx context.Context) error {
+	m.mu.Lock()
+	m.workerConsumerContext = ctx
+	m.mu.Unlock()
 	if err := m.ScanOnce(ctx); err != nil {
 		m.log("orchestrator scan: " + err.Error())
 	}
@@ -369,17 +384,18 @@ func (m *Manager) resetScanTimer(acceptedAt time.Time) {
 }
 
 func (m *Manager) scanScheduled(ctx context.Context, generation uint64) error {
-	m.scanMu.Lock()
-	defer m.scanMu.Unlock()
-	m.scanTimerMu.Lock()
-	current := m.scanTimerGeneration
-	m.scanTimerMu.Unlock()
-	if current != generation {
-		return nil
-	}
-	err := m.scanOnce(ctx)
-	m.resetScanTimer(time.Now())
-	return err
+	defer func() {
+		m.scanMu.Lock()
+		defer m.scanMu.Unlock()
+		m.scanTimerMu.Lock()
+		current := m.scanTimerGeneration
+		m.scanTimerMu.Unlock()
+		// Rearm failed attempts without replacing a newer configuration deadline.
+		if current == generation {
+			m.resetScanTimer(time.Now())
+		}
+	}()
+	return m.runScan(ctx, &generation)
 }
 
 func (m *Manager) runtimeSnapshot() config.Config {
@@ -436,10 +452,59 @@ func (m *Manager) requestScan() {
 	}
 }
 
-func (m *Manager) ScanOnce(ctx context.Context) error {
-	m.scanMu.Lock()
-	defer m.scanMu.Unlock()
-	return m.scanOnce(ctx)
+func (m *Manager) ScanOnce(ctx context.Context) error { return m.runScan(ctx, nil) }
+
+func (m *Manager) runScan(ctx context.Context, generation *uint64) error {
+	processOutbox, err := m.scanWorkflows(ctx, generation)
+	if err != nil || !processOutbox {
+		return err
+	}
+	// Delivery inspects before fencing its own effects, outside scan locks.
+	if err := m.Outbox.Process(ctx); err != nil {
+		m.log("notification delivery deferred: " + err.Error())
+	}
+	return nil
+}
+
+func (m *Manager) scanWorkflows(ctx context.Context, generation *uint64) (bool, error) {
+	var retained []harness.WorkerExecution
+	processOutbox := false
+	if m.Worker != nil {
+		m.workerAdmissionMu.Lock()
+		defer m.workerAdmissionMu.Unlock()
+		reply, err := m.Worker.Call(ctx, harness.WorkerRequest{Action: "inspect"})
+		if err != nil {
+			return false, err
+		}
+		retained = reply.Executions
+	}
+	scan := func() error {
+		m.scanMu.Lock()
+		defer m.scanMu.Unlock()
+		if generation != nil {
+			m.scanTimerMu.Lock()
+			current := m.scanTimerGeneration
+			m.scanTimerMu.Unlock()
+			if current != *generation {
+				return nil
+			}
+		}
+		if err := m.attachWorkerWorkflows(ctx, retained); err != nil {
+			return err
+		}
+		m.attachWorkerAgents(ctx, retained)
+		m.attachWorkerConversations(ctx, retained)
+		err := m.scanOnce(ctx)
+		processOutbox = err == nil && m.orchestratorEnabled.Load()
+		return err
+	}
+	var err error
+	if m.Worker != nil {
+		err = m.Worker.RunOwned(ctx, scan)
+	} else {
+		err = scan()
+	}
+	return processOutbox, err
 }
 
 func (m *Manager) scanOnce(ctx context.Context) error {
@@ -497,9 +562,6 @@ func (m *Manager) scanOnce(ctx context.Context) error {
 		if err := m.scanPhaseQueue(ctx, route, filepath.Join(base, "review"), filepath.Join(base, "reviewing"), phase); err != nil {
 			return err
 		}
-	}
-	if err := m.Outbox.Process(ctx); err != nil {
-		m.log("notification delivery deferred: " + err.Error())
 	}
 	return nil
 }
@@ -562,7 +624,7 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 		attemptField := phaseAttemptField(phase)
 		attempt := numberValue(document.FrontMatter[attemptField]) + 1
 		lease := Lease{
-			ID: key, ClaimID: key, DocumentType: strings.TrimSuffix(route.Name, "s"), Route: route.Name,
+			ID: key, ClaimID: key, WorkID: documentID, DocumentType: strings.TrimSuffix(route.Name, "s"), Route: route.Name,
 			OwnerID: m.ownerID,
 			File:    target, SourceFile: source, SessionKey: phaseSessionKey(route.Name, documentID, phase, attempt),
 			State: "claiming", Phase: phase, ClaimAttempt: attempt, StartedAt: now, HeartbeatAt: now,
@@ -594,15 +656,17 @@ func (m *Manager) scanPhaseQueue(ctx context.Context, route workflowRoute, sourc
 		}
 		if phase == phaseTaskImplementation && m.runtimeSnapshot().Extensions.Enabled {
 			output, hookErr := m.Hooks.Run(ctx, "task.claimed", map[string]any{"route": route.Name, "phase": phase, "file": target, "id": documentID})
-			if hookErr != nil {
-				m.recordError(lease, hookErr)
-				continue
-			}
-			if output.Cancel {
+			if hookErr != nil || output.Cancel {
 				lease.State = "hook_cancelled"
 				lease.LastError = output.Message
+				if hookErr != nil {
+					lease.State = "error"
+					lease.LastError = hookErr.Error()
+					lease.HeartbeatAt = time.Now().UTC()
+					m.log(fmt.Sprintf("dispatch %s: %v", lease.File, hookErr))
+				}
 				if err := m.saveLease(lease); err != nil {
-					m.log("save hook-cancelled lease: " + err.Error())
+					m.log("save task.claimed hook state: " + err.Error())
 				}
 				continue
 			}
@@ -642,7 +706,7 @@ func (m *Manager) startExistingClaim(ctx context.Context, route workflowRoute, p
 		state = "recovering"
 	}
 	lease := Lease{
-		ID: key, ClaimID: key, DocumentType: strings.TrimSuffix(route.Name, "s"), Route: route.Name,
+		ID: key, ClaimID: key, WorkID: id, DocumentType: strings.TrimSuffix(route.Name, "s"), Route: route.Name,
 		OwnerID: m.ownerID,
 		File:    path, SessionKey: phaseSessionKey(route.Name, id, phase, attempt), State: state,
 		Phase: phase, ClaimAttempt: attempt, StartedAt: now, HeartbeatAt: now,
@@ -680,16 +744,23 @@ func (m *Manager) ensureRouteDirectories() error {
 }
 
 func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease, recovery bool) {
+	m.dispatchExecution(ctx, route, lease, recovery, nil)
+}
+
+func (m *Manager) dispatchExecution(ctx context.Context, route workflowRoute, lease Lease, recovery bool, attached *harness.WorkerExecution) {
 	m.setInflight(lease.ID, true)
 	m.jobs.Add(1)
 	go func() {
 		defer m.jobs.Done()
+		rescan := m.Worker == nil
 		defer func() {
 			m.setInflight(lease.ID, false)
 			// Harness completion is the event that makes agent-authored durable
 			// transitions observable. Wake the manager immediately instead of
 			// waiting for the periodic recovery scan.
-			m.requestScan()
+			if rescan {
+				m.requestScan()
+			}
 		}()
 		if !m.acquireCapacity(ctx) {
 			return
@@ -701,91 +772,136 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 		} else if lease.Phase == phaseTaskReview || lease.Phase == phaseGoalReview || lease.Phase == "review" {
 			promptPath = route.ReviewPrompt
 		}
-		if recovery {
-			// Recovery owns a new execution; retire any ended local handle so
-			// its terminal status cannot fence the resumed job. The archive
-			// preserves this workflow dispatch's public number and history.
-			m.finishRuntimeJob(lease.ID)
-			lease.State = "recovering"
-			lease.LastError = ""
-			lease.HeartbeatAt = time.Now().UTC()
-			if err := m.saveLease(lease); err != nil {
-				m.recordError(lease, err)
-				return
+		if recovery && attached == nil {
+			prepare := func() error {
+				m.finishRuntimeJob(lease.ID)
+				var err error
+				lease, err = m.updateLease(lease, func(current *Lease) {
+					current.State, current.LastError, current.HeartbeatAt = "recovering", "", time.Now().UTC()
+				})
+				if err != nil {
+					return err
+				}
+				recoveryAttempt := lease.RecoveryCount + 1
+				note := fmt.Sprintf("Spynel started recovery attempt %d for %s after its durable execution ownership required reconciliation; the recovery agent must record its findings and outcome here.", recoveryAttempt, strings.ReplaceAll(normalizeLeasePhase(route.Name, lease.Phase), "_", " "))
+				return updateDocumentProgress(lease.File, time.Now().UTC(), note)
 			}
-			recoveryAttempt := lease.RecoveryCount + 1
-			note := fmt.Sprintf("Spynel started recovery attempt %d for %s after its durable execution ownership required reconciliation; the recovery agent must record its findings and outcome here.", recoveryAttempt, strings.ReplaceAll(normalizeLeasePhase(route.Name, lease.Phase), "_", " "))
-			if err := updateDocumentProgress(lease.File, time.Now().UTC(), note); err != nil {
-				m.recordError(lease, fmt.Errorf("record recovery progress: %w", err))
+			var err error
+			if m.Worker != nil {
+				err = m.Worker.RunOwned(ctx, prepare)
+			} else {
+				err = prepare()
+			}
+			if err != nil {
+				m.recordDispatchError(ctx, lease, err)
 				return
 			}
 		}
-		prompt, err := m.renderPrompt(route, lease, promptPath)
-		if err != nil {
-			m.recordError(lease, err)
-			return
+
+		var prompt string
+		var err error
+		var firstAssignedAt time.Time
+		var providerIterations, implementationAttempts int
+		if attached == nil {
+			prompt, err = m.renderPrompt(route, lease, promptPath)
+			if err != nil {
+				m.recordDispatchError(ctx, lease, err)
+				return
+			}
+			harnessSettings := m.harnessSettings()
+			prompt = config.PrependAgentPrefix(m.agentPrefix(lease.Phase, harnessSettings), prompt)
 		}
-		harnessSettings := m.harnessSettings()
-		prompt = config.PrependAgentPrefix(m.agentPrefix(lease.Phase, harnessSettings), prompt)
-		firstAssignedAt, providerIterations, err := ReserveProviderTurn(lease.File, time.Now().UTC())
-		if err != nil {
-			m.recordError(lease, err)
-			return
+		if attached != nil && attached.Reservation != nil {
+			firstAssignedAt, providerIterations, implementationAttempts = attached.Reservation.FirstAssignedAt, attached.Reservation.ProviderIterations, attached.Reservation.ImplementationAttempts
+		} else {
+			document, readErr := ReadDocument(lease.File)
+			if readErr != nil {
+				m.recordDispatchError(ctx, lease, readErr)
+				return
+			}
+			firstAssignedAt, _ = frontMatterTime(document.FrontMatter["first_assigned_at"])
+			providerIterations = numberValue(document.FrontMatter["provider_iterations"])
+			if route.Name == "tasks" {
+				implementationAttempts = numberValue(document.FrontMatter["attempt"])
+			}
 		}
 		jobID := 0
 		if m.JobStarted != nil {
-			implementationAttempts := 0
-			if route.Name == "tasks" {
-				if document, readErr := ReadDocument(lease.File); readErr == nil {
-					implementationAttempts = numberValue(document.FrontMatter["attempt"])
+			admit := func() error {
+				var err error
+				jobID, err = m.JobStarted(lease, filepath.Base(lease.File), firstAssignedAt, providerIterations, implementationAttempts)
+				if err == nil {
+					m.setRuntimeJob(lease.ID, jobID)
 				}
+				return err
 			}
-			jobID, err = m.JobStarted(lease, filepath.Base(lease.File), firstAssignedAt, providerIterations, implementationAttempts)
+			if m.Worker != nil {
+				err = m.Worker.RunOwned(ctx, admit)
+			} else {
+				err = admit()
+			}
 			if err != nil {
-				m.recordError(lease, err)
+				m.recordDispatchError(ctx, lease, err)
 				return
 			}
-			m.setRuntimeJob(lease.ID, jobID)
 		}
+
 		finish := func() { m.finishRuntimeJob(lease.ID) }
 		// Admission and asynchronous events must not overwrite each other's
 		// lease state (especially a terminal event racing Send's return).
 		var lifecycleMu sync.Mutex
-		emit := func(event core.Event) {
+		consume := func(event core.Event, delivery *harness.WorkerDelivery) error {
 			lifecycleMu.Lock()
 			defer lifecycleMu.Unlock()
 			if jobID > 0 && m.runtimeJob(lease.ID) != jobID {
-				return
+				if delivery != nil {
+					return errors.New("worker job execution was retired")
+				}
+				return nil
 			}
-			terminal := event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError)
-			if jobID > 0 && m.JobEvent != nil {
+			terminal := event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError)
+			if delivery != nil {
+				if jobID <= 0 || m.JobDelivery == nil {
+					return errors.New("durable worker job delivery unavailable")
+				}
+				if err := m.JobDelivery(jobID, *delivery); err != nil {
+					return err
+				}
+			} else if jobID > 0 && m.JobEvent != nil {
 				m.JobEvent(jobID, event)
 			}
 			// Runtime job bookkeeping is process-local and must not depend on
 			// the durable lease still existing. A fast agent can move its task,
 			// then a concurrent recovery scan can remove the obsolete lease
 			// before the provider emits its final event.
-			current, err := m.loadLease(lease.ID)
+			current, err := m.updateLease(lease, func(current *Lease) {
+				current.HeartbeatAt = time.Now().UTC()
+				if event.ThreadID != "" {
+					current.ThreadID = event.ThreadID
+				}
+				if event.Kind == core.EventError {
+					current.LastError = event.Text
+				}
+				if terminal && current.State != "cancelled" {
+					current.State = "awaiting_transition"
+				} else if current.State == "recovering" && event.Execution != nil && event.Execution.State == "running" {
+					current.State = "processing"
+				}
+			})
 			if err != nil {
+				if delivery != nil {
+					if os.IsNotExist(err) {
+						return nil
+					}
+					return err
+				}
+				if !os.IsNotExist(err) {
+					m.log("save lease event state: " + err.Error())
+				}
 				if terminal {
 					finish()
 				}
-				return
-			}
-			current.HeartbeatAt = time.Now().UTC()
-			if event.ThreadID != "" {
-				current.ThreadID = event.ThreadID
-			}
-			if event.Kind == core.EventError {
-				current.LastError = event.Text
-			}
-			if terminal {
-				current.State = "awaiting_transition"
-			} else if current.State == "recovering" && event.Execution != nil && event.Execution.State == "running" {
-				current.State = "processing"
-			}
-			if err := m.saveLease(current); err != nil {
-				m.log("save lease event state: " + err.Error())
+				return nil
 			}
 			if jobID > 0 && m.JobUpdated != nil {
 				m.JobUpdated(jobID, current)
@@ -795,6 +911,21 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 			}
 			// Terminal provider completion remains visible as awaiting_transition
 			// until reconciliation observes the agent-authored durable file move.
+			return nil
+		}
+		emit := func(event core.Event) { _ = consume(event, nil) }
+		if m.Worker != nil {
+			rescan = m.runWorkerWorkflow(ctx, route, lease, prompt, attached, jobID, consume)
+			return
+		}
+		firstAssignedAt, providerIterations, err = ReserveProviderTurn(lease.File, time.Now().UTC())
+		if err != nil {
+			finish()
+			m.recordDispatchError(ctx, lease, err)
+			return
+		}
+		if jobID > 0 && m.JobTimingUpdated != nil {
+			m.JobTimingUpdated(jobID, firstAssignedAt, providerIterations)
 		}
 		threadID, steered, err := m.Harness.Send(ctx, lease.SessionKey, prompt, emit)
 		lifecycleMu.Lock()
@@ -807,26 +938,24 @@ func (m *Manager) dispatch(ctx context.Context, route workflowRoute, lease Lease
 				m.JobExecutionUpdated(jobID, core.ExecutionStatus{State: "error", Detail: err.Error()})
 			}
 			finish()
-			m.recordError(lease, err)
+			m.recordDispatchError(ctx, lease, err)
 			return
 		}
-		current, loadErr := m.loadLease(lease.ID)
-		if os.IsNotExist(loadErr) {
-			return
-		}
-		if loadErr == nil {
-			lease = current
-		}
-		lease.ThreadID = threadID
-		lease.HeartbeatAt = time.Now().UTC()
-		if recovery {
-			lease.RecoveryCount++
-			if lease.State == "recovering" {
-				lease.State = "processing"
+		lease, err = m.updateLease(lease, func(current *Lease) {
+			current.ThreadID = threadID
+			current.HeartbeatAt = time.Now().UTC()
+			if recovery {
+				current.RecoveryCount++
+				if current.State == "recovering" {
+					current.State = "processing"
+				}
 			}
-		}
-		if err := m.saveLease(lease); err != nil {
-			m.log("save lease dispatch state: " + err.Error())
+		})
+		if err != nil {
+			if !os.IsNotExist(err) {
+				m.log("save lease dispatch state: " + err.Error())
+			}
+			return
 		}
 		if jobID > 0 && m.JobUpdated != nil {
 			m.JobUpdated(jobID, lease)
@@ -845,6 +974,9 @@ func (m *Manager) reconcileTransitions(ctx context.Context) error {
 		return err
 	}
 	for _, lease := range leases {
+		if m.Worker != nil && m.isInflight(lease.ID) {
+			continue
+		}
 		if lease.State == "claiming" {
 			continue
 		}
@@ -1475,7 +1607,16 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 	}
 	now := time.Now()
 	for _, lease := range leases {
-		if lease.State == "hook_cancelled" {
+		if lease.CancellationRequested {
+			if lease.State != "cancelled" {
+				lease.State = "cancelled"
+				if err := m.saveLease(lease); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if lease.State == "hook_cancelled" || lease.State == "cancelled" {
 			continue
 		}
 		if _, err := os.Stat(lease.File); os.IsNotExist(err) {
@@ -1590,7 +1731,16 @@ func (m *Manager) relatedTasksForGoal(file string) string {
 		lines = append(lines, "- ["+task.Status+"] "+task.Path)
 	}
 	sort.Strings(lines)
-	return strings.Join(lines, "\n")
+	context := strings.Join(lines, "\n")
+	const contextBytes = 32 * 1024
+	if len(context) > contextBytes {
+		tail := context[len(context)-contextBytes:]
+		if end := strings.IndexByte(tail, '\n'); end >= 0 {
+			tail = tail[end+1:]
+		}
+		return fmt.Sprintf("- Earlier linked-task paths omitted from prompt context only. Inspect the complete current round in the authoritative goal %q and task folders %q before deciding the outcome.\n%s", file, m.Config.StatePath("tasks"), tail)
+	}
+	return context
 }
 
 func (m *Manager) Wait() { m.jobs.Wait() }
@@ -1656,11 +1806,7 @@ func (m *Manager) ScheduledCheckpoints(now time.Time) ([]ScheduledCheckpoint, er
 			return waits, fmt.Errorf("scheduled goal checkpoints are incomplete: document limit reached")
 		}
 		inspected++
-		data, err := readStatusDocument(filepath.Join(directory, entry.Name()))
-		if err != nil {
-			continue
-		}
-		document, err := ParseDocument(data)
+		document, err := readStatusDocument(filepath.Join(directory, entry.Name()), false)
 		if err != nil {
 			continue
 		}
@@ -1711,6 +1857,22 @@ func (m *Manager) saveLease(lease Lease) error {
 		return err
 	}
 	return fsx.AtomicWriteFile(m.leasePath(lease.ID), append(data, '\n'), 0o600)
+}
+
+// updateLease orders asynchronous updates with scan-owned retirement and claims.
+// A retired or replaced execution must never be recreated by a late writer.
+func (m *Manager) updateLease(expected Lease, update func(*Lease)) (Lease, error) {
+	m.scanMu.Lock()
+	defer m.scanMu.Unlock()
+	current, err := m.loadLease(expected.ID)
+	if err != nil {
+		return expected, err
+	}
+	if current.OwnerID != expected.OwnerID || current.SessionKey != expected.SessionKey {
+		return expected, errors.New("lease execution changed before update")
+	}
+	update(&current)
+	return current, m.saveLease(current)
 }
 
 func (m *Manager) loadLease(id string) (Lease, error) {
@@ -1769,6 +1931,8 @@ func (m *Manager) LeaseForSession(sessionKey string) (Lease, bool) {
 // by this manager. A successful gate returns the lease to processing; the
 // provider's subsequent events remain responsible for heartbeat activity.
 func (m *Manager) PrepareControlContinuation(expected Lease, expectedDocumentID string) bool {
+	m.scanMu.Lock()
+	defer m.scanMu.Unlock()
 	if !m.ControlStillValid(expected, expectedDocumentID) || !m.Harness.IsActive(expected.SessionKey) {
 		return false
 	}
@@ -1819,7 +1983,7 @@ func (m *Manager) ControlStillValid(expected Lease, expectedDocumentID string) b
 	if err != nil || current.OwnerID != expected.OwnerID || current.SessionKey != expected.SessionKey || current.File != expected.File || current.Phase != expected.Phase {
 		return false
 	}
-	if current.State != "awaiting_transition" && current.State != "processing" && current.State != "recovering" {
+	if current.CancellationRequested || current.State != "awaiting_transition" && current.State != "processing" && current.State != "recovering" {
 		return false
 	}
 	document, err := ReadDocument(current.File)
@@ -1879,10 +2043,12 @@ func (m *Manager) isControlCancelled(leaseID string) bool {
 }
 
 func (m *Manager) recordError(lease Lease, err error) {
-	lease.LastError = err.Error()
-	lease.State = "error"
-	lease.HeartbeatAt = time.Now().UTC()
-	if saveErr := m.saveLease(lease); saveErr != nil {
+	_, saveErr := m.updateLease(lease, func(current *Lease) {
+		current.LastError = err.Error()
+		current.State = "error"
+		current.HeartbeatAt = time.Now().UTC()
+	})
+	if saveErr != nil && !os.IsNotExist(saveErr) {
 		m.log("save failed lease: " + saveErr.Error())
 	}
 	m.log(fmt.Sprintf("dispatch %s: %v", lease.File, err))

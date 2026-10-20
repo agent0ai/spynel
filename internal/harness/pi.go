@@ -237,33 +237,33 @@ func (p *Pi) SendWithModel(ctx context.Context, key, prompt, model string, emit 
 
 func (p *Pi) SendWithInference(ctx context.Context, key, prompt string, selection InferenceSelection, emit core.Emit) (string, bool, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", false, errors.New("harness prompt is empty")
+		return "", false, &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	if selection.ServiceMode != "" {
-		return "", false, errors.New(p.dialect.label + " does not support a Spynel service mode; reset harness.service_mode to inherit")
+		return "", false, &SendNotAdmittedError{Err: errors.New(p.dialect.label + " does not support a Spynel service mode; reset harness.service_mode to inherit")}
 	}
 	if err := ValidateInferenceSelection(nil, selection); err != nil {
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	lock := p.lockForKey(key)
 	lock.Lock()
 	defer lock.Unlock()
 	process, err := p.ensureProcess(ctx, key, selection.Model, selection.Effort)
 	if err != nil {
-		return "", false, err
+		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	process.mu.Lock()
 	active := process.active
 	process.mu.Unlock()
 	if active != nil {
-		threadID, err := p.steerLocked(ctx, process, prompt, emit, nil)
+		threadID, err := p.steerLocked(ctx, process, prompt, emit, true, nil)
 		return threadID, true, err
 	}
 	turn := &piTurn{emit: emit}
 	process.mu.Lock()
 	if process.closed {
 		process.mu.Unlock()
-		return process.session.ID, false, errors.New(p.dialect.label + " RPC process is closed")
+		return process.session.ID, false, &SendNotAdmittedError{Err: errors.New(p.dialect.label + " RPC process is closed")}
 	}
 	process.active = turn
 	process.mu.Unlock()
@@ -283,9 +283,17 @@ func (p *Pi) SendWithInference(ctx context.Context, key, prompt string, selectio
 	return process.session.ID, false, nil
 }
 
-func (p *Pi) Steer(ctx context.Context, key, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+func (p *Pi) Steer(ctx context.Context, key, prompt string, beforeDelivery func() bool) (string, error) {
+	return p.steer(ctx, key, prompt, nil, false, beforeDelivery)
+}
+
+func (p *Pi) SteerConversation(ctx context.Context, key, prompt string, emit core.Emit) (string, error) {
+	return p.steer(ctx, key, prompt, emit, true, nil)
+}
+
+func (p *Pi) steer(ctx context.Context, key, prompt string, emit core.Emit, replace bool, beforeDelivery func() bool) (string, error) {
 	if strings.TrimSpace(prompt) == "" {
-		return "", errors.New("harness prompt is empty")
+		return "", &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	lock := p.lockForKey(key)
 	lock.Lock()
@@ -296,10 +304,10 @@ func (p *Pi) Steer(ctx context.Context, key, prompt string, emit core.Emit, befo
 	if process == nil {
 		return p.ThreadID(key), fmt.Errorf("%s turn is no longer active: %w", p.dialect.label, errNativeTurnInactive)
 	}
-	return p.steerLocked(ctx, process, prompt, emit, beforeDelivery)
+	return p.steerLocked(ctx, process, prompt, emit, replace, beforeDelivery)
 }
 
-func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string, emit core.Emit, beforeDelivery func() bool) (string, error) {
+func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string, emit core.Emit, replace bool, beforeDelivery func() bool) (string, error) {
 	process.mu.Lock()
 	turn := process.active
 	process.mu.Unlock()
@@ -323,13 +331,15 @@ func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string,
 		reserved = true
 		turn.mu.Lock()
 		previous = turn.emit
-		turn.emit = emit
+		if replace {
+			turn.emit = emit
+		}
 		turn.mu.Unlock()
 		return true
 	})
 	if err != nil {
 		turn.mu.Lock()
-		if !turn.completed {
+		if reserved && !turn.completed && replace {
 			turn.emit = previous
 		}
 		turn.mu.Unlock()
@@ -338,12 +348,10 @@ func (p *Pi) steerLocked(ctx context.Context, process *piProcess, prompt string,
 		}
 		return process.session.ID, err
 	}
-	if previous != nil {
+	if previous != nil && replace {
 		previous(core.Event{Kind: core.EventStatus, Text: "Response continued on a newer message", ThreadID: process.session.ID, Done: true})
 	}
-	if emit != nil {
-		emit(core.Event{Kind: core.EventStatus, Text: "Steering active Pi turn", ThreadID: process.session.ID})
-	}
+	turn.emitEvent(core.Event{Kind: core.EventStatus, Text: "Steering active Pi turn", ThreadID: process.session.ID})
 	return process.session.ID, nil
 }
 
@@ -631,7 +639,7 @@ func (p *Pi) startProcess(ctx context.Context, key string, session piSession, ep
 		cancel()
 		return nil, err
 	}
-	stdin, err := command.StdinPipe()
+	stdin, err := providerStdin(command)
 	if err != nil {
 		cancel()
 		return nil, err

@@ -132,7 +132,9 @@ func runNotifyCommand(args []string, version string) error {
 	configPath := flags.String("config", "", "path to .spynel/config.yaml")
 	workdir := flags.String("workdir", "", "absolute Spynel workspace path")
 	origin := flags.String("origin", "", "stable channel/conversation origin")
-	fallbackOrigin := flags.String("fallback-origin", "", "explicit local tui/cli fallback origin")
+	fallbackOrigin := flags.String("fallback-origin", "", "explicit owner-established same-operator fallback origin")
+	escalationKey := flags.String("escalation-key", "", "send to the explicit fallback for this stable unanswered-decision reference")
+	cancelID := flags.String("cancel", "", "retire retries for this exact notification event ID, preserving delivery evidence")
 	recentAuthorized := flags.Bool("recent-authorized", false, "route to the most recently active unambiguous authorized conversation")
 	message := flags.String("message", "", "notification message")
 	stdin := flags.Bool("stdin", false, "read the notification from standard input")
@@ -145,12 +147,23 @@ func runNotifyCommand(args []string, version string) error {
 			messageSet = true
 		}
 	})
-	text, err := notificationMessageText(flags.Args(), *stdin, messageSet, *message, os.Stdin)
-	if err != nil {
-		return fmt.Errorf("usage: spynel notify [--workdir PATH|--config PATH] (--origin CHANNEL/CONVERSATION|--recent-authorized) --message MESSAGE: %w", err)
+	var text string
+	var err error
+	if *cancelID != "" {
+		if *recentAuthorized || *fallbackOrigin != "" || *escalationKey != "" || messageSet || *stdin || len(flags.Args()) != 0 {
+			return errors.New("--cancel requires only --origin and an event ID; message and routing options cannot be combined")
+		}
+	} else {
+		text, err = notificationMessageText(flags.Args(), *stdin, messageSet, *message, os.Stdin)
+		if err != nil {
+			return fmt.Errorf("usage: spynel notify [--workdir PATH|--config PATH] (--origin CHANNEL/CONVERSATION|--recent-authorized) --message MESSAGE: %w", err)
+		}
 	}
 	if (strings.TrimSpace(*origin) == "") == !*recentAuthorized {
 		return errors.New("exactly one of --origin or --recent-authorized is required")
+	}
+	if *escalationKey != "" && (*recentAuthorized || strings.TrimSpace(*fallbackOrigin) == "") {
+		return errors.New("--escalation-key requires --origin and --fallback-origin")
 	}
 	if *workdir != "" && *configPath != "" {
 		return errors.New("--workdir and --config are mutually exclusive")
@@ -175,14 +188,19 @@ func runNotifyCommand(args []string, version string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	var id string
+	var state string
 	if client, active, clientErr := activeWorkspaceClient(ctx, cfg); clientErr != nil {
 		return clientErr
 	} else if active {
-		if *recentAuthorized {
+		if *cancelID != "" {
+			state, err = client.CancelNotification(ctx, *origin, *cancelID)
+		} else if *recentAuthorized {
 			if strings.TrimSpace(*fallbackOrigin) != "" {
 				return errors.New("--fallback-origin requires --origin")
 			}
 			id, err = client.NotifyRecentAuthorized(ctx, text)
+		} else if *escalationKey != "" {
+			id, err = client.NotifyEscalation(ctx, *origin, *fallbackOrigin, *escalationKey, text)
 		} else {
 			id, err = client.NotifyWithFallback(ctx, *origin, *fallbackOrigin, text)
 		}
@@ -192,11 +210,15 @@ func runNotifyCommand(args []string, version string) error {
 			return buildErr
 		}
 		defer service.Close()
-		if *recentAuthorized {
+		if *cancelID != "" {
+			state, err = service.CancelNotification(ctx, *origin, *cancelID)
+		} else if *recentAuthorized {
 			if strings.TrimSpace(*fallbackOrigin) != "" {
 				return errors.New("--fallback-origin requires --origin")
 			}
 			id, err = service.NotifyRecentAuthorized(ctx, text)
+		} else if *escalationKey != "" {
+			id, err = service.NotifyEscalation(ctx, *origin, *fallbackOrigin, *escalationKey, text)
 		} else {
 			id, err = service.NotifyWithFallback(ctx, *origin, *fallbackOrigin, text)
 		}
@@ -204,7 +226,11 @@ func runNotifyCommand(args []string, version string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Println("queued notification " + id)
+	if *cancelID != "" {
+		fmt.Printf("notification %s: %s; no further retries (prior sends are not retracted)\n", *cancelID, state)
+	} else {
+		fmt.Println("queued notification " + id)
+	}
 	return nil
 }
 

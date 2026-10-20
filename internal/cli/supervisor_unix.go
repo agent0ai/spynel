@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -305,6 +306,8 @@ func runSupervisor(args []string, version string) error {
 			return err
 		}
 		command.Stderr = writer
+		startedAt := time.Now().UTC()
+		oomBefore := readCgroupOOMKills("/sys/fs/cgroup/memory.events")
 		if err := command.Start(); err != nil {
 			_ = control.Close()
 			_ = childFile.Close()
@@ -401,6 +404,8 @@ func runSupervisor(args []string, version string) error {
 				stopTimer = nil
 			}
 		}
+		exitedAt := time.Now().UTC()
+		oomAfter := readCgroupOOMKills("/sys/fs/cgroup/memory.events")
 		_ = control.Close()
 		<-controlDone
 		var stderr []byte
@@ -416,7 +421,7 @@ func runSupervisor(args []string, version string) error {
 			fmt.Fprintln(os.Stderr, "spynel: executor registration could not be retired")
 		}
 		_ = updater.SetExecutor(0, false, stopping)
-		retainExecutorExit(attempt.diagnostic, command.ProcessState, stderr)
+		retainExecutorExit(attempt.diagnostic, command.ProcessState, stderr, startedAt, exitedAt, oomBefore, oomAfter)
 		if stopping || attempt.stopped {
 			return executorExit(waitErr, command.ProcessState)
 		}
@@ -524,7 +529,7 @@ func publishLauncherDiagnostic(d processDiagnostic) {
 	_ = file.Close()
 }
 
-func retainExecutorExit(d *processDiagnostic, state *os.ProcessState, stderr []byte) {
+func retainExecutorExit(d *processDiagnostic, state *os.ProcessState, stderr []byte, startedAt, exitedAt time.Time, oomBefore, oomAfter cgroupOOMSample) {
 	if d == nil || state == nil {
 		return
 	}
@@ -534,12 +539,50 @@ func retainExecutorExit(d *processDiagnostic, state *os.ProcessState, stderr []b
 	if wait, ok := state.Sys().(syscall.WaitStatus); ok && wait.Signaled() {
 		observed = wait.Signal().String()
 	}
-	r.LogEvent("info", "process", "executor_exit", fmt.Sprintf("%s boundary=native_supervisor status=%d signal=%s", d.identity(), status, observed))
+	r.LogEvent("info", "process", "executor_exit", fmt.Sprintf("%s boundary=native_supervisor supervisor_pid=%d started_at=%s observed_exit_at=%s status=%d signal=%s", d.identity(), os.Getpid(), startedAt.Format(time.RFC3339Nano), exitedAt.Format(time.RFC3339Nano), status, observed))
+	if observed != "" {
+		evidence := "visible_cgroup_oom_kill=unavailable"
+		if oomAfter.available {
+			evidence = fmt.Sprintf("visible_cgroup_oom_kill_cumulative=%d", oomAfter.kills)
+			if oomBefore.available && oomAfter.kills >= oomBefore.kills {
+				evidence += fmt.Sprintf(" visible_cgroup_oom_kill_delta=%d", oomAfter.kills-oomBefore.kills)
+			}
+		}
+		r.LogEvent("warn", "process", "exit_evidence", d.identity()+" "+evidence+" attribution=unknown; signal alone does not identify sender or prove OOM; require timestamped host kernel victim or audit/container-controller records with PID mapping")
+	}
 	if strings.TrimSpace(string(stderr)) != "" {
 		r.LogEvent("info", "process", "native_stderr", d.identity()+" boundary=native_supervisor\n"+string(stderr))
 	}
 	r.Close()
 	warnDiagnosticStorage(r, d.Instance+"-supervisor")
+}
+
+type cgroupOOMSample struct {
+	kills     uint64
+	available bool
+}
+
+// These are visible cgroup counters, never proof that this child was a victim.
+func readCgroupOOMKills(path string) cgroupOOMSample {
+	file, err := os.Open(path)
+	if err != nil {
+		return cgroupOOMSample{}
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil || len(data) > 4096 {
+		return cgroupOOMSample{}
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "oom_kill" {
+			kills, err := strconv.ParseUint(fields[1], 10, 64)
+			if err == nil {
+				return cgroupOOMSample{kills: kills, available: true}
+			}
+		}
+	}
+	return cgroupOOMSample{}
 }
 
 func executorExit(err error, state *os.ProcessState) error {

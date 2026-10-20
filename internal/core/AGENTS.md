@@ -13,7 +13,11 @@
 
 - Screen action results may carry an optional `SavedControl` to refresh the committed action row in the current or preserved parent form without replacing unsaved fields. `ActionMessage` carries the application-owned outcome.
 
-- Local response events may carry the client-owned request ID solely for correlation on authenticated message/protocol surfaces; it remains excluded from public status/job and operational-log projections.
+- Local response events may carry the client-owned request ID and optional opaque durable ResponseID solely for correlation on authenticated message/protocol surfaces; both remain excluded from public status/job and operational-log projections. ResponseID lets the TUI reconcile a worker reply with the copy followed from history; it is not a notification acknowledgement or provider identity.
+
+- A conversation-changing screen carries its transcript snapshot byte offset in `HistoryOffset` so the TUI follows only later durable entries without losing the handoff window or replaying restored messages.
+
+- WorkerProtocol is the shared compatibility value for harness adoption and installation coordination. Change it when a successor cannot safely consume/control prior workers; npm package metadata must match, enforced by the updater release-metadata test.
 
 ## Child DOX Index
 

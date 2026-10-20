@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +35,104 @@ func newRecoveryTestService(t *testing.T) (*Service, *serviceHarness, config.Con
 	t.Cleanup(func() { _ = service.Close() })
 	service.SetPrimaryInstanceID("primary")
 	return service, target, cfg
+}
+
+func TestRecoveryFreshPrimaryDeliversOnceAfterLongOldHistory(t *testing.T) {
+	root := t.TempDir()
+	if err := workspace.Init(root, false); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(config.PathForRoot(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Channels.Telegram.Enabled = true
+	cfg.Channels.Telegram.AllowedUsers = []string{"7"}
+	interrupted := newHeldServiceHarness()
+	previous := New(cfg, interrupted)
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	for i := 0; i < 2001; i++ {
+		if _, err := previous.History.Append("telegram", "TG-7", history.Entry{At: old, Role: "assistant", Content: "old context"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < recoveryTotalEntryMax+1; i++ {
+		if _, err := previous.History.Append("telegram", "TG-7", history.Entry{Role: "assistant", Content: "recent context"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := previous.History.Append("telegram", "TG-7", history.Entry{At: old, Role: "assistant", Content: strings.Repeat("large output ", 500000)}); err != nil {
+		t.Fatal(err)
+	}
+	message := core.Message{Channel: "telegram", Conversation: "TG-7", SourceMessageID: "telegram:7:interrupted", Text: "check whether this report is still needed"}
+	if err := previous.Handle(context.Background(), message, nil); err != nil {
+		t.Fatal(err)
+	}
+	key := sessionKey(message)
+	if !interrupted.IsActive(key) {
+		t.Fatal("fixture did not reach provider admission")
+	}
+	// Closing the fixture without a provider terminal models loss after admission.
+	if err := previous.Close(); err != nil {
+		t.Fatal(err)
+	}
+	target := newHeldServiceHarness()
+	service := New(cfg, target)
+	defer service.Close()
+	service.SetPrimaryInstanceID("fresh-primary")
+	if result := service.scanRecovery(context.Background(), "startup"); result.Dispatched != 0 {
+		t.Fatalf("disconnected startup dispatched: %#v", result)
+	}
+	router := &conversationEventRouter{}
+	service.SetConversationDelivery(router)
+	service.SetConnectionStatus(channel.ConnectionStatus{Name: "telegram", State: channel.ConnectionConnected})
+	result := service.scanRecovery(context.Background(), "reconnect")
+	if result.Dispatched != 1 || result.Eligible != 1 || len(target.prompts[key]) != 1 {
+		t.Fatalf("fresh recovery admission = %#v", result)
+	}
+	prompt := target.prompts[key][0]
+	for _, want := range []string{"Reconcile first", "current evidence", "Always produce a visible response", message.Text} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("ordinary recovery prompt missing %q", want)
+		}
+	}
+	if result := service.scanRecovery(context.Background(), "periodic"); result.Dispatched != 0 {
+		t.Fatalf("active recovery duplicated: %#v", result)
+	}
+	target.finish(key)
+	finals := 0
+	for _, event := range router.snapshot() {
+		if event.Kind == core.EventFinal && event.Done {
+			finals++
+			if event.Text != "finished" {
+				t.Fatalf("wrong transport reply: %#v", event)
+			}
+		}
+	}
+	if finals != 1 {
+		t.Fatalf("transport received %d terminal replies", finals)
+	}
+	before := len(router.snapshot())
+	for _, trigger := range []string{"reconnect", "periodic"} {
+		if result := service.scanRecovery(context.Background(), trigger); result.Dispatched != 0 || result.Reasons["terminal_coverage"] != 1 {
+			t.Fatalf("terminal source not suppressed: %#v", result)
+		}
+	}
+	if len(target.prompts[key]) != 1 || len(router.snapshot()) != before {
+		t.Fatal("repeated scans duplicated work or replies")
+	}
+	snapshot, err := service.History.RecoveryWindow(message.Channel, message.Conversation, time.Now().UTC().Add(-recoveryWindow), recoveryTotalEntryMax)
+	for err == nil && snapshot.More && snapshot.Covered[message.SourceMessageID] == "" {
+		snapshot, err = service.History.RecoveryPage(message.Channel, message.Conversation, time.Now().UTC().Add(-recoveryWindow), snapshot.Next, recoveryTotalEntryMax)
+	}
+	if err != nil || snapshot.Covered[message.SourceMessageID] != "terminal_coverage" || !snapshot.Admitted[message.SourceMessageID] {
+		t.Fatalf("terminal correlation missing: %#v, %v", snapshot, err)
+	}
+	for _, entry := range service.Runtime.Logs() {
+		if entry.Component == "recovery" && (strings.Contains(entry.Text, message.SourceMessageID) || strings.Contains(entry.Text, message.Text) || strings.Contains(entry.Text, message.Conversation)) {
+			t.Fatal("recovery diagnostics leaked private input")
+		}
+	}
 }
 
 func TestRecoveryUpgradeBaselineCategoricallyExcludesLegacyHistory(t *testing.T) {
@@ -103,7 +202,7 @@ func TestRecoveryLeavesOlderUncoveredRequestEligibleAfterExcludedCommand(t *test
 	}
 }
 
-func TestRecoveryFailsClosedWhenConversationExceedsBound(t *testing.T) {
+func TestRecoveryProcessesConversationBeyondRecentRecordBudget(t *testing.T) {
 	service, target, _ := newRecoveryTestService(t)
 	now := time.Now().UTC()
 	if _, err := service.History.Append("cli", "overflow", history.Entry{At: now, AcceptedAt: now, Role: "user", Content: "must not recover from a partial history", SourceMessageID: "local:overflow"}); err != nil {
@@ -115,8 +214,8 @@ func TestRecoveryFailsClosedWhenConversationExceedsBound(t *testing.T) {
 		}
 	}
 	result := service.scanRecovery(context.Background(), "periodic")
-	if result.Dispatched != 0 || result.FailedClosed == 0 || !result.Truncated || len(target.prompts) != 0 {
-		t.Fatalf("overflow recovery did not fail closed: result=%#v prompts=%#v", result, target.prompts)
+	if result.Dispatched != 1 || result.FailedClosed != 0 || len(target.prompts) != 1 {
+		t.Fatalf("recent history budget prevented recovery: result=%#v prompts=%#v", result, target.prompts)
 	}
 }
 
@@ -187,6 +286,77 @@ func TestRecoveryStatusContainsOnlyAggregateEvidence(t *testing.T) {
 	}
 }
 
+func TestRecoveryStatusOwnsReasonSnapshot(t *testing.T) {
+	service, _, _ := newRecoveryTestService(t)
+	now := time.Now().UTC()
+	_, err := service.History.Append("cli", "snapshot", history.Entry{At: now, Role: "user", Content: "legacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := service.scanRecovery(context.Background(), "periodic")
+	if result.Reasons["legacy_or_pre_activation"] != 1 {
+		t.Fatalf("missing exclusion reason: %#v", result)
+	}
+	result.Reasons["legacy_or_pre_activation"] = 10
+	published := service.RecoveryStatus()
+	if published.Reasons["legacy_or_pre_activation"] != 1 {
+		t.Fatal("scan caller can mutate published status")
+	}
+	published.Reasons["legacy_or_pre_activation"] = 20
+	if service.RecoveryStatus().Reasons["legacy_or_pre_activation"] != 1 {
+		t.Fatal("status reader can mutate published status")
+	}
+}
+
+func TestRecoveryHistoryFailureDiagnostics(t *testing.T) {
+	for _, kind := range []string{"corrupt_history"} {
+		t.Run(kind, func(t *testing.T) {
+			service, target, _ := newRecoveryTestService(t)
+			now := time.Now().UTC()
+			path, err := service.History.Append("cli", "private-conversation", history.Entry{At: now, AcceptedAt: now, Role: "user", SourceMessageID: "private-source", Content: "private-body"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == "corrupt_history" {
+				f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = f.WriteString("{private-corrupt-payload}\n")
+				closeErr := f.Close()
+				if err != nil || closeErr != nil {
+					t.Fatalf("corrupt fixture: %v, %v", err, closeErr)
+				}
+			} else {
+				for i := 0; i < recoveryTotalEntryMax; i++ {
+					if _, err := service.History.Append("cli", "private-conversation", history.Entry{At: now, Role: "assistant"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			result := service.scanRecovery(context.Background(), "startup")
+			if result.Dispatched != 0 || result.FailedClosed != 1 || result.Reasons[kind] != 1 || len(target.prompts) != 0 {
+				t.Fatalf("unsafe or unexplained scan failure: %#v", result)
+			}
+			found := false
+			for _, entry := range service.Runtime.Logs() {
+				if entry.Component != "recovery" {
+					continue
+				}
+				found = found || entry.Event == "decision" && strings.Contains(entry.Text, "conversation_slot=1 candidate_slot=0 reason="+kind)
+				for _, private := range []string{"private-conversation", "private-source", "private-body", "private-corrupt-payload"} {
+					if strings.Contains(entry.Text, private) {
+						t.Fatal("recovery diagnostics retained private input")
+					}
+				}
+			}
+			if !found {
+				t.Fatal("missing bounded scan-local failure reason")
+			}
+		})
+	}
+}
+
 func TestStableSourceIdentityDeduplicatesDeliveryAndTerminalCoverage(t *testing.T) {
 	service, target, _ := newRecoveryTestService(t)
 	message := core.Message{Channel: "cli", Conversation: "duplicate", Sender: "cli", SourceMessageID: "local:same", Text: "run once", ReceivedAt: time.Now().UTC()}
@@ -199,7 +369,7 @@ func TestStableSourceIdentityDeduplicatesDeliveryAndTerminalCoverage(t *testing.
 	if len(target.prompts["chat:cli:duplicate"]) != 1 {
 		t.Fatalf("duplicate source reached provider %d times", len(target.prompts["chat:cli:duplicate"]))
 	}
-	entries, _, err := service.History.RecoveryEntries("cli", "duplicate", recoveryEntryMax)
+	entries, _, err := service.History.RecoveryEntries("cli", "duplicate", recoveryTotalEntryMax)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +523,7 @@ func (r *rejectedSteerServiceHarness) SendWithModel(ctx context.Context, key, pr
 	r.mu.Unlock()
 	if reject {
 		// Native steering can reject a request while retaining the original emitter.
-		return r.ThreadID(key), true, errors.New("provider rejected follow-up")
+		return r.ThreadID(key), true, &harness.SendNotAdmittedError{Err: errors.New("provider rejected follow-up")}
 	}
 	return r.heldServiceHarness.SendWithModel(ctx, key, prompt, model, emit)
 }
@@ -635,7 +805,7 @@ func TestConsolidatedTerminalCoversRapidFollowupSources(t *testing.T) {
 		}
 	}
 	target.finish("chat:cli:rapid")
-	entries, _, err := service.History.RecoveryEntries("cli", "rapid", recoveryEntryMax)
+	entries, _, err := service.History.RecoveryEntries("cli", "rapid", recoveryTotalEntryMax)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,5 +817,189 @@ func TestConsolidatedTerminalCoversRapidFollowupSources(t *testing.T) {
 	}
 	if !covered["local:first"] || !covered["local:second"] {
 		t.Fatalf("consolidated terminal coverage = %#v", covered)
+	}
+}
+
+func TestRecoveryEventuallyProcessesConversationAndCandidateBatches(t *testing.T) {
+	service, target, cfg := newRecoveryTestService(t)
+	now := time.Now().UTC()
+	for i := 0; i < recoveryConversationMax+5; i++ {
+		name := fmt.Sprintf("batch-%03d", i)
+		if _, err := service.History.Append("cli", name, history.Entry{At: now, AcceptedAt: now, Role: "user", SourceMessageID: name, Content: "request"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 41; i++ {
+		if _, err := service.History.Append("cli", "many", history.Entry{At: now, AcceptedAt: now, Role: "user", SourceMessageID: fmt.Sprintf("source-%d", i), Content: strings.Repeat("large request ", 4000)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for scan := 0; scan < 15; scan++ {
+		result := service.scanRecovery(context.Background(), "periodic")
+		if result.Dispatched > recoveryDispatchMax || result.FailedClosed != 0 {
+			t.Fatalf("unsafe batch scan: %#v", result)
+		}
+		if result.Truncated {
+			select {
+			case <-service.recoveryTrigger:
+			default:
+				t.Fatal("deferred conversation batch did not schedule continuation")
+			}
+		}
+	}
+	if len(target.prompts) != recoveryConversationMax+6 {
+		t.Fatalf("conversation starvation: dispatched %d", len(target.prompts))
+	}
+	for key, prompts := range target.prompts {
+		want := 1
+		if key == "chat:cli:many" {
+			want = 3
+		}
+		if len(prompts) != want {
+			t.Fatalf("duplicate or missing work in %s: %d", key, len(prompts))
+		}
+		for _, prompt := range prompts {
+			if len(prompt) > 128*1024 || key == "chat:cli:many" && (!strings.Contains(prompt, `excerpt="true"`) || !strings.Contains(prompt, "Read each complete source message")) {
+				t.Fatalf("unbounded or unexplained excerpt: %d bytes", len(prompt))
+			}
+		}
+	}
+	entries, _, err := service.History.RecoveryEntries("cli", "many", recoveryTotalEntryMax)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted, covered := map[string]int{}, map[string]int{}
+	terminals := 0
+	for _, entry := range entries {
+		if entry.Admission != "" {
+			admitted[entry.SourceMessageID]++
+		}
+		if entry.Outcome == "terminal_assistant" {
+			terminals++
+			for _, id := range entry.Covers {
+				covered[id]++
+			}
+		}
+	}
+	if terminals != 3 || len(admitted) != 41 || len(covered) != 41 {
+		t.Fatalf("batch correlation: terminals=%d admitted=%d covered=%d", terminals, len(admitted), len(covered))
+	}
+	for i := 0; i < 41; i++ {
+		id := fmt.Sprintf("source-%d", i)
+		if admitted[id] != 1 || covered[id] != 1 {
+			t.Fatalf("batch source %s: admissions=%d terminal coverage=%d", id, admitted[id], covered[id])
+		}
+	}
+	fresh := New(cfg, newServiceHarness())
+	defer fresh.Close()
+	fresh.SetPrimaryInstanceID("replacement")
+	for scan := 0; scan < 3; scan++ {
+		if result := fresh.scanRecovery(context.Background(), "reconnect"); result.Dispatched != 0 || result.FailedClosed != 0 {
+			t.Fatalf("completed batches not durably suppressed: %#v", result)
+		}
+	}
+}
+
+func TestRecoveryBatchTerminalAndCancellationCoverEverySource(t *testing.T) {
+	for _, command := range []string{"error", "/stop", "/job kill 1"} {
+		t.Run(command, func(t *testing.T) {
+			service, _, cfg := newRecoveryTestService(t)
+			target := &synchronousInterruptHarness{heldServiceHarness: newHeldServiceHarness()}
+			service.Harness = target
+			now := time.Now().UTC()
+			for _, id := range []string{"first", "second", "third"} {
+				if _, err := service.History.Append("cli", "batch-cancel", history.Entry{At: now, AcceptedAt: now, Role: "user", SourceMessageID: id, Content: "request"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if result := service.scanRecovery(context.Background(), "startup"); result.Dispatched != 1 || result.Eligible != 3 {
+				t.Fatalf("batch not admitted: %#v", result)
+			}
+			if result := service.scanRecovery(context.Background(), "reconnect"); result.Dispatched != 0 {
+				t.Fatalf("active batch duplicated: %#v", result)
+			}
+			want := "intentional_cancellation"
+			if command == "error" {
+				want = "terminal_coverage"
+				target.mu.Lock()
+				emit := target.emits["chat:cli:batch-cancel"]
+				target.active["chat:cli:batch-cancel"] = false
+				target.mu.Unlock()
+				emit(core.Event{Kind: core.EventError, Text: "provider failed", Done: true})
+			} else if err := service.Handle(context.Background(), core.Message{Channel: "cli", Conversation: "batch-cancel", Text: command}, nil); err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := service.History.RecoveryWindow("cli", "batch-cancel", now.Add(-recoveryWindow), recoveryTotalEntryMax)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{"first", "second", "third"} {
+				if !snapshot.Admitted[id] || snapshot.Covered[id] != want {
+					t.Fatalf("batch source %s: admitted=%t, coverage=%q", id, snapshot.Admitted[id], snapshot.Covered[id])
+				}
+			}
+			fresh := New(cfg, newServiceHarness())
+			defer fresh.Close()
+			fresh.SetPrimaryInstanceID("replacement")
+			if result := fresh.scanRecovery(context.Background(), "startup"); result.Dispatched != 0 || result.Reasons[want] != 3 {
+				t.Fatalf("batch not durably suppressed: %#v", result)
+			}
+		})
+	}
+}
+
+func TestRecoveryBatchSendFailureRollsBackOnlyAddedSources(t *testing.T) {
+	for _, followup := range []bool{false, true} {
+		t.Run(fmt.Sprint(followup), func(t *testing.T) {
+			service, target, _ := newRecoveryTestService(t)
+			message := core.Message{Channel: "cli", Conversation: "batch-failure", SourceMessageID: "older"}
+			if followup {
+				if _, _, err := service.reserveRecoveryExecution(message); err != nil {
+					t.Fatal(err)
+				}
+			}
+			service.Harness = &failingServiceHarness{serviceHarness: target, err: errors.New("send failed")}
+			message.SourceMessageID = "attempted-first"
+			if err := service.dispatchHarnessPrompt(context.Background(), message, "prompt", nil, "attempted-second", "older"); err == nil {
+				t.Fatal("batch send failure was not returned")
+			}
+			snapshot := service.recoveryCancellationSnapshot(sessionKey(message))
+			if !followup {
+				if snapshot != nil {
+					t.Fatal("rejected new batch left execution correlation")
+				}
+			} else if snapshot == nil || len(snapshot.sources) != 1 {
+				t.Fatalf("rejected follow-up changed older correlation: %#v", snapshot)
+			} else if _, ok := snapshot.sources["older"]; !ok {
+				t.Fatal("rejected follow-up removed the older source")
+			}
+		})
+	}
+}
+
+func TestRecoverySourceIndexBeyondDocumentBudgetAndLargeProgress(t *testing.T) {
+	service, target, cfg := newRecoveryTestService(t)
+	for i := 0; i < 2001; i++ {
+		text := fmt.Sprintf("---\nid: doc-%d\nsource_message_ids: [source-%d]\n---\n", i, i)
+		if i == 2000 {
+			text += strings.Repeat("progress\n", 1<<18)
+		}
+		if err := os.WriteFile(filepath.Join(cfg.StatePath("tasks", "done"), fmt.Sprintf("%04d.md", i)), []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	for _, id := range []string{"source-2000", "unlinked"} {
+		if _, err := service.History.Append("cli", "linked", history.Entry{At: now, AcceptedAt: now, Role: "user", SourceMessageID: id, Content: "request"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result := service.scanRecovery(context.Background(), "periodic")
+	if result.Dispatched != 1 || result.Reasons["linked_work"] != 1 || result.FailedClosed != 0 {
+		t.Fatalf("source index discarded workflow: %#v", result)
+	}
+	prompt := target.prompts["chat:cli:linked"][0]
+	if strings.Contains(prompt, `source_message_id="source-2000"`) || !strings.Contains(prompt, `source_message_id="unlinked"`) {
+		t.Fatal("linked-work suppression changed past document budget")
 	}
 }

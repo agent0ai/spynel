@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/app"
@@ -57,7 +59,7 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 			select {
 			case err := <-term.apiError:
 				term.service.Runtime.LogEvent("error", "localapi", "stopped", "Workspace API stopped: "+errorText(err))
-				stopErr := term.stop()
+				stopErr := term.stopFor("", "local_api_exit")
 				term = nil
 				return stopErr
 			default:
@@ -65,16 +67,30 @@ func runOwnerElection(ctx context.Context, cfg config.Config, version string, el
 			if now.Before(nextHeartbeat) {
 				return nil
 			}
+			if delay := now.Sub(nextHeartbeat); delay >= instance.HeartbeatInterval {
+				term.service.Runtime.LogEvent("warn", "instance", "renewal_late", fmt.Sprintf("Primary renewal scheduling delay_ms=%d", delay.Milliseconds()))
+			}
 			_, owned, err := election.Renew(term.token)
 			if err != nil {
 				term.service.Runtime.LogEvent("error", "instance", "lease_renew_failed", "Renew primary lease: "+err.Error())
 			}
 			if err != nil || !owned {
-				stopErr := term.stop()
+				reason := "ownership_changed"
+				if err != nil {
+					reason = "renewal_failed"
+				}
+				stopErr := term.stopFor("", reason)
 				term = nil
 				return stopErr
 			}
-			nextHeartbeat = now.Add(instance.HeartbeatInterval)
+			// Transport failure is not death. Rebuild the fixed service binding
+			// only after the shared native verifier confirms this worker exited.
+			if worker := term.service.Orchestrator.Worker; worker != nil && errors.Is(updater.VerifyProcess(worker.Info().Process), syscall.ESRCH) {
+				stopErr := term.stopFor("", "worker_exited")
+				term = nil
+				return stopErr
+			}
+			nextHeartbeat = time.Now().Add(instance.HeartbeatInterval)
 			return nil
 		}
 
@@ -173,9 +189,24 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 		}
 	}()
 	service.Runtime.LogEvent("info", "config", "reloaded", "Configuration loaded for primary startup")
+	election.SetObserver(func(observation instance.Observation) {
+		logElectionObservation(service.Runtime, election.ID(), observation)
+	})
 	service.SetRecoveryOwnershipFence(func(action func() error) (bool, error) {
 		return election.RunWhileOwner(token, action)
 	})
+	// Unavailable selections still need a discoverable worker for inspection
+	// and explicit settings recovery; availability is checked by Service.Start.
+	runtimeConfig, _ := cfg.RuntimeHarness(harness.HarnessConfig{Version: version})
+	settings, err := cfg.WorkerSettings()
+	if err == nil {
+		service.Orchestrator.Worker, err = harness.OpenWorker(ctx, runtimeConfig, election.ID(), token, settings)
+	}
+	if err != nil {
+		cancel()
+		_ = service.Close()
+		return nil, fmt.Errorf("bind primary harness worker: %w", err)
+	}
 	service.SetPrimaryInstanceID(election.ID())
 	if err := service.Start(ctx); err != nil {
 		service.Runtime.LogEvent("error", "harness", "unavailable", "Harness unavailable: "+err.Error())
@@ -241,7 +272,20 @@ func startPrimaryTerm(parent context.Context, original config.Config, version st
 }
 
 func runPrimaryOrchestrator(ctx context.Context, service *app.Service) error {
-	if availability, ok := service.Harness.(harness.Availability); ok {
+	if service.Orchestrator.Worker != nil {
+		ticker := time.NewTicker(instance.RetryInterval)
+		defer ticker.Stop()
+		for {
+			if ready, _, err := service.Orchestrator.Availability(ctx); err == nil && ready {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+			}
+		}
+	} else if availability, ok := service.Harness.(harness.Availability); ok {
 		if ready, _ := availability.Available(); !ready {
 			select {
 			case <-ctx.Done():
@@ -254,26 +298,23 @@ func runPrimaryOrchestrator(ctx context.Context, service *app.Service) error {
 }
 
 func (term *primaryTerm) stop() error {
-	return term.stopFor("")
+	return term.stopFor("", "controller_shutdown")
 }
 
 func (term *primaryTerm) handoff(targetID string) error {
-	return term.stopFor(targetID)
+	return term.stopFor(targetID, "explicit_handoff")
 }
 
-func (term *primaryTerm) stopFor(targetID string) error {
+func (term *primaryTerm) stopFor(targetID, reason string) error {
 	var stopErr error
 	stopped := false
 	term.stopOnce.Do(func() {
-		defer term.service.Runtime.Close()
+		defer func() { stopErr = errors.Join(stopErr, term.service.Close()) }()
 		stopped = true
+		term.service.Runtime.LogEvent("info", "instance", "primary_stopping", "Primary stopping: instance="+term.election.ID()+" reason="+reason)
 		term.service.SetPrimaryInstanceID("")
 		term.cancel()
 		_ = term.listener.Close()
-		if err := term.service.Harness.Close(); err != nil {
-			term.service.Runtime.LogEvent("error", "harness", "shutdown_failed", err.Error())
-			stopErr = err
-		}
 		<-term.apiDone
 		<-term.channelsDone
 		<-term.orchestratorDone
@@ -301,6 +342,19 @@ func (term *primaryTerm) stopFor(targetID string) error {
 		return errOwnershipLost
 	}
 	return stopErr
+}
+
+func logElectionObservation(runtime *app.Runtime, id string, observation instance.Observation) {
+	if observation.Reason == "" {
+		if observation.LockWait < instance.HeartbeatInterval && observation.LockHeld < instance.HeartbeatInterval {
+			return
+		}
+		runtime.LogEvent("warn", "instance", "election_lock_delay", fmt.Sprintf("instance=%s operation=%s wait_ms=%d held_ms=%d", id, observation.Operation, observation.LockWait.Milliseconds(), observation.LockHeld.Milliseconds()))
+		return
+	}
+	if observation.Reason != "renewed" {
+		runtime.LogEvent("warn", "instance", "lease_renewal", fmt.Sprintf("instance=%s reason=%s lease_age_ms=%d", id, observation.Reason, observation.LeaseAge.Milliseconds()))
+	}
 }
 
 func errorText(err error) string {

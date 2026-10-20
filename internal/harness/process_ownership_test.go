@@ -1,13 +1,65 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"github.com/agent0ai/spynel/internal/core"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/agent0ai/spynel/internal/core"
 )
+
+func TestProviderInputRenewsWriteDeadline(t *testing.T) {
+	reader, file, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	input := &providerInput{file}
+	defer input.Close()
+	want := []byte("synthetic 世界\n")
+	got := make([]byte, len(want)*2)
+	done := make(chan error, 1)
+	go func() { _, err := io.ReadFull(reader, got); done <- err }()
+	for range 2 {
+		if err := file.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := input.Write(want); err != nil || n != len(want) {
+			t.Fatalf("new frame inherited an expired deadline: n=%d error=%v", n, err)
+		}
+	}
+	if err := <-done; err != nil || !bytes.Equal(got, bytes.Repeat(want, 2)) {
+		t.Fatalf("input changed complete UTF-8 frames: %q error=%v", got, err)
+	}
+}
+
+func TestProviderInputDeadlineClosesPartialFrame(t *testing.T) {
+	reader, file, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	input := &providerInput{file}
+	defer input.Close()
+	data := bytes.Repeat([]byte("x"), 2*1024*1024)
+	started := time.Now()
+	n, err := input.Write(data)
+	if !errors.Is(err, os.ErrDeadlineExceeded) || n >= len(data) || time.Since(started) > 7*time.Second {
+		t.Fatalf("blocked pipe was not bounded: n=%d error=%v elapsed=%s", n, err, time.Since(started))
+	}
+	if _, err := input.Write([]byte("another frame\n")); err == nil {
+		t.Fatalf("failed input admitted another frame: %v", err)
+	}
+	got, err := io.ReadAll(reader)
+	if err != nil || !bytes.Equal(got, data[:n]) {
+		t.Fatalf("failed input did not end at its partial frame: length=%d error=%v", len(got), err)
+	}
+}
 
 func TestProviderOwnershipFencesAnotherContenderUntilOrderlyClose(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "runtime", "harness-owner")
