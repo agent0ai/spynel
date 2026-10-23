@@ -31,7 +31,17 @@ func (h *workerHost) recoverPrevious(cfg HarnessConfig) (string, error) {
 	}
 	directory := filepath.Dir(prior.Info.Socket)
 	info, err := os.Lstat(directory)
-	if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 || directory == h.directory || !strings.HasPrefix(filepath.Base(directory), "spynel-worker-") {
+	if directory == h.directory || !strings.HasPrefix(filepath.Base(directory), "spynel-worker-") {
+		return "", errors.New("prior worker journal directory unsafe")
+	}
+	// The rendezvous survives container recreation and temporary-directory cleanup.
+	// With native death confirmed and exclusive harness ownership already held,
+	// an absent journal has nothing to replay. Durable source/claim recovery owns
+	// reconciliation; never manufacture completion or retry a provider admission.
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
 		return "", errors.New("prior worker journal directory unsafe")
 	}
 	entries, err := os.ReadDir(directory)

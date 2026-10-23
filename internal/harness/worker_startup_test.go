@@ -43,13 +43,16 @@ func testWorkerPendingProcessOwnership(t *testing.T, protocol int) {
 		t.Fatal(err)
 	}
 	record.Info.Protocol = protocol
-	// Shutdown deliberately removes its journals; model crash-left empty state
-	// separately so this fixture exercises pending ownership, not missing data.
+	// Model container restart: the private rendezvous survives but /tmp is cleared.
+	// Pending guardian ownership must still delay replacement.
 	previous, err := os.MkdirTemp("", "spynel-worker-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(previous) })
+	if err := os.RemoveAll(previous); err != nil {
+		t.Fatal(err)
+	}
 	record.Info.Socket = filepath.Join(previous, "control.sock")
 	data, err = json.Marshal(record)
 	if err != nil {

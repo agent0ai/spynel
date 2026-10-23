@@ -96,7 +96,7 @@ func TestWorkerCrashReplayPreservesTerminalOutcome(t *testing.T) {
 }
 
 func TestWorkerCrashJournalValidation(t *testing.T) {
-	for _, scenario := range []string{"terminal", "unfinished", "atomic-scratch", "unsafe-scratch", "symlink-scratch", "unknown-scratch", "truncated", "future-cursor", "rewound-cursor", "invalid-utf8", "unsafe-file", "symlink", "missing-directory", "changed-config", "unverified-process"} {
+	for _, scenario := range []string{"terminal", "unfinished", "atomic-scratch", "unsafe-scratch", "symlink-scratch", "unknown-scratch", "truncated", "future-cursor", "rewound-cursor", "invalid-utf8", "unsafe-file", "symlink", "missing-directory", "missing-directory-unverified", "missing-directory-changed-config", "changed-config", "unverified-process"} {
 		t.Run(scenario, func(t *testing.T) {
 			root := t.TempDir()
 			previous, err := os.MkdirTemp(root, "spynel-worker-")
@@ -187,7 +187,7 @@ func TestWorkerCrashJournalValidation(t *testing.T) {
 				if err := os.Symlink(target, journal); err != nil {
 					t.Fatal(err)
 				}
-			case "missing-directory":
+			case "missing-directory", "missing-directory-unverified", "missing-directory-changed-config":
 				if err := os.RemoveAll(previous); err != nil {
 					t.Fatal(err)
 				}
@@ -196,6 +196,12 @@ func TestWorkerCrashJournalValidation(t *testing.T) {
 			case "unverified-process":
 				prior.Info.PID, prior.Info.Process.PID = os.Getpid(), os.Getpid()
 			}
+			if scenario == "missing-directory-unverified" {
+				prior.Info.PID, prior.Info.Process.PID = os.Getpid(), os.Getpid()
+			}
+			if scenario == "missing-directory-changed-config" {
+				prior.Info.ConfigDigest[0]++
+			}
 			record, _ := json.Marshal(prior)
 			write(host.recordPath, record)
 			directory, err := host.recoverPrevious(cfg)
@@ -203,6 +209,12 @@ func TestWorkerCrashJournalValidation(t *testing.T) {
 				if execution.file != nil {
 					defer execution.file.Close()
 				}
+			}
+			if scenario == "missing-directory" {
+				if err != nil || directory != "" || len(host.executions) != 0 || host.next != 1 || host.incomplete != 0 {
+					t.Fatal("absent temporary journal blocked fresh startup or fabricated execution state", err)
+				}
+				return
 			}
 			if scenario != "terminal" && scenario != "unfinished" && scenario != "atomic-scratch" {
 				if err == nil {
