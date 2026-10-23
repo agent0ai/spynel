@@ -249,7 +249,11 @@ func TestWorkerCrashRecoveryPreservesCancellation(t *testing.T) {
 			t.Logf("replacement worker pid=%d start=%s generation=%s", f.client.Info().PID, f.client.Info().Process.StartTime, f.client.Info().Process.Generation)
 			if scenario == "recover" {
 				f.start(t)
-				waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 1 && len(f.service.Runtime.Jobs()) == 1 })
+				// Job admission precedes asynchronous reservation publication.
+				waitWorkerAgent(t, func() bool {
+					executions, jobs := f.inspect(t), f.service.Runtime.Jobs()
+					return len(executions) == 1 && len(jobs) == 1 && jobs[0].ProviderIterations >= 2
+				})
 				current, restored := f.inspect(t)[0], f.service.Runtime.Jobs()[0]
 				if current.Workflow.LeaseID != execution.Workflow.LeaseID || restored.StableID != job.StableID || restored.Generation != job.Generation || restored.Number != job.Number || current.Reservation.ProviderIterations != 2 || restored.ProviderIterations != 2 {
 					t.Fatal("dead-worker recovery lost its claim/job or reserved more than one replacement")
