@@ -46,6 +46,8 @@
 
 - Document exact-event ordinary retry cancellation and agent-owned answer settlement before task resumption, preserving failure evidence, terminal delivery truth, and the limits of already accepted external effects.
 
+- Document the speech idle timeout as a default-120, 1–86400-whole-second live advanced setting measured from completion, with safe reload and allocator-specific memory reclamation; never promise measured Linux savings on other platforms.
+
 ## Child DOX Index
 
 No child DOX files.

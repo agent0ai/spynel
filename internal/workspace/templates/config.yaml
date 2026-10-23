@@ -58,6 +58,7 @@ speech:
   max_file_mb: 100
   max_duration_seconds: 1800
   chunk_seconds: 600
+  idle_timeout_seconds: 120
 
 startup:
   enabled: false

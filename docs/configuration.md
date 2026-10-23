@@ -189,6 +189,7 @@ When groups are enabled, the message must mention or reply to the linked account
 - `max_file_mb`: accepted source-audio limit.
 - `max_duration_seconds`: maximum beginning portion processed from one note.
 - `chunk_seconds`: maximum mono PCM segment passed to Parakeet at a time.
+- `idle_timeout_seconds`: whole seconds of inactivity before unloading the recognizer; default `120`, valid range `1`–`86400`. Available in Advanced settings and `/config set speech.idle_timeout_seconds 300`; no disabled value.
 
 Selectable values cover all 25 languages supported by multilingual Parakeet: Bulgarian (`bg`), Croatian (`hr`), Czech (`cs`), Danish (`da`), Dutch (`nl`), English (`en`), Estonian (`et`), Finnish (`fi`), French (`fr`), German (`de`), Greek (`el`), Hungarian (`hu`), Italian (`it`), Latvian (`lv`), Lithuanian (`lt`), Maltese (`mt`), Polish (`pl`), Portuguese (`pt`), Romanian (`ro`), Slovak (`sk`), Slovenian (`sl`), Spanish (`es`), Swedish (`sv`), Russian (`ru`), and Ukrainian (`uk`). `auto` is also available for multilingual automatic detection.
 
@@ -197,6 +198,10 @@ The first supported voice note downloads about 480 MB of compressed model data a
 Initialization writes the current embedded contract for new workspaces but does not overwrite an existing customized `.spynel/AGENTS.md`.
 
 Miniaudio accepts WAV, FLAC, and MP3. Telegram and WhatsApp Ogg/Opus voice notes are detected from their container signature and decoded by an in-process pure-Go Opus implementation. Both paths downmix to mono float32 at 16 kHz. M4A/AAC, WebM, and other formats return an explicit unsupported-format error without starting the model download. No Python, FFmpeg, external ASR executable, installer, or PATH change is needed. One process-wide worker serializes voice work, reuses the active recognizer, holds only one configured PCM chunk in memory, and bounds the final transcript.
+
+The idle interval starts when the latest transcription finishes, including failures or cancellation. Active transcription keeps the recognizer; bursts reset the timer, and the next request after unloading reloads it. Saving a new timeout applies it to the last completion immediately: shortening below the time already idle triggers cleanup, while active work uses the new interval when it finishes. Shutdown also releases the recognizer.
+
+Unloading destroys the native recognizer and scavenges freed Go memory. Linux/glibc builds additionally call `malloc_trim(0)` to return reclaimable native heap pages; other allocators, including macOS, decide when freed native memory returns to the OS. Savings and reload latency depend on the platform, allocator, model and workload; the timeout is a retention policy, not a memory ceiling. Downloaded models, recordings and filesystem caches are preserved.
 
 Unused configuration keys are ignored during loading without rewriting the file. The next settings save writes only current keys, removing obsolete entries such as `orchestrator.routes`. Known settings still require valid types and values; `/config set` rejects unknown names.
 

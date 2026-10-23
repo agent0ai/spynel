@@ -19,6 +19,8 @@
 
 - Own canonical worker-settings validation/persistence and canonical-to-runtime harness selection. RuntimeHarness returns the complete selected command alongside any availability error, including an absent custom executable. A validated worker-settings plan separates canonical persistence/restoration from provider unavailability; an availability error never relaxes exact runtime matching. Private encoded YAML is bounded and may contain credentials; never log it. Primary binding captures bounded raw canonical YAML only after its decoded settings match the loaded snapshot. An unchanged-intent runtime refresh rechecks the file but does not rewrite comments or unused keys; ordinary canonical saves retain their existing normalization. Match the expected canonical digest or an exact applied retry, reject unsafe paths and runtime mismatch, recheck raw bytes before saving, reload before confirmation and restore original bytes only if the saved target still matches. Store reload publishes only the expected canonical bytes without another save; exact election ownership is supplied by the worker/application, not by a process-local store mutex.
 
+- Default `speech.idle_timeout_seconds` to 120 on omission and in generated configuration. Accept only 1–86400 whole seconds, expose it in advanced speech settings, persist explicit overrides canonically, and reject invalid/overflowing input transactionally. It applies live through the application save/reload hook; no disable value exists.
+
 ## Child DOX Index
 
 No child DOX files.

@@ -82,6 +82,7 @@ func Settings(cfg Config) []Setting {
 		{Key: "speech.max_file_mb", Section: "config", Description: "Maximum accepted voice file size", Value: strconv.Itoa(cfg.Speech.MaxFileMB), Advanced: true},
 		{Key: "speech.max_duration_seconds", Section: "config", Description: "Maximum voice duration processed", Value: strconv.Itoa(cfg.Speech.MaxDurationSec), Advanced: true},
 		{Key: "speech.chunk_seconds", Section: "config", Description: "Maximum transcription chunk duration", Value: strconv.Itoa(cfg.Speech.ChunkSeconds), Advanced: true},
+		{Key: "speech.idle_timeout_seconds", Section: "config", Description: "Unload the speech model after 1–86400 idle seconds; default 120; next voice message reloads it", Value: strconv.Itoa(cfg.Speech.IdleTimeoutSec), Advanced: true},
 	}
 	return values
 }
@@ -299,6 +300,8 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 		cfg.Speech.MaxDurationSec, err = parseInteger(1)
 	case "speech.chunk_seconds":
 		cfg.Speech.ChunkSeconds, err = parseInteger(1)
+	case "speech.idle_timeout_seconds":
+		cfg.Speech.IdleTimeoutSec, err = parseInteger(1)
 	case "startup.enabled":
 		cfg.Startup.Enabled, err = parseBoolean()
 	default:

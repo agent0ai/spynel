@@ -8,7 +8,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/media/miniaudio"
@@ -51,6 +54,10 @@ type Parakeet struct {
 	cachedModel   string
 	cachedThreads int
 	cached        speechRecognizer
+	closed        bool
+	idleMu        sync.Mutex // Timer state; native resources remain owned by serial.
+	idleTimer     *time.Timer
+	idleSince     time.Time
 }
 
 func NewParakeet(settings *config.Store, modelDir string, cacheInitErr error, log io.Writer) *Parakeet {
@@ -69,6 +76,21 @@ func (p *Parakeet) Transcribe(ctx context.Context, audioPath string) (string, er
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
+
+	if p.closed {
+		return "", errors.New("speech transcriber is closed")
+	}
+	p.idleMu.Lock()
+	p.stopIdleTimer()
+	p.idleMu.Unlock()
+	defer func() {
+		p.idleMu.Lock()
+		defer p.idleMu.Unlock()
+		if p.cached != nil {
+			p.idleSince = time.Now()
+			p.scheduleIdleTimer()
+		}
+	}()
 
 	cfg := p.settings.Snapshot().Speech
 	if !cfg.Enabled {
@@ -141,6 +163,66 @@ func (p *Parakeet) Transcribe(ctx context.Context, audioPath string) (string, er
 		return "", errors.New("Parakeet produced an empty transcription")
 	}
 	return strings.Join(parts, "\n"), nil
+}
+
+// RefreshIdleTimeout applies the saved interval to the last completed use.
+// Active transcription rearms from completion using the newest settings.
+func (p *Parakeet) RefreshIdleTimeout() {
+	p.idleMu.Lock()
+	defer p.idleMu.Unlock()
+	if !p.idleSince.IsZero() {
+		p.scheduleIdleTimer()
+	}
+}
+
+// Timer helpers require idleMu; destruction also requires serial.
+func (p *Parakeet) stopIdleTimer() {
+	if p.idleTimer != nil {
+		p.idleTimer.Stop()
+		p.idleTimer = nil
+	}
+	p.idleSince = time.Time{}
+}
+
+func (p *Parakeet) scheduleIdleTimer() {
+	if p.idleTimer != nil {
+		p.idleTimer.Stop()
+	}
+	timeout := time.Duration(p.settings.Snapshot().Speech.IdleTimeoutSec) * time.Second
+	var timer *time.Timer
+	timer = time.AfterFunc(timeout-time.Since(p.idleSince), func() {
+		p.serial <- struct{}{}
+		defer func() { <-p.serial }()
+		p.idleMu.Lock()
+		if p.idleTimer != timer {
+			p.idleMu.Unlock()
+			return
+		}
+		p.stopIdleTimer()
+		p.idleMu.Unlock()
+		p.unload()
+	})
+	p.idleTimer = timer
+}
+
+// Close waits for native work, cancels idle cleanup and permanently closes the worker.
+func (p *Parakeet) Close() {
+	p.serial <- struct{}{}
+	defer func() { <-p.serial }()
+	p.closed = true
+	p.idleMu.Lock()
+	p.stopIdleTimer()
+	p.idleMu.Unlock()
+	p.unload()
+}
+
+func (p *Parakeet) unload() {
+	if p.cached != nil {
+		p.cached.Close()
+		p.cached = nil
+		debug.FreeOSMemory()
+		trimNativeMemory()
+	}
 }
 
 func (p *Parakeet) recognizer(files parakeetFiles, threads int) (speechRecognizer, error) {

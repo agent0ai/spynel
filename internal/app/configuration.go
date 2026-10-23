@@ -1298,6 +1298,9 @@ func (s *Service) ApplySettings(values map[string]string) ([]config.Setting, err
 		return nil, errors.Join(err, rollback)
 	}
 	next = reloaded
+	if previous.Speech.IdleTimeoutSec != next.Speech.IdleTimeoutSec && s.RefreshSpeechIdleTimeout != nil {
+		s.RefreshSpeechIdleTimeout()
+	}
 	for _, setting := range changed {
 		if setting.Key == "channels.tui.title" {
 			s.publishTitle(values[setting.Key])

@@ -111,6 +111,7 @@ func TestManagedParakeetModelRejectsCorruptionAndDownloadsReplacement(t *testing
 	}))
 	defer server.Close()
 	worker := NewParakeet(config.NewStore(config.Default()), cache, nil, nil)
+	t.Cleanup(worker.Close)
 	worker.models[parakeetEnglishModel] = spec
 	worker.modelBaseURL = server.URL + "/"
 	if _, err := worker.model(context.Background(), config.Default().Speech); err == nil || !strings.Contains(err.Error(), "HTTP 503") {
@@ -141,6 +142,7 @@ func TestParakeetRepairsIncompleteManagedModel(t *testing.T) {
 	}))
 	defer server.Close()
 	worker := NewParakeet(config.NewStore(config.Default()), cache, nil, nil)
+	t.Cleanup(worker.Close)
 	worker.modelBaseURL = server.URL + "/"
 	_, err := worker.model(context.Background(), config.Default().Speech)
 	if err == nil || !strings.Contains(err.Error(), "HTTP 503") {
@@ -161,6 +163,7 @@ func TestParakeetExplicitModelBypassesUnavailableCache(t *testing.T) {
 	cfg.Root = root
 	cfg.Speech.ModelDir = explicit
 	worker := NewParakeet(config.NewStore(cfg), "", errors.New("cache unavailable"), nil)
+	t.Cleanup(worker.Close)
 	files, err := worker.model(context.Background(), cfg.Speech)
 	if err != nil {
 		t.Fatal(err)
@@ -185,6 +188,7 @@ func TestParakeetChunksAndSerializesTranscription(t *testing.T) {
 	store := config.NewStore(cfg)
 	recognizer := &recordingRecognizer{delay: 20 * time.Millisecond}
 	worker := NewParakeet(store, filepath.Join(root, "managed"), nil, nil)
+	t.Cleanup(worker.Close)
 	worker.openAudio = func(string) (audioDecoder, error) {
 		return &sliceDecoder{samples: make([]float32, parakeetSampleRate+8000)}, nil
 	}
@@ -238,6 +242,7 @@ func TestParakeetUsesMiniaudioForWAV(t *testing.T) {
 	cfg.Root = root
 	cfg.Speech.ModelDir = modelDir
 	worker := NewParakeet(config.NewStore(cfg), filepath.Join(root, "managed"), nil, nil)
+	t.Cleanup(worker.Close)
 	worker.newRecognizer = func(parakeetFiles, int) (speechRecognizer, error) {
 		return &fixedRecognizer{text: "decoded locally"}, nil
 	}
@@ -266,6 +271,7 @@ func TestParakeetDecodesTelegramStyleOggOpus(t *testing.T) {
 	cfg.Speech.ModelDir = modelDir
 	recognizer := &sampleRecognizer{}
 	worker := NewParakeet(config.NewStore(cfg), filepath.Join(root, "managed"), nil, nil)
+	t.Cleanup(worker.Close)
 	worker.newRecognizer = func(parakeetFiles, int) (speechRecognizer, error) {
 		return recognizer, nil
 	}
@@ -342,6 +348,7 @@ func TestOggOpusParsesSignedGainAndBoundsGranuleConversion(t *testing.T) {
 
 func TestRecognizerReplacementKeepsWorkingRecognizerOnLoadFailure(t *testing.T) {
 	worker := NewParakeet(config.NewStore(config.Default()), t.TempDir(), nil, nil)
+	t.Cleanup(worker.Close)
 	previous := &trackingRecognizer{}
 	worker.cached = previous
 	worker.cachedModel = "old"
@@ -364,6 +371,7 @@ func TestParakeetRejectsUnsupportedAudioBeforeModelDownload(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker := NewParakeet(config.NewStore(config.Default()), filepath.Join(root, "models"), nil, nil)
+	t.Cleanup(worker.Close)
 	_, err := worker.Transcribe(context.Background(), audio)
 	if err == nil || !strings.Contains(err.Error(), "supported formats: WAV, FLAC, MP3, Ogg/Opus") {
 		t.Fatalf("unsupported format error = %v", err)
@@ -388,6 +396,7 @@ func TestParakeetDownloadsVerifiedPartialArchive(t *testing.T) {
 	defer server.Close()
 	root := t.TempDir()
 	worker := NewParakeet(config.NewStore(config.Default()), root, nil, nil)
+	t.Cleanup(worker.Close)
 	worker.modelBaseURL = server.URL + "/"
 	spec := parakeetModel{ID: "fixture", Archive: "model.tar.bz2", SHA256: hex.EncodeToString(hash[:]), ArchiveBytes: int64(len(payload))}
 	archive, cleanup, err := worker.downloadModel(context.Background(), spec)
@@ -417,6 +426,7 @@ func TestParakeetRejectsModelChecksumMismatch(t *testing.T) {
 	defer server.Close()
 	root := t.TempDir()
 	worker := NewParakeet(config.NewStore(config.Default()), root, nil, nil)
+	t.Cleanup(worker.Close)
 	worker.modelBaseURL = server.URL + "/"
 	_, cleanup, err := worker.downloadModel(context.Background(), parakeetModel{
 		ID: "fixture", Archive: "model.tar.bz2", SHA256: strings.Repeat("0", 64), ArchiveBytes: 7,
@@ -464,6 +474,7 @@ func TestParakeetRealIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker := NewParakeet(config.NewStore(cfg), cacheRoot, nil, os.Stderr)
+	t.Cleanup(worker.Close)
 	text, err := worker.Transcribe(context.Background(), audio)
 	if err != nil {
 		t.Fatal(err)

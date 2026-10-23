@@ -59,6 +59,7 @@ Every setting below is exposed by the shared typed catalog used by the TUI, slas
 | `speech.max_file_mb` | Live | Replacement rejects subsequent oversized voice files at the new bound | Range validation rejects before commit | speech size-limit tests |
 | `speech.max_duration_seconds` | Live | Replacement bounds the next transcription duration | Range validation rejects before commit | speech duration tests |
 | `speech.chunk_seconds` | Live | Replacement chunks the next transcription at the new duration | Range validation rejects before commit | speech chunk tests |
+| `speech.idle_timeout_seconds` | Live | Reschedule from the latest completed transcription; active work rearms on completion without transport restart | Whole seconds 1–86400; default 120; reject before commit | config round-trip, shared command/screen and deterministic idle lifecycle tests |
 
 `channels.tui.enabled` is intentionally absent. Legacy YAML containing it is normalized during load and a canonical save removes it. Bare `spynel` launches the TUI; `spynel serve` remains headless unless invoked with `--tui`.
 

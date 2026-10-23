@@ -197,6 +197,16 @@ func TestWorkerSettingsCanonicalApplicationCommitAndControllerReplacement(t *tes
 	}
 	f.service = app.New(f.cfg, harness.NewSupervisor(harness.NewBuiltinRegistry(), runtime))
 	f.service.Orchestrator.Worker = f.client
+	refreshes, refreshedTimeout := 0, 0
+	refreshSpeech := func() {
+		saved, err := config.Load(f.cfg.Path)
+		if err != nil || f.service.Settings.Snapshot().Speech != saved.Speech {
+			t.Fatal("speech refresh preceded confirmed canonical/application publication", err)
+		}
+		refreshes++
+		refreshedTimeout = saved.Speech.IdleTimeoutSec
+	}
+	f.service.RefreshSpeechIdleTimeout = refreshSpeech
 	identity := f.client.Info()
 	t.Logf("canonical settings worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
 	first, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "send", Sequence: 1, Key: "synthetic/settings", Prompt: "synthetic initial turn"})
@@ -206,20 +216,30 @@ func TestWorkerSettingsCanonicalApplicationCommitAndControllerReplacement(t *tes
 	before, _ := f.cfg.Encode()
 	f.client.Close()
 	restore := dropWorkerReply(t, f.client.Info().Socket, "configure", false, false)
-	if _, err := f.service.ApplySettings(map[string]string{"harness.model": "not-admitted"}); err == nil {
+	if _, err := f.service.ApplySettings(map[string]string{"harness.model": "not-admitted", "speech.idle_timeout_seconds": "300"}); err == nil {
 		t.Fatal("absent worker settings request claimed a commit")
 	}
 	restore()
 	f.client.Close()
-	if actual, _ := os.ReadFile(f.cfg.Path); !bytes.Equal(actual, before) || f.service.Settings.Snapshot().Harness.Model == "not-admitted" {
+	if actual, _ := os.ReadFile(f.cfg.Path); !bytes.Equal(actual, before) || f.service.Settings.Snapshot().Harness.Model == "not-admitted" || refreshes != 0 || f.service.Settings.Snapshot().Speech.IdleTimeoutSec != 120 {
 		t.Fatal("absent worker request changed canonical/application settings")
 	}
 	restore = dropWorkerReply(t, f.client.Info().Socket, "configure", true, false)
-	if _, err := f.service.ApplySettings(map[string]string{"harness.model": "model-a", "harness.reasoning_effort": "high", "harness.service_mode": "priority", "orchestrator.interval_seconds": "19"}); err != nil {
+	if _, err := f.service.ApplySettings(map[string]string{"harness.model": "model-a", "harness.reasoning_effort": "high", "harness.service_mode": "priority", "orchestrator.interval_seconds": "19", "speech.idle_timeout_seconds": "300"}); err != nil {
 		t.Fatal(err)
 	}
 	restore()
 	f.client.Close()
+	if refreshes != 1 || refreshedTimeout != 300 {
+		t.Fatal("reconciled worker save did not refresh speech exactly once")
+	}
+	// A timeout-only save must not replace the worker or admit another provider turn.
+	if _, err := f.service.ApplySettings(map[string]string{"speech.idle_timeout_seconds": "600"}); err != nil {
+		t.Fatal(err)
+	}
+	if refreshes != 2 || refreshedTimeout != 600 || f.client.Info().Process != identity.Process {
+		t.Fatal("timeout-only save lost speech refresh or retained worker identity")
+	}
 	saved, err := config.Load(f.cfg.Path)
 	if err != nil || saved.Harness.Model != "model-a" || saved.Harness.ServiceMode != "priority" || saved.Orchestrator.IntervalSec != 19 || f.service.Settings.Snapshot().Harness.Model != "model-a" {
 		t.Fatal("canonical/application selection did not commit", err)
@@ -231,15 +251,21 @@ func TestWorkerSettingsCanonicalApplicationCommitAndControllerReplacement(t *tes
 		t.Fatal("settings replaced or redispatched retained work", err)
 	}
 	// A structural change must fail before either canonical or runtime mutation.
-	if _, err := f.service.ApplySettings(map[string]string{"harness.sandbox": "workspace-write"}); err == nil {
+	if _, err := f.service.ApplySettings(map[string]string{"harness.sandbox": "workspace-write", "speech.idle_timeout_seconds": "700"}); err == nil {
 		t.Fatal("active retained work was replaced")
 	}
 	actual, _ := os.ReadFile(saved.Path)
-	if !bytes.Equal(actual, encoded) || f.service.Settings.Snapshot().Harness.Sandbox != "read-only" {
+	if !bytes.Equal(actual, encoded) || f.service.Settings.Snapshot().Harness.Sandbox != "read-only" || refreshes != 2 || f.service.Settings.Snapshot().Speech.IdleTimeoutSec != 600 {
 		t.Fatal("rejected structural change altered saved/published settings")
 	}
 	if _, err := f.service.ApplySettings(map[string]string{"harness.service_mode": "unsupported"}); err == nil {
 		t.Fatal("unverified service mode was saved")
+	}
+	if _, err := f.service.ApplySettings(map[string]string{"speech.idle_timeout_seconds": "1.5"}); err == nil {
+		t.Fatal("invalid speech timeout was saved")
+	}
+	if actual, _ := os.ReadFile(saved.Path); !bytes.Equal(actual, encoded) || refreshes != 2 {
+		t.Fatal("invalid timeout changed canonical speech or refreshed it")
 	}
 	// Repeated explicit confirmation after a lost reply has no provider admission.
 	request := harness.WorkerRequest{Action: "configure", Config: &runtime, ExpectedConfig: identity.ConfigDigest,
@@ -272,6 +298,7 @@ func TestWorkerSettingsCanonicalApplicationCommitAndControllerReplacement(t *tes
 	}
 	f.service = app.New(saved, harness.NewSupervisor(harness.NewBuiltinRegistry(), runtime))
 	f.service.Orchestrator.Worker = f.client
+	f.service.RefreshSpeechIdleTimeout = refreshSpeech
 	// Release the first turn and exercise a real next provider dispatch.
 	if _, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "interrupt", Key: "synthetic/settings"}); err != nil {
 		t.Fatal(err)
@@ -323,15 +350,15 @@ func TestWorkerSettingsCanonicalApplicationCommitAndControllerReplacement(t *tes
 	f.service.Startup = startup
 	f.client.Close()
 	restore = dropWorkerReply(t, f.client.Info().Socket, "configure", true, true)
-	if _, err := f.service.ApplySettings(map[string]string{"startup.enabled": "true"}); err == nil || !strings.Contains(err.Error(), "commit unconfirmed") {
+	if _, err := f.service.ApplySettings(map[string]string{"startup.enabled": "true", "speech.idle_timeout_seconds": "900"}); err == nil || !strings.Contains(err.Error(), "commit unconfirmed") {
 		t.Fatal("unreachable confirmation invented a settings result", err)
 	}
-	if current, err := config.Load(saved.Path); err != nil || !current.Startup.Enabled || !startup.enabled || f.service.Settings.Snapshot().Startup.Enabled {
+	if current, err := config.Load(saved.Path); err != nil || !current.Startup.Enabled || !startup.enabled || f.service.Settings.Snapshot().Startup.Enabled || current.Speech.IdleTimeoutSec != 900 || f.service.Settings.Snapshot().Speech.IdleTimeoutSec != 600 || refreshes != 2 {
 		t.Fatal("unconfirmed commit was published or its native registration was undone", err)
 	}
 	restore()
 	f.client.Close()
-	if _, err := f.service.ApplySettings(map[string]string{"startup.enabled": "true"}); err != nil || !f.service.Settings.Snapshot().Startup.Enabled || !startup.enabled {
+	if _, err := f.service.ApplySettings(map[string]string{"startup.enabled": "true", "speech.idle_timeout_seconds": "900"}); err != nil || !f.service.Settings.Snapshot().Startup.Enabled || !startup.enabled || refreshes != 3 || refreshedTimeout != 900 {
 		t.Fatal("explicit same-selection retry did not reconcile native and canonical settings", err)
 	}
 	if _, err := f.client.Call(context.Background(), harness.WorkerRequest{Action: "interrupt", Key: "synthetic/settings"}); err != nil {

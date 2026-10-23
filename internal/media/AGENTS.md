@@ -11,6 +11,8 @@
 - Decode supported audio to mono 16 kHz float PCM and serialize transcription through one process-wide worker; preserve originals and make failures visible without invoking Python, FFmpeg, or external ASR tools.
 - Coordinate model cache installation across processes, enforce pinned size/hash/archive safety and compatibility markers, and atomically publish only complete private model directories.
 
+- Serialize native recognizer use, replacement, idle expiry and permanent `Close` through the existing worker ownership channel. Timer state has its own mutex so live timeout changes never wait for transcription; invalidate stopped callbacks by timer identity before closing resources. Start the configured idle interval at completion, including failures, and reload after expiry. Destroy the recognizer, scavenge Go memory and trim native free pages only under a glibc guard; other allocators retain their own reclamation policy. Never delete recordings or model/cache files for RAM cleanup.
+
 ## Child DOX Index
 
 Direct child DOX files:

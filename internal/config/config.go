@@ -151,6 +151,25 @@ type Speech struct {
 	MaxFileMB      int    `yaml:"max_file_mb"`
 	MaxDurationSec int    `yaml:"max_duration_seconds"`
 	ChunkSeconds   int    `yaml:"chunk_seconds"`
+	IdleTimeoutSec int    `yaml:"idle_timeout_seconds"`
+}
+
+func (s *Speech) UnmarshalYAML(node *yaml.Node) error {
+	// yaml.v3 otherwise silently truncates fractional numbers into integer fields.
+	var fields map[string]yaml.Node
+	if err := node.Decode(&fields); err != nil {
+		return err
+	}
+	if idle, present := fields["idle_timeout_seconds"]; present && idle.ShortTag() != "!!int" {
+		return errors.New("speech.idle_timeout_seconds must be whole seconds")
+	}
+	type plain Speech
+	next := plain(*s)
+	if err := node.Decode(&next); err != nil {
+		return err
+	}
+	*s = Speech(next)
+	return nil
 }
 
 var speechLanguages = []string{
@@ -218,7 +237,7 @@ func Default() Config {
 			Telegram: Telegram{Name: "spynel", TokenEnv: "SPYNEL_TELEGRAM_TOKEN", Mode: "polling", WebhookListen: "127.0.0.1:8787", PollTimeoutSec: 30, GroupMode: "mention", WelcomeMessage: "Welcome, {name}!"},
 			WhatsApp: WhatsApp{Mode: "self-chat", Database: ".spynel/whatsapp.db", PollIntervalSec: 3},
 		},
-		Speech:  Speech{Enabled: true, Language: "en", NumThreads: 2, MaxFileMB: 100, MaxDurationSec: 1800, ChunkSeconds: 600},
+		Speech:  Speech{Enabled: true, Language: "en", NumThreads: 2, MaxFileMB: 100, MaxDurationSec: 1800, ChunkSeconds: 600, IdleTimeoutSec: 120},
 		Startup: Startup{},
 		Orchestrator: Orchestrator{
 			Enabled: true, IntervalSec: 10, RetriggerUnrespondedMessages: true, SemanticHeartbeatMinutes: 15, TaskNotifications: TaskNotificationsDecide, MaxParallel: 4,
@@ -469,6 +488,9 @@ func (c Config) Validate() error {
 	}
 	if c.Speech.MaxFileMB <= 0 || c.Speech.MaxDurationSec <= 0 || c.Speech.ChunkSeconds <= 0 || c.Speech.NumThreads <= 0 {
 		problems = append(problems, "speech resource limits must be positive")
+	}
+	if c.Speech.IdleTimeoutSec < 1 || c.Speech.IdleTimeoutSec > 86400 {
+		problems = append(problems, "speech.idle_timeout_seconds must be between 1 and 86400 whole seconds")
 	}
 	if !IsSpeechLanguage(c.Speech.Language) {
 		problems = append(problems, "speech.language must be auto or a supported Parakeet language code")

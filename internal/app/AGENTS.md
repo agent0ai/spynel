@@ -79,6 +79,8 @@
 
 - Exact-event notification cancellation uses the ordinary outbox/send mutex and existing cancelled terminal state, preserves attempts/errors and delivered/expired records, and never retracts external effects. Authenticated workspace operators can retire a recorded event by its exact original route and ID even after route revocation; it sends nothing and grants no delivery authority. Communication, notification and heartbeat prompts require confirmed cancellation of resolved-question deliveries before ordinary task resumption, leaving unrelated decisions pending. No runtime answer parser, reminder state or task transition belongs to this primitive.
 
+- After a confirmed speech idle-timeout save/reload and application snapshot publication, invoke the shared speech transcriber’s refresh hook before returning. Worker-backed settings retain canonical ownership, reconciliation and dispatch fencing; invalid, failed or unconfirmed transactions never refresh speech. The CLI installs this hook before channel/API admission.
+
 ## Child DOX Index
 
 No child DOX files.

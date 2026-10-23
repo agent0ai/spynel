@@ -21,6 +21,8 @@
 - Heartbeat guidance checks actual dependency/policy/authorization and independent work before asking for external input, distinguishes a first prerequisite question from repeat reminders, permits private exact-route and necessary bounded original-thread inspection, and validates delivery/relevant answers before suppressing escalation or resuming work. Runtime injection covers custom templates; upgrades still preserve their files.
 - Human-wait defaults require an answerable question and finite agent-owned audit/follow-up in existing Progress. Executor contact restrictions remain role-scoped; notification/heartbeat roles retain authorized original-thread questions and relevant-answer verification. Generic status, queued delivery and saved history do not prove presentation or reading, and time never grants consent. Keep runtime-injected guidance aligned without rewriting customized workspace files.
 
+- Generated speech settings include `idle_timeout_seconds: 120`; preserve existing workspace configuration during upgrades and let decode defaults handle omission.
+
 ## Child DOX Index
 
 No child DOX files.

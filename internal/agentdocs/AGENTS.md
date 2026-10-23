@@ -26,6 +26,8 @@
 
 - Document exact-event ordinary retry cancellation and agent-owned answer settlement before task resumption, preserving failure evidence, terminal delivery truth, and the limits of already accepted external effects.
 
+- Keep compiled speech idle-timeout guidance aligned with its validated seconds range, live effect, active-work protection, reload behavior and allocator limitations.
+
 ## Child DOX Index
 
 No child DOX files.

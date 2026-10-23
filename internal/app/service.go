@@ -43,6 +43,8 @@ type Service struct {
 	Settings        *config.Store
 	PairingControl  channel.PairingManager
 	DeliveryControl channel.DeliveryRouter
+
+	RefreshSpeechIdleTimeout func()
 	// ConversationDelivery is the ordinary channel response path used by
 	// communication recovery; it is intentionally separate from Notify.
 	ConversationDelivery   channel.DeliveryRouter

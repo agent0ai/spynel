@@ -1313,6 +1313,7 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 		return nil, cacheErr
 	}
 	speech := media.NewParakeet(service.Settings, cacheRoot, cacheErr, service.Runtime.Writer("media"))
+	service.RefreshSpeechIdleTimeout = speech.RefreshIdleTimeout
 	managed := managedChannels(service, speech)
 	supervisor := channel.NewSupervisor(service.Settings, service.Handle, managed, report, service.Runtime.Writer("channel"))
 	supervisor.SetEventLogger(service.Runtime.LogEvent)
@@ -1322,11 +1323,15 @@ func startChannels(ctx context.Context, service *app.Service, report channel.Sta
 	done := make(chan error, 1)
 	go func() {
 		defer service.Runtime.RecoverPanic("channel", "supervisor_panic")
-		err := supervisor.Run(ctx)
+		var err error
+		defer func() {
+			speech.Close()
+			done <- err
+		}()
+		err = supervisor.Run(ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			service.Runtime.LogEvent("error", "channel", "supervisor_stopped", "Channel supervisor: "+err.Error())
 		}
-		done <- err
 	}()
 	return done, nil
 }
@@ -1337,6 +1342,7 @@ func managedChannels(service *app.Service, speech media.Transcriber) []channel.M
 			Name:    "telegram",
 			Enabled: func(cfg config.Config) bool { return cfg.Channels.Telegram.Enabled },
 			Fingerprint: func(cfg config.Config) string {
+				cfg.Speech.IdleTimeoutSec = 0 // Timer changes must not cancel an active voice message.
 				return configFingerprint(struct {
 					Settings config.Telegram
 					Token    string
@@ -1367,6 +1373,7 @@ func managedChannels(service *app.Service, speech media.Transcriber) []channel.M
 			Name:    "whatsapp",
 			Enabled: func(cfg config.Config) bool { return cfg.Channels.WhatsApp.Enabled },
 			Fingerprint: func(cfg config.Config) string {
+				cfg.Speech.IdleTimeoutSec = 0 // Timer changes must not cancel an active voice message.
 				return configFingerprint(struct {
 					Settings config.WhatsApp
 					Speech   config.Speech
