@@ -6,6 +6,8 @@
 
 ## Local Contracts
 
+- Own the canonical slash-command catalog and parsing shared by application dispatch and remote intake classification, including Telegram mentions and existing aliases. Recognition is a scheduling hint only; transport authorization and application effects retain their existing owners.
+
 - Keep types provider- and transport-neutral; implementation dependencies belong in consuming packages.
 - Preserve bounded and optional serialization semantics, including reply references and attachment directives, without embedding secrets.
 - `Message.ForwardedFrom` is optional display-only provenance: empty means direct, `unknown` means a provider-confirmed forward without a source. Normalize provider labels with `ForwardedSource`; never substitute them for sender authorization, conversation, reply routing or source correlation.

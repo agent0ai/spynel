@@ -6,6 +6,8 @@
 
 ## Local Contracts
 
+- Remote adapters use one ordered ordinary worker and one ordered command worker through RunInbox, with at most 64 waiting events in each lane. Classify only recognized commands in authored text without media using the shared core catalog/grammar; never derive priority from speech, quotes, or arbitrary slash-looking text. Both lanes use the same application handler and existing authentication, addressing, correlation and delivery paths. Cancel and join both workers with their adapter generation; recheck cancellation and live authority after preparation before application effects. Overflow is rejected before admission, never handled by spawning another worker.
+
 - Adapters translate messages and screens through `core` and the application service; they never invoke harness implementations directly.
 - The supervisor consumes refreshed shared configuration snapshots, replaces only changed adapters, revokes stale adapter authority before cancellation, isolates failures, publishes lifecycle state, and retries only eligible unchanged configurations.
 - Reconciliation checks owner cancellation before construction and again after construction/authorization before admitting a replacement. A cancelled build revokes its replacement authority without starting or retaining it; selected configuration/retry events cannot rebuild channels after shutdown is already observed.

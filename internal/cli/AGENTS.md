@@ -66,7 +66,7 @@
 
 - Ordinary notify cancellation accepts only exact original origin plus `--cancel EVENT_ID` / `cancel_id`; it rejects send/routing alternatives. Return confirmed terminal state without exposing delivery content or claiming a retraction. Keep client/server and CLI validation synchronized; older owners lacking confirmation must fail visibly.
 
-- Own one shared speech worker per channel-supervisor lifetime. Apply idle-timeout saves through the application refresh hook, exclude that timer-only setting from transport restart fingerprints, and close the worker after the supervisor stops before reporting channel shutdown complete.
+- Own one shared speech worker per channel-supervisor lifetime. Apply idle-timeout saves through the application refresh hook, exclude that timer-only setting from transport restart fingerprints, and close the worker after the supervisor stops before reporting channel shutdown complete. Speech close refuses new work immediately; an uninterruptible native call retains its resources until completion or process exit and cannot hold restart on the transcription lock.
 
 ## Child DOX Index
 
