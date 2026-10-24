@@ -530,6 +530,7 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 	}
 	err = handler(ctx, core.Message{
 		Channel: b.Name(), Conversation: b.conversationID(message), Sender: b.sender(message.From),
+		ForwardedFrom:   b.forwardedFrom(message),
 		SourceMessageID: fmt.Sprintf("telegram:%s:%d", chatID, message.MessageID), ReplyTo: telegramReplyTo(message), Text: text, ReceivedAt: time.Unix(message.Date, 0).UTC(),
 	}, emit)
 	if err != nil {
@@ -553,6 +554,42 @@ func telegramReplyTo(message *telegramMessage) string {
 	}
 	replied := message.ReplyToMessage
 	return channel.ReplyReference(strconv.FormatInt(replied.MessageID, 10), firstNonempty(replied.Text, replied.Caption))
+}
+
+func (b *Bot) forwardedFrom(message *telegramMessage) string {
+	if message.ForwardOrigin == nil {
+		if message.IsAutomaticForward {
+			return "unknown"
+		}
+		return ""
+	}
+	origin := message.ForwardOrigin
+	name := ""
+	switch origin.Type {
+	case "user":
+		if user := origin.SenderUser; user != nil {
+			name = user.FirstName
+			if user.Username != "" || (name == "" && user.ID != 0) {
+				name = b.sender(*user)
+			}
+		}
+	case "hidden_user":
+		name = origin.SenderUserName
+	case "chat", "channel":
+		chat := origin.SenderChat
+		if origin.Type == "channel" {
+			chat = origin.Chat
+		}
+		if chat != nil {
+			name = chat.Title
+			if chat.Username != "" {
+				name = "@" + chat.Username
+			} else if name == "" && chat.ID != 0 {
+				name = strconv.FormatInt(chat.ID, 10)
+			}
+		}
+	}
+	return core.ForwardedSource(name)
 }
 
 func (b *Bot) conversationID(message *telegramMessage) string {
@@ -903,19 +940,21 @@ type telegramUpdate struct {
 }
 
 type telegramMessage struct {
-	MessageID      int64             `json:"message_id"`
-	From           telegramUser      `json:"from"`
-	Chat           telegramChat      `json:"chat"`
-	Date           int64             `json:"date"`
-	Text           string            `json:"text"`
-	Caption        string            `json:"caption"`
-	Document       *telegramDocument `json:"document"`
-	Photo          []telegramPhoto   `json:"photo"`
-	Video          *telegramMedia    `json:"video"`
-	Audio          *telegramMedia    `json:"audio"`
-	Voice          *telegramMedia    `json:"voice"`
-	ReplyToMessage *telegramMessage  `json:"reply_to_message"`
-	NewChatMembers []telegramUser    `json:"new_chat_members"`
+	MessageID          int64                  `json:"message_id"`
+	From               telegramUser           `json:"from"`
+	Chat               telegramChat           `json:"chat"`
+	Date               int64                  `json:"date"`
+	Text               string                 `json:"text"`
+	Caption            string                 `json:"caption"`
+	Document           *telegramDocument      `json:"document"`
+	Photo              []telegramPhoto        `json:"photo"`
+	Video              *telegramMedia         `json:"video"`
+	Audio              *telegramMedia         `json:"audio"`
+	Voice              *telegramMedia         `json:"voice"`
+	ReplyToMessage     *telegramMessage       `json:"reply_to_message"`
+	ForwardOrigin      *telegramMessageOrigin `json:"forward_origin"`
+	IsAutomaticForward bool                   `json:"is_automatic_forward"`
+	NewChatMembers     []telegramUser         `json:"new_chat_members"`
 }
 
 type telegramUser struct {
@@ -926,8 +965,18 @@ type telegramUser struct {
 }
 
 type telegramChat struct {
-	ID   int64  `json:"id"`
-	Type string `json:"type"`
+	ID       int64  `json:"id"`
+	Type     string `json:"type"`
+	Title    string `json:"title"`
+	Username string `json:"username"`
+}
+
+type telegramMessageOrigin struct {
+	Type           string        `json:"type"`
+	SenderUser     *telegramUser `json:"sender_user"`
+	SenderUserName string        `json:"sender_user_name"`
+	SenderChat     *telegramChat `json:"sender_chat"`
+	Chat           *telegramChat `json:"chat"`
 }
 
 type telegramDocument struct {

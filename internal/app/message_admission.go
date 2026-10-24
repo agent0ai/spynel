@@ -30,7 +30,7 @@ func ValidateLocalMessage(message core.Message) error {
 	if message.SourceMessageID != "" && !requestIdentity.MatchString(message.SourceMessageID) {
 		return errors.New("invalid source_message_id")
 	}
-	if len(message.Sender) > 128 || len(message.InstanceID) > 128 || len(message.ReplyTo) > 1024 {
+	if len(message.Sender) > 128 || len(message.InstanceID) > 128 || len(message.ReplyTo) > 1024 || len(message.ForwardedFrom) > 512 || !utf8.ValidString(message.ForwardedFrom) {
 		return errors.New("message metadata exceeds bounds")
 	}
 	return nil

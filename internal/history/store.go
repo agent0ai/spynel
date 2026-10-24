@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/fsx"
 	"github.com/agent0ai/spynel/internal/shortid"
 )
@@ -28,6 +29,7 @@ type Entry struct {
 	At                time.Time `json:"at"`
 	Role              string    `json:"role"`
 	Sender            string    `json:"sender,omitempty"`
+	ForwardedFrom     string    `json:"forwarded_from,omitempty"`
 	ReplyTo           string    `json:"reply_to,omitempty"`
 	Content           string    `json:"content"`
 	EventID           string    `json:"event_id,omitempty"`
@@ -303,7 +305,7 @@ func (s *Store) RecentBounded(channel, conversation string, messageLimit, charac
 	}
 	lines := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		lines = append(lines, formatEntry(entry))
+		lines = append(lines, FormatEntry(entry))
 	}
 	result := strings.Join(lines, "\n")
 	runes := []rune(result)
@@ -395,7 +397,7 @@ func readRecentEntriesThroughFile(file *os.File, messageLimit, characterLimit in
 		if entry.Role == "correlation" {
 			return
 		}
-		formatted := formatEntry(entry)
+		formatted := FormatEntry(entry)
 		characters := len([]rune(formatted))
 		if len(reversed) == 0 && characters > characterLimit {
 			var ok bool
@@ -404,7 +406,7 @@ func readRecentEntriesThroughFile(file *os.File, messageLimit, characterLimit in
 				stopped = true
 				return
 			}
-			formatted = formatEntry(entry)
+			formatted = FormatEntry(entry)
 			characters = len([]rune(formatted))
 		}
 		if len(reversed) > 0 {
@@ -483,12 +485,13 @@ func readRecentEntriesThroughFile(file *os.File, messageLimit, characterLimit in
 	return resolveNotificationOrder(reversed), nil
 }
 
-func formatEntry(entry Entry) string {
+// FormatEntry shares agent-visible attribution with recovery projections.
+func FormatEntry(entry Entry) string {
 	reply := ""
 	if entry.ReplyTo != "" {
 		reply = "[reply_to: " + entry.ReplyTo + "]"
 	}
-	if entry.compact {
+	if entry.compact && entry.ForwardedFrom == "" {
 		if entry.Content == "" {
 			return reply
 		}
@@ -496,7 +499,14 @@ func formatEntry(entry Entry) string {
 	}
 	label := entry.Role
 	if entry.Sender != "" {
-		label += " (" + entry.Sender + ")"
+		sender := entry.Sender
+		if entry.ForwardedFrom != "" {
+			sender = core.ForwardedSource(sender)
+		}
+		label += " (" + sender + ")"
+	}
+	if entry.ForwardedFrom != "" {
+		label += " forwarded from (" + core.ForwardedSource(entry.ForwardedFrom) + ")"
 	}
 	if reply != "" {
 		reply += " "
@@ -507,6 +517,19 @@ func formatEntry(entry Entry) string {
 func boundNewestEntry(entry Entry, limit int) (Entry, bool) {
 	if limit <= 0 {
 		return Entry{}, false
+	}
+	if entry.ForwardedFrom != "" {
+		if entry.ReplyTo != "" {
+			return boundReplyEntry(entry, limit, false)
+		}
+		content := entry.Content
+		entry.Content = ""
+		budget := limit - len([]rune(FormatEntry(entry)))
+		if budget < 0 || (budget == 0 && content != "") {
+			return Entry{}, false
+		}
+		entry.Content = truncateTail([]rune(content), budget)
+		return entry, true
 	}
 	if entry.ReplyTo == "" {
 		content := []rune(entry.Content)
@@ -535,7 +558,7 @@ func boundReplyEntry(entry Entry, limit int, compact bool) (Entry, bool) {
 	candidate.compact = compact
 	candidate.ReplyTo = id
 	candidate.Content = ""
-	base := len([]rune(formatEntry(candidate)))
+	base := len([]rune(FormatEntry(candidate)))
 	previewRunes := []rune(preview)
 	contentRunes := []rune(entry.Content)
 	minimum := base
@@ -562,7 +585,7 @@ func boundReplyEntry(entry Entry, limit int, compact bool) (Entry, bool) {
 		budget := remaining - 1
 		candidate.Content = truncateTail(contentRunes, budget)
 	}
-	return candidate, len([]rune(formatEntry(candidate))) <= limit
+	return candidate, len([]rune(FormatEntry(candidate))) <= limit
 }
 
 func splitReply(value string) (string, string) {

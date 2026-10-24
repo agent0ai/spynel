@@ -740,6 +740,18 @@ func whatsappReplyTo(message *waE2E.Message) string {
 	return channel.ReplyReference(contextInfo.GetStanzaID(), quotedMessagePreview(contextInfo.GetQuotedMessage()))
 }
 
+func whatsappForwardedFrom(message *waE2E.Message) string {
+	info := messageContext(message)
+	if newsletter := info.GetForwardedNewsletterMessageInfo(); newsletter != nil {
+		return core.ForwardedSource(newsletter.GetNewsletterName())
+	}
+	if info.GetIsForwarded() || info.GetForwardingScore() > 0 || info.GetForwardOrigin() != waE2E.ContextInfo_UNKNOWN {
+		// Ordinary forwards expose no original author; participant belongs to replies.
+		return "unknown"
+	}
+	return ""
+}
+
 func quotedMessagePreview(message *waE2E.Message) string {
 	message = unwrapMessage(message)
 	if message == nil {
@@ -828,7 +840,7 @@ func (c *Client) messageWorker(ctx context.Context) {
 			if err := c.requireRuntimeAuthorization(); err != nil {
 				continue
 			}
-			c.handleWithReplyID(incoming.received, incoming.chat, incoming.sender, text, whatsappReplyTo(incoming.message), "whatsapp:"+incoming.chat.String()+":"+string(incoming.id), nil)
+			c.handleWithReplyID(incoming.received, incoming.chat, incoming.sender, text, whatsappReplyTo(incoming.message), "whatsapp:"+incoming.chat.String()+":"+string(incoming.id), whatsappForwardedFrom(incoming.message), nil)
 		}
 	}
 }
@@ -921,10 +933,10 @@ func (c *Client) handleWithActivity(received time.Time, chat types.JID, sender, 
 }
 
 func (c *Client) handleWithReply(received time.Time, chat types.JID, sender, text, replyTo string, finishActivity func()) {
-	c.handleWithReplyID(received, chat, sender, text, replyTo, "", finishActivity)
+	c.handleWithReplyID(received, chat, sender, text, replyTo, "", "", finishActivity)
 }
 
-func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, text, replyTo, sourceMessageID string, finishActivity func()) {
+func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, text, replyTo, sourceMessageID, forwardedFrom string, finishActivity func()) {
 	ctx := c.ctx
 	if ctx == nil {
 		ctx = context.Background()
@@ -1001,6 +1013,7 @@ func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, t
 	}
 	err := c.handler(ctx, core.Message{
 		Channel: c.Name(), Conversation: conversation, Sender: sender,
+		ForwardedFrom:   forwardedFrom,
 		SourceMessageID: sourceMessageID, ReplyTo: replyTo, Text: text, ReceivedAt: received.UTC(),
 	}, emit)
 	if err != nil {
