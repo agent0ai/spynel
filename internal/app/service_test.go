@@ -4099,7 +4099,7 @@ func TestNewCommandCreatesDistinctTUIConversationAndPreservesPriorHistory(t *tes
 	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "TG-7", Text: "/new"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(response.Text, "available in the TUI") {
+	if !strings.Contains(response.Text, "Started a new conversation") {
 		t.Fatalf("remote /new response = %#v", response)
 	}
 }
@@ -4239,5 +4239,74 @@ func TestAutostartScreenReadsRegistrationInsteadOfPreference(t *testing.T) {
 	result, err := service.ScreenAction(context.Background(), "config", "autostart:check", nil)
 	if err != nil || result.SavedControl.Key != "autostart:enable" || len(manager.calls) != 0 {
 		t.Fatalf("recheck mutated registration: %#v, %v", result, err)
+	}
+}
+
+func TestRemoteNewResetsContextAndPreservesTranscript(t *testing.T) {
+	for _, channel := range []string{"telegram", "whatsapp", "cli"} {
+		t.Run(channel, func(t *testing.T) {
+			s, target, cfg := newRecoveryTestService(t)
+			message := core.Message{Channel: channel, Conversation: "42", SourceMessageID: "new-request", Text: "/new"}
+			if _, err := s.History.Append(channel, "42", history.Entry{Role: "user", Content: "old private context", SourceMessageID: "old-request"}); err != nil {
+				t.Fatal(err)
+			}
+			target.threads[sessionKey(message)] = "missing-rollout"
+			if err := s.Handle(t.Context(), message, nil); err != nil {
+				t.Fatal(err)
+			}
+			if target.ThreadID(sessionKey(message)) != "" {
+				t.Fatal("retained stale harness session")
+			}
+			conversations, err := s.History.List(10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			archived := false
+			for _, conversation := range conversations {
+				if conversation.Channel == "tui" {
+					text, _, err := s.History.Recent("tui", conversation.Conversation, 10000)
+					if err != nil {
+						t.Fatal(err)
+					}
+					archived = strings.Contains(text, "old private context")
+				}
+			}
+			if !archived {
+				t.Fatal("previous transcript was not preserved")
+			}
+			if channel != "cli" {
+				if err := s.Handle(t.Context(), message, nil); err != nil {
+					t.Fatal(err)
+				}
+				after, err := s.History.List(10)
+				if err != nil || len(after) != len(conversations) {
+					t.Fatal("retry reset conversation twice", err)
+				}
+			}
+			restarted := New(cfg, newServiceHarness())
+			t.Cleanup(func() { _ = restarted.Close() })
+			prompt, err := restarted.chatPrompt(core.Message{Channel: channel, Conversation: "42", Text: "hello"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(prompt, "old private context") {
+				t.Fatal("new context retained old history after restart")
+			}
+		})
+	}
+}
+
+func TestRemoteNewPreservesHistoryWhenResetFails(t *testing.T) {
+	s, target, _ := newRecoveryTestService(t)
+	target.resetErr = errors.New("active execution or pending delivery")
+	if _, err := s.History.Append("telegram", "42", history.Entry{Role: "assistant", Content: "keep this"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Handle(t.Context(), core.Message{Channel: "telegram", Conversation: "42", Text: "/new"}, nil); err == nil {
+		t.Fatal("reset failure was hidden")
+	}
+	text, _, err := s.History.Recent("telegram", "42", 10000)
+	if err != nil || !strings.Contains(text, "keep this") {
+		t.Fatalf("history lost: %s, %v", text, err)
 	}
 }

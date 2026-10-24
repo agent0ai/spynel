@@ -72,7 +72,7 @@ var slashCommands = []SlashCommand{
 	{Value: "/whatsapp off", Usage: "/whatsapp off", Description: "Disable WhatsApp"},
 	{Value: "/whatsapp set ", Usage: "/whatsapp set <key> <value>", Description: "Persist a WhatsApp setting"},
 	{Value: "/title ", Usage: "/title <name>", Description: "Rename and persist this TUI window"},
-	{Value: "/new", Usage: "/new", Description: "Start a distinct TUI conversation and preserve this one"},
+	{Value: "/new", Usage: "/new", Description: "Start fresh and preserve the previous transcript"},
 	{Value: "/stop", Usage: "/stop", Description: "Stop the active execution for this conversation"},
 	{Value: "/restart", Usage: "/restart", Description: "Restart Spynel and restore saved state"},
 	{Value: "/update", Usage: "/update", Description: "Update and restart all instances of this installation"},

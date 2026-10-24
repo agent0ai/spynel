@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/history"
 )
 
 var ErrDuplicateMessage = errors.New("duplicate message identity; inspect events or history for its outcome")
@@ -68,6 +69,10 @@ func (s *Service) admitMessage(message core.Message) (func(), error) {
 
 // The empty-source slot excludes new intake while reset/clear is in progress.
 func (s *Service) clearConversation(ctx context.Context, message core.Message) error {
+	return s.resetConversation(ctx, message, false)
+}
+
+func (s *Service) resetConversation(ctx context.Context, message core.Message, preserve bool) error {
 	prefix := sessionKey(message) + "\x00"
 	current := prefix + message.SourceMessageID
 	s.admissionMu.Lock()
@@ -84,6 +89,19 @@ func (s *Service) clearConversation(ctx context.Context, message core.Message) e
 	s.admissionMu.Unlock()
 	defer func() { s.admissionMu.Lock(); delete(s.admissions, prefix); s.admissionMu.Unlock() }()
 	return s.Orchestrator.ResetConversation(ctx, sessionKey(message), func() error {
-		return s.History.Clear(message.Channel, message.Conversation)
+		if preserve {
+			if _, _, err := s.History.Branch(message.Channel, message.Conversation); err != nil {
+				return err
+			}
+		}
+		if err := s.History.Clear(message.Channel, message.Conversation); err != nil {
+			return err
+		}
+		if preserve {
+			// Retain command identity so transport retries cannot reset twice.
+			_, err := s.History.Append(message.Channel, message.Conversation, history.Entry{Role: "user", Content: "/new", SourceMessageID: message.SourceMessageID})
+			return err
+		}
+		return nil
 	})
 }
