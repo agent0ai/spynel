@@ -179,7 +179,10 @@ func TestUpdateWorkerCompatibilityBeforePublication(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("SPYNEL_TEST_HARNESS_WORKER", "1")
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	worker := lifecycleFixture(t, root)
 	record, err := ProcessRecord(worker.Process.Pid)
 	if err != nil || record.WorkerProtocol != core.WorkerProtocol {
