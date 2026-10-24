@@ -141,3 +141,29 @@ func TestProgressCancellationFencesReconnect(t *testing.T) {
 		}
 	})
 }
+
+func TestProgressContinuingErrorResetsObservedPosition(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mode atomic.Value
+		mode.Store("off")
+		p := ProgressStreams{Mode: func() string { return mode.Load().(string) }}
+		sent := make(chan string, 1)
+		send := func(_ context.Context, _, text string) (string, error) { sent <- text; return "preview", nil }
+		p.Push(t.Context(), "one", core.Event{Kind: core.EventDelta, Text: "HIDDEN progress from failed turn"}, send)
+		p.Push(t.Context(), "one", core.Event{Kind: core.EventError, Text: "continuing error", Continues: true}, send)
+		mode.Store("on")
+		p.Push(t.Context(), "one", core.Event{Kind: core.EventFinal, Text: "新しい output", Continues: true}, send)
+		synctest.Wait()
+		time.Sleep(time.Second)
+		synctest.Wait()
+		p.Stop("one")
+		select {
+		case text := <-sent:
+			if text != "新しい output" {
+				t.Fatal(text)
+			}
+		default:
+			t.Fatal("next turn was hidden by the failed turn's byte position")
+		}
+	})
+}

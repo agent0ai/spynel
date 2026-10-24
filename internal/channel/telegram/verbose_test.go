@@ -186,3 +186,62 @@ func TestTelegramVerboseLongFinalSurvivesEditFailure(t *testing.T) {
 		}
 	})
 }
+
+func TestTelegramVerboseContinuationDoesNotReplaySuppressedDeltas(t *testing.T) {
+	for _, route := range []string{"reply", "retained"} {
+		for _, suffix := range []string{"", " Visible suffix."} {
+			t.Run(route+suffix, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					var mode atomic.Value
+					mode.Store("off")
+					var texts []string
+
+					b := New(config.Telegram{AllowedUsers: []string{"7"}}, "fixture")
+					b.SetVerboseSource(func() string { return mode.Load().(string) })
+					b.client.Transport = telegramRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+						var payload map[string]any
+						if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+							t.Fatal(err)
+						}
+						if text, ok := payload["text"].(string); ok {
+							texts = append(texts, text)
+						}
+						return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":9}}`))}, nil
+					})
+
+					stream := func(emit core.Emit) {
+						tick := func() { synctest.Wait(); time.Sleep(time.Second); synctest.Wait() }
+						emit(core.Event{Kind: core.EventDelta, Text: "HIDDEN commentary"})
+						tick()
+						mode.Store("on")
+						item := "HIDDEN commentary" + suffix
+						emit(core.Event{Kind: core.EventFinal, Text: item, FinalText: &item, Done: true, Continues: true})
+						tick()
+						if strings.Contains(strings.Join(texts, "\n"), "HIDDEN") {
+							t.Fatal("hidden progress replayed", texts)
+						}
+						if suffix == "" && len(texts) != 0 || suffix != "" && (len(texts) != 1 || !strings.Contains(texts[0], strings.TrimSpace(suffix))) {
+							t.Fatal("new suffix lost or duplicated", texts)
+						}
+						final := "Next turn final."
+						emit(core.Event{Kind: core.EventFinal, Text: final, FinalText: &final, Done: true})
+					}
+
+					if route == "reply" {
+						b.handle(t.Context(), func(_ context.Context, _ core.Message, emit core.Emit) error { stream(emit); return nil }, &telegramMessage{MessageID: 10, Text: "/fixture", From: telegramUser{ID: 7}, Chat: telegramChat{ID: 7, Type: "private"}})
+					} else {
+						stream(func(e core.Event) {
+							if err := b.DeliverEvent(t.Context(), "TG-7", "receipt", e); err != nil {
+								t.Fatal(err)
+							}
+						})
+					}
+
+					if strings.Count(strings.Join(texts, "\n"), "Next turn final.") != 1 {
+						t.Fatal("final lost or duplicated", texts)
+					}
+				})
+			})
+		}
+	}
+}

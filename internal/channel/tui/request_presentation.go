@@ -2,6 +2,7 @@ package tui
 
 import (
 	"slices"
+	"strings"
 
 	"github.com/agent0ai/spynel/internal/channel"
 	"github.com/agent0ai/spynel/internal/core"
@@ -14,6 +15,85 @@ const requestFinished = "tui_request_finished"
 type requestPresentation struct {
 	active, started, ended, retired bool
 	progressSuppressed              bool
+	deltaBytes                      int
+}
+
+// Final items restore their hidden portions without repeating visible fragments.
+// Continuing snapshots only add bytes not already observed in this turn.
+func (m *model) finishFilteredResponse(request, text string, final *string, continues, showProgress bool) {
+	if !continues && request == m.responseRequestID && m.requests[request].deltaBytes == len(m.responseText) {
+		if final != nil {
+			text = *final
+		}
+		m.finishRecipientResponse(text)
+		return
+	}
+	if request == m.responseRequestID {
+		m.commitStreamingResponse()
+	}
+	remaining := ""
+	if continues {
+		if showProgress {
+			remaining = channel.UnstreamedFinal(text, final, m.requests[request].deltaBytes)
+		}
+	} else {
+		start := 0
+		if final != nil && strings.HasSuffix(text, *final) {
+			start = len(text) - len(*final)
+		}
+		cursor := start
+		last := -1
+		for i := range m.transcript {
+			e := &m.transcript[i]
+			if e.requestID != request || e.streamEnd <= start || e.streamEnd > len(text) || e.streamStart < 0 || e.text != text[e.streamStart:e.streamEnd] {
+				continue
+			}
+			prefix := e.text[:max(0, start-e.streamStart)]
+			e.text = prefix + text[cursor:e.streamEnd]
+			cursor = e.streamEnd
+			if last == i-1 && last >= 0 {
+				e.text = m.transcript[last].text + e.text
+				m.transcript[last].text = ""
+			}
+			last = i
+		}
+		remaining = text[cursor:]
+		if last >= 0 && last == len(m.transcript)-1 {
+			m.transcript[last].text += remaining
+			remaining = ""
+		}
+		m.transcript = slices.DeleteFunc(m.transcript, func(e transcriptEntry) bool {
+			return e.requestID == request && e.streamEnd > 0 && e.text == ""
+		})
+		m.transcript = boundTranscript(m.transcript)
+		if last >= 0 {
+			m.selection = outputSelection{}
+			if m.drag.pane == outputPane {
+				m.cancelDrag()
+			}
+		}
+		m.invalidateHistoryRender()
+	}
+	if remaining != "" {
+		m.appendTranscript(transcriptEntry{role: "assistant", text: remaining, requestID: request})
+	}
+	if request == m.responseRequestID {
+		m.resetResponse()
+	} else {
+		m.finishResponsePresentation(request)
+	}
+}
+
+func (m *model) finishResponsePresentation(request string) {
+	for i := range m.transcript {
+		if m.transcript[i].requestID == request {
+			m.transcript[i].streamStart, m.transcript[i].streamEnd = 0, 0
+		}
+	}
+	if r, ok := m.requests[request]; ok {
+		r.deltaBytes = 0
+		m.requests[request] = r
+	}
 }
 
 func (m *model) observeRequest(event core.Event) {

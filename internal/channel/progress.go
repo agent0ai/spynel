@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -22,12 +23,12 @@ type ProgressStreams struct {
 }
 
 type progressStream struct {
-	mu       sync.Mutex
-	text, id string
-	dirty    bool
-	hasDelta bool
-	cancel   context.CancelFunc
-	done     chan struct{}
+	mu         sync.Mutex
+	text, id   string
+	dirty      bool
+	deltaBytes int
+	cancel     context.CancelFunc
+	done       chan struct{}
 }
 
 type ProgressSend func(context.Context, string, string) (string, error)
@@ -53,18 +54,13 @@ func progressTail(text string) string {
 
 // Push is nonblocking with respect to transport I/O, including a slow edit.
 func (p *ProgressStreams) Push(ctx context.Context, key string, event core.Event, send ProgressSend) {
-	if event.Local || (event.Kind != core.EventDelta && !(event.Kind == core.EventFinal && event.Continues)) {
+	if event.Local || (event.Kind != core.EventDelta && !((event.Kind == core.EventFinal || event.Kind == core.EventError) && event.Continues)) {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	stream := p.streams[key]
-	if !p.enabled() || ctx.Err() != nil {
-		if stream != nil {
-			stream.mu.Lock()
-			stream.text, stream.dirty, stream.hasDelta = "", false, false
-			stream.mu.Unlock()
-		}
+	if ctx.Err() != nil {
 		return
 	}
 	if stream == nil {
@@ -78,18 +74,29 @@ func (p *ProgressStreams) Push(ctx context.Context, key string, event core.Event
 	}
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
-	if event.Kind == core.EventFinal {
-		if !stream.hasDelta {
-			text := event.Text
-			if event.FinalText != nil {
-				text = *event.FinalText
-			}
-			stream.text, stream.dirty = progressTail(text), true
-		}
-		stream.hasDelta = false
+	enabled := p.enabled()
+	if !enabled {
+		stream.text, stream.dirty = "", false
+	}
+	if event.Kind == core.EventError {
+		stream.deltaBytes = 0
 		return
 	}
-	stream.hasDelta = true
+	if event.Kind == core.EventFinal {
+		text := UnstreamedFinal(event.Text, event.FinalText, stream.deltaBytes)
+		if enabled && text != "" {
+			if stream.deltaBytes == 0 {
+				stream.text = ""
+			}
+			stream.text, stream.dirty = progressTail(stream.text+text), true
+		}
+		stream.deltaBytes = 0
+		return
+	}
+	stream.deltaBytes += len(event.Text)
+	if !enabled {
+		return
+	}
 	stream.text = progressTail(stream.text + progressTail(event.Text))
 	stream.dirty = true
 }
@@ -113,7 +120,7 @@ func (p *ProgressStreams) run(ctx context.Context, key string, stream *progressS
 		}
 		stream.mu.Lock()
 		if !p.enabled() {
-			stream.text, stream.dirty, stream.hasDelta = "", false, false
+			stream.text, stream.dirty = "", false
 		}
 		text, id, dirty := stream.text, stream.id, stream.dirty
 		stream.dirty = false
@@ -130,6 +137,16 @@ func (p *ProgressStreams) run(ctx context.Context, key string, stream *progressS
 			stream.mu.Unlock()
 		}
 	}
+}
+
+// UnstreamedFinal excludes deltas already observed, including hidden ones,
+// from a cumulative continuing snapshot. A new final item still gets through.
+func UnstreamedFinal(text string, final *string, deltaBytes int) string {
+	start := 0
+	if final != nil && strings.HasSuffix(text, *final) {
+		start = len(text) - len(*final)
+	}
+	return text[min(len(text), max(start, deltaBytes)):]
 }
 
 // Stop fences queued/in-flight progress before the terminal's independent send.

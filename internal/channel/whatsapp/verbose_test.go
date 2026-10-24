@@ -288,3 +288,63 @@ func TestWhatsAppVerboseConnectedApplicationTurn(t *testing.T) {
 		}
 	})
 }
+
+func TestWhatsAppVerboseContinuationDoesNotReplaySuppressedDeltas(t *testing.T) {
+	for _, route := range []string{"reply", "retained"} {
+		for _, suffix := range []string{"", " Visible suffix."} {
+			t.Run(route+suffix, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					var mode atomic.Value
+					mode.Store("off")
+					var texts []string
+
+					c := New(config.WhatsApp{AllowedNumbers: []string{"15551234567"}}, t.TempDir()+"/wa.db")
+					c.ctx = t.Context()
+					c.SetVerboseSource(func() string { return mode.Load().(string) })
+					c.presence = func(context.Context, types.JID, types.ChatPresence, types.ChatPresenceMedia) error { return nil }
+					c.deliver = func(_ context.Context, _ types.JID, m *waE2E.Message) (whatsmeow.SendResponse, error) {
+						text := m.GetConversation()
+						if edit := m.GetEditedMessage().GetMessage().GetProtocolMessage(); edit != nil {
+							text = edit.GetEditedMessage().GetConversation()
+						}
+						texts = append(texts, text)
+						return whatsmeow.SendResponse{ID: "preview"}, nil
+					}
+
+					stream := func(emit core.Emit) {
+						tick := func() { synctest.Wait(); time.Sleep(time.Second); synctest.Wait() }
+						emit(core.Event{Kind: core.EventDelta, Text: "HIDDEN commentary"})
+						tick()
+						mode.Store("on")
+						item := "HIDDEN commentary" + suffix
+						emit(core.Event{Kind: core.EventFinal, Text: item, FinalText: &item, Done: true, Continues: true})
+						tick()
+						if strings.Contains(strings.Join(texts, "\n"), "HIDDEN") {
+							t.Fatal("hidden progress replayed", texts)
+						}
+						if suffix == "" && len(texts) != 0 || suffix != "" && (len(texts) != 1 || !strings.Contains(texts[0], strings.TrimSpace(suffix))) {
+							t.Fatal("new suffix lost or duplicated", texts)
+						}
+						final := "Next turn final."
+						emit(core.Event{Kind: core.EventFinal, Text: final, FinalText: &final, Done: true})
+					}
+
+					if route == "reply" {
+						c.handler = func(_ context.Context, _ core.Message, emit core.Emit) error { stream(emit); return nil }
+						c.handle(time.Now(), types.NewJID("15551234567", types.DefaultUserServer), "15551234567", "synthetic")
+					} else {
+						stream(func(e core.Event) {
+							if err := c.DeliverEvent(t.Context(), "WA-15551234567", "receipt", e); err != nil {
+								t.Fatal(err)
+							}
+						})
+					}
+
+					if strings.Count(strings.Join(texts, "\n"), "Next turn final.") != 1 {
+						t.Fatal("final lost or duplicated", texts)
+					}
+				})
+			})
+		}
+	}
+}

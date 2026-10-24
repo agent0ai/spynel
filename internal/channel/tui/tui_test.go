@@ -1609,7 +1609,7 @@ func TestCtrlCStopsActiveHarnessWhenComposerIsEmpty(t *testing.T) {
 	if !got.working || got.input.Value() != "" || got.ignoreNextLF {
 		t.Fatalf("stop dispatch corrupted active state: working=%t input=%q ignore-next-lf=%t", got.working, got.input.Value(), got.ignoreNextLF)
 	}
-	if len(got.transcript) != 2 || got.transcript[0] != (transcriptEntry{role: "assistant", text: "partial response"}) || got.transcript[1] != (transcriptEntry{role: "user", text: "/stop"}) {
+	if len(got.transcript) != 2 || got.transcript[0] != (transcriptEntry{role: "assistant", text: "partial response", streamEnd: len("partial response")}) || got.transcript[1] != (transcriptEntry{role: "user", text: "/stop"}) {
 		t.Fatalf("stop dispatch transcript = %#v", got.transcript)
 	}
 	batch, ok := cmd().(tea.BatchMsg)
@@ -3026,7 +3026,7 @@ func TestFrameworkCommandDuringRecipientTurnKeepsResponsesAndSpinnerFlow(t *test
 	if !m.working || m.streaming != "" || len(m.transcript) != 3 {
 		t.Fatalf("command did not commit active response: working=%t streaming=%q transcript=%#v", m.working, m.streaming, m.transcript)
 	}
-	if m.transcript[1] != (transcriptEntry{role: "assistant", text: "first response", requestID: source}) || m.transcript[2] != (transcriptEntry{role: "user", text: "/jobs"}) {
+	if m.transcript[1] != (transcriptEntry{role: "assistant", text: "first response", requestID: source, streamEnd: len("first response")}) || m.transcript[2] != (transcriptEntry{role: "user", text: "/jobs"}) {
 		t.Fatalf("committed response and command are out of order: %#v", m.transcript)
 	}
 

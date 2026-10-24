@@ -167,10 +167,11 @@ type Options struct {
 }
 
 type transcriptEntry struct {
-	role       string
-	text       string
-	requestID  string
-	responseID string
+	role                   string
+	text                   string
+	requestID              string
+	responseID             string
+	streamStart, streamEnd int
 }
 
 type liveConversationTracker struct {
@@ -222,6 +223,7 @@ type model struct {
 	transcript               []transcriptEntry
 	streaming                string
 	responseText             string
+	streamOffset             int
 	responseCommit           int
 	responseRequestID        string
 	requests                 map[string]requestPresentation
@@ -1113,6 +1115,15 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case requestFinished:
 			m.finishRequest(event.RequestID)
 		case core.EventDelta:
+			if m.requests == nil {
+				m.requests = make(map[string]requestPresentation)
+			}
+			r := m.requests[event.RequestID]
+			if m.streaming == "" {
+				m.streamOffset = r.deltaBytes
+			}
+			r.deltaBytes += len(event.Text)
+			m.requests[event.RequestID] = r
 			if !showProgress {
 				m.suppressProgress(event.RequestID)
 				break
@@ -1161,14 +1172,13 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if !showProgress && event.Continues {
 				m.suppressProgress(event.RequestID)
-				break
-			}
-			text := event.Text
-			if (!showProgress || m.responseSuppressed || m.requests[event.RequestID].progressSuppressed) && event.FinalText != nil {
-				text = *event.FinalText
 			}
 			suppressed := m.responseSuppressed
-			m.finishRecipientResponse(text)
+			if !showProgress || suppressed || m.requests[event.RequestID].progressSuppressed {
+				m.finishFilteredResponse(event.RequestID, event.Text, event.FinalText, event.Continues, showProgress)
+			} else {
+				m.finishRecipientResponse(event.Text)
+			}
 			if event.Continues {
 				m.responseSuppressed = suppressed
 			}
@@ -1182,15 +1192,15 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case core.EventError:
 			if !event.Local && event.Continues && !showProgress {
 				m.suppressProgress(event.RequestID)
+				m.resetResponse()
 				break
 			}
 			if !event.Local {
 				m.working = event.Continues || m.mainAgentActivity > 0
 				if m.streaming != "" {
 					m.commitStreamingResponse()
-				} else {
-					m.resetResponse()
 				}
+				m.resetResponse()
 			}
 			m.appendTranscript(transcriptEntry{role: "error", text: event.Text})
 			if !event.Continues {
@@ -1879,10 +1889,8 @@ func (m *model) appendRecoveredResponse(notification channel.Notification) {
 	if !showProgress && notification.Continues {
 		r.progressSuppressed = true
 		m.requests[notification.RequestID] = r
+		m.finishFilteredResponse(notification.RequestID, notification.Text, notification.FinalText, true, false)
 		return
-	}
-	if (!showProgress || r.progressSuppressed || notification.RequestID == m.responseRequestID && m.responseSuppressed) && !notification.Error && notification.FinalText != nil {
-		notification.Text = *notification.FinalText
 	}
 	if !notification.Continues {
 		r.ended = true
@@ -1907,7 +1915,9 @@ func (m *model) appendRecoveredResponse(notification channel.Notification) {
 	if notification.Error {
 		role = "error"
 	}
-	if notification.RequestID != "" && notification.RequestID == m.responseRequestID {
+	if !notification.Error && (!showProgress || r.progressSuppressed || notification.RequestID == m.responseRequestID && m.responseSuppressed) {
+		m.finishFilteredResponse(notification.RequestID, notification.Text, notification.FinalText, notification.Continues, showProgress)
+	} else if notification.RequestID != "" && notification.RequestID == m.responseRequestID {
 		if notification.Error {
 			m.commitStreamingResponse()
 			m.resetResponse()
@@ -2004,7 +2014,7 @@ func (m *model) dispatchMessage(displayText, messageText string) []tea.Cmd {
 
 func (m *model) commitStreamingResponse() {
 	if m.streaming != "" {
-		m.appendTranscript(transcriptEntry{role: "assistant", text: m.streaming, requestID: m.responseRequestID})
+		m.appendTranscript(transcriptEntry{role: "assistant", text: m.streaming, requestID: m.responseRequestID, streamStart: m.streamOffset, streamEnd: m.streamOffset + len(m.streaming)})
 	}
 	m.responseCommit = len(m.responseText)
 	m.streaming = ""
@@ -2015,7 +2025,9 @@ func (m *model) commitStreamingPrefix(afterChars int) {
 	afterChars = min(max(afterChars, 0), len(response))
 	committedChars := len([]rune(m.responseText[:m.responseCommit]))
 	if afterChars > committedChars {
-		m.appendTranscript(transcriptEntry{role: "assistant", text: string(response[committedChars:afterChars]), requestID: m.responseRequestID})
+		text := string(response[committedChars:afterChars])
+		m.appendTranscript(transcriptEntry{role: "assistant", text: text, requestID: m.responseRequestID, streamStart: m.streamOffset, streamEnd: m.streamOffset + len(text)})
+		m.streamOffset += len(text)
 	}
 	m.responseCommit = len(string(response[:afterChars]))
 	m.streaming = string(response[afterChars:])
@@ -2042,9 +2054,11 @@ func (m *model) finishRecipientResponse(final string) {
 
 func (m *model) resetResponse() {
 	m.responseSuppressed = false
+	m.finishResponsePresentation(m.responseRequestID)
 	m.streaming = ""
 	m.responseText = ""
 	m.responseCommit = 0
+	m.streamOffset = 0
 }
 
 func completedResponse(streaming, final string) string {
@@ -4703,9 +4717,10 @@ func (m *model) setVerbose(mode string) {
 
 func (m *model) suppressProgress(requestID string) {
 	m.responseSuppressed = true
-	if requestID != "" {
-		r := m.requests[requestID]
-		r.progressSuppressed = true
-		m.requests[requestID] = r
+	if m.requests == nil {
+		m.requests = make(map[string]requestPresentation)
 	}
+	r := m.requests[requestID]
+	r.progressSuppressed = true
+	m.requests[requestID] = r
 }
