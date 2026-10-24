@@ -301,7 +301,7 @@ func runHarnessFixture(mode string) int {
 	executable, _ := os.Executable()
 	appendFixtureLog(map[string]any{"kind": "invocation", "pid": os.Getpid(), "args": os.Args[1:], "cwd": mustGetwd(), "executable": executable})
 	switch mode {
-	case "codex-lifecycle", "codex-interrupt", "codex-worker", "codex-followup-refusal", "codex-models", "codex-init-missing-method", "codex-resume-missing-method", "codex-resume-error", "codex-stream-overflow", "codex-thread-changed-field", "codex-terminal-changed-status":
+	case "codex-lifecycle", "codex-interrupt", "codex-worker", "codex-followup-refusal", "codex-models", "codex-init-missing-method", "codex-resume-missing-method", "codex-resume-error", "codex-resume-no-rollout", "codex-stream-overflow", "codex-thread-changed-field", "codex-terminal-changed-status":
 		return runCodexFixture(mode)
 	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero":
 		return runClaudeFixture(mode)
@@ -584,6 +584,10 @@ func runCodexFixture(mode string) int {
 			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{}})
 		case "thread/start", "thread/resume":
+			if mode == "codex-resume-no-rollout" && message.Method == "thread/resume" {
+				write(map[string]any{"id": message.ID, "error": map[string]any{"code": -32600, "message": "no rollout found for thread id existing-thread"}})
+				continue
+			}
 			if mode == "codex-resume-error" && message.Method == "thread/resume" {
 				write(map[string]any{"id": message.ID, "error": map[string]any{"code": -32000, "message": "resume failed"}})
 				continue

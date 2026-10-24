@@ -765,3 +765,86 @@ func TestCodexPassesCapturedEffortAndServiceTier(t *testing.T) {
 		t.Fatalf("recorded %d turns, want %d", turns, len(modes))
 	}
 }
+
+func TestCodexMissingRolloutRecoveryIsChatOnly(t *testing.T) {
+	for _, key := range []string{"chat:telegram:42", "task:working:42"} {
+		t.Run(key, func(t *testing.T) {
+			command, root, logPath := portableHarnessFixture(t, "codex-resume-no-rollout")
+			sessions := filepath.Join(root, "sessions.json")
+			original, _ := json.Marshal(map[string]string{key: "existing-thread"})
+			if err := os.WriteFile(sessions, original, 0600); err != nil {
+				t.Fatal(err)
+			}
+			codex, err := NewCodex(CodexConfig{Command: command, Cwd: root, SessionsFile: sessions})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			if err := codex.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			defer codex.Close()
+			recovered := false
+			thread, _, err := codex.Send(ctx, key, "saved Spynel history and current request", func(event core.Event) {
+				if strings.Contains(event.Text, "saved Spynel chat context") {
+					recovered = true
+				}
+			})
+			if strings.HasPrefix(key, "chat:") {
+				if err != nil || thread != "thr_test" || !recovered {
+					t.Fatalf("recovery = %q, %v, %t", thread, err, recovered)
+				}
+				persisted, err := NewCodex(CodexConfig{SessionsFile: sessions})
+				if err != nil || persisted.ThreadID(key) != thread {
+					t.Fatalf("replacement not persisted: %v", err)
+				}
+				if _, err := codex.ensureThread(ctx, key, "", nil); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err == nil || recovered || codex.ThreadID(key) != "existing-thread" {
+					t.Fatal("workflow resume failure replaced its context", err)
+				}
+			}
+			starts, resumes := 0, 0
+			for _, record := range readFixtureRecords(t, logPath) {
+				if record.Method == "thread/start" {
+					starts++
+				}
+				if record.Method == "thread/resume" {
+					resumes++
+				}
+			}
+			want := 0
+			if strings.HasPrefix(key, "chat:") {
+				want = 1
+			}
+			if starts != want || resumes != 1 {
+				t.Fatalf("starts=%d resumes=%d", starts, resumes)
+			}
+		})
+	}
+}
+
+func TestCodexMissingRolloutKeepsMappingWhenReplacementCannotPersist(t *testing.T) {
+	command, root, _ := portableHarnessFixture(t, "codex-resume-no-rollout")
+	codex, err := NewCodex(CodexConfig{Command: command, Cwd: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := codex.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer codex.Close()
+	codex.session["chat:telegram:42"] = "existing-thread"
+	codex.config.SessionsFile = root
+	if _, _, err := codex.Send(ctx, "chat:telegram:42", "continue", nil); err == nil {
+		t.Fatal("replacement persistence failure hidden")
+	}
+	if codex.ThreadID("chat:telegram:42") != "existing-thread" {
+		t.Fatal("failed replacement changed saved session")
+	}
+}

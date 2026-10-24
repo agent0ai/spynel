@@ -340,7 +340,7 @@ func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selec
 	lock := c.lockForKey(key)
 	lock.Lock()
 	defer lock.Unlock()
-	threadID, err := c.ensureThread(ctx, key, selection.Model)
+	threadID, err := c.ensureThread(ctx, key, selection.Model, emit)
 	if err != nil {
 		return "", false, &SendNotAdmittedError{Err: err}
 	}
@@ -478,7 +478,7 @@ func (c *Codex) steerLocked(ctx context.Context, threadID string, active *turnSt
 	return nil
 }
 
-func (c *Codex) ensureThread(ctx context.Context, key, model string) (string, error) {
+func (c *Codex) ensureThread(ctx context.Context, key, model string, emit core.Emit) (string, error) {
 	c.mu.Lock()
 	threadID := c.session[key]
 	loaded := c.loaded[threadID]
@@ -486,6 +486,7 @@ func (c *Codex) ensureThread(ctx context.Context, key, model string) (string, er
 	if threadID != "" && loaded {
 		return threadID, nil
 	}
+	missingRollout := false
 	if threadID != "" {
 		// Codex retains the full conversation internally. Spynel needs only
 		// its identity; returning the history can overflow the shared stream.
@@ -495,7 +496,13 @@ func (c *Codex) ensureThread(ctx context.Context, key, model string) (string, er
 			if errors.As(err, &callErr) && callErr.Code == -32601 {
 				return "", fmt.Errorf("cannot safely resume persisted Codex thread %q: required method thread/resume is unavailable: %w", threadID, err)
 			}
-			return "", fmt.Errorf("cannot safely resume persisted Codex thread: %w", err)
+			// Only an explicit absent rollout permits rebuilding a chat from
+			// Spynel history; workflow sessions and uncertain errors stay fenced.
+			missingRollout = strings.HasPrefix(key, "chat:") && errors.As(err, &callErr) &&
+				callErr.Code == -32600 && callErr.Message == "no rollout found for thread id "+threadID
+			if !missingRollout {
+				return "", fmt.Errorf("cannot safely resume persisted Codex thread: %w", err)
+			}
 		} else {
 			var response struct {
 				Thread struct {
@@ -539,7 +546,18 @@ func (c *Codex) ensureThread(ctx context.Context, key, model string) (string, er
 	c.session[key] = response.Thread.ID
 	c.loaded[response.Thread.ID] = true
 	err = c.saveSessionsLocked()
+	if err != nil {
+		if threadID == "" {
+			delete(c.session, key)
+		} else {
+			c.session[key] = threadID
+		}
+		delete(c.loaded, response.Thread.ID)
+	}
 	c.mu.Unlock()
+	if err == nil && missingRollout && emit != nil {
+		emit(core.Event{Kind: core.EventStatus, Text: "Codex rollout is unavailable; continuing in a new thread with saved Spynel chat context."})
+	}
 	return response.Thread.ID, err
 }
 
