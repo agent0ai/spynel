@@ -44,6 +44,11 @@ type WorkerClient struct {
 // worker's fenced transaction. Only absence or confirmed death permits a launch.
 // It must not be called from inside an election ownership callback.
 func OpenWorker(ctx context.Context, cfg HarnessConfig, instanceID, termToken string, settings ...WorkerSettings) (*WorkerClient, error) {
+	unlockLaunch, err := updater.LockWorkerLaunch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockLaunch()
 	root, err := filepath.EvalSymlinks(cfg.Cwd)
 	if err != nil || !filepath.IsAbs(root) {
 		return nil, errors.New("worker requires an absolute existing workspace")

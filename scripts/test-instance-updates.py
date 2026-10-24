@@ -55,6 +55,7 @@ def main():
         (replacement / "package.json").write_text(json.dumps({"name": "spynel", "version": updated, "workerProtocol": protocol}))
         (replacement / "npm" / "vendor" / ".installed.json").write_text(json.dumps({"version": updated}))
         incompatible = temp / "incompatible"
+        incompatible_version = "9.9.10"
         shutil.copytree(replacement, incompatible)
         core_source = repo / "internal" / "core" / "types.go"
         changed = core_source.read_text().replace(f"const WorkerProtocol = {protocol}\n", f"const WorkerProtocol = {protocol + 1}\n")
@@ -64,9 +65,10 @@ def main():
         overlay = temp / "incompatible-overlay.json"
         overlay.write_text(json.dumps({"Replace": {str(core_source): str(core_overlay)}}))
         incompatible_image = incompatible / "npm" / "vendor" / "spynel"
-        subprocess.run([os.environ.get("SPYNEL_GO_BINARY", "go"), "build", "-trimpath", "-overlay", str(overlay), "-ldflags=-s -w -X main.version=" + updated, "-o", str(incompatible_image), "./cmd/spynel"], cwd=repo, env=build_env, check=True, timeout=180)
-        (incompatible / "package.json").write_text(json.dumps({"name": "spynel", "version": updated, "workerProtocol": protocol + 1}))
-        assert subprocess.check_output([str(incompatible_image), "--version"], text=True).strip() == "spynel " + updated
+        subprocess.run([os.environ.get("SPYNEL_GO_BINARY", "go"), "build", "-trimpath", "-overlay", str(overlay), "-ldflags=-s -w -X main.version=" + incompatible_version, "-o", str(incompatible_image), "./cmd/spynel"], cwd=repo, env=build_env, check=True, timeout=180)
+        (incompatible / "package.json").write_text(json.dumps({"name": "spynel", "version": incompatible_version, "workerProtocol": protocol + 1}))
+        (incompatible / "npm" / "vendor" / ".installed.json").write_text(json.dumps({"version": incompatible_version}))
+        assert subprocess.check_output([str(incompatible_image), "--version"], text=True).strip() == "spynel " + incompatible_version
         if len(sys.argv) > 3:
             shutil.copy2(incompatible_image, Path(sys.argv[3]).resolve())
         print(json.dumps({"event": "incompatible_target", "worker_protocol": protocol + 1, "image_sha256": hashlib.sha256(incompatible_image.read_bytes()).hexdigest()}), flush=True)
@@ -138,13 +140,14 @@ for line in sys.stdin:
         registry = home / ("Library/Application Support" if sys.platform == "darwin" else ".config") / "spynel" / "processes"
 
         advertised_protocol = protocol
+        advertised_version = updated
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
 
             def do_GET(self):
-                data = json.dumps({"version": version if self.path == "/legacy/latest" else updated, "workerProtocol": advertised_protocol}).encode()
+                data = json.dumps({"version": version if self.path == "/legacy/latest" else advertised_version, "workerProtocol": advertised_protocol}).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -160,6 +163,7 @@ for line in sys.stdin:
             for path in registry.glob("*.json"):
                 try:
                     record = json.loads(path.read_text())
+                    record.pop("worker_update_token", None)
                     if workers is None or (bool(record.get("harness_worker")) == workers and not record.get("diagnostic_reader") and not record.get("provider_guardian") and not record.get("application_client") and not record.get("supervisor_pid")):
                         result.append(record)
                 except (FileNotFoundError, json.JSONDecodeError):
@@ -255,7 +259,7 @@ for line in sys.stdin:
             for advertised_protocol in (0, protocol + 1):
                 for route, command in (("shell", [*launcher, "update"]), ("channel", [*launcher, "command", "update"])):
                     refused = subprocess.run(command, cwd=workspaces[0], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
-                    assert "update cannot preserve a live worker" in refused.stdout + refused.stderr, refused
+                    assert "update deferred" in refused.stdout + refused.stderr, refused
                     assert {r["pid"]: r["generation"] for r in records()} == before, "refusal restarted an application"
                     assert worker_identity() == workers_before, "refusal changed a live worker"
                     assert native_start(active_provider) == provider_start, "refusal lost the active provider"
@@ -287,7 +291,7 @@ for line in sys.stdin:
             Path(env["INSTANCE_TEST_COMPLETE"]).touch()
 
             def completed_history():
-                return [json.loads(line) for path in (workspaces[0] / ".spynel" / "history").rglob("*.jsonl") for line in path.read_text().splitlines(keepends=True) if line.endswith("\n") and line.strip()]
+                return [json.loads(line) for path in (workspaces[0] / ".spynel" / "history").rglob("installation-continuity.jsonl") for line in path.read_text().splitlines(keepends=True) if line.endswith("\n") and line.strip()]
 
             wait_for(lambda: sum(e.get("role") == "assistant" and e.get("content") == "synthetic installed worker result" for e in completed_history()) == 1)
             prompts = [e for e in provider_events() if e["event"] == "prompt"]
@@ -295,6 +299,21 @@ for line in sys.stdin:
             assert prompts == [{"event": "prompt", "pid": active_provider}] and completions == [{"event": "completed", "pid": active_provider}], "update duplicated or replaced the active provider turn"
             assert [e for e in provider_events() if e["event"] == "started"] == provider_starts, "update restarted a provider"
             evidence("retained_turn_completed_once", provider_pid=active_provider, workers=list(worker_identity().values()))
+
+            # Once delivery retires, an incompatible idle worker is replaced
+            # across both workspaces by the ordinary installation update.
+            advertised_protocol, advertised_version = protocol + 1, incompatible_version
+            env["INSTANCE_TEST_REPLACEMENT"] = str(incompatible)
+            before = {r["pid"]: r["generation"] for r in records()}
+            replaced_workers = worker_identity()
+            result = subprocess.run([*launcher, "update"], cwd=temp, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+            assert result.returncode == 0, result.stderr
+            wait_for(lambda: len(records()) == 3 and all(r["ready"] and r["version"] == incompatible_version and before.get(r["pid"]) != r["generation"] for r in records()))
+            wait_for(lambda: len(worker_identity()) == 2 and all(r["worker_protocol"] == advertised_protocol for r in worker_identity().values()))
+            assert all(native_start(pid) is None for pid in replaced_workers), "idle predecessor worker survived replacement"
+            reply = subprocess.run([*launcher, "send", "--conversation", "after-idle-update", "synthetic service after worker replacement"], cwd=workspaces[0], env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            assert reply.returncode == 0 and "synthetic installed worker result" in reply.stdout, reply.stderr
+            evidence("idle_incompatible_workers_replaced", workers=list(worker_identity().values()), version=incompatible_version, application_service_resumed=True)
             # A registered native process made legacy must block publication without a signal.
             record = records()[0]
             path = registry / (str(record["pid"]) + ".json")
@@ -367,8 +386,8 @@ assert sys.argv[1] == "check-restartable", sys.argv
             Path(env["INSTANCE_TEST_COMPLETE"]).unlink()
             for command, workspace in ((launcher, workspaces[0]), (legacy_launcher, workspaces[2])):
                 requests.append(subprocess.Popen([*command, "send", "--conversation", "active-teardown", "synthetic active teardown request"], cwd=workspace, env=env, stdin=subprocess.DEVNULL, stdout=request_log, stderr=request_log))
-            wait_for(lambda: len([e for e in provider_events() if e["event"] == "prompt"]) == 3)
-            assert len([e for e in provider_events() if e["event"] == "completed"]) == 1
+            wait_for(lambda: len([e for e in provider_events() if e["event"] == "prompt"]) == 4)
+            assert len([e for e in provider_events() if e["event"] == "completed"]) == 2
             active = [e["pid"] for e in provider_events() if e["event"] == "prompt"][-2:]
             active_starts = {pid: native_start(pid) for pid in active}
             assert all(active_starts.values()), "teardown provider already exited"
@@ -410,8 +429,8 @@ assert sys.argv[1] == "check-restartable", sys.argv
             assert not legacy.exists() and unrelated.poll() is None, "second uninstall failed or stopped an unrelated process"
             assert all(path.read_bytes() == content for path, content in configurations.items())
             assert sum(e.get("role") == "assistant" and e.get("content") == "synthetic installed worker result" for e in completed_history()) == 1, "teardown lost or duplicated the completed result"
-            assert len([e for e in provider_events() if e["event"] == "prompt"]) == 3
-            assert len([e for e in provider_events() if e["event"] == "completed"]) == 1, "teardown invented provider completion"
+            assert len([e for e in provider_events() if e["event"] == "prompt"]) == 4
+            assert len([e for e in provider_events() if e["event"] == "completed"]) == 2, "teardown invented provider completion"
             for process in processes:
                 process.wait(timeout=10)
             evidence("second_active_uninstall_passed", stopped=other, provider_pids=active)

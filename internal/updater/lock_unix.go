@@ -10,6 +10,28 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func lockUpdate(path string, shared bool) (func(), error) {
+	fd, err := unix.Open(path, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+		file.Close()
+		return nil, fmt.Errorf("installation update lock must be a private regular file")
+	}
+	mode := unix.LOCK_EX
+	if shared {
+		mode = unix.LOCK_SH
+	}
+	if err := unix.Flock(fd, mode|unix.LOCK_NB); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("installation update or worker launch is in progress; retry after it finishes: %w", err)
+	}
+	return func() { _ = unix.Flock(fd, unix.LOCK_UN); _ = file.Close() }, nil
+}
+
 func lockInstall(root string) (func(), error) {
 	fd, err := unix.Open(filepath.Join(root, ".install.lock"), unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
 	if err != nil {

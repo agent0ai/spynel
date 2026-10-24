@@ -44,6 +44,11 @@ func runUpdateCommand(args []string, version string) error {
 		fmt.Fprintf(os.Stdout, "Spynel %s; latest %s release: %s.\n", result.Current, result.Source, result.Latest)
 		return nil
 	}
+	unregister, err := manager.RegisterApplicationClient()
+	if err != nil {
+		return err
+	}
+	defer unregister()
 	requestID := ""
 	if *jsonOutput {
 		requestID, err = core.NewSourceMessageID()

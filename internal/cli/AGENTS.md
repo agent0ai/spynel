@@ -70,6 +70,10 @@
 
 - Expose `verbose [on|off|auto]` on the existing shared command path. Bind both remote adapters to live global verbosity without restarting them; carry it through owner shared-state polling to every attached TUI. Explicit send --stream/--json and integration subscriptions remain unfiltered.
 
+- Private hold-worker-update registers a native application client and holds updater launch ownership over the npm parent lifetime pipe: readiness precedes npm replacement, EOF aborts and commit retires idle workers after publication. restart-instances first resolves paused/incompatible idle workers against the installed local protocol, then uses ordinary verified supervisor/application readiness. Shell updates register their finite native owner too. No new user configuration or public bypass exists.
+
+- Native registrations advertise participation in the installation worker-launch gate as registry-only metadata. Unknown/incompatible replacement refuses an older application without that capability, even if it currently has no worker, so it cannot launch an unfenced predecessor during publication. Known-compatible restart behavior remains unchanged.
+
 ## Child DOX Index
 
 No child DOX files.

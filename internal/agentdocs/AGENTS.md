@@ -30,6 +30,8 @@
 
 - Keep `/verbose`, the global `channels.verbose` enum, auto/on/off delivery matrix, bounded editable remote previews and unfiltered explicit CLI/API stream behavior aligned with the owning channel/config contracts.
 
+- Compiled update guidance includes idle worker replacement, pending-delivery/admission protection and explicit legacy bootstrap limitations; it never claims release publication or live deployment.
+
 ## Child DOX Index
 
 No child DOX files.

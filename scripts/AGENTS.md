@@ -42,6 +42,8 @@
 
 - Raw native inventories may include diagnostic helpers without the optional installation field; inventory comparisons honor that shared schema while cleanup still checks every recorded native identity. The instance-update verifier also advertises unknown and incompatible target protocols while the same provider turn is active, through shell and channel updates. Require no npm call, installed-byte changes, generation changes, worker replacement or extra admission/completion. Retain a second synthetic target image built with a test-only shared-protocol overlay (optional third output argument) and its hash; this qualifies refusal, not live incompatible adoption. The local npm fixture validates exact-version install arguments while retaining immutable old-wrapper update behavior.
 
+- The instance-update fixture now also drains its retained turn and uses the existing protocol-overlay image for an actual idle incompatible upgrade across both workspaces. Require old worker death, target-version ready application/worker generations and a successful ordinary synthetic request after restart, followed by existing isolated teardown. Remove registry-only worker-update credentials from projected evidence. This does not establish real Telegram/WhatsApp delivery or retroactively patch a released updater.
+
 ## Child DOX Index
 
 Direct child DOX files:
@@ -50,3 +52,5 @@ Direct child DOX files:
 | --- | --- |
 | [doxcheck/AGENTS.md](doxcheck/AGENTS.md) | Deterministic repository DOX coverage and index validation. |
 | [native-evidence/AGENTS.md](native-evidence/AGENTS.md) | Synthetic native-package execution evidence helper. |
+
+- Native lifecycle and affected-upgrade evidence excludes the private worker installation-update credential when projecting process registry records; retain native identity fields for cleanup verification.

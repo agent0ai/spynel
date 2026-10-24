@@ -35,6 +35,9 @@ type ProcessRegistration struct {
 	ProviderGuardian     bool   `json:"provider_guardian,omitempty"`
 	HarnessWorker        bool   `json:"harness_worker,omitempty"`
 	WorkerProtocol       int    `json:"-"`
+	WorkerUpdateSocket   string `json:"-"`
+	WorkerUpdateToken    string `json:"-"`
+	WorkerUpdates        bool   `json:"-"`
 	ApplicationClient    bool   `json:"application_client,omitempty"`
 	Supervisor           bool   `json:"supervisor,omitempty"`
 	SupervisorPID        int    `json:"supervisor_pid,omitempty"`
@@ -50,11 +53,14 @@ type ProcessRegistration struct {
 // schema, which also embeds ProcessRegistration as native identity evidence.
 type processRecord struct {
 	ProcessRegistration
-	WorkerProtocol int `json:"worker_protocol,omitempty"`
+	WorkerProtocol     int    `json:"worker_protocol,omitempty"`
+	WorkerUpdateSocket string `json:"worker_update_socket,omitempty"`
+	WorkerUpdateToken  string `json:"worker_update_token,omitempty"`
+	WorkerUpdates      bool   `json:"worker_updates,omitempty"`
 }
 
 func (r ProcessRegistration) registryJSON() ([]byte, error) {
-	return json.Marshal(processRecord{ProcessRegistration: r, WorkerProtocol: r.WorkerProtocol})
+	return json.Marshal(processRecord{ProcessRegistration: r, WorkerProtocol: r.WorkerProtocol, WorkerUpdateSocket: r.WorkerUpdateSocket, WorkerUpdateToken: r.WorkerUpdateToken, WorkerUpdates: r.WorkerUpdates})
 }
 
 func processDirectory() (string, error) {
@@ -126,6 +132,7 @@ func (m *Manager) registerProcess(role ProcessRegistration) (func(), error) {
 		return nil, errors.New("cannot verify own process start time")
 	}
 	record := role
+	record.WorkerUpdates = true
 	record.PID, record.Generation, record.Executable = os.Getpid(), hex.EncodeToString(nonce[:]), executable
 	record.StartTime = start
 	record.Installation, record.Version = m.InstallationRoot(), m.CurrentVersion
@@ -182,6 +189,8 @@ func readProcess(path string) (ProcessRegistration, error) {
 	err = json.NewDecoder(io.LimitReader(file, 4097)).Decode(&stored)
 	record = stored.ProcessRegistration
 	record.WorkerProtocol = stored.WorkerProtocol
+	record.WorkerUpdateSocket, record.WorkerUpdateToken = stored.WorkerUpdateSocket, stored.WorkerUpdateToken
+	record.WorkerUpdates = stored.WorkerUpdates
 	if err != nil || record.PID <= 1 || len(record.Generation) != 32 || !filepath.IsAbs(record.Executable) || record.Installation != "" && !filepath.IsAbs(record.Installation) || filepath.Base(path) != strconv.Itoa(record.PID)+".json" {
 		return record, errors.New("invalid Spynel process identity")
 	}
@@ -294,7 +303,7 @@ func (m *Manager) CheckRestartable() error {
 }
 
 // CheckRestartableFor also fences publication against a target worker protocol.
-// Zero means unknown; only installations without live workers may proceed.
+// Unknown or incompatible workers require authenticated idle replacement.
 func (m *Manager) CheckRestartableFor(workerProtocol int) error {
 	root := m.InstallationRoot()
 	if root == "" {
@@ -307,13 +316,24 @@ func (m *Manager) CheckRestartableFor(workerProtocol int) error {
 	if err != nil {
 		return err
 	}
+	replacement := workerProtocol <= 0
+	for _, record := range records {
+		if record.HarnessWorker && (record.Installation == root || m.ownsProcessPath(root, record.Executable)) && record.WorkerProtocol != workerProtocol {
+			replacement = true
+		}
+	}
 	for _, record := range records {
 		owned := record.Installation == root || m.ownsProcessPath(root, record.Executable)
 		if record.HarnessWorker && owned && (workerProtocol <= 0 || record.WorkerProtocol <= 0 || record.WorkerProtocol != workerProtocol) {
-			return errors.New("update cannot preserve a live worker with incompatible or unknown compatibility; let its jobs and pending delivery finish, then explicitly stop Spynel with spynel killall, update and relaunch")
+			if err := m.workerUpdate(context.Background(), record, "check", ProcessRegistration{}); err != nil {
+				return err
+			}
 		}
 		if record.DiagnosticReader || record.ProviderGuardian || record.HarnessWorker || record.ApplicationClient {
 			continue
+		}
+		if owned && replacement && !record.WorkerUpdates {
+			return errors.New("an older application cannot fence worker launch during replacement; drain work and pending delivery, then run spynel killall, update and relaunch once")
 		}
 		if record.SupervisorPID != 0 && (record.Installation == root || m.ownsProcessPath(root, record.Executable)) {
 			parent, err := ProcessRecord(record.SupervisorPID)

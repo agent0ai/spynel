@@ -63,7 +63,11 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	if len(os.Args) == 2 && os.Args[1] == "__worker" {
-		unregister, err := updater.Detect("fixture").RegisterHarnessWorker()
+		manager := updater.Detect("fixture")
+		if root := os.Getenv("SPYNEL_TEST_WORKER_INSTALL"); root != "" {
+			manager.InstallRoot, manager.CurrentVersion = root, "1.0.0"
+		}
+		unregister, err := manager.RegisterHarnessWorker()
 		if err != nil {
 			os.Exit(1)
 		}
@@ -77,6 +81,14 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	if len(os.Args) > 1 && os.Args[1] == "__provider" {
+		if root := os.Getenv("SPYNEL_TEST_WORKER_INSTALL"); root != "" {
+			manager := &updater.Manager{InstallRoot: root, CurrentVersion: "1.0.0"}
+			unregister, err := manager.RegisterProviderGuardian()
+			if err != nil {
+				os.Exit(1)
+			}
+			defer unregister()
+		}
 		if err := RunProvider(os.Args[2:]); err != nil {
 			os.Exit(1)
 		}

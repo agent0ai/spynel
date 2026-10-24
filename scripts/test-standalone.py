@@ -146,7 +146,7 @@ def main():
                             os.chown(directory, 65534, 65534)
                     temp.chmod(0o755)
                     readonly_tools.chmod(0o555)
-                    regular_env = {**env, "HOME": str(nonroot_home), "PATH": str(readonly_tools), "SPYNEL_INSTALL_DIR": str(nonroot / "installation"), "SPYNEL_VERSION": new_version}
+                    regular_env = {**env, "HOME": str(nonroot_home), "XDG_CONFIG_HOME": str(nonroot_home / ".config"), "XDG_RUNTIME_DIR": str(nonroot / "runtime"), "PATH": str(readonly_tools), "SPYNEL_INSTALL_DIR": str(nonroot / "installation"), "SPYNEL_VERSION": new_version}
                     regular_env.pop("SPYNEL_BIN_DIR")
                     command = 'before=$PATH; curl -LsSf "$1/install.sh" | sh && [ "$PATH" = "$before" ] && spynel --version && curl -LsSf "$1/uninstall.sh" | sh && hash -r && ! command -v spynel'
                     result = subprocess.run(["sh", "-c", command, "sh", base], cwd=nonroot, env=regular_env, **identity, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)

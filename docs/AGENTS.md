@@ -50,6 +50,8 @@
 
 - Document global `/verbose` and `channels.verbose`, live toggles without replay, remote preview rate/size and native edit/failure limits, unchanged retained history and explicit CLI/API streaming, and the worker compatibility change without claiming live-provider/platform verification.
 
+- Update documentation distinguishes automatic idle replacement by capable workers from the unavoidable first upgrade of already-running older updaters/workers. Active/retained work defers incompatible replacement without manual killall; compatible workers continue. State exact verified-installation recovery limits and keep publication separate from deployment.
+
 ## Child DOX Index
 
 No child DOX files.

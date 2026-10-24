@@ -212,7 +212,7 @@ func run(args []string, version string) error {
 		return err
 	case "update":
 		return runUpdateCommand(args[1:], version)
-	case "check-restartable":
+	case "check-restartable", "hold-worker-update":
 		flags := flag.NewFlagSet("check-restartable", flag.ContinueOnError)
 		protocol := flags.Int("worker-protocol", core.WorkerProtocol, "target worker protocol (0 if unknown)")
 		if err := flags.Parse(args[1:]); err != nil {
@@ -221,14 +221,38 @@ func run(args []string, version string) error {
 		if flags.NArg() != 0 || *protocol < 0 {
 			return errors.New("usage: spynel check-restartable [--worker-protocol N]")
 		}
-		return updater.Detect(version).CheckRestartableFor(*protocol)
+		manager := updater.Detect(version)
+		if args[0] == "hold-worker-update" {
+			closeRecord, err := manager.RegisterApplicationClient()
+			if err != nil {
+				return err
+			}
+			defer closeRecord()
+			return manager.HoldWorkerUpdate(context.Background(), *protocol, os.Stdin, os.Stdout)
+		}
+		return manager.CheckRestartableFor(*protocol)
 	case "restart-instances":
 		if len(args) != 1 {
 			return errors.New("usage: spynel restart-instances")
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), updater.RestartTimeout+5*time.Second)
 		defer cancel()
-		count, err := updater.Detect(version).RestartInstances(ctx, version)
+		manager := updater.Detect(version)
+		unregister, err := manager.RegisterApplicationClient()
+		if err != nil {
+			return err
+		}
+		defer unregister()
+		guard, err := manager.BeginWorkerUpdate(ctx, core.WorkerProtocol)
+		if err != nil {
+			return err
+		}
+		err = guard.Finish(ctx)
+		guard.Close()
+		if err != nil {
+			return err
+		}
+		count, err := manager.RestartInstances(ctx, version)
 		if err == nil {
 			fmt.Fprintf(os.Stderr, "Restarted %d other Spynel instance(s).\n", count)
 		}

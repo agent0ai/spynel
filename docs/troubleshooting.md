@@ -60,6 +60,10 @@ If Spynel was first started before its harness was installed, install the select
 - Do not delete or overwrite a fresh primary lease to work around a foreign-loopback error. A known mismatch fails before dialing but retains the 30-second owner fence; an older lease with a missing/invalid environment ID receives a bounded compatibility attempt and remains fenced too. Upgrade or stop a live older primary; wait for stale takeover only after confirming its process is dead.
 - If an existing same-environment primary accepts no connection, startup reports a sanitized condition after ten seconds instead of waiting silently. Check the owner process and `/log`, then retry or exit it cleanly. The connection message appears only for an interactive TUI before alternate-screen rendering, not in headless services or automation output.
 
+## Updates deferred by worker activity
+
+An update requiring worker replacement waits for both provider work and retained delivery to finish. Retry `/update` after that condition clears; compatible workers can continue through updates. Capable idle workers are paused and replaced automatically with the installation restart. If the error identifies an older worker without safe pause support, follow the one-time bootstrap in [getting started](getting-started.md#first-upgrade-from-an-older-worker). A published patch cannot change an already-running old preflight. Never erase leases or process records to bypass it.
+
 ## Coding harness
 
 - If no supported harness is detected, open the harness setup and follow its installation guidance. Spynel does not copy credentials; sign in with the harness itself.

@@ -108,7 +108,9 @@ func main() {
             result = []
             for path in registry.glob("*.json"):
                 try:
-                    result.append(json.loads(path.read_text()))
+                    record = json.loads(path.read_text())
+                    record.pop("worker_update_token", None)
+                    result.append(record)
                 except (FileNotFoundError, json.JSONDecodeError):
                     pass
             return result

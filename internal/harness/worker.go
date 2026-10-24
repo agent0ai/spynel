@@ -244,6 +244,8 @@ type workerHost struct {
 	recordPath   string
 	stop         chan struct{}
 	stopOnce     sync.Once
+	updateOwner  updater.ProcessRegistration
+	stopping     bool
 	operations   operationGate
 	mu           sync.Mutex
 	lastSeen     time.Time
@@ -261,6 +263,15 @@ type workerHost struct {
 // HTTP clients or elected controller does not cancel its provider context.
 // Explicit shutdown, signal, journal failure or bounded detachment still do.
 func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *Registry, workflow WorkerWorkflowAction, settings WorkerSettingsAction, conversation WorkerConversationAction) (runErr error) {
+	unlockLaunch, err := updater.LockWorkerLaunch(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if unlockLaunch != nil {
+			unlockLaunch()
+		}
+	}()
 	var bootstrap WorkerBootstrap
 	data, err := io.ReadAll(io.LimitReader(input, workerRequestBytes+1))
 	if err != nil || len(data) > workerRequestBytes {
@@ -424,6 +435,11 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 		_ = server.Shutdown(shutdownCtx)
 		_ = server.Close()
 	}()
+	if err := updater.RegisterWorkerUpdate(info.Socket, bootstrap.Token); err != nil {
+		return err
+	}
+	unlockLaunch()
+	unlockLaunch = nil
 	if err := json.NewEncoder(ready).Encode(info); err != nil {
 		return errors.New("worker readiness pipe unavailable")
 	}
@@ -456,6 +472,10 @@ func RunWorker(ctx context.Context, input io.Reader, ready io.Writer, registry *
 }
 
 func (h *workerHost) serve(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/update" {
+		h.serveUpdate(w, r)
+		return
+	}
 	if r.Method != http.MethodPost || r.URL.Path != "/worker" {
 		http.Error(w, "invalid worker request", http.StatusNotFound)
 		return
@@ -513,6 +533,12 @@ func (h *workerHost) serve(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *workerHost) apply(request WorkerRequest) WorkerReply {
+	if h.stopping {
+		return WorkerReply{Error: "worker is stopping for an installation update"}
+	}
+	if h.updatePaused() && request.Action != "inspect" && request.Action != "session" {
+		return WorkerReply{Error: "installation update in progress; retry after restart"}
+	}
 	switch request.Action {
 	case "inspect":
 		cfg := h.supervisor.HarnessConfig()

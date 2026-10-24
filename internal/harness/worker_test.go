@@ -64,7 +64,11 @@ func newWorkerFixture(t *testing.T, name, mode string, configure ...func(*Harnes
 	if err != nil {
 		t.Fatal(err)
 	}
-	command := exec.Command(os.Args[0], "__worker")
+	executable := os.Args[0]
+	if installed := os.Getenv("SPYNEL_TEST_WORKER_EXECUTABLE"); installed != "" {
+		executable = installed
+	}
+	command := exec.Command(executable, "__worker")
 	command.Stdin = bytes.NewReader(data)
 	command.Stderr = os.Stderr
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}

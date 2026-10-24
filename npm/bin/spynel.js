@@ -79,12 +79,65 @@ async function coordinateInstances(command, environment, signal, workerProtocol)
   }
 }
 
+async function replacePackage(environment, signal, version, workerProtocol) {
+  const operation = new AbortController();
+  const abort = () => operation.abort();
+  signal.addEventListener("abort", abort, { once: true });
+  if (signal.aborted) abort();
+  const child = childProcess.spawn(path.join(packageRoot, "npm", "vendor", "spynel"),
+    ["hold-worker-update", "--worker-protocol", String(workerProtocol)],
+    { env: environment, stdio: ["pipe", "pipe", "inherit"], signal: operation.signal });
+  child.stdin.on("error", () => {});
+  let observedError;
+  child.on("error", error => { observedError = error; });
+  let finishing = false;
+  const closed = new Promise(resolve => child.once("close", status => { if (!finishing) abort(); resolve(status); }));
+  let timer;
+  try {
+    await new Promise((resolve, reject) => {
+      let output = "";
+      timer = setTimeout(() => reject(new Error("worker update preparation timed out")), 70_000);
+      child.stdout.on("data", chunk => {
+        output = (output + chunk.toString("utf8")).slice(0, 7);
+        if (output === "ready\n") resolve();
+        else if (output.length >= 6) reject(new Error("invalid worker update readiness"));
+      });
+      closed.then(() => reject(observedError || new Error("worker update preparation failed")));
+    });
+    clearTimeout(timer);
+    await runNPMUpdate({ packageRoot, expectedVersion: version, signal: operation.signal });
+    finishing = true;
+    timer = setTimeout(() => child.kill("SIGKILL"), 20_000);
+    child.stdin.end("commit\n");
+    if (await closed !== 0) throw observedError || new Error("updated worker shutdown was not confirmed");
+  } finally {
+    clearTimeout(timer);
+    child.stdin.end();
+    // EOF aborts a prepared update; native owns resumption and the OS lock.
+    const kill = setTimeout(() => child.kill("SIGKILL"), 20_000);
+    await closed;
+    clearTimeout(kill);
+    signal.removeEventListener("abort", abort);
+  }
+}
+
+async function verifiedInstallation(version, environment, signal) {
+  try {
+    if (JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")).version !== version) return false;
+    const result = await runCommand(path.join(packageRoot, "npm", "vendor", "spynel"), ["--version"], {
+      env: environment, stdio: ["ignore", "pipe", "inherit"], timeout: 10_000, signal
+    });
+    return !result.error && result.status === 0 && result.stdout.trim() === `spynel ${version}`;
+  } catch (_) { return false; }
+}
+
 async function main(handoff, lifetime) {
   current();
   let args = handoff ? handoff.args : process.argv.slice(2);
   let startupUpdate = handoff && handoff.startupUpdate;
   let startupUpdateCheckedAt = handoff && handoff.startupUpdateCheckedAt;
   const { controller } = lifetime;
+  const launchVersion = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")).version;
   const periodicChecks = handoff ? handoff.periodicChecks : shouldCheckAtStartup(args);
   const nextLauncher = () => ({ handoff: { args, periodicChecks, startupUpdate, startupUpdateCheckedAt } });
   if (!handoff && periodicChecks) {
@@ -96,12 +149,14 @@ async function main(handoff, lifetime) {
         try {
           const environment = createLaunchEnvironment(process.env, false);
           await coordinateInstances("check-restartable", environment, controller.signal, update.workerProtocol);
-          await runNPMUpdate({ packageRoot, expectedVersion: update.latest, signal: controller.signal });
+          await replacePackage(environment, controller.signal, update.latest, update.workerProtocol);
           return controller.signal.aborted ? 0 : nextLauncher();
         } catch (error) {
-          console.error(`Unable to update Spynel: ${error.message}. Relaunch Spynel with the installed command.`);
+          console.error(`Unable to update Spynel: ${error.message}.`);
           if (controller.signal.aborted) return 0;
-          return 1;
+          if (!await verifiedInstallation(launchVersion, createLaunchEnvironment(process.env, false), controller.signal)) return 1;
+          await coordinateInstances("restart-instances", createLaunchEnvironment(process.env, false), controller.signal);
+          console.error(`Starting the unchanged Spynel ${launchVersion} installation.`);
         }
       }
     } catch (error) {
@@ -167,13 +222,19 @@ async function main(handoff, lifetime) {
     try {
       await coordinateInstances("check-restartable", environment, controller.signal, request.worker_protocol);
       if (request.install) {
-        await runNPMUpdate({ packageRoot, expectedVersion: request.version, signal: controller.signal });
+        await replacePackage(environment, controller.signal, request.version, request.worker_protocol);
         return controller.signal.aborted ? 0 : nextLauncher();
       }
       await coordinateInstances("restart-instances", environment, controller.signal);
     } catch (error) {
       console.error(`Unable to update Spynel: ${error.message}`);
       if (controller.signal.aborted) return 0;
+      if (request.install && await verifiedInstallation(request.version, environment, controller.signal)) return nextLauncher();
+      if (args[0] !== "version" && await verifiedInstallation(launchVersion, environment, controller.signal)) {
+        await coordinateInstances("restart-instances", environment, controller.signal);
+        console.error(`Restarting the unchanged Spynel ${launchVersion} installation after the failed update.`);
+        continue;
+      }
       return 1;
     }
   }

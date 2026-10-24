@@ -56,11 +56,17 @@ func (m *Manager) PrepareUpdate(ctx context.Context, result Result) error {
 		return err
 	}
 	if result.Source == "GitHub" {
+		guard, err := m.BeginWorkerUpdate(ctx, result.TargetWorkerProtocol())
+		if err != nil {
+			return err
+		}
+		defer guard.Close()
 		if result.Available {
 			if err := m.Install(ctx, result.Latest); err != nil {
 				return err
 			}
 		}
+		return guard.Finish(ctx)
 	}
 	return nil
 }
