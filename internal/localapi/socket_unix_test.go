@@ -17,7 +17,7 @@ import (
 )
 
 func TestSocketLifecycle(t *testing.T) {
-	_, server, _, stop, done := startTestServer(t, t.TempDir())
+	_, server, _, stop, done := startTestServer(t, socketTestDirectory(t))
 	defer func() { stop(); <-done; _ = server.Service.Close() }()
 	directory := socketTestDirectory(t)
 	path := filepath.Join(directory, "api.sock")
