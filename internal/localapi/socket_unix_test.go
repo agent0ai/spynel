@@ -19,10 +19,7 @@ import (
 func TestSocketLifecycle(t *testing.T) {
 	_, server, _, stop, done := startTestServer(t, t.TempDir())
 	defer func() { stop(); <-done; _ = server.Service.Close() }()
-	directory := t.TempDir()
-	if err := os.Chmod(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	directory := socketTestDirectory(t)
 	path := filepath.Join(directory, "api.sock")
 	listener, err := ListenSocket(path, server.Service.Config.Root, server.Token)
 	if err != nil {
@@ -98,10 +95,7 @@ func TestSocketLifecycle(t *testing.T) {
 }
 
 func TestSocketCleanupPreservesReplacement(t *testing.T) {
-	directory := t.TempDir()
-	if err := os.Chmod(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	directory := socketTestDirectory(t)
 	path := filepath.Join(directory, "api.sock")
 	l, err := ListenSocket(path, "workspace", strings.Repeat("a", 64))
 	if err != nil {
@@ -141,10 +135,7 @@ func TestSocketCleanupPreservesReplacement(t *testing.T) {
 }
 
 func TestSocketConcurrentClosePreservesSuccessor(t *testing.T) {
-	directory := t.TempDir()
-	if err := os.Chmod(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	directory := socketTestDirectory(t)
 	path := filepath.Join(directory, "api.sock")
 	listener, err := ListenSocket(path, "workspace", strings.Repeat("a", 64))
 	if err != nil {
@@ -171,4 +162,23 @@ func TestSocketConcurrentClosePreservesSuccessor(t *testing.T) {
 	if err != nil || descriptor.Token != strings.Repeat("b", 64) {
 		t.Fatalf("repeated close damaged successor: %v", err)
 	}
+}
+
+func socketTestDirectory(t *testing.T) string {
+	t.Helper()
+	// macOS test temp paths can exceed the Unix socket limit or contain symlinks.
+	directory, err := os.MkdirTemp("/tmp", "spynel-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(directory); err != nil {
+			t.Error(err)
+		}
+	})
+	canonical, err := filepath.EvalSymlinks(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return canonical
 }
