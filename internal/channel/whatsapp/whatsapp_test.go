@@ -206,7 +206,7 @@ func TestWhatsAppWorkerReplyValueReachesProviderNeutralMessage(t *testing.T) {
 		return nil
 	}
 	chat := types.NewJID("15551234567", types.DefaultUserServer)
-	client.handleWithReplyID(time.Unix(10, 0), chat, "15557654321", "/tasks", "quoted-id referenced text", "whatsapp:chat:stanza", func() {})
+	client.handleWithReplyID(time.Unix(10, 0), chat, "15557654321", "/tasks", "quoted-id referenced text", "whatsapp:chat:stanza", "", func() {})
 	if got.ReplyTo != "quoted-id referenced text" || got.Text != "/tasks" || got.SourceMessageID != "whatsapp:chat:stanza" {
 		t.Fatalf("provider-neutral message = %#v", got)
 	}
@@ -743,14 +743,14 @@ func TestWhatsAppEventlessAndFrameworkOnlyIntakeDoNotCompose(t *testing.T) {
 	chat := types.NewJID("15551234567", types.DefaultUserServer)
 
 	client.handler = func(context.Context, core.Message, core.Emit) error { return nil }
-	client.handleWithReplyID(time.Unix(10, 0), chat, "15557654321", "duplicate", "", "whatsapp:chat:duplicate", nil)
+	client.handleWithReplyID(time.Unix(10, 0), chat, "15557654321", "duplicate", "", "whatsapp:chat:duplicate", "", nil)
 	assertNoWhatsAppPresence(t, presenceEvents, "eventless duplicate intake")
 
 	client.handler = func(_ context.Context, _ core.Message, emit core.Emit) error {
 		emit(core.Event{Kind: core.EventFinal, Text: "local result", Done: true, Local: true})
 		return nil
 	}
-	client.handleWithReplyID(time.Unix(11, 0), chat, "15557654321", "/status", "", "whatsapp:chat:command", nil)
+	client.handleWithReplyID(time.Unix(11, 0), chat, "15557654321", "/status", "", "whatsapp:chat:command", "", nil)
 	assertNoWhatsAppPresence(t, presenceEvents, "framework-only command")
 }
 

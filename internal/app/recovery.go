@@ -611,6 +611,10 @@ func (s *Service) recoveryPrompt(origin orchestrator.Origin, entries []history.E
 		if len(body) > budget {
 			body = strings.ToValidUTF8(body[:budget], "")
 		}
+		if entry.ForwardedFrom != "" {
+			entry.Content = body
+			body = history.FormatEntry(entry)
+		}
 		fmt.Fprintf(&bodies, "\n<stalled_message index=\"%d\" source_message_id=\"%s\" excerpt=\"%t\">\n%s\n</stalled_message>\n", index+1, entry.SourceMessageID, excerpt, body)
 	}
 	mode := "No provider admission was recorded, but you must still validate relevance against all later conversation and durable work before acting."

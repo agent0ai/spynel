@@ -33,6 +33,9 @@ type Message struct {
 	// job or conversation identifier.
 	SourceMessageID string `json:"source_message_id,omitempty"`
 	Sender          string `json:"sender,omitempty"`
+	// ForwardedFrom is display-only provenance; empty means direct, "unknown"
+	// means forwarded without an available source. Sender retains all authority.
+	ForwardedFrom string `json:"forwarded_from,omitempty"`
 	// ReplyTo is a bounded provider-neutral reference derived only from the
 	// accepted inbound event: native message ID followed by an optional preview.
 	ReplyTo      string    `json:"reply_to,omitempty"`

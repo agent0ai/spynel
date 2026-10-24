@@ -110,4 +110,10 @@ Speech is enabled with English Parakeet in new workspaces; selecting `auto` or o
 
 ## Durable histories
 
+Forwarded Telegram and WhatsApp messages use the compact agent-visible header `[timestamp] user (@alice) forwarded from (@bob): message`. The ordinary arrival timestamp and actual sender remain unchanged. Source handles take precedence over available names and identity fallbacks; Telegram supports user, hidden-user, chat and channel origins. Direct messages keep their existing format. Source labels are bounded and stripped of controls, line breaks and header delimiters.
+
+Ordinary WhatsApp forwards expose a forward indicator, not the original author, so they display `forwarded from (unknown)`. Explicit forwarded-newsletter metadata can supply a channel name; absent names remain unknown and opaque newsletter identifiers are not displayed. Reply participants and quoted messages never supply forwarding attribution. See Telegram's [message-origin contract](https://core.telegram.org/bots/api#messageorigin) and the pinned [WhatsApp protocol definitions](https://github.com/tulir/whatsmeow/blob/8b4a8ba0d318/proto/waE2E/WAWebProtobufsE2E.proto).
+
+This optional display metadata survives text, media/captions, voice transcription, history reloads, branching, queued follow-up batches and recovery prompts. It never grants access or changes the reply destination. Old history stays unchanged, with no inferred forwarding. Tight prompt limits shorten the body while retaining attribution, or omit the entry when the complete header cannot fit.
+
 Every stable external identity maps to a sanitized append-only JSONL file containing timestamp, role, sender, and content. The complete path is linked in the harness prompt, but only the newest window allowed by both `workspace.history_max_messages` and `workspace.history_char_limit` is read from disk. `/clear` erases only the issuing remote conversation and resets only its harness session. Remote transports cannot `/resume`, because they cannot replace their native visible history; their files remain browsable and branchable from the TUI.

@@ -30,7 +30,7 @@ func (s *Service) dispatchWorkerConversation(ctx context.Context, message core.M
 	if message.Channel == "telegram" || message.Channel == "whatsapp" {
 		// The inbound emitter cannot acknowledge delivery. The ordinary scan
 		// consumes through the fallible router after this intake returns.
-		_, err := s.Orchestrator.AdmitConversation(ctx, c, prompt, message.Text)
+		_, err := s.Orchestrator.AdmitConversation(ctx, c, prompt, conversationMessageText(message))
 		return err
 	}
 	activity := newChatActivityEmitter(func(event core.Event) {
@@ -41,7 +41,7 @@ func (s *Service) dispatchWorkerConversation(ctx context.Context, message core.M
 	})
 	defer activity.stop()
 	terminal := false
-	err = s.Orchestrator.Converse(ctx, c, prompt, message.Text, message.FollowupOnly, func(_ context.Context, jobID int, delivery harness.WorkerDelivery) error {
+	err = s.Orchestrator.Converse(ctx, c, prompt, conversationMessageText(message), message.FollowupOnly, func(_ context.Context, jobID int, delivery harness.WorkerDelivery) error {
 		activity.start()
 		return s.ConsumeConversationDelivery(jobID, delivery, func(transformed harness.WorkerDelivery) error {
 			activity.emit(transformed.Event)

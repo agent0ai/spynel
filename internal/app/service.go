@@ -680,7 +680,7 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 	var recordErr error
 	recordUser := func() error {
 		_, recordErr = s.History.Append(message.Channel, message.Conversation, history.Entry{
-			At: message.ReceivedAt, AcceptedAt: time.Now().UTC(), Role: "user", Sender: message.Sender, ReplyTo: message.ReplyTo, Content: redactSensitiveCommand(message.Text), SourceMessageID: message.SourceMessageID,
+			At: message.ReceivedAt, AcceptedAt: time.Now().UTC(), Role: "user", Sender: message.Sender, ForwardedFrom: message.ForwardedFrom, ReplyTo: message.ReplyTo, Content: redactSensitiveCommand(message.Text), SourceMessageID: message.SourceMessageID,
 		})
 		recorded = recordErr == nil
 		return recordErr
@@ -747,7 +747,19 @@ func messageHookPayload(message core.Message) map[string]any {
 	return map[string]any{
 		"channel": message.Channel, "conversation": message.Conversation,
 		"sender": message.Sender, "text": message.Text, "reply_to": message.ReplyTo,
+		"forwarded_from": message.ForwardedFrom,
 	}
+}
+
+// Queued batches may outlive the recent-history window; keep their provenance.
+func conversationMessageText(message core.Message) string {
+	if message.ForwardedFrom == "" {
+		return message.Text
+	}
+	return history.FormatEntry(history.Entry{
+		At: message.ReceivedAt, Role: "user", Sender: message.Sender,
+		ForwardedFrom: message.ForwardedFrom, ReplyTo: message.ReplyTo, Content: message.Text,
+	})
 }
 
 func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Message, prompt string, emit core.Emit, additionalSourceIDs ...string) error {
@@ -779,7 +791,7 @@ func (s *Service) dispatchHarnessPrompt(ctx context.Context, message core.Messag
 	var threadID string
 	var steered bool
 	if sender, ok := s.Harness.(harness.ConversationSender); ok {
-		threadID, steered, err = sender.SendConversation(ctx, key, prompt, message.Text, wrapped)
+		threadID, steered, err = sender.SendConversation(ctx, key, prompt, conversationMessageText(message), wrapped)
 	} else {
 		threadID, steered, err = s.Harness.Send(ctx, key, prompt, wrapped)
 	}
