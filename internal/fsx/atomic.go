@@ -38,29 +38,41 @@ func AtomicWriteFile(path string, data []byte, mode os.FileMode) error {
 // does not already exist. The hard-link publication cannot replace a manual or
 // concurrent writer's file.
 func AtomicCreateFile(path string, data []byte, mode os.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(path), ".spynel-create-*")
+	file, err := prepareCreateFile(path, data, mode)
 	if err != nil {
 		return err
 	}
-	tempName := temp.Name()
-	defer os.Remove(tempName)
+	defer os.Remove(file.Name())
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Link(file.Name(), path)
+}
+
+func prepareCreateFile(path string, data []byte, mode os.FileMode) (_ *os.File, err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), ".spynel-create-*")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			os.Remove(temp.Name())
+		}
+	}()
 	if err := temp.Chmod(mode); err != nil {
 		temp.Close()
-		return err
+		return nil, err
 	}
 	if _, err := temp.Write(data); err != nil {
 		temp.Close()
-		return err
+		return nil, err
 	}
 	if err := temp.Sync(); err != nil {
 		temp.Close()
-		return err
+		return nil, err
 	}
-	if err := temp.Close(); err != nil {
-		return err
-	}
-	return os.Link(tempName, path)
+	return temp, nil
 }

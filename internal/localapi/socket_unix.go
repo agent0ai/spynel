@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,13 +30,22 @@ type privateSocket struct {
 	path       string
 	socketInfo os.FileInfo
 	authInfo   os.FileInfo
+	authFile   *os.File
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 func (l *privateSocket) Close() error {
-	err := l.Listener.Close()
-	removeOwnedFile(l.path, l.socketInfo)
-	removeOwnedFile(l.path+".json", l.authInfo)
-	return err
+	l.closeOnce.Do(func() {
+		// Keep both inodes alive until cleanup; stale numbers can identify replacements.
+		removeOwnedFile(l.path, l.socketInfo)
+		removeOwnedFile(l.path+".json", l.authInfo)
+		l.closeErr = l.Listener.Close()
+		if l.authFile != nil {
+			l.closeErr = errors.Join(l.closeErr, l.authFile.Close())
+		}
+	})
+	return l.closeErr
 }
 
 func removeOwnedFile(path string, owned os.FileInfo) {
@@ -96,13 +106,13 @@ func ListenSocket(path, root, token string) (net.Listener, error) {
 	}
 	data, err := json.Marshal(socketDescriptor{Schema: "spynel.socket/v1", WorkspaceID: fmt.Sprintf("%x", sha256.Sum256([]byte(root))), Token: token})
 	if err == nil {
-		err = fsx.AtomicCreateFile(path+".json", append(data, '\n'), 0o600)
+		owned.authFile, err = fsx.AtomicCreateOpenFile(path+".json", append(data, '\n'), 0o600)
 	}
 	if err != nil {
 		_ = owned.Close()
 		return nil, err
 	}
-	owned.authInfo, err = os.Lstat(path + ".json")
+	owned.authInfo, err = owned.authFile.Stat()
 	if err != nil {
 		_ = owned.Close()
 		return nil, err

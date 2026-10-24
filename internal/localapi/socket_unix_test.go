@@ -4,10 +4,12 @@ package localapi
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,21 +99,76 @@ func TestSocketLifecycle(t *testing.T) {
 
 func TestSocketCleanupPreservesReplacement(t *testing.T) {
 	directory := t.TempDir()
-	_ = os.Chmod(directory, 0o700)
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(directory, "api.sock")
 	l, err := ListenSocket(path, "workspace", strings.Repeat("a", 64))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = os.Remove(path)
-	_ = os.Remove(path + ".json")
-	_ = os.WriteFile(path, []byte("replacement"), 0o600)
-	_ = os.WriteFile(path+".json", []byte("replacement"), 0o600)
-	_ = l.Close()
+	defer l.Close()
+	owned := l.(*privateSocket)
+	for _, name := range []string{path, path + ".json"} {
+		if err := os.Remove(name); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, []byte("replacement"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A retained handle makes descriptor inode reuse impossible, without relying on allocator luck.
+	pinned, err := owned.authFile.Stat()
+	if err != nil || !os.SameFile(pinned, owned.authInfo) {
+		t.Fatalf("descriptor ownership lost: %v", err)
+	}
+	replacement, err := os.Stat(path + ".json")
+	if err != nil || os.SameFile(pinned, replacement) {
+		t.Fatalf("descriptor inode reused before cleanup: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owned.authFile.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("descriptor handle not released: %v", err)
+	}
 	for _, name := range []string{path, path + ".json"} {
 		data, err := os.ReadFile(name)
 		if err != nil || string(data) != "replacement" {
 			t.Fatal("cleanup deleted a replacement")
 		}
+	}
+}
+
+func TestSocketConcurrentClosePreservesSuccessor(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "api.sock")
+	listener, err := ListenSocket(path, "workspace", strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var callers sync.WaitGroup
+	for range 8 {
+		callers.Go(func() {
+			if err := listener.Close(); err != nil {
+				t.Errorf("concurrent close: %v", err)
+			}
+		})
+	}
+	callers.Wait()
+	successor, err := ListenSocket(path, "workspace", strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer successor.Close()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := readSocketDescriptor(path)
+	if err != nil || descriptor.Token != strings.Repeat("b", 64) {
+		t.Fatalf("repeated close damaged successor: %v", err)
 	}
 }

@@ -9,6 +9,7 @@
 - Write complete temporary content in the destination directory, apply requested private permissions, synchronize as required, and rename only after successful preparation.
 - No-clobber publication must never overwrite a concurrently created target; platform-specific replacement files preserve equivalent observable semantics.
 - Callers own content validation and higher-level rollback; this package owns filesystem publication integrity.
+- On Unix, `AtomicCreateOpenFile` retains the exact published file handle; callers close it after any inode-based cleanup. The cross-platform `AtomicCreateFile` still closes its prepared temporary file before publication.
 - AtomicWriteFile uses `.spynel-write-<decimal uint32>` temporary siblings. Abrupt process death may leave one before publication; directory owners may discard validated uncommitted scratch during their own recovery, never treat it as committed content.
 
 ## Child DOX Index
