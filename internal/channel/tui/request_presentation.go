@@ -18,6 +18,31 @@ type requestPresentation struct {
 	deltaBytes                      int
 }
 
+// Native steering replaces the request emitter without completing the response.
+func (m *model) continueResponse(request string) {
+	if m.requests == nil {
+		m.requests = make(map[string]requestPresentation)
+	}
+	if previous := m.responseSourceID; previous != request {
+		prior := m.requests[previous]
+		next := m.requests[request]
+		next.deltaBytes = prior.deltaBytes
+		next.progressSuppressed = next.progressSuppressed || m.responseSuppressed
+		m.requests[request] = next
+		if prior.deltaBytes > 0 {
+			prior.deltaBytes = 0
+			m.requests[previous] = prior
+		}
+		for i := range m.transcript {
+			if e := &m.transcript[i]; e.requestID == previous && e.streamEnd > 0 && e.responseID == "" {
+				e.requestID = request
+			}
+		}
+	}
+	m.responseSourceID = request
+	m.responseRequestID = request
+}
+
 // Final items restore their hidden portions without repeating visible fragments.
 // Continuing snapshots only add bytes not already observed in this turn.
 func (m *model) finishFilteredResponse(request, text string, final *string, continues, showProgress bool) {
@@ -85,6 +110,9 @@ func (m *model) finishFilteredResponse(request, text string, final *string, cont
 }
 
 func (m *model) finishResponsePresentation(request string) {
+	if request == m.responseSourceID {
+		m.responseSourceID = ""
+	}
 	for i := range m.transcript {
 		if m.transcript[i].requestID == request {
 			m.transcript[i].streamStart, m.transcript[i].streamEnd = 0, 0
@@ -101,6 +129,7 @@ func (m *model) observeRequest(event core.Event) {
 	if event.Kind == core.EventActivity {
 		if event.Active {
 			r.started = true
+			m.responseRequestID = event.RequestID
 		} else {
 			r.ended = true
 		}

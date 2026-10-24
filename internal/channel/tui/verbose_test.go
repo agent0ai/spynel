@@ -69,7 +69,9 @@ func TestVerboseTUIMidTurnDoesNotReplayHiddenProgress(t *testing.T) {
 func verboseFixture(m model) model {
 	final := "Verbose final answer."
 	hidden := "HIDDEN-PROGRESS"
-	for _, e := range []core.Event{
+	request := "verbose-initial"
+	m.requests = map[string]requestPresentation{request: {active: true}}
+	for i, e := range []core.Event{
 		{Kind: core.EventDelta, Text: "Visible progress before the change.\n", Verbose: "on"},
 		{Kind: core.EventFinal, Text: "Global verbose: off.", Local: true, Done: true, Verbose: "off"},
 		{Kind: core.EventDelta, Text: hidden, Verbose: "off"},
@@ -80,8 +82,13 @@ func verboseFixture(m model) model {
 		{Kind: core.EventDelta, Text: "answer.", Verbose: "on"},
 		{Kind: core.EventFinal, Text: final, FinalText: &final, Done: true, Verbose: "on"},
 	} {
+		e.RequestID = request
 		next, _ := m.Update(uiEvent{event: e})
 		m = next.(model)
+		if i == 6 {
+			m.dispatchMessage("Please include the answer.", "Please include the answer.")
+			request = m.responseRequestID
+		}
 	}
 	m.invalidateHistoryRender()
 	m.renderHistory()

@@ -306,9 +306,9 @@ func runSemanticPTY(t *testing.T, exit string) {
 	}
 	if exit == "verbose" {
 		write("\x0e")
-		waitForTerminalOutput(t, capture, func(text string) bool { return strings.Contains(ansi.Strip(text), "Verbose final answer.") })
+		waitForTerminalOutput(t, capture, func(text string) bool { return strings.Contains(ansi.Strip(text), "final answer.") })
 		visible := ansi.Strip(snapshot().View)
-		if strings.Contains(visible, "HIDDEN-PROGRESS") || !strings.Contains(visible, "Visible progress before") || strings.Count(visible, "Verbose final answer.") != 1 {
+		if strings.Contains(visible, "HIDDEN-PROGRESS") || !strings.Contains(visible, "Visible progress before") || strings.Count(visible, "Verbose ") != 1 || strings.Count(visible, "final answer.") != 1 || !strings.Contains(visible, "Please include the answer.") {
 			t.Fatalf("verbose PTY: %s", visible)
 		}
 		finish()

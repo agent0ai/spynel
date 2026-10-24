@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -201,5 +202,177 @@ func TestRequestPresentationFencesSwitchedConversation(t *testing.T) {
 	}
 	if len(m.transcript) != 0 || m.streaming != "" || m.mainAgentActivity != 0 || len(m.requests) != 0 {
 		t.Fatal("old request crossed the conversation switch")
+	}
+}
+
+func TestVerboseWorkerHandoffPreservesTurnPresentation(t *testing.T) {
+	for _, handoff := range []string{"native", "native-final-only", "queued", "new-turn"} {
+		for _, route := range []string{"stream", "history"} {
+			t.Run(handoff+"/"+route, func(t *testing.T) {
+				s, _ := notificationWorkflowService(t)
+				m := notificationTestModel()
+				m.conversation = "selected"
+				apply := func(event core.Event) { next, _ := m.Update(uiEvent{event: event}); m = next.(model) }
+				var sources []string
+				submit := func(text string) string {
+					m.dispatchMessage(text, text)
+					id := m.responseRequestID
+					sources = append(sources, id)
+					slices.Sort(sources)
+					if _, err := s.History.Append("tui", m.conversation, history.Entry{Role: "user", Content: text, SourceMessageID: id}); err != nil {
+						t.Fatal(err)
+					}
+					return id
+				}
+				first := submit("Initial request")
+				_, path, offset, err := s.History.RecentEntriesSnapshot("tui", m.conversation, 10, 1000)
+				if err != nil {
+					t.Fatal(err)
+				}
+				followed := watchTaskNotifications(t.Context(), path, offset)
+				job, err := s.Runtime.TryBeginJobWithDetails("chat:tui:selected", "tui", m.conversation, "synthetic", app.JobDetails{Kind: "conversation", WorkID: "execution"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var cursor uint64
+				execution, sequence := "execution", uint64(1)
+				deliver := func(id string, event core.Event, loseFinal bool) {
+					cursor++
+					c := &harness.WorkerConversation{Channel: "tui", Conversation: m.conversation, SourceMessageID: id, ExecutionID: execution, Sources: slices.Clone(sources)}
+					d := harness.WorkerDelivery{WorkerID: strings.Repeat("f", 32), Sequence: sequence, WorkerEvent: harness.WorkerEvent{Cursor: cursor, Conversation: c, Event: event}}
+					if event.Kind == core.EventFinal {
+						d.Streamed = event.Text
+					}
+					lost := errors.New("synthetic lost terminal callback")
+					err := s.ConsumeConversationDelivery(job, d, func(v harness.WorkerDelivery) error {
+						if loseFinal {
+							return lost
+						}
+						apply(v.Event)
+						return nil
+					})
+					if loseFinal && !errors.Is(err, lost) || !loseFinal && err != nil {
+						t.Fatal(err)
+					}
+				}
+				mode := func(value string) {
+					if _, err := s.ApplySettings(map[string]string{"channels.verbose": value}); err != nil {
+						t.Fatal(err)
+					}
+					m.setVerbose(value)
+				}
+				mode("on")
+				deliver(first, core.Event{Kind: core.EventDelta, Text: "The "}, false)
+				mode("off")
+				deliver(first, core.Event{Kind: core.EventDelta, Text: "result "}, false)
+				final := "The result is 42."
+				want := final
+				responses := 1
+				second := ""
+				if handoff == "queued" {
+					second = submit("Please include the number.")
+				}
+				if handoff == "queued" || handoff == "new-turn" {
+					firstFinal := "The result "
+					deliver(first, core.Event{Kind: core.EventFinal, Text: firstFinal, FinalText: &firstFinal, Done: true, Continues: handoff == "queued"}, false)
+					responses++
+					if handoff == "queued" {
+						want = "The " + final
+					} else {
+						want = firstFinal + final
+					}
+				}
+				if handoff == "new-turn" {
+					sources = nil
+					execution, sequence, cursor = "next-execution", 2, 0
+					job, err = s.Runtime.TryBeginJobWithDetails("chat:tui:selected", "tui", m.conversation, "synthetic", app.JobDetails{Kind: "conversation", WorkID: execution})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				if second == "" {
+					second = submit("Please include the number.")
+				}
+				if handoff != "new-turn" {
+					deliver(first, core.Event{Kind: core.EventStatus, Done: true}, false)
+				}
+				apply(core.Event{Kind: requestFinished, RequestID: first})
+				mode("on")
+				if handoff == "queued" || handoff == "new-turn" {
+					deliver(second, core.Event{Kind: core.EventDelta, Text: "The "}, false)
+					mode("off")
+					deliver(second, core.Event{Kind: core.EventDelta, Text: "result "}, false)
+					mode("on")
+				}
+				if handoff != "native-final-only" {
+					deliver(second, core.Event{Kind: core.EventDelta, Text: "is 42."}, false)
+				}
+				m.handler = func(_ context.Context, _ core.Message, emit core.Emit) error {
+					emit(core.Event{Kind: core.EventFinal, Text: "Command reply.", Done: true, Local: true})
+					return nil
+				}
+				m.dispatchMessage("/status", "/status")[0]()
+				for len(m.events) > 0 {
+					apply(<-m.events)
+				}
+				deliver(second, core.Event{Kind: core.EventFinal, Text: final, FinalText: &final, Done: true}, route == "history")
+				for range responses {
+					select {
+					case n := <-followed:
+						m.receiveRecoveredResponse(n)
+					case <-time.After(3 * time.Second):
+						t.Fatal("missing durable response")
+					}
+				}
+				apply(core.Event{Kind: requestFinished, RequestID: second})
+				var answer string
+				for _, entry := range m.transcript {
+					if entry.role == "assistant" && entry.text != "Command reply." {
+						answer += entry.text
+					}
+					if entry.streamEnd != 0 {
+						t.Fatal("completed turn retained fragment positions")
+					}
+				}
+				if answer != want {
+					t.Fatalf("handoff duplicated, replayed or lost text: got %q, want %q", answer, want)
+				}
+				if m.requests[first].deltaBytes != 0 || m.requests[second].deltaBytes != 0 {
+					t.Fatal("completed turn retained observed position")
+				}
+			})
+		}
+	}
+}
+
+func TestVerboseHarnessCommandRecoversHandoffFinal(t *testing.T) {
+	m := notificationTestModel()
+	m.requests = map[string]requestPresentation{"first": {active: true}}
+	apply := func(event core.Event) { next, _ := m.Update(uiEvent{event: event}); m = next.(model) }
+	m.setVerbose("on")
+	apply(core.Event{Kind: core.EventDelta, RequestID: "first", Text: "The "})
+	m.setVerbose("off")
+	apply(core.Event{Kind: core.EventDelta, RequestID: "first", Text: "result "})
+	var second string
+	m.handler = func(_ context.Context, message core.Message, emit core.Emit) error {
+		second = message.SourceMessageID
+		emit(core.Event{Kind: core.EventActivity, Active: true})
+		return nil
+	}
+	m.dispatchMessage("/task Include the number", "/task Include the number")[0]()
+	for len(m.events) > 0 {
+		apply(<-m.events)
+	}
+	m.setVerbose("on")
+	final := "The result is 42."
+	m.receiveRecoveredResponse(channel.Notification{Recovery: true, RequestID: second, ResponseID: "terminal", Text: final, FinalText: &final})
+	var answer string
+	for _, entry := range m.transcript {
+		if entry.role == "assistant" {
+			answer += entry.text
+		}
+	}
+	if answer != final {
+		t.Fatalf("harness command duplicated final fragments: %q", answer)
 	}
 }

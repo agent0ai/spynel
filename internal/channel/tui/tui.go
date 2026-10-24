@@ -226,6 +226,7 @@ type model struct {
 	streamOffset             int
 	responseCommit           int
 	responseRequestID        string
+	responseSourceID         string
 	requests                 map[string]requestPresentation
 	finishedRequests         []string
 	presentedResponses       []string
@@ -1095,11 +1096,14 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if event.ResponseID != "" && event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
 			m.rememberResponse(event.ResponseID)
 		}
+		if !event.Local && (event.Kind == core.EventDelta || event.Kind == core.EventFinal || event.Kind == core.EventError) && event.RequestID == "" {
+			event.RequestID = m.responseRequestID
+		}
 		if event.RequestID != "" {
 			m.observeRequest(event)
 		}
-		if event.RequestID != "" && (event.Kind == core.EventDelta || event.ResponseID != "") {
-			m.responseRequestID = event.RequestID
+		if !event.Local && (event.Kind == core.EventDelta || event.Kind == core.EventFinal || event.Kind == core.EventError) {
+			m.continueResponse(event.RequestID)
 		}
 		if event.Local && event.Verbose != "" {
 			m.setVerbose(event.Verbose)
@@ -1115,9 +1119,6 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case requestFinished:
 			m.finishRequest(event.RequestID)
 		case core.EventDelta:
-			if m.requests == nil {
-				m.requests = make(map[string]requestPresentation)
-			}
 			r := m.requests[event.RequestID]
 			if m.streaming == "" {
 				m.streamOffset = r.deltaBytes
@@ -1884,6 +1885,9 @@ func (m *model) appendRecoveredResponse(notification channel.Notification) {
 	if m.requests == nil {
 		m.requests = make(map[string]requestPresentation)
 	}
+	if notification.RequestID == m.responseRequestID {
+		m.continueResponse(notification.RequestID)
+	}
 	r := m.requests[notification.RequestID]
 	showProgress := core.ShowProgress(m.verbose, "tui")
 	if !showProgress && notification.Continues {
@@ -1984,7 +1988,9 @@ func (m *model) dispatchMessage(displayText, messageText string) []tea.Cmd {
 		m.requests = make(map[string]requestPresentation)
 	}
 	m.requests[sourceMessageID] = requestPresentation{active: true}
-	m.responseRequestID = sourceMessageID
+	if !isCommand {
+		m.responseRequestID = sourceMessageID
+	}
 	msg := core.Message{Channel: "tui", Conversation: m.conversation, Sender: "local", SourceMessageID: sourceMessageID, Text: messageText, ReceivedAt: time.Now().UTC()}
 	handler := m.handler
 	events := m.events
@@ -3719,6 +3725,7 @@ func (m *model) selectConversation(conversation string, offset int64) {
 	m.presentedResponses = nil
 	m.pendingRecovery = nil
 	m.responseRequestID = ""
+	m.responseSourceID = ""
 	if m.liveConversation != nil {
 		m.liveConversation.Set(conversation)
 	}
