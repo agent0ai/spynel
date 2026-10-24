@@ -266,7 +266,41 @@ func (b *Bot) cleanupAttachments(ctx context.Context) {
 	}
 }
 
+// updateQueues is shared by polling and webhook; no media work runs on receipt.
+func (b *Bot) updateQueues(ctx context.Context, handler channel.Handler) (chan telegramUpdate, chan telegramUpdate, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	messages, commands := make(chan telegramUpdate, 64), make(chan telegramUpdate, 64)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		channel.RunInbox(ctx, messages, commands, func(ctx context.Context, update telegramUpdate) { b.processUpdate(ctx, handler, update) })
+	}()
+	return messages, commands, func() { cancel(); <-done }
+}
+
+func (b *Bot) enqueueUpdate(ctx context.Context, messages, commands chan telegramUpdate, update telegramUpdate) bool {
+	message := update.Message
+	if ctx.Err() != nil || b.requireRuntimeAuthorization() != nil || message == nil || !message.hasContent() || !b.allowed(message.From) {
+		return true
+	}
+	if !b.groupAllowed(message) && !(b.config.WelcomeEnabled && len(message.NewChatMembers) > 0) {
+		return true
+	}
+	queue := messages
+	if !message.hasMedia() && core.IsCommand(b.Name(), message.Text) {
+		queue = commands
+	}
+	select {
+	case queue <- update:
+		return true
+	default:
+		return false
+	}
+}
+
 func (b *Bot) runPolling(ctx context.Context, handler channel.Handler) error {
+	messages, commands, stop := b.updateQueues(ctx, handler)
+	defer stop()
 	if err := b.post(ctx, "deleteWebhook", map[string]any{"drop_pending_updates": false}); err != nil {
 		return err
 	}
@@ -294,7 +328,9 @@ func (b *Bot) runPolling(ctx context.Context, handler channel.Handler) error {
 			if update.UpdateID >= offset {
 				offset = update.UpdateID + 1
 			}
-			b.processUpdate(ctx, handler, update)
+			if !b.enqueueUpdate(ctx, messages, commands, update) {
+				_ = b.send(ctx, strconv.FormatInt(update.Message.Chat.ID, 10), channel.ErrorResponse("Incoming queue is full; please retry this message."), update.Message.MessageID)
+			}
 			select {
 			case <-b.authLost:
 				return errTelegramRuntimeAuthorization
@@ -314,17 +350,8 @@ func (b *Bot) runWebhook(ctx context.Context, handler channel.Handler) error {
 	}
 	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(b.token)))
 	path := "/spynel/telegram/" + hash[:16]
-	updates := make(chan telegramUpdate, 64)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case update := <-updates:
-				b.processUpdate(ctx, handler, update)
-			}
-		}
-	}()
+	messages, commands, stop := b.updateQueues(ctx, handler)
+	defer stop()
 	mux := http.NewServeMux()
 	mux.HandleFunc(path, func(writer http.ResponseWriter, request *http.Request) {
 		if err := b.requireRuntimeAuthorization(); err != nil {
@@ -345,12 +372,11 @@ func (b *Bot) runWebhook(ctx context.Context, handler channel.Handler) error {
 			http.Error(writer, "invalid update", http.StatusBadRequest)
 			return
 		}
-		select {
-		case updates <- update:
-			writer.WriteHeader(http.StatusOK)
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			http.Error(writer, "shutting down", http.StatusServiceUnavailable)
-		default:
+		} else if b.enqueueUpdate(ctx, messages, commands, update) {
+			writer.WriteHeader(http.StatusOK)
+		} else {
 			http.Error(writer, "update queue full", http.StatusServiceUnavailable)
 		}
 	})
@@ -387,7 +413,7 @@ func (b *Bot) runWebhook(ctx context.Context, handler channel.Handler) error {
 }
 
 func (b *Bot) processUpdate(ctx context.Context, handler channel.Handler, update telegramUpdate) {
-	if err := b.requireRuntimeAuthorization(); err != nil {
+	if ctx.Err() != nil || b.requireRuntimeAuthorization() != nil {
 		return
 	}
 	message := update.Message
@@ -436,7 +462,7 @@ func telegramUsername(value string) string {
 }
 
 func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *telegramMessage) {
-	if err := b.requireRuntimeAuthorization(); err != nil {
+	if ctx.Err() != nil || b.requireRuntimeAuthorization() != nil || !b.allowed(message.From) {
 		return
 	}
 	chatID := strconv.FormatInt(message.Chat.ID, 10)
@@ -474,13 +500,17 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 		setActivity(true)
 	}
 	text, err := b.messageText(ctx, message)
+	if ctx.Err() != nil {
+		setActivity(false)
+		return
+	}
 	if err != nil {
-		_ = b.send(context.Background(), chatID, channel.ErrorResponse("Spynel attachment error: "+err.Error()), message.MessageID)
+		_ = b.send(ctx, chatID, channel.ErrorResponse("Spynel attachment error: "+err.Error()), message.MessageID)
 		setActivity(false)
 		return
 	}
 	if b.config.NotifyMessages && b.notice != nil {
-		if err := b.requireRuntimeAuthorization(); err != nil {
+		if ctx.Err() != nil || b.requireRuntimeAuthorization() != nil || !b.allowed(message.From) {
 			setActivity(false)
 			return
 		}
@@ -490,7 +520,15 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 		}
 		b.notice(channel.Notice{Channel: b.Name(), Sender: b.sender(message.From), Text: preview})
 	}
+	replyID := message.MessageID
+	var emitMu sync.Mutex
 	emit := func(event core.Event) {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		if ctx.Err() != nil {
+			setActivity(false)
+			return
+		}
 		if event.Kind == core.EventActivity {
 			if event.Active {
 				activityMu.Lock()
@@ -514,17 +552,17 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 			text = channel.ErrorResponse(text)
 		}
 		if text != "" {
-			_ = b.send(context.Background(), chatID, text, message.MessageID)
-			message.MessageID = 0
+			_ = b.send(ctx, chatID, text, replyID)
+			replyID = 0
 		}
 		for _, attachment := range event.Attachments {
-			if err := b.sendAttachment(context.Background(), chatID, attachment, message.MessageID); err != nil {
-				_ = b.send(context.Background(), chatID, channel.ErrorResponse("Spynel attachment delivery error: "+err.Error()), message.MessageID)
+			if err := b.sendAttachment(ctx, chatID, attachment, replyID); err != nil {
+				_ = b.send(ctx, chatID, channel.ErrorResponse("Spynel attachment delivery error: "+err.Error()), message.MessageID)
 			}
-			message.MessageID = 0
+			replyID = 0
 		}
 	}
-	if err := b.requireRuntimeAuthorization(); err != nil {
+	if ctx.Err() != nil || b.requireRuntimeAuthorization() != nil || !b.allowed(message.From) {
 		setActivity(false)
 		return
 	}
@@ -535,7 +573,7 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 	}, emit)
 	if err != nil {
 		setActivity(false)
-		_ = b.send(context.Background(), chatID, channel.ErrorResponse(err.Error()), message.MessageID)
+		_ = b.send(ctx, chatID, channel.ErrorResponse(err.Error()), message.MessageID)
 		return
 	}
 	activityMu.Lock()

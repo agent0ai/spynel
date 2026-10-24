@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/agent0ai/spynel/internal/config"
@@ -54,7 +55,7 @@ type Parakeet struct {
 	cachedModel   string
 	cachedThreads int
 	cached        speechRecognizer
-	closed        bool
+	closed        atomic.Bool
 	idleMu        sync.Mutex // Timer state; native resources remain owned by serial.
 	idleTimer     *time.Timer
 	idleSince     time.Time
@@ -70,28 +71,64 @@ func NewParakeet(settings *config.Store, modelDir string, cacheInitErr error, lo
 }
 
 func (p *Parakeet) Transcribe(ctx context.Context, audioPath string) (string, error) {
+	if p.closed.Load() {
+		return "", errors.New("speech transcriber is closed")
+	}
 	select {
 	case p.serial <- struct{}{}:
-		defer func() { <-p.serial }()
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}
-
-	if p.closed {
+	if p.closed.Load() || ctx.Err() != nil {
+		p.releaseNative()
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		return "", errors.New("speech transcriber is closed")
 	}
 	p.idleMu.Lock()
 	p.stopIdleTimer()
 	p.idleMu.Unlock()
-	defer func() {
+	type result struct {
+		text string
+		err  error
+	}
+	results := make(chan result, 1)
+	// Native inference cannot be interrupted. Retain the serial slot until it
+	// returns, even if the caller or channel generation has already gone away.
+	go func() {
+		text, err := p.transcribe(ctx, audioPath)
 		p.idleMu.Lock()
-		defer p.idleMu.Unlock()
-		if p.cached != nil {
+		if !p.closed.Load() && p.cached != nil {
 			p.idleSince = time.Now()
 			p.scheduleIdleTimer()
 		}
+		p.idleMu.Unlock()
+		p.releaseNative()
+		results <- result{text, err}
 	}()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case result := <-results:
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return result.text, result.err
+	}
+}
 
+// Every native owner, including an already-fired idle callback, finishes Close.
+func (p *Parakeet) releaseNative() {
+	p.idleMu.Lock()
+	defer p.idleMu.Unlock()
+	if p.closed.Load() {
+		p.unload()
+	}
+	<-p.serial
+}
+
+func (p *Parakeet) transcribe(ctx context.Context, audioPath string) (string, error) {
 	cfg := p.settings.Snapshot().Speech
 	if !cfg.Enabled {
 		return "", errors.New("speech transcription is disabled")
@@ -192,7 +229,7 @@ func (p *Parakeet) scheduleIdleTimer() {
 	var timer *time.Timer
 	timer = time.AfterFunc(timeout-time.Since(p.idleSince), func() {
 		p.serial <- struct{}{}
-		defer func() { <-p.serial }()
+		defer p.releaseNative()
 		p.idleMu.Lock()
 		if p.idleTimer != timer {
 			p.idleMu.Unlock()
@@ -205,15 +242,19 @@ func (p *Parakeet) scheduleIdleTimer() {
 	p.idleTimer = timer
 }
 
-// Close waits for native work, cancels idle cleanup and permanently closes the worker.
+// Close refuses new work immediately. An active native call owns its resources
+// through completion and unloads them itself; shutdown never frees them in use.
 func (p *Parakeet) Close() {
-	p.serial <- struct{}{}
-	defer func() { <-p.serial }()
-	p.closed = true
 	p.idleMu.Lock()
+	defer p.idleMu.Unlock()
+	p.closed.Store(true)
 	p.stopIdleTimer()
-	p.idleMu.Unlock()
-	p.unload()
+	select {
+	case p.serial <- struct{}{}:
+		p.unload()
+		<-p.serial
+	default:
+	}
 }
 
 func (p *Parakeet) unload() {

@@ -6,6 +6,8 @@
 
 ## Local Contracts
 
+- Use core command parsing/catalog for the ordinary handler and public picker copy. Remote command intake may overlap ordinary media/message preparation; preserve source-ID admission, exact once-only history checks, normal hooks and response-before-restart publication for both lanes.
+
 - Keep channel/harness supervisors, histories, commands, hooks, configuration, startup registration, conversations, runtime logs, durable-work lists, and agent jobs behind the shared service boundary.
 - Carry optional forwarding provenance unchanged through message hooks and saved user entries, preserve attributed text in local/worker queued follow-up batches, and render selected recovery sources with the shared history formatter even outside the recent-history window. Provenance is untrusted display metadata only; actual sender, conversation, reply and correlation authority remain unchanged.
 - Shared status carries the serving process's startup version from `Updates.CurrentVersion` in `StatusSnapshot.Version`; render exactly one Version row between title and the adjacent instance IDs. Preserve build metadata verbatim, including `dev`; absent metadata remains empty in JSON and displays `not available`, never an inferred installed/latest version.

@@ -6,6 +6,8 @@
 
 ## Local Contracts
 
+- After actual-sender and group/self-chat validation, place recognized text-only commands in the separate bounded command lane. Both lanes recheck the generation and live authorization, preserve the authenticated stanza and provenance, and join on shutdown. Overflow retains the existing rejected-intake behavior with content-free logging; no per-message goroutine or extra harness session is created.
+
 - Canonicalize phone-number authorization to international digits, resolve self-chat LIDs before authorization and conversation keying, and re-check the live allow-list at every pairing, event, provider, and delivery boundary.
 - A changed live allow-list invalidates the old adapter at its next authorization check, including between encrypted upload and message send; the supervisor constructs the replacement. Partial native sends retain ordinary retry semantics.
 - Distinguish socket pairing readiness from an authenticated connected device; expose only validated phone-number identities and retain QR data solely in the fullscreen pairing flow.

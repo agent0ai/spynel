@@ -168,8 +168,8 @@ func TestParakeetActiveTranscriptionAndShutdown(t *testing.T) {
 				synctest.Wait()
 				select {
 				case <-closed:
-					t.Fatal("shutdown did not wait for native work")
 				default:
+					t.Fatal("shutdown waited for native work")
 				}
 			}
 			close(release)
@@ -256,6 +256,71 @@ func TestParakeetReplacementRejectsExpiredCallback(t *testing.T) {
 		synctest.Wait()
 		if (*created)[1].closes.Load() != 1 {
 			t.Fatal("replacement not unloaded")
+		}
+	})
+}
+
+func TestParakeetCancelledNativeCallDoesNotBlockShutdownOrStartAnother(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		worker, audio, created := idleWorker(t)
+		transcribeIdleFixture(t, worker, audio)
+		recognizer := (*created)[0]
+		release := make(chan struct{})
+		recognizer.transcribe = func() error { <-release; return nil }
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() { _, err := worker.Transcribe(ctx, audio); result <- err }()
+		synctest.Wait()
+		cancel()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel: %v", err)
+		}
+		if recognizer.closes.Load() != 0 {
+			t.Fatal("freed active native recognizer")
+		}
+		second, stopSecond := context.WithCancel(context.Background())
+		go func() { _, err := worker.Transcribe(second, audio); result <- err }()
+		synctest.Wait()
+		stopSecond()
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Fatalf("queued cancel: %v", err)
+		}
+		if recognizer.calls != 3 {
+			t.Fatalf("another native call started: %d", recognizer.calls)
+		}
+		worker.Close()
+		if _, err := worker.Transcribe(context.Background(), audio); err == nil {
+			t.Fatal("closed active worker accepted new work")
+		}
+		if recognizer.closes.Load() != 0 {
+			t.Fatal("closed active recognizer")
+		}
+		close(release)
+		synctest.Wait()
+		if recognizer.closes.Load() != 1 || worker.cached != nil {
+			t.Fatal("late completion did not clean native resources exactly once")
+		}
+		if _, err := worker.Transcribe(context.Background(), audio); err == nil {
+			t.Fatal("closed worker accepted new work")
+		}
+	})
+}
+
+func TestParakeetCloseWithPendingIdleCallback(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		worker, audio, created := idleWorker(t)
+		transcribeIdleFixture(t, worker, audio)
+		worker.serial <- struct{}{}
+		time.Sleep(2 * time.Second)
+		synctest.Wait() // The expired callback is queued at the native boundary.
+		worker.Close()
+		if (*created)[0].closes.Load() != 0 {
+			t.Fatal("closed resources owned by pending work")
+		}
+		<-worker.serial
+		synctest.Wait()
+		if (*created)[0].closes.Load() != 1 || worker.cached != nil {
+			t.Fatal("cancelled idle callback stranded closed resources")
 		}
 	})
 }

@@ -6,6 +6,8 @@
 
 ## Local Contracts
 
+- Polling and webhook intake enqueue authorized/addressed updates into the common bounded ordinary/command lanes before media preparation. Webhook overflow returns 503 for provider retry; polling overflow returns an explicit retry response. Recheck sender/live authorization on dequeue and after preparation. Keep native source identity immutable and reply delivery state local; generation cancellation suppresses late preparation and responses.
+
 - Re-resolve and validate the current allow-list at startup and every inbound/outbound/provider boundary; stale identity mappings or credentials never grant access, and authorization loss terminates useful traffic.
 - A changed live allow-list invalidates the old adapter at its next authorization check, including between native files and captions; the supervisor constructs the replacement. Partial native sends retain ordinary retry semantics.
 - Persist only minimal identity learned from an authenticated private update, keep webhook secrets and URLs out of status, and permit only teardown `deleteWebhook` after revocation.

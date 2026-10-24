@@ -46,6 +46,7 @@ type Client struct {
 	store                  *media.Store
 	speech                 media.Transcriber
 	incoming               chan incomingMessage
+	commands               chan incomingMessage
 	download               func(context.Context, whatsmeow.DownloadableMessage, *os.File) error
 	upload                 func(context.Context, io.Reader, io.ReadWriteSeeker, whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
 	deliver                func(context.Context, types.JID, *waE2E.Message) (whatsmeow.SendResponse, error)
@@ -87,7 +88,7 @@ var errWhatsAppRuntimeAuthorization = errors.New("WhatsApp runtime authorization
 func New(cfg config.WhatsApp, database string) *Client {
 	client := &Client{
 		config: cfg, dbPath: database, sentIDs: map[types.MessageID]time.Time{}, log: os.Stderr,
-		incoming: make(chan incomingMessage, 64), pairingRetry: make(chan struct{}, 1), pairingDelay: 2 * time.Second,
+		incoming: make(chan incomingMessage, 64), commands: make(chan incomingMessage, 64), pairingRetry: make(chan struct{}, 1), pairingDelay: 2 * time.Second,
 		authLost: make(chan struct{}), conversationActivity: map[string][]func(){},
 	}
 	client.allowedNumbers = func() []string { return cfg.AllowedNumbers }
@@ -311,6 +312,8 @@ func (c *Client) sendEvent(ctx context.Context, chat types.JID, eventID, text st
 }
 
 func (c *Client) Run(ctx context.Context, handler channel.Handler) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if err := c.requireRuntimeAuthorization(); err != nil {
 		return err
 	}
@@ -356,7 +359,9 @@ func (c *Client) Run(ctx context.Context, handler channel.Handler) error {
 	if err := c.requireRuntimeAuthorization(); err != nil {
 		return err
 	}
-	go c.messageWorker(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); c.messageWorker(ctx) }()
+	defer func() { cancel(); <-done }()
 	c.client.AddEventHandler(c.onEvent)
 	if c.client.Store.ID == nil {
 		if err := c.runPairing(ctx); err != nil {
@@ -656,10 +661,17 @@ func (c *Client) onEvent(raw any) {
 		return
 	}
 	chat := event.Info.Chat
+	if c.ctx != nil && c.ctx.Err() != nil {
+		return
+	}
+	queue := c.incoming
+	if !hasMedia(event.Message) && core.IsCommand(c.Name(), messageText(event)) {
+		queue = c.commands
+	}
 	select {
-	case c.incoming <- incomingMessage{received: event.Info.Timestamp, chat: chat, sender: sender, message: event.Message, id: event.Info.ID}:
+	case queue <- incomingMessage{received: event.Info.Timestamp, chat: chat, sender: sender, message: event.Message, id: event.Info.ID}:
 	default:
-		fmt.Fprintln(c.log, "WhatsApp incoming queue is full; dropping message", event.Info.ID)
+		fmt.Fprintln(c.log, "WhatsApp incoming queue is full; message not accepted")
 	}
 }
 
@@ -824,25 +836,20 @@ func (c *Client) reportPairing(event channel.PairingEvent) {
 }
 
 func (c *Client) messageWorker(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
+	channel.RunInbox(ctx, c.incoming, c.commands, func(ctx context.Context, incoming incomingMessage) {
+		if c.requireRuntimeAuthorization() != nil {
 			return
-		case incoming := <-c.incoming:
-			if err := c.requireRuntimeAuthorization(); err != nil {
-				continue
-			}
-			text, err := c.prepareMessage(ctx, incoming)
-			if err != nil {
-				_ = c.send(ctx, incoming.chat, channel.ErrorResponse("Spynel attachment error: "+err.Error()))
-				continue
-			}
-			if err := c.requireRuntimeAuthorization(); err != nil {
-				continue
-			}
-			c.handleWithReplyID(incoming.received, incoming.chat, incoming.sender, text, whatsappReplyTo(incoming.message), "whatsapp:"+incoming.chat.String()+":"+string(incoming.id), whatsappForwardedFrom(incoming.message), nil)
 		}
-	}
+		text, err := c.prepareMessage(ctx, incoming)
+		if ctx.Err() != nil || c.requireRuntimeAuthorization() != nil {
+			return
+		}
+		if err != nil {
+			_ = c.send(ctx, incoming.chat, channel.ErrorResponse("Spynel attachment error: "+err.Error()))
+			return
+		}
+		c.handleWithReplyID(incoming.received, incoming.chat, incoming.sender, text, whatsappReplyTo(incoming.message), "whatsapp:"+incoming.chat.String()+":"+string(incoming.id), whatsappForwardedFrom(incoming.message), nil)
+	})
 }
 
 func (c *Client) prepareMessage(ctx context.Context, incoming incomingMessage) (string, error) {
@@ -941,7 +948,7 @@ func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, t
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := c.requireRuntimeAuthorization(); err != nil {
+	if ctx.Err() != nil || c.requireRuntimeAuthorization() != nil {
 		if finishActivity != nil {
 			finishActivity()
 		}
@@ -982,7 +989,14 @@ func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, t
 			panic(recovered)
 		}
 	}()
+	var emitMu sync.Mutex
 	emit := func(event core.Event) {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		if ctx.Err() != nil {
+			setActivity(false)
+			return
+		}
 		if event.Kind == core.EventActivity {
 			setActivity(event.Active)
 			return
