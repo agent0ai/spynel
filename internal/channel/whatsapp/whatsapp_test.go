@@ -247,33 +247,44 @@ func TestWhatsAppSendsOnlyLastTerminalResponse(t *testing.T) {
 }
 
 func TestWhatsAppFormatsErrorsAsOrdinaryUnindentedResponses(t *testing.T) {
-	client := New(config.WhatsApp{AllowedNumbers: []string{"15551234567"}}, filepath.Join(t.TempDir(), "whatsapp.db"))
-	client.ctx = context.Background()
-	client.presence = func(context.Context, types.JID, types.ChatPresence, types.ChatPresenceMedia) error { return nil }
-	sent := make(chan string, 4)
-	client.deliver = func(_ context.Context, _ types.JID, message *waE2E.Message) (whatsmeow.SendResponse, error) {
-		sent <- message.GetConversation()
-		return whatsmeow.SendResponse{ID: types.MessageID("sent")}, nil
-	}
-	partial := "partial"
-	client.handler = func(_ context.Context, _ core.Message, emit core.Emit) error {
-		emit(core.Event{Kind: core.EventError, Text: "first line\nsecond line", FinalText: &partial, Done: true})
-		return nil
-	}
-	chat := types.NewJID("15551234567", types.DefaultUserServer)
-	client.handle(time.Unix(10, 0), chat, "15557654321", "hello")
-	client.handler = func(context.Context, core.Message, core.Emit) error { return errors.New("handler failed") }
-	client.handle(time.Unix(11, 0), chat, "15557654321", "hello")
-
-	for _, want := range []string{"Error first line\nsecond line", "Error handler failed"} {
-		select {
-		case got := <-sent:
-			if got != want {
-				t.Fatalf("WhatsApp error reply = %q, want %q", got, want)
+	for _, mode := range []string{"auto", "on", "off"} {
+		t.Run(mode, func(t *testing.T) {
+			client := New(config.WhatsApp{AllowedNumbers: []string{"15551234567"}}, filepath.Join(t.TempDir(), "whatsapp.db"))
+			client.ctx = context.Background()
+			client.presence = func(context.Context, types.JID, types.ChatPresence, types.ChatPresenceMedia) error { return nil }
+			sent := make(chan string, 4)
+			client.deliver = func(_ context.Context, _ types.JID, message *waE2E.Message) (whatsmeow.SendResponse, error) {
+				sent <- message.GetConversation()
+				return whatsmeow.SendResponse{ID: types.MessageID("sent")}, nil
 			}
-		default:
-			t.Fatalf("WhatsApp did not send error reply %q", want)
-		}
+			client.SetVerboseSource(func() string { return mode })
+			partial := "partial"
+			client.handler = func(_ context.Context, _ core.Message, emit core.Emit) error {
+				emit(core.Event{Kind: core.EventError, Text: "first line\nsecond line", FinalText: &partial, Done: true})
+				emit(core.Event{Kind: core.EventError, Text: "duplicate", Done: true})
+				return errors.New("already reported")
+			}
+			chat := types.NewJID("15551234567", types.DefaultUserServer)
+			client.handle(time.Unix(10, 0), chat, "15557654321", "hello")
+			client.handler = func(context.Context, core.Message, core.Emit) error { return errors.New("handler failed") }
+			client.handle(time.Unix(11, 0), chat, "15557654321", "hello")
+
+			for _, want := range []string{"Error first line\nsecond line", "Error handler failed"} {
+				select {
+				case got := <-sent:
+					if got != want {
+						t.Fatalf("WhatsApp error reply = %q, want %q", got, want)
+					}
+				default:
+					t.Fatalf("WhatsApp did not send error reply %q", want)
+				}
+			}
+			select {
+			case extra := <-sent:
+				t.Fatal("duplicate terminal", extra)
+			default:
+			}
+		})
 	}
 }
 

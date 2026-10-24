@@ -234,14 +234,14 @@ func TestWorkerSettingsCanonicalApplicationCommitAndControllerReplacement(t *tes
 		t.Fatal("reconciled worker save did not refresh speech exactly once")
 	}
 	// A timeout-only save must not replace the worker or admit another provider turn.
-	if _, err := f.service.ApplySettings(map[string]string{"speech.idle_timeout_seconds": "600"}); err != nil {
+	if _, err := f.service.ApplySettings(map[string]string{"speech.idle_timeout_seconds": "600", "channels.verbose": "on"}); err != nil {
 		t.Fatal(err)
 	}
 	if refreshes != 2 || refreshedTimeout != 600 || f.client.Info().Process != identity.Process {
 		t.Fatal("timeout-only save lost speech refresh or retained worker identity")
 	}
 	saved, err := config.Load(f.cfg.Path)
-	if err != nil || saved.Harness.Model != "model-a" || saved.Harness.ServiceMode != "priority" || saved.Orchestrator.IntervalSec != 19 || f.service.Settings.Snapshot().Harness.Model != "model-a" {
+	if err != nil || saved.Channels.Verbose != "on" || f.service.SharedState().Verbose != "on" || saved.Harness.Model != "model-a" || saved.Harness.ServiceMode != "priority" || saved.Orchestrator.IntervalSec != 19 || f.service.Settings.Snapshot().Harness.Model != "model-a" {
 		t.Fatal("canonical/application selection did not commit", err)
 	}
 	encoded, _ := saved.Encode()
@@ -299,6 +299,9 @@ func TestWorkerSettingsCanonicalApplicationCommitAndControllerReplacement(t *tes
 	f.service = app.New(saved, harness.NewSupervisor(harness.NewBuiltinRegistry(), runtime))
 	f.service.Orchestrator.Worker = f.client
 	f.service.RefreshSpeechIdleTimeout = refreshSpeech
+	if f.service.SharedState().Verbose != "on" {
+		t.Fatal("controller replacement lost global verbose")
+	}
 	// Release the first turn and exercise a real next provider dispatch.
 	if _, err := f.client.Call(t.Context(), harness.WorkerRequest{Action: "interrupt", Key: "synthetic/settings"}); err != nil {
 		t.Fatal(err)

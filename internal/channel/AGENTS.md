@@ -17,6 +17,8 @@
 
 - Local history-followed conversation responses carry `Notification.Continues` plus private request/response correlation through the existing recovery presentation path. ResponseID reuses the existing application history receipt, pairing its partial and result records; EventID remains reserved for ordinary notification acknowledgement. Partial/intermediate output never settles activity and never enters task-notification acknowledgement.
 
+- Remote verbose progress uses one bounded editable preview per conversation, coalescing only assistant deltas and non-streamed continuing replies at most once per second with a 3000-rune tail. Run native progress sends outside intake/provider callbacks, with a three-second bound and live mode/authorization checks. Stop and join pending progress before final delivery; replace the preview with the first final chunk, then use ordinary chunk/media delivery. Failed/cancelled previews never suppress a final; native edit failure falls back to ordinary delivery with existing transport uncertainty. Generation cancellation releases previews; no replay or durable progress queue exists.
+
 ## Child DOX Index
 
 Direct child DOX files:

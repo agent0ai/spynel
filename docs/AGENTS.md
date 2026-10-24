@@ -20,7 +20,7 @@
 - Document that WhatsApp setup automatically saves and enables the channel after access configuration, then opens pairing without a separate enable-choice step.
 - Document that WhatsApp QR pairing uses a chrome-free full-terminal view exited by any key, expired/error sessions retry automatically without restarting Spynel, the manual retry action is only an immediate override, and phone-number linking codes are the supported non-QR alternative.
 - Document transport-specific Markdown rendering and terminal limitations around pasted file data.
-- Document response-delivery differences: the TUI exposes live progress, explicit CLI streaming remains opt-in, and Telegram/WhatsApp send only the last terminal response or error.
+- Document response-delivery differences: global verbose auto shows TUI progress and remote final-only output, on shows progress in all three, and off hides it in all three; explicit CLI streaming remains opt-in and independent.
 - Document the human-facing communication boundary: routine delegation and completion confirmations are brief, natural, outcome-first, and hide internal paths/IDs/metrics; explicit detail requests and dedicated diagnostic commands remain precise, and remote routine confirmations never render local-path links.
 - Distinguish bounded in-memory/display windows from complete disk-backed histories and attachments.
 - Document plain-CLI output contracts precisely: the last assistant-message item by default, all response deltas with `--stream`, NDJSON events with `send --json` and shared command aliases using `--json`, structured JSON for status/history queries, and flags before positional command arguments.
@@ -47,6 +47,8 @@
 - Document exact-event ordinary retry cancellation and agent-owned answer settlement before task resumption, preserving failure evidence, terminal delivery truth, and the limits of already accepted external effects.
 
 - Document the speech idle timeout as a default-120, 1–86400-whole-second live advanced setting measured from completion, with safe reload and allocator-specific memory reclamation; never promise measured Linux savings on other platforms.
+
+- Document global `/verbose` and `channels.verbose`, live toggles without replay, remote preview rate/size and native edit/failure limits, unchanged retained history and explicit CLI/API streaming, and the worker compatibility change without claiming live-provider/platform verification.
 
 ## Child DOX Index
 

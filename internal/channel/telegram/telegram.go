@@ -29,6 +29,7 @@ import (
 )
 
 type Bot struct {
+	progress          channel.ProgressStreams
 	config            config.Telegram
 	token             string
 	client            *http.Client
@@ -77,6 +78,8 @@ func newTelegramActivity(bot *Bot, interval time.Duration) *channel.ActivityIndi
 }
 
 func (b *Bot) Name() string { return "telegram" }
+
+func (b *Bot) SetVerboseSource(source func() string) { b.progress.Mode = source }
 
 func (b *Bot) SetStatusReporter(report channel.StatusReporter) { b.report = report }
 
@@ -127,6 +130,10 @@ func (b *Bot) requireRuntimeAuthorization() error {
 }
 
 func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string, attachments []core.OutboundAttachment) error {
+	return b.deliver(ctx, conversation, eventID, text, attachments, "")
+}
+
+func (b *Bot) deliver(ctx context.Context, conversation, eventID, text string, attachments []core.OutboundAttachment, previewID string) error {
 	if err := b.requireRuntimeAuthorization(); err != nil {
 		return err
 	}
@@ -153,7 +160,7 @@ func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string, a
 			return err
 		}
 	}
-	_, err := b.sendWithIDs(ctx, chatID, text, 0, false)
+	_, err := b.sendWithIDs(ctx, chatID, text, 0, false, previewID)
 	return err
 }
 
@@ -199,8 +206,15 @@ func (b *Bot) DeliverEvent(ctx context.Context, conversation, eventID string, ev
 		if event.Kind == core.EventError {
 			text = channel.ErrorResponse(text)
 		}
-		return b.Deliver(ctx, conversation, eventID, text, event.Attachments)
+		previewID := b.progress.Stop(conversation)
+		return b.deliver(ctx, conversation, eventID, text, event.Attachments, previewID)
 	}
+	b.progress.Push(ctx, conversation, event, func(ctx context.Context, id, text string) (string, error) {
+		if _, err := b.deliveryChatID(conversation); err != nil {
+			return "", err
+		}
+		return b.sendProgress(ctx, chatID, id, text, 0)
+	})
 	return nil
 }
 
@@ -521,6 +535,8 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 		b.notice(channel.Notice{Channel: b.Name(), Sender: b.sender(message.From), Text: preview})
 	}
 	replyID := message.MessageID
+	progressKey := b.conversationID(message)
+	var terminalDelivered bool
 	var emitMu sync.Mutex
 	emit := func(event core.Event) {
 		emitMu.Lock()
@@ -538,12 +554,26 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 			setActivity(event.Active)
 			return
 		}
+		if terminalDelivered {
+			return
+		}
 		if !event.Done || event.Continues || (event.Kind != core.EventFinal && event.Kind != core.EventError) {
+			b.progress.Push(ctx, progressKey, event, func(ctx context.Context, id, text string) (string, error) {
+				if !b.allowed(message.From) {
+					return "", errTelegramRuntimeAuthorization
+				}
+				return b.sendProgress(ctx, chatID, id, text, message.MessageID)
+			})
 			return
 		}
 		// Terminal events are a fallback cleanup boundary for handlers that do
 		// not yet emit the explicit activity-off event. Stop before delivery.
 		setActivity(false)
+		terminalDelivered = true
+		previewID := ""
+		if !event.Local {
+			previewID = b.progress.Stop(progressKey)
+		}
 		text := event.Text
 		if event.Kind == core.EventFinal && event.FinalText != nil {
 			text = *event.FinalText
@@ -552,7 +582,7 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 			text = channel.ErrorResponse(text)
 		}
 		if text != "" {
-			_ = b.send(ctx, chatID, text, replyID)
+			_, _ = b.sendWithIDs(ctx, chatID, text, replyID, false, previewID)
 			replyID = 0
 		}
 		for _, attachment := range event.Attachments {
@@ -572,6 +602,15 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 		SourceMessageID: fmt.Sprintf("telegram:%s:%d", chatID, message.MessageID), ReplyTo: telegramReplyTo(message), Text: text, ReceivedAt: time.Unix(message.Date, 0).UTC(),
 	}, emit)
 	if err != nil {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		if terminalDelivered {
+			return
+		}
+		terminalDelivered = true
+		if !core.IsCommand(b.Name(), rawText) {
+			b.progress.Stop(progressKey)
+		}
 		setActivity(false)
 		_ = b.send(ctx, chatID, channel.ErrorResponse(err.Error()), message.MessageID)
 		return
@@ -790,12 +829,21 @@ func (b *Bot) send(ctx context.Context, chatID, text string, replyTo int64) erro
 	return err
 }
 
-func (b *Bot) sendWithIDs(ctx context.Context, chatID, text string, replyTo int64, requireID bool) ([]string, error) {
+func (b *Bot) sendWithIDs(ctx context.Context, chatID, text string, replyTo int64, requireID bool, previewID ...string) ([]string, error) {
 	var ids []string
 	for _, chunk := range telegramChunks(text, 4096) {
 		payload := map[string]any{"chat_id": chatID, "text": chunk, "parse_mode": "HTML", "disable_web_page_preview": true}
 		if replyTo > 0 {
 			payload["reply_parameters"] = map[string]any{"message_id": replyTo}
+		}
+		if len(previewID) > 0 && previewID[0] != "" {
+			id := previewID[0]
+			previewID = nil
+			if err := b.edit(ctx, chatID, id, chunk); err == nil {
+				ids = append(ids, id)
+				replyTo = 0
+				continue
+			}
 		}
 		result, err := b.call(ctx, "sendMessage", payload)
 		if err != nil {
@@ -1086,4 +1134,37 @@ func joinNonempty(values []string) string {
 		}
 	}
 	return strings.Join(result, "\n\n")
+}
+
+func (b *Bot) edit(ctx context.Context, chatID, id, html string) error {
+	_, err := b.call(ctx, "editMessageText", map[string]any{"chat_id": chatID, "message_id": id, "text": html, "parse_mode": "HTML", "disable_web_page_preview": true})
+	return err
+}
+
+func (b *Bot) sendProgress(ctx context.Context, chatID, id, text string, replyTo int64) (string, error) {
+	const label = "<b>Spy</b>\n\n"
+	chunks := telegramChunks(text, 4096-len(label))
+	if len(chunks) == 0 {
+		return id, nil
+	}
+	// Keep the newest formatted tail within one native message.
+	preview := label + chunks[len(chunks)-1]
+	if id != "" {
+		return id, b.edit(ctx, chatID, id, preview)
+	}
+	payload := map[string]any{"chat_id": chatID, "text": preview, "parse_mode": "HTML", "disable_web_page_preview": true}
+	if replyTo > 0 {
+		payload["reply_parameters"] = map[string]any{"message_id": replyTo}
+	}
+	result, err := b.call(ctx, "sendMessage", payload)
+	if err != nil {
+		return "", err
+	}
+	var sent struct {
+		MessageID int64 `json:"message_id"`
+	}
+	if json.Unmarshal(result, &sent) != nil || sent.MessageID <= 0 {
+		return "", errors.New("Telegram progress returned no message identifier")
+	}
+	return strconv.FormatInt(sent.MessageID, 10), nil
 }

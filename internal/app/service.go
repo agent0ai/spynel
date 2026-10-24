@@ -1161,6 +1161,7 @@ func (s *Service) conversationEventConsumer(message core.Message, jobID int, dow
 			s.Runtime.RecordJobEvent(jobID, event)
 		}
 		if downstream != nil {
+			event.Verbose = s.Settings.Snapshot().Channels.Verbose
 			if err := downstream(event); err != nil {
 				return err
 			}
@@ -1244,6 +1245,11 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		return s.localReply(message, status, emit)
 	case "primary":
 		return s.primaryCommand(message, emit)
+	case "verbose":
+		if remainder == "" {
+			return s.localReply(message, "Global verbose: `"+s.Settings.Snapshot().Channels.Verbose+"`. Use /verbose on|off|auto.", emit)
+		}
+		return s.setSetting(message, "channels.verbose", remainder, emit)
 	case "config":
 		return s.configurationCommand(message, "config", remainder, emit)
 	case "telegram":
@@ -2192,7 +2198,7 @@ func (s *Service) localReply(message core.Message, text string, emit core.Emit) 
 		return err
 	}
 	if emit != nil {
-		emit(core.Event{Kind: core.EventFinal, Text: text, Done: true, Local: true})
+		emit(core.Event{Kind: core.EventFinal, Text: text, Done: true, Local: true, Verbose: s.Settings.Snapshot().Channels.Verbose})
 	}
 	return nil
 }

@@ -40,6 +40,10 @@ type ptyFixtureModel struct {
 
 func (m ptyFixtureModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if k, ok := msg.(tea.KeyMsg); ok {
+		if k.Type == tea.KeyCtrlN {
+			m.model = verboseFixture(m.model)
+			return m, nil
+		}
 		if k.Type == tea.KeyCtrlQ {
 			return m, tea.Quit
 		}
@@ -103,7 +107,7 @@ func TestSemanticPTYFixture(t *testing.T) {
 }
 
 func TestRealPTYSemanticInputAndModeRestoration(t *testing.T) {
-	for _, exit := range []string{"ctrl-c", "after-f6", "slash-quit", "sigterm"} {
+	for _, exit := range []string{"ctrl-c", "after-f6", "slash-quit", "sigterm", "verbose"} {
 		t.Run(exit, func(t *testing.T) { runSemanticPTY(t, exit) })
 	}
 }
@@ -299,6 +303,16 @@ func runSemanticPTY(t *testing.T, exit string) {
 				t.Fatal(err)
 			}
 		}
+	}
+	if exit == "verbose" {
+		write("\x0e")
+		waitForTerminalOutput(t, capture, func(text string) bool { return strings.Contains(ansi.Strip(text), "Verbose final answer.") })
+		visible := ansi.Strip(snapshot().View)
+		if strings.Contains(visible, "HIDDEN-PROGRESS") || !strings.Contains(visible, "Visible progress before") || strings.Count(visible, "Verbose final answer.") != 1 {
+			t.Fatalf("verbose PTY: %s", visible)
+		}
+		finish()
+		return
 	}
 	s = resize(42, 20)
 	if exit != "after-f6" {

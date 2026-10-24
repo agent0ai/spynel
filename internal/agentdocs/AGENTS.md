@@ -28,6 +28,8 @@
 
 - Keep compiled speech idle-timeout guidance aligned with its validated seconds range, live effect, active-work protection, reload behavior and allocator limitations.
 
+- Keep `/verbose`, the global `channels.verbose` enum, auto/on/off delivery matrix, bounded editable remote previews and unfiltered explicit CLI/API stream behavior aligned with the owning channel/config contracts.
+
 ## Child DOX Index
 
 No child DOX files.

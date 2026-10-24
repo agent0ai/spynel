@@ -34,6 +34,8 @@
 
 - Ordinary notify cancellation accepts only exact original origin plus `--cancel EVENT_ID` / `cancel_id`; it rejects send/routing alternatives. Return confirmed terminal state without exposing delivery content or claiming a retraction. Keep client/server and CLI validation synchronized; older owners lacking confirmation must fail visibly.
 
+- Shared state includes global verbose mode for all attached TUIs. Optional response `verbose` hints affect only channel presentation; authenticated raw event streams, aggregate/final text and committed subscriptions retain their existing protocol meaning.
+
 ## Child DOX Index
 
 No child DOX files.

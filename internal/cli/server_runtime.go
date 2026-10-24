@@ -365,6 +365,7 @@ func errorText(err error) string {
 }
 
 type tuiStateEvents struct {
+	verbose     chan string
 	connections chan channel.ConnectionStatus
 	pairings    chan channel.PairingEvent
 	notices     chan channel.Notice
@@ -378,6 +379,7 @@ type tuiStateEvents struct {
 
 func startTUIStatePolling(ctx context.Context, client *localapi.Client, initial app.SharedState, themeDirectory string, conversations ...string) tuiStateEvents {
 	events := tuiStateEvents{
+		verbose:     make(chan string, 1),
 		connections: make(chan channel.ConnectionStatus, 4),
 		pairings:    make(chan channel.PairingEvent, 4),
 		notices:     make(chan channel.Notice, 4), titles: make(chan string, 1),
@@ -417,6 +419,9 @@ func startTUIStatePolling(ctx context.Context, client *localapi.Client, initial 
 }
 
 func publishTUIStateChanges(events tuiStateEvents, previous, state app.SharedState, themeDirectory string, conversation ...string) {
+	if state.Verbose != previous.Verbose {
+		publishLatest(events.verbose, state.Verbose)
+	}
 	if state.Title != previous.Title {
 		publishLatest(events.titles, state.Title)
 	}

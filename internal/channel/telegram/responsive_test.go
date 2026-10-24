@@ -55,7 +55,7 @@ func TestTelegramCommandsDuringTranscription(t *testing.T) {
 					t.Fatal(err)
 				}
 				cfg.Extensions.Enabled = false
-				cfg.Channels.Telegram = config.Telegram{Enabled: true, AllowedUsers: []string{"7"}, Mode: mode, GroupMode: "mentions", WebhookSecret: "fixture"}
+				cfg.Channels.Telegram = config.Telegram{Enabled: true, AllowedUsers: []string{"7"}, Mode: mode, GroupMode: "mention", WebhookSecret: "fixture"}
 				listener, err := net.Listen("tcp", "127.0.0.1:0")
 				if err != nil {
 					t.Fatal(err)
@@ -158,6 +158,14 @@ func TestTelegramCommandsDuringTranscription(t *testing.T) {
 					t.Fatal("denied sender restarted")
 				default:
 				}
+				submit(50, 7, "/verbose off", "")
+				response = receive(t, sent)
+				if !strings.Contains(response["text"].(string), "channels.verbose") || service.Settings.Snapshot().Channels.Verbose != "off" {
+					t.Fatalf("verbose failed during transcription: %#v", response)
+				}
+				if m := receive(t, handled); m.Text != "/verbose off" {
+					t.Fatal("wrong verbose admission")
+				}
 				submit(6, 7, "/restart", "")
 				response = receive(t, sent)
 				if !strings.Contains(response["text"].(string), "Restarting") {
@@ -220,9 +228,9 @@ func TestTelegramCommandsDuringTranscription(t *testing.T) {
 						users[entry.SourceMessageID]++
 					}
 				}
-				want := 2
+				want := 3
 				if finish == "ordered" {
-					want = 5
+					want = 6
 				}
 				if len(users) != want {
 					t.Fatalf("user entries: %#v", users)

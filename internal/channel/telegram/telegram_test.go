@@ -264,43 +264,54 @@ func TestTelegramSendsOnlyLastTerminalResponse(t *testing.T) {
 }
 
 func TestTelegramFormatsErrorsAsOrdinaryUnindentedResponses(t *testing.T) {
-	sent := make(chan string, 4)
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		writer.Header().Set("Content-Type", "application/json")
-		switch request.URL.Path {
-		case "/bottest/sendChatAction":
-			_, _ = writer.Write([]byte(`{"ok":true}`))
-		case "/bottest/sendMessage":
-			var payload map[string]any
-			_ = json.NewDecoder(request.Body).Decode(&payload)
-			sent <- payload["text"].(string)
-			_, _ = writer.Write([]byte(`{"ok":true}`))
-		default:
-			http.NotFound(writer, request)
-		}
-	}))
-	defer server.Close()
+	for _, mode := range []string{"auto", "on", "off"} {
+		t.Run(mode, func(t *testing.T) {
+			sent := make(chan string, 4)
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				switch request.URL.Path {
+				case "/bottest/sendChatAction":
+					_, _ = writer.Write([]byte(`{"ok":true}`))
+				case "/bottest/sendMessage":
+					var payload map[string]any
+					_ = json.NewDecoder(request.Body).Decode(&payload)
+					sent <- payload["text"].(string)
+					_, _ = writer.Write([]byte(`{"ok":true}`))
+				default:
+					http.NotFound(writer, request)
+				}
+			}))
+			defer server.Close()
 
-	bot := New(config.Telegram{AllowedUsers: []string{"7"}}, "test")
-	bot.baseURL = server.URL
-	partial := "partial"
-	bot.handle(context.Background(), func(_ context.Context, _ core.Message, emit core.Emit) error {
-		emit(core.Event{Kind: core.EventError, Text: "first line\nsecond line", FinalText: &partial, Done: true})
-		return nil
-	}, &telegramMessage{MessageID: 8, From: telegramUser{ID: 7}, Chat: telegramChat{ID: 42, Type: "private"}, Date: 1, Text: "hello"})
-	bot.handle(context.Background(), func(context.Context, core.Message, core.Emit) error {
-		return errors.New("handler failed")
-	}, &telegramMessage{MessageID: 9, From: telegramUser{ID: 7}, Chat: telegramChat{ID: 42, Type: "private"}, Date: 2, Text: "hello"})
+			bot := New(config.Telegram{AllowedUsers: []string{"7"}}, "test")
+			bot.baseURL = server.URL
+			bot.SetVerboseSource(func() string { return mode })
+			partial := "partial"
+			bot.handle(context.Background(), func(_ context.Context, _ core.Message, emit core.Emit) error {
+				emit(core.Event{Kind: core.EventError, Text: "first line\nsecond line", FinalText: &partial, Done: true})
+				emit(core.Event{Kind: core.EventError, Text: "duplicate", Done: true})
+				return errors.New("already reported")
+			}, &telegramMessage{MessageID: 8, From: telegramUser{ID: 7}, Chat: telegramChat{ID: 42, Type: "private"}, Date: 1, Text: "hello"})
+			bot.handle(context.Background(), func(context.Context, core.Message, core.Emit) error {
+				return errors.New("handler failed")
+			}, &telegramMessage{MessageID: 9, From: telegramUser{ID: 7}, Chat: telegramChat{ID: 42, Type: "private"}, Date: 2, Text: "hello"})
 
-	for _, want := range []string{"Error first line\nsecond line", "Error handler failed"} {
-		select {
-		case got := <-sent:
-			if got != want {
-				t.Fatalf("Telegram error reply = %q, want %q", got, want)
+			for _, want := range []string{"Error first line\nsecond line", "Error handler failed"} {
+				select {
+				case got := <-sent:
+					if got != want {
+						t.Fatalf("Telegram error reply = %q, want %q", got, want)
+					}
+				default:
+					t.Fatalf("Telegram did not send error reply %q", want)
+				}
 			}
-		default:
-			t.Fatalf("Telegram did not send error reply %q", want)
-		}
+			select {
+			case extra := <-sent:
+				t.Fatal("duplicate terminal", extra)
+			default:
+			}
+		})
 	}
 }
 

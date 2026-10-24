@@ -43,6 +43,7 @@ func Settings(cfg Config) []Setting {
 		{Key: "harness.acp_args", Section: "harness", Description: "Command-line arguments for custom ACP (quotes and escapes group values; no shell expansion)", Value: cfg.ACPArgsText(), Advanced: true},
 		{Key: "workspace.attachment_max_mb", Section: "config", Description: "Maximum downloaded attachment size", Value: strconv.Itoa(cfg.Workspace.AttachmentMaxMB), Advanced: true},
 		{Key: "workspace.cleanup_retention_days", Section: "config", Description: "Age in whole days before automatic conversation/job cleanup and terminal-task archiving", Value: strconv.Itoa(cfg.Workspace.CleanupRetentionDays), Advanced: true},
+		{Key: "channels.verbose", Section: "config", Description: "Global assistant progress: auto shows it in TUI only; on shows it everywhere; off keeps final replies only", Value: cfg.Channels.Verbose, Advanced: true, Choices: []string{"auto", "on", "off"}},
 		{Key: "channels.tui.title", Section: "config", Description: "Default TUI title", Value: cfg.Channels.TUI.Title, Advanced: true},
 		{Key: "channels.tui.theme", Section: "config", Description: "Active color theme from .spynel/themes", Value: cfg.Channels.TUI.Theme, Advanced: true},
 		{Key: "orchestrator.enabled", Section: "config", Description: "Run Markdown tasks and goals", Value: formatBool(cfg.Orchestrator.Enabled), Choices: []string{"on", "off"}, Advanced: true},
@@ -186,6 +187,11 @@ func setSetting(cfg *Config, key, value string) (Setting, error) { //nolint:gocy
 	parseBoolean := func() (bool, error) { return parseBool(value, key) }
 	var err error
 	switch key {
+	case "channels.verbose":
+		if value != "on" && value != "off" && value != "auto" {
+			return Setting{}, fmt.Errorf("channels.verbose must be on, off, or auto")
+		}
+		cfg.Channels.Verbose = value
 	case "workspace.attachment_max_mb":
 		cfg.Workspace.AttachmentMaxMB, err = parseInteger(1)
 	case "workspace.history_max_messages":

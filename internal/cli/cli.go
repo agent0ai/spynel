@@ -158,7 +158,7 @@ func run(args []string, version string) error {
 	switch args[0] {
 	case "send", "followup", "events", "notify", "command", "status", "run",
 		"jobs", "tasks", "goals", "job", "log", "logs", "stop", "new", "clear", "history",
-		"harness", "model", "effort", "speed", "telegram", "restart", "config", "whatsapp":
+		"harness", "model", "effort", "speed", "verbose", "telegram", "restart", "config", "whatsapp":
 		unregister, err := updater.Detect(version).RegisterApplicationClient()
 		if err != nil {
 			return err
@@ -302,7 +302,7 @@ func run(args []string, version string) error {
 		return runFrameworkCLICommand("", args[1:], version)
 	case "status":
 		return runStatusCLICommand(args[1:], version, os.Stdout)
-	case "jobs", "tasks", "goals", "job", "log", "logs", "stop", "new", "clear", "history", "harness", "model", "effort", "speed", "telegram", "restart":
+	case "jobs", "tasks", "goals", "job", "log", "logs", "stop", "new", "clear", "history", "harness", "model", "effort", "speed", "verbose", "telegram", "restart":
 		return runFrameworkCLICommand(args[0], args[1:], version)
 	case "conversation", "conversations":
 		return runConversationCommand(args[1:], os.Stdout)
@@ -894,13 +894,15 @@ func runServerWithSocket(configPath string, withTUI bool, version string, restar
 			Initialized: func() error {
 				return admitExecutor(cfg.StatePath("runtime", "logs"), version, restartArgs)
 			},
-			Version:      version,
-			Attachments:  cfg.StatePath("attachments"),
-			TitlePath:    cfg.StatePath("tui-title"),
-			TitleEvents:  stateEvents.titles,
-			Themes:       themes,
-			InitialTheme: activeTheme,
-			ThemeEvents:  stateEvents.themes,
+			Version:        version,
+			Attachments:    cfg.StatePath("attachments"),
+			TitlePath:      cfg.StatePath("tui-title"),
+			TitleEvents:    stateEvents.titles,
+			InitialVerbose: shared.Verbose,
+			VerboseEvents:  stateEvents.verbose,
+			Themes:         themes,
+			InitialTheme:   activeTheme,
+			ThemeEvents:    stateEvents.themes,
 			SaveTheme: func(name string) error {
 				return client.ApplySettings(ctx, map[string]string{"channels.tui.theme": name})
 			},
@@ -1352,6 +1354,7 @@ func managedChannels(service *app.Service, speech media.Transcriber) []channel.M
 			},
 			Build: func(cfg config.Config) (channel.Channel, error) {
 				bot := telegram.NewWithIdentityStore(cfg.Channels.Telegram, cfg.TelegramToken(), cfg.StatePath("runtime", "telegram-identities.json"))
+				bot.SetVerboseSource(func() string { return service.Settings.Snapshot().Channels.Verbose })
 				bot.SetAllowedUsersSource(func() []string {
 					current := service.Settings.Snapshot().Channels.Telegram
 					if !current.Enabled {
@@ -1382,6 +1385,7 @@ func managedChannels(service *app.Service, speech media.Transcriber) []channel.M
 			},
 			Build: func(cfg config.Config) (channel.Channel, error) {
 				client := whatsapp.New(cfg.Channels.WhatsApp, cfg.Resolve(cfg.Channels.WhatsApp.Database))
+				client.SetVerboseSource(func() string { return service.Settings.Snapshot().Channels.Verbose })
 				client.SetAllowedNumbersSource(func() []string {
 					current := service.Settings.Snapshot().Channels.WhatsApp
 					if !current.Enabled {
@@ -1552,6 +1556,7 @@ Usage:
   spynel status [flags]          Show workspace and current conversation status
   spynel command [flags] NAME    Run any non-visual framework slash command
   spynel model|effort|speed ... Inspect or select model inference properties
+  spynel verbose [on|off|auto] Show or set global assistant progress
   spynel tasks [flags] [VIEW]   List durable tasks (open by default)
   spynel goals [flags] [VIEW]   List durable goals (open by default)
     VIEW                        open|recent|active|review|waiting|done|failed|all

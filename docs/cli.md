@@ -178,3 +178,7 @@ Installed extensions are trusted executable integrations. When enabled, their `m
 ## Exit status and cancellation
 
 Argument, configuration, inactive-follow-up, hook, transport, and harness failures return an error and a nonzero process exit through the executable entry point. Ctrl+C or SIGTERM cancels the caller context; a loopback request disconnect does not impose a shorter provider timeout. Complete histories remain disk-backed even though every list/show/input operation is bounded.
+
+### Global progress control
+
+`spynel verbose [on|off|auto]` and `spynel command /verbose [on|off|auto]` use the shared global channel setting. Bare queries report the value; invalid values fail without changing it. Auto keeps TUI progress and remote final-only behavior; on enables progress in TUI/Telegram/WhatsApp; off keeps their final responses only. Explicit `send --stream`, `send --json` and event subscriptions remain unfiltered. See [configuration](configuration.md#global-assistant-progress).

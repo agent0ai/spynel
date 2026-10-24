@@ -273,3 +273,5 @@ fixtures verify the interface; real provider, terminal emulator and 80|20 sandbo
 topology still require your local test.
 
 The authenticated `POST /v1/notify` also accepts `{ "origin": "cli/adapter", "cancel_id": "<event-id>" }` without message or routing alternatives. It returns HTTP 200 with `id` and terminal `state` (`cancelled`, `delivered`, or `expired`). This retires future retries for the exact existing event, preserves failure/delivery evidence, and never retracts prior remote effects. Normal notification admission remains HTTP 202.
+
+Response events may include an optional `verbose` presentation hint (`on`, `off`, or `auto`) for interactive displays. It does not filter or change the event payload, terminal/continuation meaning, aggregate `text`, `final_text`, or committed conversation subscriptions. Shared configuration commands can update global `channels.verbose`; integrations choosing explicit streams continue receiving the full stream.

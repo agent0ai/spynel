@@ -9,7 +9,7 @@ import (
 
 // WorkerProtocol binds harness adoption and installation update compatibility.
 // Bump whenever a successor cannot safely consume or control a prior worker.
-const WorkerProtocol = 17
+const WorkerProtocol = 18
 
 const SpynelASCII = `    ████     ████     ███████ ██████  ██    ██ ███    ██ ███████ ██
   ██    ██ ██    ██   ██      ██   ██  ██  ██  ████   ██ ██      ██
@@ -57,6 +57,8 @@ func NewSourceMessageID() (string, error) {
 
 // Event is a streamed harness or application response.
 type Event struct {
+	// Verbose is a live presentation hint; event payloads and history stay complete.
+	Verbose   string `json:"verbose,omitempty"`
 	Kind      string `json:"kind"`
 	RequestID string `json:"request_id,omitempty"`
 	// ResponseID correlates a local durable reply with its request-stream copy.
@@ -206,3 +208,8 @@ const (
 
 // Emit is safe for asynchronous use by a harness implementation.
 type Emit func(Event)
+
+// ShowProgress interprets the global presentation mode, including old UI snapshots.
+func ShowProgress(mode, channel string) bool {
+	return mode == "on" || (mode == "auto" || mode == "") && channel == "tui"
+}

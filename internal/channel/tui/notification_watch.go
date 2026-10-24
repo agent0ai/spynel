@@ -58,6 +58,7 @@ func watchTaskNotifications(ctx context.Context, path string, initialOffset ...i
 					select {
 					case output <- channel.Notification{ID: entry.EventID, RequestID: entry.SourceMessageID,
 						ResponseID: strings.TrimSuffix(strings.TrimSuffix(entry.ReceiptID, ":result"), ":partial"),
+						FinalText:  entry.FinalText,
 						Text:       entry.Content, Recovery: entry.Recovery, Error: entry.Recovery && entry.Role == "error", Continues: entry.Continues}:
 					case <-ctx.Done():
 						file.Close()

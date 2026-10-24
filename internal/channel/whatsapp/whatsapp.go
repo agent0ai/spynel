@@ -35,6 +35,7 @@ import (
 )
 
 type Client struct {
+	progress               channel.ProgressStreams
 	config                 config.WhatsApp
 	dbPath                 string
 	handler                channel.Handler
@@ -108,6 +109,8 @@ func newWhatsAppActivity(client *Client, interval time.Duration) *channel.Activi
 
 func (c *Client) Name() string { return "whatsapp" }
 
+func (c *Client) SetVerboseSource(source func() string) { c.progress.Mode = source }
+
 func (c *Client) SetStatusReporter(report channel.StatusReporter) { c.report = report }
 
 func (c *Client) SetPairingReporter(report channel.PairingReporter) { c.pairing = report }
@@ -161,6 +164,10 @@ func (c *Client) requireRuntimeAuthorization() error {
 }
 
 func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string, attachments []core.OutboundAttachment) error {
+	return c.deliverResponse(ctx, conversation, eventID, text, attachments, "")
+}
+
+func (c *Client) deliverResponse(ctx context.Context, conversation, eventID, text string, attachments []core.OutboundAttachment, previewID string) error {
 	if err := c.requireRuntimeAuthorization(); err != nil {
 		return err
 	}
@@ -189,7 +196,7 @@ func (c *Client) Deliver(ctx context.Context, conversation, eventID, text string
 			return err
 		}
 	}
-	_, err := c.sendEvent(ctx, chat, eventID, text)
+	_, err := c.sendEvent(ctx, chat, eventID, text, previewID)
 	return err
 }
 
@@ -222,8 +229,15 @@ func (c *Client) DeliverEvent(ctx context.Context, conversation, eventID string,
 		if event.Kind == core.EventError {
 			text = channel.ErrorResponse(text)
 		}
-		return c.Deliver(ctx, conversation, eventID, text, event.Attachments)
+		previewID := c.progress.Stop(conversation)
+		return c.deliverResponse(ctx, conversation, eventID, text, event.Attachments, previewID)
 	}
+	c.progress.Push(ctx, conversation, event, func(ctx context.Context, id, text string) (string, error) {
+		if _, err := c.deliveryChat(conversation); err != nil {
+			return "", err
+		}
+		return c.sendProgress(ctx, chat, id, text)
+	})
 	return nil
 }
 
@@ -284,7 +298,7 @@ func stableWhatsAppMessageID(eventID string, index int) types.MessageID {
 	return types.MessageID("3EB0" + strings.ToUpper(hex.EncodeToString(sum[:9])))
 }
 
-func (c *Client) sendEvent(ctx context.Context, chat types.JID, eventID, text string) ([]string, error) {
+func (c *Client) sendEvent(ctx context.Context, chat types.JID, eventID, text string, previewID ...string) ([]string, error) {
 	if err := c.requireRuntimeAuthorization(); err != nil {
 		return nil, err
 	}
@@ -296,7 +310,18 @@ func (c *Client) sendEvent(ctx context.Context, chat types.JID, eventID, text st
 		if err := c.requireRuntimeAuthorization(); err != nil {
 			return nil, err
 		}
-		id := stableWhatsAppMessageID(eventID, index)
+		if len(previewID) > 0 && previewID[0] != "" {
+			id := previewID[0]
+			previewID = nil
+			if err := c.edit(ctx, chat, id, chunk); err == nil {
+				ids = append(ids, id)
+				continue
+			}
+		}
+		var id types.MessageID
+		if eventID != "" {
+			id = stableWhatsAppMessageID(eventID, index)
+		}
 		response, err := c.sendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)}, id)
 		if err != nil {
 			return nil, err
@@ -989,6 +1014,8 @@ func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, t
 			panic(recovered)
 		}
 	}()
+	progressKey := conversation
+	var terminalDelivered bool
 	var emitMu sync.Mutex
 	emit := func(event core.Event) {
 		emitMu.Lock()
@@ -1001,7 +1028,13 @@ func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, t
 			setActivity(event.Active)
 			return
 		}
+		if terminalDelivered {
+			return
+		}
 		if !event.Done || event.Continues || (event.Kind != core.EventFinal && event.Kind != core.EventError) {
+			c.progress.Push(ctx, progressKey, event, func(ctx context.Context, id, text string) (string, error) {
+				return c.sendProgress(ctx, chat, id, text)
+			})
 			return
 		}
 		// Activity-off normally arrives immediately before the terminal event.
@@ -1009,6 +1042,11 @@ func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, t
 		// before delivery when no overlapping turn remains in the conversation.
 		setActivity(false)
 		pauseReleasedActivity()
+		terminalDelivered = true
+		previewID := ""
+		if !event.Local {
+			previewID = c.progress.Stop(progressKey)
+		}
 		text := event.Text
 		if event.Kind == core.EventFinal && event.FinalText != nil {
 			text = *event.FinalText
@@ -1017,7 +1055,7 @@ func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, t
 			text = channel.ErrorResponse(text)
 		}
 		if text != "" {
-			_ = c.send(ctx, chat, text)
+			_, _ = c.sendEvent(ctx, chat, "", text, previewID)
 		}
 		for _, attachment := range event.Attachments {
 			if err := c.sendAttachment(ctx, chat, attachment, ""); err != nil {
@@ -1031,6 +1069,15 @@ func (c *Client) handleWithReplyID(received time.Time, chat types.JID, sender, t
 		SourceMessageID: sourceMessageID, ReplyTo: replyTo, Text: text, ReceivedAt: received.UTC(),
 	}, emit)
 	if err != nil {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		if terminalDelivered {
+			return
+		}
+		terminalDelivered = true
+		if !core.IsCommand(c.Name(), text) {
+			c.progress.Stop(progressKey)
+		}
 		setActivity(false)
 		pauseReleasedActivity()
 		_ = c.send(ctx, chat, channel.ErrorResponse(err.Error()))
@@ -1069,20 +1116,32 @@ func whatsappConversation(chat types.JID, sender string) string {
 }
 
 func (c *Client) send(ctx context.Context, chat types.JID, text string) error {
-	if err := c.requireRuntimeAuthorization(); err != nil {
-		return err
-	}
-	if c.client == nil && c.deliver == nil {
-		return errors.New("WhatsApp is not connected")
-	}
-	for _, chunk := range split(markdownfmt.WhatsApp(text), 60000) {
-		response, err := c.sendMessage(ctx, chat, &waE2E.Message{Conversation: proto.String(chunk)}, "")
-		if err != nil {
-			return err
-		}
+	_, err := c.sendEvent(ctx, chat, "", text)
+	return err
+}
+
+func (c *Client) edit(ctx context.Context, chat types.JID, id, text string) error {
+	message := c.client.BuildEdit(chat, types.MessageID(id), &waE2E.Message{Conversation: proto.String(text)})
+	response, err := c.sendMessage(ctx, chat, message, "")
+	if err == nil {
 		c.recordSent(response.ID)
 	}
-	return nil
+	return err
+}
+
+func (c *Client) sendProgress(ctx context.Context, chat types.JID, id, text string) (string, error) {
+	text = "**Spy**\n\n" + text
+	if id != "" {
+		return id, c.edit(ctx, chat, id, markdownfmt.WhatsApp(text))
+	}
+	ids, err := c.sendEvent(ctx, chat, "", text)
+	if err != nil {
+		return "", err
+	}
+	if len(ids) == 0 || ids[0] == "" {
+		return "", errors.New("WhatsApp progress returned no message identifier")
+	}
+	return ids[0], nil
 }
 
 func (c *Client) sendAttachment(ctx context.Context, chat types.JID, attachment core.OutboundAttachment, id types.MessageID) error {

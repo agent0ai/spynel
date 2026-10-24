@@ -40,6 +40,7 @@ type connectionEvent struct{ status channel.ConnectionStatus }
 type pairingEvent struct{ event channel.PairingEvent }
 type noticeEvent struct{ notice channel.Notice }
 type titleEvent struct{ title string }
+type verboseEvent struct{ mode string }
 type runtimeEvent struct{ status core.RuntimeStatus }
 type durableWorkEvent struct{ counts core.DurableWorkCounts }
 type themeEvent struct{ theme theme.Theme }
@@ -129,6 +130,8 @@ type historyRenderResult struct {
 type diagnosticResultMsg struct{}
 
 type Options struct {
+	InitialVerbose     string
+	VerboseEvents      <-chan string
 	Initialized        func() error
 	Conversation       string
 	Version            string
@@ -203,6 +206,9 @@ type screenFrame struct {
 }
 
 type model struct {
+	verbose                  string
+	verboseEvents            <-chan string
+	responseSuppressed       bool
 	initialized              func() error
 	ctx                      context.Context
 	handler                  channel.Handler
@@ -517,6 +523,8 @@ func Run(ctx context.Context, title string, handler channel.Handler, commands []
 		conversationEvents:   options.ConversationEvents,
 		ackNotification:      options.AckNotification,
 		titles:               options.TitleEvents,
+		verbose:              options.InitialVerbose,
+		verboseEvents:        options.VerboseEvents,
 		runtimeEvents:        options.RuntimeEvents,
 		runtimeStatus:        options.InitialRuntime,
 		durableWorkEvents:    options.DurableWorkEvents,
@@ -776,6 +784,8 @@ func (m model) waitEvent() tea.Cmd {
 			return taskNotificationEvent{conversation: m.conversation, notification: notification, closed: !ok}
 		case event := <-m.conversationEvents:
 			return uiEvent{event: event, conversation: true}
+		case mode := <-m.verboseEvents:
+			return verboseEvent{mode: mode}
 		case title := <-m.titles:
 			return titleEvent{title: title}
 		case value := <-m.themeEvents:
@@ -1089,10 +1099,24 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if event.RequestID != "" && (event.Kind == core.EventDelta || event.ResponseID != "") {
 			m.responseRequestID = event.RequestID
 		}
+		if event.Local && event.Verbose != "" {
+			m.setVerbose(event.Verbose)
+		}
+		showProgress := core.ShowProgress(m.verbose, "tui")
+		if event.Verbose != "" {
+			showProgress = core.ShowProgress(event.Verbose, "tui")
+		}
+		if !showProgress && m.streaming != "" {
+			m.commitStreamingResponse()
+		}
 		switch event.Kind {
 		case requestFinished:
 			m.finishRequest(event.RequestID)
 		case core.EventDelta:
+			if !showProgress {
+				m.suppressProgress(event.RequestID)
+				break
+			}
 			refreshEvent = false
 			m.deltaSequence++
 			m.streamVersion++
@@ -1135,7 +1159,19 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				break
 			}
-			m.finishRecipientResponse(event.Text)
+			if !showProgress && event.Continues {
+				m.suppressProgress(event.RequestID)
+				break
+			}
+			text := event.Text
+			if (!showProgress || m.responseSuppressed || m.requests[event.RequestID].progressSuppressed) && event.FinalText != nil {
+				text = *event.FinalText
+			}
+			suppressed := m.responseSuppressed
+			m.finishRecipientResponse(text)
+			if event.Continues {
+				m.responseSuppressed = suppressed
+			}
 			m.flushNotifications()
 			m.working = event.Continues || m.mainAgentActivity > 0
 			if m.working {
@@ -1144,6 +1180,10 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "Ready"
 			}
 		case core.EventError:
+			if !event.Local && event.Continues && !showProgress {
+				m.suppressProgress(event.RequestID)
+				break
+			}
 			if !event.Local {
 				m.working = event.Continues || m.mainAgentActivity > 0
 				if m.streaming != "" {
@@ -1162,7 +1202,9 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "Harness error"
 			}
 		case core.EventStatus:
-			m.status = event.Text
+			if event.Local || showProgress {
+				m.status = event.Text
+			}
 		case core.EventActivity:
 			wasWorking := m.working
 			if value.conversation && event.Active {
@@ -1328,6 +1370,10 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		commands = append(commands, m.waitEvent())
 	case noticeEvent:
 		m.status = strings.Title(value.notice.Channel) + " · " + value.notice.Sender + ": " + value.notice.Text //nolint:staticcheck
+		commands = append(commands, m.waitEvent())
+	case verboseEvent:
+		m.setVerbose(value.mode)
+		m.refresh()
 		commands = append(commands, m.waitEvent())
 	case titleEvent:
 		m.title = value.title
@@ -1825,6 +1871,24 @@ func (m *model) flushNotificationPrefix(count int) {
 // are not task notifications and therefore never enter the acknowledgement
 // protocol.
 func (m *model) appendRecoveredResponse(notification channel.Notification) {
+	if m.requests == nil {
+		m.requests = make(map[string]requestPresentation)
+	}
+	r := m.requests[notification.RequestID]
+	showProgress := core.ShowProgress(m.verbose, "tui")
+	if !showProgress && notification.Continues {
+		r.progressSuppressed = true
+		m.requests[notification.RequestID] = r
+		return
+	}
+	if (!showProgress || r.progressSuppressed || notification.RequestID == m.responseRequestID && m.responseSuppressed) && !notification.Error && notification.FinalText != nil {
+		notification.Text = *notification.FinalText
+	}
+	if !notification.Continues {
+		r.ended = true
+		m.requests[notification.RequestID] = r
+		m.retireRequest(notification.RequestID)
+	}
 	followingTail := m.shouldFollowTail()
 	// The durable terminal and polled activity count deliberately travel over
 	// separate reconnect-safe paths. Visibly settle one already-observed
@@ -1977,6 +2041,7 @@ func (m *model) finishRecipientResponse(final string) {
 }
 
 func (m *model) resetResponse() {
+	m.responseSuppressed = false
 	m.streaming = ""
 	m.responseText = ""
 	m.responseCommit = 0
@@ -4623,4 +4688,24 @@ func truncateWidth(value string, width int) string {
 		result.WriteRune(character)
 	}
 	return result.String() + "…"
+}
+
+func (m *model) setVerbose(mode string) {
+	if mode == m.verbose {
+		return
+	}
+	if !core.ShowProgress(mode, "tui") && m.streaming != "" {
+		// Keep text already displayed; suppress only subsequent output.
+		m.commitStreamingResponse()
+	}
+	m.verbose = mode
+}
+
+func (m *model) suppressProgress(requestID string) {
+	m.responseSuppressed = true
+	if requestID != "" {
+		r := m.requests[requestID]
+		r.progressSuppressed = true
+		m.requests[requestID] = r
+	}
 }

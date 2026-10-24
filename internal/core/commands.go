@@ -44,6 +44,7 @@ func IsCommand(channel, text string) bool {
 func SlashCommands() []SlashCommand { return append([]SlashCommand(nil), slashCommands...) }
 
 var slashCommands = []SlashCommand{
+	{Value: "/verbose ", Usage: "/verbose [on|off|auto]", Description: "Show or set assistant progress globally across channels"},
 	{Value: "/help", Usage: "/help", Description: "Show the help topic index"},
 	{Value: "/help about", Usage: "/help about", Description: "Learn what Spynel does and where it stores state"},
 	{Value: "/help commands", Usage: "/help commands", Description: "Show the complete slash-command reference"},

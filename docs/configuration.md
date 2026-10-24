@@ -249,3 +249,19 @@ The semantic heartbeat is not the ten-second route scan, the five-second primary
 - `hook_timeout`: maximum duration per executable hook.
 
 These extension controls are available through `/config` and take effect after restart. Extension repositories are trusted local code and receive the same filesystem/process authority as Spynel.
+
+## Global assistant progress
+
+`/verbose` reports one global setting for every conversation, channel and instance sharing this configuration. `/verbose on`, `/verbose off`, and `/verbose auto` persist `channels.verbose` atomically and apply without restarting a conversation or provider. The same enum is available in Advanced settings and through `/config get channels.verbose` and `/config set channels.verbose on`.
+
+| Mode | TUI | Telegram and WhatsApp |
+| --- | --- | --- |
+| `auto` (default, including older configuration files) | Assistant progress and final response | Final response only |
+| `on` | Assistant progress and final response | Bounded editable progress preview, then final response |
+| `off` | Final response only | Final response only |
+
+Only subsequent user-facing assistant output changes. Already displayed TUI text and saved history remain intact; enabling verbosity does not replay suppressed progress. Commands, terminal errors and final attachments remain visible. This does not change reasoning effort, generated length, execution, log retention, notification subscriptions or authorization. Raw tool data, private reasoning and background-job events are never added to progress.
+
+Remote previews retain at most 3000 Unicode characters, coalesce at most once per second, and use the existing native formatting and size limits. The first final chunk replaces the preview, with remaining chunks and files delivered normally. Each progress request has a three-second bound and runs separately from command intake. Final delivery cancels and joins pending progress; generation cancellation drops queued progress. A native request already in flight may finish after a toggle, and an accepted preview cannot be recalled. Edits may be rejected by native provider limits (including edit age); final delivery then falls back to an ordinary message. Ambiguous native sends retain the transport's existing at-least-once uncertainty. Progress is best-effort and is not replayed after reconnect; the saved aggregate remains available in history.
+
+Attached TUIs receive mode changes through the existing one-second owner-state poll and per-response hints. `spynel send --stream`, `--json`, and committed API subscriptions retain their complete event streams, independently of verbosity. No per-conversation override or cross-workspace service is created.

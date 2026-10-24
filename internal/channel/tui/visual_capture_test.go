@@ -35,6 +35,7 @@ func TestVisualCapture(t *testing.T) {
 		"initialization":        visualInitializationModel(),
 		"workspace-choice":      visualWorkspaceChoiceModel(),
 		"chat":                  visualChatModel(),
+		"verbose-off":           verboseFixture(visualBaseModel()),
 		"selection-content":     visualSelectionModel(false),
 		"selection-labels":      visualSelectionModel(true),
 		"selection-composer":    visualComposerSelectionModel(),

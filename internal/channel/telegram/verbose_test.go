@@ -1,0 +1,188 @@
+package telegram
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/agent0ai/spynel/internal/config"
+	"github.com/agent0ai/spynel/internal/core"
+)
+
+func TestTelegramVerboseDeliveryMatrix(t *testing.T) {
+	for _, mode := range []string{"auto", "on", "off"} {
+		for _, route := range []string{"reply", "retained"} {
+			t.Run(mode+"/"+route, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					bot := New(config.Telegram{AllowedUsers: []string{"7"}}, "fixture")
+					bot.SetVerboseSource(func() string { return mode })
+					var texts, methods []string
+					files := 0
+					path := filepath.Join(t.TempDir(), "result.txt")
+					if err := os.WriteFile(path, []byte("synthetic file"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					attachments := []core.OutboundAttachment{{Kind: "attachment", Name: "result.txt", Path: path, MaxBytes: 1024}}
+					bot.client.Transport = telegramRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+						if strings.HasSuffix(r.URL.Path, "/sendDocument") {
+							files++
+							if _, err := io.Copy(io.Discard, r.Body); err != nil {
+								t.Fatal(err)
+							}
+							return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":92}}`))}, nil
+						}
+						var payload map[string]any
+						if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+							t.Fatal(err)
+						}
+						if text, ok := payload["text"].(string); ok {
+							if payload["chat_id"] != "7" {
+								t.Fatal("wrong destination")
+							}
+							texts = append(texts, text)
+							methods = append(methods, r.URL.Path)
+						}
+						return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":91}}`))}, nil
+					})
+					stream := func(emit core.Emit) {
+						emit(core.Event{Kind: core.EventStatus, Text: "private diagnostic"})
+						for range 100 {
+							emit(core.Event{Kind: core.EventDelta, Text: "progress "})
+						}
+						synctest.Wait()
+						time.Sleep(time.Second)
+						synctest.Wait()
+						want := 0
+						if mode == "on" {
+							want = 1
+						}
+						if len(texts) != want {
+							t.Fatalf("progress sends=%d want %d", len(texts), want)
+						}
+						final := "Final **answer**."
+						emit(core.Event{Kind: core.EventFinal, Text: "progress\n" + final, FinalText: &final, Done: true, Attachments: attachments})
+					}
+					if route == "reply" {
+						bot.handle(t.Context(), func(_ context.Context, _ core.Message, emit core.Emit) error {
+							stream(emit)
+							emit(core.Event{Kind: core.EventFinal, Text: "duplicate", Done: true})
+							return nil
+						}, &telegramMessage{MessageID: 10, Text: "/fixture", From: telegramUser{ID: 7}, Chat: telegramChat{ID: 7, Type: "private"}})
+					} else {
+						stream(func(e core.Event) {
+							if err := bot.DeliverEvent(t.Context(), "TG-7", "receipt", e); err != nil {
+								t.Fatal(err)
+							}
+						})
+					}
+					want := 1
+					if mode == "on" {
+						want = 2
+					}
+					if files != 1 {
+						t.Fatalf("files=%d", files)
+					}
+					if len(texts) != want || texts[len(texts)-1] != "Final <b>answer</b>." {
+						t.Fatal(texts)
+					}
+					if mode == "on" && !strings.HasSuffix(methods[1], "/editMessageText") {
+						t.Fatal("final duplicated preview", methods)
+					}
+				})
+			})
+		}
+	}
+}
+
+func TestTelegramVerboseLiveToggleRevocationAndFailedPreview(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mode atomic.Value
+		mode.Store("on")
+		var allowed atomic.Value
+		allowed.Store([]string{"7"})
+		bot := New(config.Telegram{AllowedUsers: allowed.Load().([]string)}, "fixture")
+		bot.SetVerboseSource(func() string { return mode.Load().(string) })
+		bot.SetAllowedUsersSource(func() []string { return allowed.Load().([]string) })
+		var texts []string
+		fail := true
+		bot.client.Transport = telegramRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+			var p map[string]any
+			json.NewDecoder(r.Body).Decode(&p)
+			if fail {
+				return nil, errors.New("synthetic preview failure")
+			}
+			texts = append(texts, p["text"].(string))
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":9}}`))}, nil
+		})
+		emit := func(text string) {
+			if err := bot.DeliverEvent(t.Context(), "TG-7", "delta", core.Event{Kind: core.EventDelta, Text: text}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tick := func() { synctest.Wait(); time.Sleep(time.Second); synctest.Wait() }
+		emit("failed")
+		tick()
+		fail = false
+		mode.Store("off")
+		emit("hidden")
+		tick()
+		mode.Store("on")
+		emit("visible")
+		tick()
+		if len(texts) != 1 || strings.Contains(texts[0], "hidden") || strings.Contains(texts[0], "failed") {
+			t.Fatal(texts)
+		}
+		allowed.Store([]string(nil))
+		emitErr := bot.DeliverEvent(t.Context(), "TG-7", "end", core.Event{Kind: core.EventFinal, Text: "denied", Done: true})
+		if emitErr == nil {
+			t.Fatal("revoked final allowed")
+		}
+		tick()
+		if len(texts) != 1 {
+			t.Fatal("revoked progress sent")
+		}
+		bot.progress.Stop("TG-7")
+	})
+}
+
+func TestTelegramVerboseLongFinalSurvivesEditFailure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b := New(config.Telegram{AllowedUsers: []string{"7"}}, "fixture")
+		b.SetVerboseSource(func() string { return "on" })
+		var sent []string
+		b.client.Transport = telegramRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/editMessageText") {
+				return nil, errors.New("synthetic edit rejection")
+			}
+			var p map[string]any
+			json.NewDecoder(r.Body).Decode(&p)
+			sent = append(sent, p["text"].(string))
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":1}}`))}, nil
+		})
+		b.DeliverEvent(t.Context(), "TG-7", "p", core.Event{Kind: core.EventDelta, Text: "progress"})
+		synctest.Wait()
+		time.Sleep(time.Second)
+		synctest.Wait()
+		final := strings.Repeat("x", 10000)
+		if err := b.DeliverEvent(t.Context(), "TG-7", "f", core.Event{Kind: core.EventFinal, Text: "progress\n" + final, FinalText: &final, Done: true}); err != nil {
+			t.Fatal(err)
+		}
+		if len(sent) < 3 || strings.Join(sent[1:], "") != final {
+			t.Fatal("final lost, repeated, or not chunked")
+		}
+		for _, text := range sent {
+			if len(text) > 4096 {
+				t.Fatal("oversized native message")
+			}
+		}
+	})
+}

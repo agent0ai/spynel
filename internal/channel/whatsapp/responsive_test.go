@@ -54,7 +54,7 @@ func TestWhatsAppCommandsDuringTranscription(t *testing.T) {
 				t.Fatal(err)
 			}
 			cfg.Extensions.Enabled = false
-			cfg.Channels.WhatsApp = config.WhatsApp{Enabled: true, Mode: "dedicated", AllowedNumbers: []string{"15551234567"}}
+			cfg.Channels.WhatsApp = config.WhatsApp{Enabled: true, Mode: "dedicated", PollIntervalSec: 3, AllowedNumbers: []string{"15551234567"}}
 			service := app.New(cfg, harness.NewSupervisor(harness.NewBuiltinRegistry(), harness.HarnessConfig{Name: "codex", Command: "missing-fixture-provider", Cwd: root}))
 			defer service.Close()
 			client := New(cfg.Channels.WhatsApp, filepath.Join(root, "whatsapp.db"))
@@ -110,6 +110,14 @@ func TestWhatsAppCommandsDuringTranscription(t *testing.T) {
 			case <-service.RestartRequests():
 				t.Fatal("denied sender restarted")
 			default:
+			}
+			submit(50, chat, text("/verbose off"))
+			response = receive(t, sent)
+			if !strings.Contains(response.text, "channels.verbose") || service.Settings.Snapshot().Channels.Verbose != "off" {
+				t.Fatalf("verbose failed during transcription: %#v", response)
+			}
+			if m := receive(t, handled); m.Text != "/verbose off" {
+				t.Fatal("wrong verbose admission")
 			}
 			submit(6, chat, text("/restart"))
 			response = receive(t, sent)
@@ -172,9 +180,9 @@ func TestWhatsAppCommandsDuringTranscription(t *testing.T) {
 					users[entry.SourceMessageID]++
 				}
 			}
-			want := 2
+			want := 3
 			if finish == "ordered" {
-				want = 5
+				want = 6
 			}
 			if len(users) != want {
 				t.Fatalf("user entries: %#v", users)

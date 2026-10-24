@@ -617,6 +617,7 @@ func (s *Service) NoticeEvents() <-chan channel.Notice { return s.noticeEvents }
 // intentionally excludes configuration secrets, log bodies, and conversation
 // contents.
 type SharedState struct {
+	Verbose              string                     `json:"verbose"`
 	Title                string                     `json:"title"`
 	Theme                string                     `json:"theme"`
 	Connections          []channel.ConnectionStatus `json:"connections"`
@@ -633,7 +634,8 @@ type SharedState struct {
 func (s *Service) SharedState() SharedState {
 	work := s.Orchestrator.WorkStatus()
 	state := SharedState{
-		Title: s.currentTitle(), Theme: s.Settings.Snapshot().Channels.TUI.Theme,
+		Verbose: s.Settings.Snapshot().Channels.Verbose,
+		Title:   s.currentTitle(), Theme: s.Settings.Snapshot().Channels.TUI.Theme,
 		Runtime:              s.Runtime.Status(),
 		DurableWork:          core.DurableWorkCounts{Tasks: work.TasksActive, Goals: work.GoalsActive},
 		WorkDiagnostics:      append([]string(nil), work.CountDiagnostics...),

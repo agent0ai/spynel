@@ -13,6 +13,7 @@ const requestFinished = "tui_request_finished"
 
 type requestPresentation struct {
 	active, started, ended, retired bool
+	progressSuppressed              bool
 }
 
 func (m *model) observeRequest(event core.Event) {

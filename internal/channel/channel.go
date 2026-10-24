@@ -79,13 +79,14 @@ type Notice struct {
 type NoticeReporter func(Notice)
 
 type Notification struct {
-	ID         string `json:"id"`
-	RequestID  string `json:"request_id,omitempty"`
-	ResponseID string `json:"response_id,omitempty"`
-	Text       string `json:"text"`
-	Recovery   bool   `json:"recovery,omitempty"`
-	Error      bool   `json:"error,omitempty"`
-	Continues  bool   `json:"continues,omitempty"`
+	FinalText  *string `json:"final_text,omitempty"`
+	ID         string  `json:"id"`
+	RequestID  string  `json:"request_id,omitempty"`
+	ResponseID string  `json:"response_id,omitempty"`
+	Text       string  `json:"text"`
+	Recovery   bool    `json:"recovery,omitempty"`
+	Error      bool    `json:"error,omitempty"`
+	Continues  bool    `json:"continues,omitempty"`
 }
 
 type Channel interface {
