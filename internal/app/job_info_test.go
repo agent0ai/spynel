@@ -508,8 +508,8 @@ func TestJobPingAndGuardedContinuationPersistProviderIterations(t *testing.T) {
 	if err := supervisor.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	defer supervisor.Close()
 	service := New(cfg, supervisor)
+	defer service.Close()
 	task, err := orchestrator.Create(cfg, "tasks", "count control turns", "")
 	if err != nil {
 		t.Fatal(err)
