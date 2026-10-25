@@ -183,4 +183,4 @@ Argument, configuration, inactive-follow-up, hook, transport, and harness failur
 
 ### Global progress control
 
-`spynel verbose [on|off|auto]` and `spynel command /verbose [on|off|auto]` use the shared global channel setting. Bare queries report the value; invalid values fail without changing it. Auto keeps TUI progress and remote final-only behavior; on enables progress in TUI/Telegram/WhatsApp; off keeps their final responses only. Explicit `send --stream`, `send --json` and event subscriptions remain unfiltered. See [configuration](configuration.md#global-assistant-progress).
+`spynel verbose [on|off]` and `spynel command /verbose [on|off]` use the shared global channel setting. Bare queries report the value; invalid values fail without changing it. On (the default) enables progress in TUI/Telegram/WhatsApp; off keeps their final responses only. Explicit `send --stream`, `send --json` and event subscriptions remain unfiltered. See [configuration](configuration.md#global-assistant-progress).

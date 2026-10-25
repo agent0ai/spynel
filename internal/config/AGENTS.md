@@ -21,7 +21,7 @@
 
 - Default `speech.idle_timeout_seconds` to 120 on omission and in generated configuration. Accept only 1–86400 whole seconds, expose it in advanced speech settings, persist explicit overrides canonically, and reject invalid/overflowing input transactionally. It applies live through the application save/reload hook; no disable value exists.
 
-- `channels.verbose` defaults to `auto` on omission and accepts exactly `on`, `off`, or `auto` through YAML and the typed advanced setting. Reject invalid values/types transactionally. It controls global channel presentation only, applies live without replacing transports/providers, and survives worker-owned canonical save/reload.
+- `channels.verbose` defaults to `on` on omission and accepts only `on` or `off` as current values and selectable choices. Normalize obsolete YAML `auto` to `on` only on input, without rewriting the file or changing unrelated settings; canonical saves emit on/off and commands reject auto. Reject invalid values/types transactionally. It controls global channel presentation only, applies live without replacing transports/providers, and survives worker-owned canonical save/reload.
 
 ## Child DOX Index
 

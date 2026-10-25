@@ -9,7 +9,7 @@ import (
 
 // WorkerProtocol binds harness adoption and installation update compatibility.
 // Bump whenever a successor cannot safely consume or control a prior worker.
-const WorkerProtocol = 18
+const WorkerProtocol = 19
 
 const SpynelASCII = `    ████     ████     ███████ ██████  ██    ██ ███    ██ ███████ ██
   ██    ██ ██    ██   ██      ██   ██  ██  ██  ████   ██ ██      ██
@@ -209,7 +209,7 @@ const (
 // Emit is safe for asynchronous use by a harness implementation.
 type Emit func(Event)
 
-// ShowProgress interprets the global presentation mode, including old UI snapshots.
-func ShowProgress(mode, channel string) bool {
-	return mode == "on" || (mode == "auto" || mode == "") && channel == "tui"
+// ShowProgress applies the default-on presentation setting.
+func ShowProgress(mode string) bool {
+	return mode == "on" || mode == ""
 }

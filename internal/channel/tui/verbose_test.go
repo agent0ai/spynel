@@ -9,7 +9,7 @@ import (
 )
 
 func TestVerboseTUIStreamAndHistoryMatrix(t *testing.T) {
-	for _, mode := range []string{"auto", "on", "off"} {
+	for _, mode := range []string{"", "on", "off"} {
 		for _, route := range []string{"stream", "history"} {
 			t.Run(mode+"/"+route, func(t *testing.T) {
 				m := notificationTestModel()

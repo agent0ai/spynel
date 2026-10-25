@@ -1108,9 +1108,9 @@ func (m model) update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if event.Local && event.Verbose != "" {
 			m.setVerbose(event.Verbose)
 		}
-		showProgress := core.ShowProgress(m.verbose, "tui")
+		showProgress := core.ShowProgress(m.verbose)
 		if event.Verbose != "" {
-			showProgress = core.ShowProgress(event.Verbose, "tui")
+			showProgress = core.ShowProgress(event.Verbose)
 		}
 		if !showProgress && m.streaming != "" {
 			m.commitStreamingResponse()
@@ -1889,7 +1889,7 @@ func (m *model) appendRecoveredResponse(notification channel.Notification) {
 		m.continueResponse(notification.RequestID)
 	}
 	r := m.requests[notification.RequestID]
-	showProgress := core.ShowProgress(m.verbose, "tui")
+	showProgress := core.ShowProgress(m.verbose)
 	if !showProgress && notification.Continues {
 		r.progressSuppressed = true
 		m.requests[notification.RequestID] = r
@@ -4715,7 +4715,7 @@ func (m *model) setVerbose(mode string) {
 	if mode == m.verbose {
 		return
 	}
-	if !core.ShowProgress(mode, "tui") && m.streaming != "" {
+	if !core.ShowProgress(mode) && m.streaming != "" {
 		// Keep text already displayed; suppress only subsequent output.
 		m.commitStreamingResponse()
 	}

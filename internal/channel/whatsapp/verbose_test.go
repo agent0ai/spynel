@@ -21,7 +21,7 @@ import (
 )
 
 func TestWhatsAppVerboseDeliveryMatrix(t *testing.T) {
-	for _, mode := range []string{"auto", "on", "off"} {
+	for _, mode := range []string{"", "on", "off"} {
 		for _, route := range []string{"reply", "retained"} {
 			t.Run(mode+"/"+route, func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
@@ -65,11 +65,20 @@ func TestWhatsAppVerboseDeliveryMatrix(t *testing.T) {
 						time.Sleep(time.Second)
 						synctest.Wait()
 						want := 0
-						if mode == "on" {
+						if mode != "off" {
 							want = 1
 						}
 						if len(texts) != want {
 							t.Fatal(texts)
+						}
+						if want == 1 && texts[0] != strings.TrimSpace(strings.Repeat("progress ", 100)) {
+							t.Fatal("injected progress heading", texts)
+						}
+						emit(core.Event{Kind: core.EventDelta, Text: "**Spy** is model-authored."})
+						time.Sleep(time.Second)
+						synctest.Wait()
+						if len(texts) != want*2 || want == 1 && texts[1] != strings.Repeat("progress ", 100)+"*Spy* is model-authored." {
+							t.Fatal("progress edit changed model text", texts)
 						}
 						final := "Final **answer**."
 						emit(core.Event{Kind: core.EventFinal, Text: "progress\n" + final, FinalText: &final, Done: true, Attachments: attachments})
@@ -89,8 +98,8 @@ func TestWhatsAppVerboseDeliveryMatrix(t *testing.T) {
 						})
 					}
 					want := 1
-					if mode == "on" {
-						want = 2
+					if mode != "off" {
+						want = 3
 					}
 					if files != 1 {
 						t.Fatalf("files=%d", files)
@@ -98,7 +107,7 @@ func TestWhatsAppVerboseDeliveryMatrix(t *testing.T) {
 					if len(texts) != want || texts[len(texts)-1] != "Final *answer*." {
 						t.Fatal(texts)
 					}
-					if mode == "on" && edits != 1 {
+					if mode != "off" && edits != 2 {
 						t.Fatal("final duplicated preview")
 					}
 				})

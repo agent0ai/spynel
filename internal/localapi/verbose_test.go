@@ -11,7 +11,7 @@ func TestVerboseAcrossAttachedClientsAndPersistence(t *testing.T) {
 	election, server, target, cancel, done := startTestServer(t, t.TempDir())
 	defer func() { cancel(); <-done; _ = election.Release(server.Token) }()
 	first, second := NewClient(election), NewClient(election)
-	for _, mode := range []string{"on", "off", "auto"} {
+	for _, mode := range []string{"off", "on"} {
 		var reply core.Event
 		if err := first.Handle(t.Context(), core.Message{Channel: "tui", Conversation: "first", Text: "/verbose " + mode}, func(e core.Event) { reply = e }); err != nil {
 			t.Fatal(err)

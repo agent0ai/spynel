@@ -1250,7 +1250,7 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		return s.primaryCommand(message, emit)
 	case "verbose":
 		if remainder == "" {
-			return s.localReply(message, "Global verbose: `"+s.Settings.Snapshot().Channels.Verbose+"`. Use /verbose on|off|auto.", emit)
+			return s.localReply(message, "Global verbose: `"+s.Settings.Snapshot().Channels.Verbose+"`. Use /verbose on|off.", emit)
 		}
 		return s.setSetting(message, "channels.verbose", remainder, emit)
 	case "config":

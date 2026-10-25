@@ -225,12 +225,12 @@ func TestWorkerSettingsCanonicalApplicationCommitAndControllerReplacement(t *tes
 		t.Fatal("absent worker request changed canonical/application settings")
 	}
 	restore = dropWorkerReply(t, f.client.Info().Socket, "configure", true, false)
-	if _, err := f.service.ApplySettings(map[string]string{"harness.model": "model-a", "harness.reasoning_effort": "high", "harness.service_mode": "priority", "orchestrator.interval_seconds": "19", "speech.idle_timeout_seconds": "300"}); err != nil {
+	if _, err := f.service.ApplySettings(map[string]string{"harness.model": "model-a", "harness.reasoning_effort": "high", "harness.service_mode": "priority", "orchestrator.interval_seconds": "19", "speech.idle_timeout_seconds": "300", "channels.verbose": "off"}); err != nil {
 		t.Fatal(err)
 	}
 	restore()
 	f.client.Close()
-	if refreshes != 1 || refreshedTimeout != 300 {
+	if refreshes != 1 || refreshedTimeout != 300 || f.service.SharedState().Verbose != "off" {
 		t.Fatal("reconciled worker save did not refresh speech exactly once")
 	}
 	// A timeout-only save must not replace the worker or admit another provider turn.

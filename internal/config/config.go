@@ -118,12 +118,16 @@ func (c *Channels) UnmarshalYAML(node *yaml.Node) error {
 		return err
 	}
 	if mode, present := fields["verbose"]; present && mode.ShortTag() != "!!str" {
-		return errors.New("channels.verbose must be on, off, or auto")
+		return errors.New("channels.verbose must be on or off")
 	}
 	type plain Channels
 	next := plain(*c)
 	if err := node.Decode(&next); err != nil {
 		return err
+	}
+	// Normalize the retired default only while reading existing configuration.
+	if next.Verbose == "auto" {
+		next.Verbose = "on"
 	}
 	*c = Channels(next)
 	return nil
@@ -251,7 +255,7 @@ func Default() Config {
 			Reviews: TaskReviewsSkipTrivial,
 		},
 		Channels: Channels{
-			Verbose:  "auto",
+			Verbose:  "on",
 			TUI:      TUI{Title: "Spynel", Theme: "spynel"},
 			Telegram: Telegram{Name: "spynel", TokenEnv: "SPYNEL_TELEGRAM_TOKEN", Mode: "polling", WebhookListen: "127.0.0.1:8787", PollTimeoutSec: 30, GroupMode: "mention", WelcomeMessage: "Welcome, {name}!"},
 			WhatsApp: WhatsApp{Mode: "self-chat", Database: ".spynel/whatsapp.db", PollIntervalSec: 3},
@@ -380,8 +384,8 @@ func rootForConfigPath(path string) string {
 
 func (c Config) Validate() error {
 	var problems []string
-	if c.Channels.Verbose != "auto" && c.Channels.Verbose != "on" && c.Channels.Verbose != "off" {
-		problems = append(problems, "channels.verbose must be on, off, or auto")
+	if c.Channels.Verbose != "on" && c.Channels.Verbose != "off" {
+		problems = append(problems, "channels.verbose must be on or off")
 	}
 	if c.Version != 1 {
 		problems = append(problems, "version must be 1")

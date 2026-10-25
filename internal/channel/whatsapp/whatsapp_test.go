@@ -247,7 +247,7 @@ func TestWhatsAppSendsOnlyLastTerminalResponse(t *testing.T) {
 }
 
 func TestWhatsAppFormatsErrorsAsOrdinaryUnindentedResponses(t *testing.T) {
-	for _, mode := range []string{"auto", "on", "off"} {
+	for _, mode := range []string{"", "on", "off"} {
 		t.Run(mode, func(t *testing.T) {
 			client := New(config.WhatsApp{AllowedNumbers: []string{"15551234567"}}, filepath.Join(t.TempDir(), "whatsapp.db"))
 			client.ctx = context.Background()

@@ -203,8 +203,8 @@ func receiveTUIActivity(t *testing.T, events <-chan core.Event) core.Event {
 
 func TestPublishTUIStateChangesCarriesGlobalVerbose(t *testing.T) {
 	events := tuiStateEvents{verbose: make(chan string, 1)}
-	previous := app.SharedState{Verbose: "auto"}
-	for _, mode := range []string{"on", "off", "auto"} {
+	previous := app.SharedState{Verbose: "on"}
+	for _, mode := range []string{"off", "on", "off"} {
 		next := app.SharedState{Verbose: mode}
 		publishTUIStateChanges(events, previous, next, "")
 		if got := <-events.verbose; got != mode {

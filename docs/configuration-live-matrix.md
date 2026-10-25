@@ -4,7 +4,7 @@ Every setting below is exposed by the shared typed catalog used by the TUI, slas
 
 | Setting | Prior behavior | Runtime owner and final effect | Validation / application | Verification boundary |
 | --- | --- | --- | --- | --- |
-| `channels.verbose` | Auto: TUI progress, remote final-only | All requested channels filter live presentation; transports/providers retain their generation | Exactly on/off/auto; atomic save/reload; explicit CLI/API streams and history unchanged | deterministic mode/toggle/authorization tests, connected commands, secondary client state and native worker persistence |
+| `channels.verbose` | On: progress in TUI, Telegram and WhatsApp | All requested channels filter live presentation; transports/providers retain their generation | Exactly on/off; obsolete YAML auto reads as on; atomic save/reload; explicit CLI/API streams and history unchanged | deterministic mode/toggle/authorization tests, connected commands, secondary client state and native worker persistence |
 | `harness.name` | Live, idle-only | Harness supervisor replaces the adapter before commit | Old harness restored if persistence fails | harness supervisor and service tests |
 | `harness.model` | Live, active-safe | Persistence commit and provider-dispatch snapshot share one supervisor fence; admitted turns keep their model and later dispatches use the new value | No runtime model publication if persistence fails | active-turn, continuation, and dispatch-race tests |
 | `harness.reasoning_effort` | Live, active-safe | Shares the atomic inference-selection commit and dispatch snapshot with model/service mode | Unsupported model combinations reject; a model change clears stale effort to inherit | capability, adapter, continuation, and dispatch-race tests |

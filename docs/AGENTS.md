@@ -20,7 +20,7 @@
 - Document that WhatsApp setup automatically saves and enables the channel after access configuration, then opens pairing without a separate enable-choice step.
 - Document that WhatsApp QR pairing uses a chrome-free full-terminal view exited by any key, expired/error sessions retry automatically without restarting Spynel, the manual retry action is only an immediate override, and phone-number linking codes are the supported non-QR alternative.
 - Document transport-specific Markdown rendering and terminal limitations around pasted file data.
-- Document response-delivery differences: global verbose auto shows TUI progress and remote final-only output, on shows progress in all three, and off hides it in all three; explicit CLI streaming remains opt-in and independent.
+- Document response-delivery differences: global verbose defaults on and shows progress in all three channels, off hides subsequent progress in all three, and obsolete saved auto normalizes to on; explicit CLI streaming remains opt-in and independent.
 - Document the human-facing communication boundary: routine delegation and completion confirmations are brief, natural, outcome-first, and hide internal paths/IDs/metrics; explicit detail requests and dedicated diagnostic commands remain precise, and remote routine confirmations never render local-path links.
 - Distinguish bounded in-memory/display windows from complete disk-backed histories and attachments.
 - Document plain-CLI output contracts precisely: the last assistant-message item by default, all response deltas with `--stream`, NDJSON events with `send --json` and shared command aliases using `--json`, structured JSON for status/history queries, and flags before positional command arguments.

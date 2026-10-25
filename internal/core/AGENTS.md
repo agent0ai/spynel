@@ -20,7 +20,7 @@
 
 - A conversation-changing screen carries its transcript snapshot byte offset in `HistoryOffset` so the TUI follows only later durable entries without losing the handoff window or replaying restored messages.
 
-- WorkerProtocol is the shared compatibility value for harness adoption and installation coordination. Change it when a successor cannot safely consume/control prior workers; npm package metadata must match, enforced by the updater release-metadata test. Protocol 18 includes canonical global verbosity; older workers would omit it on save.
+- WorkerProtocol is the shared compatibility value for harness adoption and installation coordination. Change it when a successor cannot safely consume/control prior workers; npm package metadata must match, enforced by the updater release-metadata test. Protocol 19 includes default-on, two-state verbosity and legacy-auto normalization; protocol-18 workers can reject settings saves because their canonical digests retain auto.
 
 - Own the shared global progress-mode interpretation and `/verbose` discovery. Optional Event.Verbose is a live presentation hint only; event kind, aggregate text, final-item metadata, continuation, activity and explicit integration streaming semantics remain unchanged.
 

@@ -19,7 +19,7 @@ import (
 )
 
 func TestTelegramVerboseDeliveryMatrix(t *testing.T) {
-	for _, mode := range []string{"auto", "on", "off"} {
+	for _, mode := range []string{"", "on", "off"} {
 		for _, route := range []string{"reply", "retained"} {
 			t.Run(mode+"/"+route, func(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
@@ -62,11 +62,20 @@ func TestTelegramVerboseDeliveryMatrix(t *testing.T) {
 						time.Sleep(time.Second)
 						synctest.Wait()
 						want := 0
-						if mode == "on" {
+						if mode != "off" {
 							want = 1
 						}
 						if len(texts) != want {
 							t.Fatalf("progress sends=%d want %d", len(texts), want)
+						}
+						if want == 1 && texts[0] != strings.TrimSpace(strings.Repeat("progress ", 100)) {
+							t.Fatal("injected progress heading", texts)
+						}
+						emit(core.Event{Kind: core.EventDelta, Text: "**Spy** is model-authored."})
+						time.Sleep(time.Second)
+						synctest.Wait()
+						if len(texts) != want*2 || want == 1 && texts[1] != strings.Repeat("progress ", 100)+"<b>Spy</b> is model-authored." {
+							t.Fatal("progress edit changed model text", texts)
 						}
 						final := "Final **answer**."
 						emit(core.Event{Kind: core.EventFinal, Text: "progress\n" + final, FinalText: &final, Done: true, Attachments: attachments})
@@ -85,8 +94,8 @@ func TestTelegramVerboseDeliveryMatrix(t *testing.T) {
 						})
 					}
 					want := 1
-					if mode == "on" {
-						want = 2
+					if mode != "off" {
+						want = 3
 					}
 					if files != 1 {
 						t.Fatalf("files=%d", files)
@@ -94,7 +103,7 @@ func TestTelegramVerboseDeliveryMatrix(t *testing.T) {
 					if len(texts) != want || texts[len(texts)-1] != "Final <b>answer</b>." {
 						t.Fatal(texts)
 					}
-					if mode == "on" && !strings.HasSuffix(methods[1], "/editMessageText") {
+					if mode != "off" && (!strings.HasSuffix(methods[1], "/editMessageText") || !strings.HasSuffix(methods[2], "/editMessageText")) {
 						t.Fatal("final duplicated preview", methods)
 					}
 				})

@@ -84,7 +84,7 @@
 
 - After a confirmed speech idle-timeout save/reload and application snapshot publication, invoke the shared speech transcriber’s refresh hook before returning. Worker-backed settings retain canonical ownership, reconciliation and dispatch fencing; invalid, failed or unconfirmed transactions never refresh speech. The CLI installs this hook before channel/API admission.
 
-- `/verbose [on|off|auto]` uses the same global `channels.verbose` save/reload path as configuration forms and commands. Expose the current non-secret mode in shared state and optional response presentation hints after history/archive processing; never filter stored events, explicit CLI/API streams or task/background output. Deterministic replies remain visible in every mode.
+- `/verbose [on|off]` uses the same global `channels.verbose` save/reload path as configuration forms and commands. Expose the current non-secret mode in shared state and optional response presentation hints after history/archive processing; never filter stored events, explicit CLI/API streams or task/background output. Deterministic replies remain visible in every mode.
 
 ## Child DOX Index
 

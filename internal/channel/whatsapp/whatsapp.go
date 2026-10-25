@@ -1130,7 +1130,6 @@ func (c *Client) edit(ctx context.Context, chat types.JID, id, text string) erro
 }
 
 func (c *Client) sendProgress(ctx context.Context, chat types.JID, id, text string) (string, error) {
-	text = "**Spy**\n\n" + text
 	if id != "" {
 		return id, c.edit(ctx, chat, id, markdownfmt.WhatsApp(text))
 	}

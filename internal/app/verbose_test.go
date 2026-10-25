@@ -21,8 +21,11 @@ func TestVerboseSharedCommandsAndUnfilteredConsumer(t *testing.T) {
 	cfg.Extensions.Enabled = false
 	s := New(cfg, newServiceHarness())
 	defer s.Close()
+	if s.SharedState().Verbose != "on" {
+		t.Fatal("generated configuration did not enable progress")
+	}
 	for i, channel := range []string{"tui", "telegram", "whatsapp", "cli"} {
-		mode := []string{"off", "on", "auto", "off"}[i]
+		mode := []string{"off", "on", "on", "off"}[i]
 		var reply core.Event
 		if err := s.Handle(t.Context(), core.Message{Channel: channel, Conversation: "global", Text: "/verbose " + mode}, func(e core.Event) { reply = e }); err != nil {
 			t.Fatal(err)
@@ -34,7 +37,7 @@ func TestVerboseSharedCommandsAndUnfilteredConsumer(t *testing.T) {
 			t.Fatalf("global read: %#v %v", reply, err)
 		}
 	}
-	if err := s.Handle(t.Context(), core.Message{Channel: "cli", Conversation: "other", Text: "/verbose yes"}, nil); err == nil {
+	if err := s.Handle(t.Context(), core.Message{Channel: "cli", Conversation: "other", Text: "/verbose auto"}, nil); err == nil {
 		t.Fatal("invalid accepted")
 	}
 	loaded, err := config.Load(cfg.Path)

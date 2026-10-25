@@ -34,7 +34,7 @@ type progressStream struct {
 type ProgressSend func(context.Context, string, string) (string, error)
 
 func (p *ProgressStreams) enabled() bool {
-	return p.Mode != nil && core.ShowProgress(p.Mode(), "remote")
+	return p.Mode != nil && core.ShowProgress(p.Mode())
 }
 
 func progressTail(text string) string {

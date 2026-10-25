@@ -1142,13 +1142,12 @@ func (b *Bot) edit(ctx context.Context, chatID, id, html string) error {
 }
 
 func (b *Bot) sendProgress(ctx context.Context, chatID, id, text string, replyTo int64) (string, error) {
-	const label = "<b>Spy</b>\n\n"
-	chunks := telegramChunks(text, 4096-len(label))
+	chunks := telegramChunks(text, 4096)
 	if len(chunks) == 0 {
 		return id, nil
 	}
 	// Keep the newest formatted tail within one native message.
-	preview := label + chunks[len(chunks)-1]
+	preview := chunks[len(chunks)-1]
 	if id != "" {
 		return id, b.edit(ctx, chatID, id, preview)
 	}

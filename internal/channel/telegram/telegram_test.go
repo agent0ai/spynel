@@ -264,7 +264,7 @@ func TestTelegramSendsOnlyLastTerminalResponse(t *testing.T) {
 }
 
 func TestTelegramFormatsErrorsAsOrdinaryUnindentedResponses(t *testing.T) {
-	for _, mode := range []string{"auto", "on", "off"} {
+	for _, mode := range []string{"", "on", "off"} {
 		t.Run(mode, func(t *testing.T) {
 			sent := make(chan string, 4)
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

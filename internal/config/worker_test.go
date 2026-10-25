@@ -29,6 +29,10 @@ func workerSettingsConfig(t *testing.T) (Config, harness.HarnessConfig) {
 func TestWorkerBindingSettingsPreserveRawCanonicalIntent(t *testing.T) {
 	cfg, runtime := workerSettingsConfig(t)
 	before, _ := os.ReadFile(cfg.Path)
+	before = bytes.Replace(before, []byte(`verbose: "on"`), []byte("verbose: auto"), 1)
+	if !bytes.Contains(before, []byte("verbose: auto")) {
+		t.Fatal("legacy fixture did not replace the default")
+	}
 	before = append(before, []byte("\n# operator comment\nunused_binding_key: kept\n")...)
 	if err := os.WriteFile(cfg.Path, before, 0600); err != nil {
 		t.Fatal(err)
@@ -43,6 +47,16 @@ func TestWorkerBindingSettingsPreserveRawCanonicalIntent(t *testing.T) {
 	}
 	if after, _ := os.ReadFile(cfg.Path); !bytes.Equal(after, before) {
 		t.Fatal("runtime discovery rewrote comments or ignored keys")
+	}
+	previous, _ := cfg.Encode()
+	cfg.Channels.Verbose = "off"
+	next, _ := cfg.Encode()
+	plan, err = PrepareWorkerSettings(cfg.Root, runtime, runtime, harness.WorkerSettings{Expected: sha256.Sum256(previous), YAML: next})
+	if err != nil || plan.Commit() != nil {
+		t.Fatal("normalized legacy configuration blocked the next worker save", err)
+	}
+	if saved, err := Load(cfg.Path); err != nil || saved.Channels.Verbose != "off" {
+		t.Fatal("worker save lost explicit off", err)
 	}
 	cfg.Harness.Model = "stale snapshot"
 	if _, err := cfg.WorkerSettings(); err == nil {

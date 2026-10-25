@@ -1580,7 +1580,7 @@ Usage:
   spynel status [flags]          Show workspace and current conversation status
   spynel command [flags] NAME    Run any non-visual framework slash command
   spynel model|effort|speed ... Inspect or select model inference properties
-  spynel verbose [on|off|auto] Show or set global assistant progress
+  spynel verbose [on|off] Show or set global assistant progress
   spynel tasks [flags] [VIEW]   List durable tasks (open by default)
   spynel goals [flags] [VIEW]   List durable goals (open by default)
     VIEW                        open|recent|active|review|waiting|done|failed|all
