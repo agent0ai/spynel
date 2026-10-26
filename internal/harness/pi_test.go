@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -325,5 +326,189 @@ done:
 	}
 	if !foundAbort {
 		t.Fatal("Pi fixture did not receive abort")
+	}
+}
+
+func TestOhMyPiSettlesOnlyOnTerminalAgentEndAndResumes(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "omp-lifecycle")
+	sessionsPath := filepath.Join(root, "sessions.json")
+	config := HarnessConfig{
+		Command: command, Cwd: root, Model: "fixture/model-a", Effort: "high",
+		Sandbox: "read-only", SessionsFile: sessionsPath,
+	}
+	omp, err := NewOhMyPi(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := omp.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var events []core.Event
+	deltaSeen := make(chan struct{}, 1)
+	done := make(chan core.Event, 1)
+	threadID, steered, err := omp.Send(ctx, "chat", "test prompt", func(event core.Event) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		if event.Kind == core.EventDelta && strings.Contains(event.Text, "world") {
+			select {
+			case deltaSeen <- struct{}{}:
+			default:
+			}
+		}
+		if event.Done {
+			done <- event
+		}
+	})
+	if err != nil || steered || threadID != "pi-session" {
+		t.Fatalf("Send() = %q, %t, %v", threadID, steered, err)
+	}
+	select {
+	case <-deltaSeen:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for Oh My Pi delta")
+	}
+	select {
+	case event := <-done:
+		t.Fatalf("Oh My Pi treated a non-terminal agent_end as terminal: %#v", event)
+	case <-time.After(30 * time.Millisecond):
+	}
+	var final core.Event
+	select {
+	case final = <-done:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for terminal Oh My Pi agent_end")
+	}
+	if final.Kind != core.EventFinal || final.Text != "hello world" || final.FinalText == nil || *final.FinalText != "hello world" || omp.IsActive("chat") {
+		t.Fatalf("Oh My Pi final = %#v, active %t", final, omp.IsActive("chat"))
+	}
+	models, err := omp.Models(ctx)
+	if err != nil || len(models) != 1 || models[0].ID != "fixture/model-a" || models[0].DefaultEffort != "high" || strings.Join(models[0].Efforts, ",") != "off,low,medium,high" {
+		t.Fatalf("Oh My Pi models = %#v, %v", models, err)
+	}
+	if err := omp.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewOhMyPi(config)
+	if err != nil || restarted.ThreadID("chat") != "pi-session" {
+		t.Fatalf("persisted Oh My Pi session = %q, %v", restarted.ThreadID("chat"), err)
+	}
+	if err := restarted.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	restartedDone := make(chan struct{}, 1)
+	if threadID, steered, err := restarted.Send(ctx, "chat", "continued", func(event core.Event) {
+		if event.Done {
+			restartedDone <- struct{}{}
+		}
+	}); err != nil || steered || threadID != "pi-session" {
+		t.Fatalf("resumed Oh My Pi Send() = %q, %t, %v", threadID, steered, err)
+	}
+	select {
+	case <-restartedDone:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for resumed Oh My Pi turn")
+	}
+	_ = restarted.Close()
+
+	var rpcInvocations, resumed int
+	for _, record := range readFixtureRecords(t, logPath) {
+		if record.Kind != "invocation" || containsArgument(record.Args, "--version") {
+			continue
+		}
+		rpcInvocations++
+		arguments := strings.Join(record.Args, " ")
+		if !strings.Contains(arguments, "--mode rpc") || !strings.Contains(arguments, "--no-extensions") || !strings.Contains(arguments, "--no-skills") || record.Cwd != root || record.Executable != command {
+			t.Fatalf("portable Oh My Pi invocation = %#v", record)
+		}
+		if strings.Contains(arguments, "--no-prompt-templates") || strings.Contains(arguments, "--no-themes") || strings.Contains(arguments, "--session ") {
+			t.Fatalf("Oh My Pi invocation carried an upstream Pi flag: %#v", record)
+		}
+		if !strings.Contains(arguments, "read,grep,glob") || strings.Contains(arguments, "read,grep,find,ls") {
+			t.Fatalf("Oh My Pi read-only tool set = %#v", record)
+		}
+		if containsArgument(record.Args, "--resume") {
+			resumed++
+		}
+	}
+	if rpcInvocations != 3 || resumed != 1 {
+		t.Fatalf("Oh My Pi RPC invocations = %d, resumed = %d; want 3, 1 (catalog efforts must not probe per model)", rpcInvocations, resumed)
+	}
+}
+
+func TestOhMyPiModelsUseCatalogEmbeddedThinkingEfforts(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "omp-model-capabilities")
+	omp, err := NewOhMyPi(HarnessConfig{Command: command, Cwd: root, SessionsFile: filepath.Join(root, "sessions.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := omp.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer omp.Close()
+
+	models, err := omp.Models(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 3 {
+		t.Fatalf("Oh My Pi model count = %d, want 3: %#v", len(models), models)
+	}
+	if got := strings.Join(models[0].Efforts, ","); got != "off,low,medium,high" || models[0].DefaultEffort != "high" {
+		t.Fatalf("model-a efforts/default = %q/%q", got, models[0].DefaultEffort)
+	}
+	if len(models[1].Efforts) != 0 || models[1].DefaultEffort != "" {
+		t.Fatalf("model without a thinking block = %#v", models[1])
+	}
+	if got := strings.Join(models[2].Efforts, ","); got != "off,medium,xhigh,max" || models[2].DefaultEffort != "" {
+		t.Fatalf("model-max efforts/default = %q/%q", got, models[2].DefaultEffort)
+	}
+	if !models[0].Default || models[1].Default || models[2].Default {
+		t.Fatalf("Oh My Pi current/default model mapping = %#v", models)
+	}
+	if err := ValidateInferenceSelection(models, InferenceSelection{Model: "fixture/model-a", Effort: "turbo"}); err != nil {
+		t.Fatalf("Oh My Pi rejected a manual effort absent from discovery: %v", err)
+	}
+	if err := ValidateInferenceSelection(models, InferenceSelection{Model: "fixture/model-max", Effort: "xhigh"}); err != nil {
+		t.Fatalf("Oh My Pi rejected a catalog-advertised effort: %v", err)
+	}
+
+	var levelQueries, modelProbes int
+	for _, record := range readFixtureRecords(t, logPath) {
+		if record.Method == "get_available_thinking_levels" {
+			levelQueries++
+		}
+		if record.Kind == "invocation" && containsArgument(record.Args, "--model") {
+			modelProbes++
+		}
+	}
+	if levelQueries != 0 || modelProbes != 0 {
+		t.Fatalf("Oh My Pi capability discovery = %d level queries, %d --model probes; want 0, 0 (efforts ride the catalog)", levelQueries, modelProbes)
+	}
+}
+
+func TestPiEventFlagTreatsOmittedNullAndNonBooleanValuesAsTrue(t *testing.T) {
+	event := map[string]json.RawMessage{
+		"false":      json.RawMessage(`false`),
+		"true":       json.RawMessage(`true`),
+		"null":       json.RawMessage(`null`),
+		"nonBoolean": json.RawMessage(`"false"`),
+	}
+	for _, key := range []string{"missing", "null", "nonBoolean"} {
+		if !piEventFlagNotFalse(event, key) {
+			t.Fatalf("flag %q should count as true", key)
+		}
+	}
+	if piEventFlagNotFalse(event, "false") {
+		t.Fatal("explicit false should count as false")
+	}
+	if !piEventFlagNotFalse(event, "true") {
+		t.Fatal("explicit true should count as true")
 	}
 }

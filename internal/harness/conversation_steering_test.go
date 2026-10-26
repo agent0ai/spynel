@@ -100,7 +100,7 @@ func TestPiConversationSteeringClosedInputKeepsEmitter(t *testing.T) {
 	}
 	original, replacement := 0, 0
 	turn := &piTurn{emit: func(core.Event) { original++ }}
-	p.processes["chat"] = &piProcess{active: turn, closed: true}
+	p.processes["chat"] = &piProcess{owner: p, active: turn, closed: true}
 	_, err = p.SteerConversation(context.Background(), "chat", "follow-up", func(core.Event) { replacement++ })
 	if err == nil {
 		t.Fatal("closed input accepted steering")

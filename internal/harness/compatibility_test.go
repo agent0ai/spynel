@@ -19,11 +19,12 @@ const (
 	codexFixtureProvenance  = "codex-app-server-0.154.0-schema-retrieved-2026-09-14"
 	claudeFixtureProvenance = "claude-code-stream-json-docs-retrieved-2026-08-07"
 	piFixtureProvenance     = "pi-jsonl-rpc-docs-retrieved-2026-08-08"
+	ohMyPiFixtureProvenance = "oh-my-pi-18.2.6-rpc-docs-retrieved-2026-10-03"
 	acpFixtureProvenance    = "acp-stable-v1-schema-retrieved-2026-08-08"
 )
 
 func TestCompatibilityFixtureProvenanceIsVersionLabeled(t *testing.T) {
-	for _, label := range []string{codexFixtureProvenance, claudeFixtureProvenance, piFixtureProvenance, acpFixtureProvenance} {
+	for _, label := range []string{codexFixtureProvenance, claudeFixtureProvenance, piFixtureProvenance, ohMyPiFixtureProvenance, acpFixtureProvenance} {
 		_, date, ok := strings.Cut(label, "retrieved-")
 		if _, err := time.Parse(time.DateOnly, date); !ok || err != nil {
 			t.Fatalf("fixture provenance is not retrieval-version labeled: %q", label)
