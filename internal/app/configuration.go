@@ -704,7 +704,7 @@ func (s *Service) harnessCommand(message core.Message, remainder string, emit co
 		return nil
 	}
 	current := emptyAs(s.Settings.Snapshot().Harness.Name, "not selected")
-	lines := []string{"# Coding harnesses", "", "Active: `" + current + "`", ""}
+	lines := []string{"# Coding harnesses", "", "Current harness: `" + current + "`", ""}
 	for _, definition := range harness.Catalog() {
 		status := "not installed"
 		if _, err := s.resolveHarnessCommand(definition.Name); err == nil {
@@ -795,18 +795,19 @@ func (s *Service) modelCommand(ctx context.Context, message core.Message, remain
 		emit(core.Event{Kind: core.EventScreen, Screen: screen, Local: true})
 		return nil
 	}
+	current := "Current model: `" + emptyAs(s.Settings.Snapshot().Harness.Model, "harness default") + "`"
 	provider := s.modelProvider()
 	if provider == nil {
-		return s.localReply(message, "The active harness does not provide a model catalog. Set an exact model with `/model <name>`.", emit)
+		return s.localReply(message, current+"\n\nThe active harness does not provide a model catalog. Set an exact model with `/model <name>`.", emit)
 	}
 	models, err := provider.Models(ctx)
 	if err != nil {
-		return s.localReply(message, "Cannot load models: "+err.Error(), emit)
+		return s.localReply(message, current+"\n\nCannot load models: "+err.Error(), emit)
 	}
 	if len(models) == 0 {
-		return s.localReply(message, "The active harness returned no available models. Set an exact model with `/model <name>`.", emit)
+		return s.localReply(message, current+"\n\nThe active harness returned no available models. Set an exact model with `/model <name>`.", emit)
 	}
-	lines := []string{"# Available models", ""}
+	lines := []string{"# Available models", "", current, ""}
 	for _, model := range models {
 		marker := ""
 		if model.Default {

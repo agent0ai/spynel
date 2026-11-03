@@ -32,6 +32,7 @@ type ConversationEvent struct {
 	At             time.Time `json:"at"`
 	Kind           string    `json:"kind"`
 	Text           string    `json:"text,omitempty"`
+	Provenance     string    `json:"provenance,omitempty"`
 	RequestID      string    `json:"request_id,omitempty"`
 	NotificationID string    `json:"notification_id,omitempty"`
 	FinalText      *string   `json:"final_text,omitempty"`
@@ -178,7 +179,7 @@ func conversationEvent(entry Entry, cursor string) (ConversationEvent, bool) {
 	if kind != "user" && kind != "assistant" && kind != "error" && kind != "notification" {
 		return ConversationEvent{}, false
 	}
-	return ConversationEvent{ID: cursor, Cursor: cursor, At: entry.At, Kind: kind, Text: entry.Content,
+	return ConversationEvent{ID: cursor, Cursor: cursor, At: entry.At, Kind: kind, Text: entry.Content, Provenance: entry.Provenance,
 		RequestID: entry.SourceMessageID, NotificationID: entry.EventID, FinalText: entry.FinalText,
 		Done: entry.Terminal, Continues: entry.Continues}, true
 }

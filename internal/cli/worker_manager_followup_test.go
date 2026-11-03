@@ -253,7 +253,11 @@ func TestWorkerConversationManagerRemoteFollowup(t *testing.T) {
 			original := f.inspect(t)[0]
 			job, _ := f.service.Runtime.JobForSession(original.Key)
 			message.SourceMessageID, message.Text = "beta", "synthetic second"
-			if err := f.service.Handle(t.Context(), message, func(core.Event) { t.Error("remote provider output used inbound emitter") }); err != nil {
+			if err := f.service.Handle(t.Context(), message, func(event core.Event) {
+				if name != "telegram" || event.Kind != core.EventAccepted || event.RequestID != message.SourceMessageID || !event.Local {
+					t.Error("remote provider output used inbound emitter")
+				}
+			}); err != nil {
 				t.Fatal(err)
 			}
 			current := f.inspect(t)[0]

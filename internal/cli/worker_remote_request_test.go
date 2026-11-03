@@ -96,10 +96,20 @@ func TestWorkerConversationOrdinaryRemoteRequest(t *testing.T) {
 				identity := f.client.Info()
 				t.Logf("ordinary remote worker pid=%d start=%s generation=%s", identity.PID, identity.Process.StartTime, identity.Process.Generation)
 				ctx, cancel := context.WithCancel(t.Context())
-				err := f.service.Handle(ctx, message, func(core.Event) { t.Error("worker reply used the unacknowledged inbound emitter") })
+				boundaries := 0
+				err := f.service.Handle(ctx, message, func(event core.Event) {
+					if name == "telegram" && event.Kind == core.EventAccepted && event.RequestID == message.SourceMessageID && event.Local {
+						boundaries++
+						return
+					}
+					t.Error("worker reply used the unacknowledged inbound emitter")
+				})
 				cancel() // Returning from intake must not own the consumer or provider.
 				if err != nil {
 					t.Fatal("remote request admission failed", err)
+				}
+				if name == "telegram" && boundaries != 1 {
+					t.Fatal("remote admission did not emit exactly one presentation boundary")
 				}
 				key := "chat:" + name + ":" + message.Conversation
 				original, ok := f.service.Runtime.JobForSession(key)

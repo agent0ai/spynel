@@ -24,6 +24,10 @@
 
 - Own the shared global progress-mode interpretation and `/verbose` discovery. Optional Event.Verbose is a live presentation hint only; event kind, aggregate text, final-item metadata, continuation, activity and explicit integration streaming semantics remain unchanged.
 
+- `EventAccepted` carries the deduplicated human source in RequestID for a transport presentation boundary, before hooks/provider admission. It never starts or cancels a harness turn. RequestID also follows immutable source snapshots on communication events; terminal ResponseID reuses the application history receipt across local and remote delivery. Neither is proactive-notification identity.
+- Protocol-19 events retain the optional `Succeeded` field because an already-running worker can still emit it; presentation does not depend on it.
+
+
 ## Child DOX Index
 
 No child DOX files.

@@ -61,7 +61,7 @@ type Event struct {
 	Verbose   string `json:"verbose,omitempty"`
 	Kind      string `json:"kind"`
 	RequestID string `json:"request_id,omitempty"`
-	// ResponseID correlates a local durable reply with its request-stream copy.
+	// ResponseID correlates a durable reply with its request-stream/delivery copy.
 	ResponseID string `json:"response_id,omitempty"`
 	Text       string `json:"text,omitempty"`
 	// Active is meaningful only for EventActivity. The application emits true
@@ -82,6 +82,8 @@ type Event struct {
 	// Execution is a provider-neutral lifecycle signal. Adapters populate it
 	// from structured protocol events; renderers must never infer it from Text.
 	Execution *ExecutionStatus `json:"execution,omitempty"`
+	// Retained protocol-19 workers may still send this optional completion field.
+	Succeeded bool `json:"succeeded,omitempty"`
 }
 
 // ExecutionStatus describes a live provider turn without mixing in a durable
@@ -198,6 +200,9 @@ const (
 	EventFinal  = "final"
 	EventError  = "error"
 	EventStatus = "status"
+	// EventAccepted closes a transport preview after deduplicated human admission.
+	// RequestID identifies the new input; it does not imply provider admission.
+	EventAccepted = "accepted"
 	// EventActivity exposes the main communication-agent activity boundary to
 	// presentation channels without coupling them to harness or job internals.
 	EventActivity = "activity"

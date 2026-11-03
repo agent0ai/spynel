@@ -334,7 +334,7 @@ func TestConversationConsumerSerializesTerminalAndReentrantDelivery(t *testing.T
 
 func TestConversationEmitterReportsUnsavedResult(t *testing.T) {
 	service, _, _ := newRecoveryTestService(t)
-	message := core.Message{Channel: "cli", Conversation: "unsaved"}
+	message := core.Message{Channel: "telegram", Conversation: "unsaved", SourceMessageID: "telegram:7:10"}
 	job := service.Runtime.BeginJob(sessionKey(message), message.Channel, message.Conversation, "synthetic result")
 	path := service.History.Path(message.Channel, message.Conversation)
 	if err := os.MkdirAll(path, 0700); err != nil {
@@ -342,7 +342,7 @@ func TestConversationEmitterReportsUnsavedResult(t *testing.T) {
 	}
 	var got core.Event
 	service.wrapEmit(message, job, func(event core.Event) { got = event })(core.Event{Kind: core.EventFinal, Text: "must not claim saved success", Done: true})
-	if got.Kind != core.EventError || !got.Done || strings.Contains(got.Text, path) {
+	if got.Kind != core.EventError || !got.Done || got.RequestID != message.SourceMessageID || strings.Contains(got.Text, path) {
 		t.Fatalf("unsaved result was not an explicit content-free failure: %#v", got)
 	}
 	if current, exists := service.Runtime.JobForSession(sessionKey(message)); !exists || current.Execution != JobDegraded {

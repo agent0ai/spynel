@@ -48,6 +48,10 @@ func TestAppendOncePersistsEffectReceiptAcrossStores(t *testing.T) {
 	if added, err := store.AppendOnce("cli", "another", "worker:1:3", entry); err != nil || !added {
 		t.Fatal("receipt crossed conversation boundary")
 	}
+	got, found, err := New(root).Receipt("cli", "owned", "worker:1:3")
+	if err != nil || !found || got.ReceiptID != "worker:1:3" || got.Outcome != "terminal_assistant" || !got.IsContentExcerpt() {
+		t.Fatal("bounded committed receipt lookup failed", found, err)
+	}
 }
 
 func TestAppendOnceSerializesLocalConsumersAndFailsClosed(t *testing.T) {
@@ -89,6 +93,9 @@ func TestAppendOnceSerializesLocalConsumersAndFailsClosed(t *testing.T) {
 	}
 	if _, err := store.AppendOnce("cli", "owned", "worker:1:1", entry); !errors.Is(err, ErrRecoveryCorrupt) {
 		t.Fatalf("receipt hid later corruption: %v", err)
+	}
+	if _, _, err := store.Receipt("cli", "owned", "worker:1:1"); !errors.Is(err, ErrRecoveryCorrupt) {
+		t.Fatal("lookup hid corruption after a committed receipt", err)
 	}
 	if _, err := store.AppendOnce("cli", "owned", "worker:1:2", entry); !errors.Is(err, ErrRecoveryCorrupt) {
 		t.Fatalf("new receipt appended after corruption: %v", err)

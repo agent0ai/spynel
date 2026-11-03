@@ -19,6 +19,8 @@
 
 - Remote verbose progress uses one bounded editable preview per conversation, coalescing only assistant deltas and non-streamed continuing replies at most once per second with a 3000-rune tail. Run native progress sends outside intake/provider callbacks, with a three-second bound and live mode/authorization checks. Stop and join pending progress before final delivery; replace the preview with the first final chunk, then use ordinary chunk/media delivery. Failed/cancelled previews never suppress a final; native edit failure falls back to ordinary delivery with existing transport uncertainty. Count observed delta bytes even while progress is disabled and retain that position through timer flushes; continuing snapshots add only unseen final-item bytes, then reset the turn position. Generation cancellation releases previews; no replay or durable progress queue exists.
 
+- Telegram additionally consumes the application acceptance boundary and existing private request/response correlation to freeze previews across interventions. The transport freezes previews before user and outgoing notification boundaries and uses durable final-delivery receipts.
+
 ## Child DOX Index
 
 Direct child DOX files:

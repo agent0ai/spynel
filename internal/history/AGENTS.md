@@ -34,6 +34,9 @@
 
 - `SetConversationCancellation` syncs append-only private request/restoration receipts for the exact admitted execution/source set under the caller's native/election fence. Recovery resolves bounded per-source intent separately from terminal coverage: pending requests suppress redispatch, restoration clears only the matching intent, earlier cancellation and terminal coverage survive, and a branch baseline clears prior correlation. Corrupt or changed admission fails closed before provider control. Receipts and cancellation identities remain absent from context and committed events; intent is not confirmed interruption or provider release.
 
+- `Receipt` performs bounded-body, complete-file validation of a committed AppendOnce effect, including after a match, and rejects incomplete tails. Telegram uses correlation receipts for finalized native responses. Existing framework-origin history entries preserve their provenance and native message metadata; private delivery receipts remain excluded from public projections. Retention and clear remove these records normally.
+
+
 ## Child DOX Index
 
 No child DOX files.

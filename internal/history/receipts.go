@@ -24,6 +24,38 @@ func (s *Store) AppendOnce(channel, conversation, receipt string, entry Entry) (
 	return s.appendOnceLocked(channel, conversation, receipt, entry, nil)
 }
 
+// Receipt reads a committed effect without exposing private receipt identities
+// in rendered history. Validate the entire retained file, even after a match.
+func (s *Store) Receipt(channel, conversation, receipt string) (Entry, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateReceiptIdentity(receipt); err != nil {
+		return Entry{}, false, err
+	}
+	file, err := os.Open(s.Path(channel, conversation))
+	if os.IsNotExist(err) {
+		return Entry{}, false, nil
+	}
+	if err != nil {
+		return Entry{}, false, err
+	}
+	defer file.Close()
+	reader := bufio.NewReaderSize(file, historyReadChunk)
+	var found Entry
+	for {
+		entry, _, err := readProjectedEntry(reader, true)
+		if err == io.EOF {
+			return found, found.ReceiptID != "", nil
+		}
+		if err != nil {
+			return Entry{}, false, err
+		}
+		if entry.ReceiptID == receipt {
+			found = entry
+		}
+	}
+}
+
 func validateReceiptIdentity(receipt string) error {
 	if receipt == "" || len(receipt) > 256 || !utf8.ValidString(receipt) || strings.IndexFunc(receipt, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
 		return errors.New("invalid history receipt identity")

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -14,6 +15,54 @@ import (
 	"github.com/agent0ai/spynel/internal/harness"
 	"github.com/agent0ai/spynel/internal/history"
 )
+
+func TestWorkerCompletionEvidenceSurvivesControllerReplay(t *testing.T) {
+	for _, succeeded := range []bool{false, true} {
+		t.Run(map[bool]string{false: "interrupted", true: "completed"}[succeeded], func(t *testing.T) {
+			s, _, cfg := newRecoveryTestService(t)
+			c := &harness.WorkerConversation{Channel: "telegram", Conversation: "TG-7", ExecutionID: "execution", SourceMessageID: "source", Sources: []string{"source"}}
+			if _, err := s.History.Append(c.Channel, c.Conversation, history.Entry{Role: "user", Content: "synthetic", SourceMessageID: c.SourceMessageID}); err != nil {
+				t.Fatal(err)
+			}
+			answer := "authoritative answer"
+			delivery := harness.WorkerDelivery{WorkerID: strings.Repeat("a", 32), Sequence: 1, WorkerEvent: harness.WorkerEvent{Cursor: 1, Conversation: c,
+				Event: core.Event{Kind: core.EventFinal, Text: answer, FinalText: &answer, Done: true, Succeeded: succeeded}}}
+			data, err := json.Marshal(delivery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var retained harness.WorkerDelivery
+			if err := json.Unmarshal(data, &retained); err != nil {
+				t.Fatal(err)
+			}
+			for attempt := range 2 {
+				id, err := s.Runtime.TryBeginJobWithDetails("chat:telegram:TG-7", c.Channel, c.Conversation, "synthetic", JobDetails{Kind: "conversation", WorkID: c.ExecutionID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				err = s.ConsumeConversationDelivery(id, retained, func(actual harness.WorkerDelivery) error {
+					if actual.Event.Succeeded != succeeded || actual.Event.Text != answer || actual.Event.FinalText == nil || *actual.Event.FinalText != answer {
+						t.Fatal("delivery changed completion evidence or canonical answer")
+					}
+					if attempt == 0 {
+						return errors.New("synthetic delivery unavailable")
+					}
+					return nil
+				})
+				if (err != nil) != (attempt == 0) {
+					t.Fatal("unexpected delivery result", err)
+				}
+				if err := s.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if attempt == 0 {
+					s = New(cfg, newServiceHarness())
+					defer s.Close()
+				}
+			}
+		})
+	}
+}
 
 func TestWorkerConversationRechecksRemoteAdmissionPolicy(t *testing.T) {
 	for _, channel := range []string{"telegram", "whatsapp"} {
@@ -284,6 +333,9 @@ func TestWorkerConversationSettlementSurvivesControllerReplacement(t *testing.T)
 	if err := s.ConsumeConversationDelivery(id, delivery, func(actual harness.WorkerDelivery) error {
 		if actual.ReceiptID() != delivery.ReceiptID() {
 			t.Fatal("downstream lost stable delivery identity")
+		}
+		if actual.Event.RequestID != metadata.SourceMessageID || actual.Event.ResponseID != delivery.ReceiptID() {
+			t.Fatal("replay lost immutable request/response presentation identity")
 		}
 		delivered++
 		return nil

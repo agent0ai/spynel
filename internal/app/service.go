@@ -678,6 +678,9 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 			return errors.New("there is no active execution for this conversation")
 		}
 	}
+	if message.Channel == "telegram" && emit != nil {
+		emit(core.Event{Kind: core.EventAccepted, RequestID: message.SourceMessageID, Local: true})
+	}
 	recorded := false
 	var recordErr error
 	recordUser := func() error {
@@ -725,6 +728,9 @@ func (s *Service) Handle(ctx context.Context, message core.Message, emit core.Em
 			}
 			if output.Message != "" {
 				return s.localReply(message, output.Message, emit)
+			}
+			if message.Channel == "telegram" && emit != nil {
+				emit(core.Event{Kind: core.EventStatus, RequestID: message.SourceMessageID, Local: true, Done: true})
 			}
 			return nil
 		}
@@ -956,7 +962,7 @@ func (s *Service) wrapEmit(message core.Message, jobID int, downstream core.Emit
 			s.Runtime.LogEvent("error", "history", "conversation_settlement_failed", fmt.Sprintf("Persist conversation result failed (%T)", err))
 			s.Runtime.UpdateJob(jobID, core.ExecutionStatus{State: string(JobDegraded), Detail: "Conversation result could not be saved"})
 			if downstream != nil {
-				downstream(core.Event{Kind: core.EventError, Text: "Conversation result could not be saved; execution settlement remains pending", Done: true})
+				downstream(core.Event{Kind: core.EventError, RequestID: message.SourceMessageID, Text: "Conversation result could not be saved; execution settlement remains pending", Done: true})
 			}
 		}
 	}
@@ -991,14 +997,12 @@ func (s *Service) conversationEventConsumer(message core.Message, jobID int, dow
 		}
 		terminal := event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError)
 		receipt := fmt.Sprintf("conversation:%s:%d", consumerID, cursor+1)
+		event.RequestID = message.SourceMessageID
 		if worker != nil {
 			receipt = worker.ReceiptID()
-			if message.Channel == "tui" {
-				event.RequestID = message.SourceMessageID
-				if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
-					event.ResponseID = receipt
-				}
-			}
+		}
+		if event.Done && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
+			event.ResponseID = receipt
 		}
 		key := sessionKey(message)
 		// A queued request can be cancelled while the shared provider turn is
@@ -1314,7 +1318,7 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 			return s.localReply(message, "Cannot clear this conversation: "+err.Error(), emit)
 		}
 		if emit != nil {
-			emit(core.Event{Kind: core.EventFinal, Text: "Conversation history and harness thread cleared.", Clear: true, Done: true, Local: true})
+			emit(core.Event{Kind: core.EventFinal, RequestID: message.SourceMessageID, Text: "Conversation history and harness thread cleared.", Clear: true, Done: true, Local: true})
 		}
 		return nil
 	case "stop":
@@ -2201,7 +2205,7 @@ func (s *Service) localReply(message core.Message, text string, emit core.Emit) 
 		return err
 	}
 	if emit != nil {
-		emit(core.Event{Kind: core.EventFinal, Text: text, Done: true, Local: true, Verbose: s.Settings.Snapshot().Channels.Verbose})
+		emit(core.Event{Kind: core.EventFinal, RequestID: message.SourceMessageID, Text: text, Done: true, Local: true, Verbose: s.Settings.Snapshot().Channels.Verbose})
 	}
 	return nil
 }

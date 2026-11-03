@@ -1378,6 +1378,7 @@ func managedChannels(service *app.Service, speech media.Transcriber) []channel.M
 			},
 			Build: func(cfg config.Config) (channel.Channel, error) {
 				bot := telegram.NewWithIdentityStore(cfg.Channels.Telegram, cfg.TelegramToken(), cfg.StatePath("runtime", "telegram-identities.json"))
+				bot.SetHistory(service.History)
 				bot.SetVerboseSource(func() string { return service.Settings.Snapshot().Channels.Verbose })
 				bot.SetAllowedUsersSource(func() []string {
 					current := service.Settings.Snapshot().Channels.Telegram

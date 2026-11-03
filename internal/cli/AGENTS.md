@@ -74,6 +74,8 @@
 
 - Native registrations advertise participation in the installation worker-launch gate as registry-only metadata. Unknown/incompatible replacement refuses an older application without that capability, even if it currently has no worker, so it cannot launch an unfenced predecessor during publication. Known-compatible restart behavior remains unchanged.
 
+- The managed Telegram builder supplies the application-owned history store for ordinary streamed-response delivery receipts, in addition to live verbosity and authorization. This adds no startup, provider or notification-worker dispatch.
+
 ## Child DOX Index
 
 No child DOX files.

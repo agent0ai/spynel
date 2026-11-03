@@ -544,6 +544,17 @@ func TestTelegramTypingRefreshesFromArrivalThroughVoiceTranscriptionAndAgentTurn
 	agentRelease := make(chan struct{})
 	bot := New(config.Telegram{AllowedUsers: []string{"7"}}, "test")
 	bot.baseURL = server.URL
+	// Count initiated activity, not a cancelled request's delayed server arrival.
+	bot.client.Transport = telegramRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(request.URL.Path, "/sendChatAction") {
+			if err := request.Context().Err(); err != nil {
+				return nil, err
+			}
+			actions.Add(1)
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true}`))}, nil
+		}
+		return http.DefaultTransport.RoundTrip(request)
+	})
 	bot.activity = newTelegramActivity(bot, 10*time.Millisecond)
 	bot.SetMedia(&media.Store{Directory: filepath.Join(t.TempDir(), "attachments"), MaxBytes: 1024}, blockingTelegramTranscriber{
 		entered: transcriptionEntered, release: transcriptionRelease,

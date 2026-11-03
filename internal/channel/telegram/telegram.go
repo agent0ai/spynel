@@ -24,12 +24,16 @@ import (
 	"github.com/agent0ai/spynel/internal/channel"
 	"github.com/agent0ai/spynel/internal/config"
 	"github.com/agent0ai/spynel/internal/core"
+	"github.com/agent0ai/spynel/internal/history"
 	markdownfmt "github.com/agent0ai/spynel/internal/markdown"
 	"github.com/agent0ai/spynel/internal/media"
 )
 
 type Bot struct {
 	progress          channel.ProgressStreams
+	responseMu        sync.Mutex
+	responses         map[string]*responsePresentation
+	history           *history.Store
 	config            config.Telegram
 	token             string
 	client            *http.Client
@@ -81,6 +85,8 @@ func (b *Bot) Name() string { return "telegram" }
 
 func (b *Bot) SetVerboseSource(source func() string) { b.progress.Mode = source }
 
+func (b *Bot) SetHistory(store *history.Store) { b.history = store }
+
 func (b *Bot) SetStatusReporter(report channel.StatusReporter) { b.report = report }
 
 func (b *Bot) SetNoticeReporter(report channel.NoticeReporter) { b.notice = report }
@@ -130,6 +136,18 @@ func (b *Bot) requireRuntimeAuthorization() error {
 }
 
 func (b *Bot) Deliver(ctx context.Context, conversation, eventID, text string, attachments []core.OutboundAttachment) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := b.requireRuntimeAuthorization(); err != nil {
+		return err
+	}
+	if _, err := b.deliveryChatID(conversation); err != nil {
+		return err
+	}
+	r, unlock := b.lockResponse(ctx, conversation, true)
+	defer unlock()
+	b.freezePreview(conversation, r)
 	return b.deliver(ctx, conversation, eventID, text, attachments, "")
 }
 
@@ -198,24 +216,7 @@ func (b *Bot) DeliverEvent(ctx context.Context, conversation, eventID string, ev
 		b.activityMu.Unlock()
 		return nil
 	}
-	if event.Done && !event.Continues && (event.Kind == core.EventFinal || event.Kind == core.EventError) {
-		text := event.Text
-		if event.Kind == core.EventFinal && event.FinalText != nil {
-			text = *event.FinalText
-		}
-		if event.Kind == core.EventError {
-			text = channel.ErrorResponse(text)
-		}
-		previewID := b.progress.Stop(conversation)
-		return b.deliver(ctx, conversation, eventID, text, event.Attachments, previewID)
-	}
-	b.progress.Push(ctx, conversation, event, func(ctx context.Context, id, text string) (string, error) {
-		if _, err := b.deliveryChatID(conversation); err != nil {
-			return "", err
-		}
-		return b.sendProgress(ctx, chatID, id, text, 0)
-	})
-	return nil
+	return b.presentEvent(ctx, conversation, chatID, eventID, event, 0)
 }
 
 func (b *Bot) deliveryChatID(conversation string) (string, error) {
@@ -343,7 +344,7 @@ func (b *Bot) runPolling(ctx context.Context, handler channel.Handler) error {
 				offset = update.UpdateID + 1
 			}
 			if !b.enqueueUpdate(ctx, messages, commands, update) {
-				_ = b.send(ctx, strconv.FormatInt(update.Message.Chat.ID, 10), channel.ErrorResponse("Incoming queue is full; please retry this message."), update.Message.MessageID)
+				_ = b.sendIndependent(ctx, update.Message, channel.ErrorResponse("Incoming queue is full; please retry this message."))
 			}
 			select {
 			case <-b.authLost:
@@ -519,7 +520,7 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 		return
 	}
 	if err != nil {
-		_ = b.send(ctx, chatID, channel.ErrorResponse("Spynel attachment error: "+err.Error()), message.MessageID)
+		_ = b.sendIndependent(ctx, message, channel.ErrorResponse("Spynel attachment error: "+err.Error()))
 		setActivity(false)
 		return
 	}
@@ -534,8 +535,8 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 		}
 		b.notice(channel.Notice{Channel: b.Name(), Sender: b.sender(message.From), Text: preview})
 	}
-	replyID := message.MessageID
 	progressKey := b.conversationID(message)
+	var acceptedRequest string
 	var terminalDelivered bool
 	var emitMu sync.Mutex
 	emit := func(event core.Event) {
@@ -557,39 +558,19 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 		if terminalDelivered {
 			return
 		}
+		if event.Kind == core.EventAccepted {
+			acceptedRequest = event.RequestID
+		}
 		if !event.Done || event.Continues || (event.Kind != core.EventFinal && event.Kind != core.EventError) {
-			b.progress.Push(ctx, progressKey, event, func(ctx context.Context, id, text string) (string, error) {
-				if !b.allowed(message.From) {
-					return "", errTelegramRuntimeAuthorization
-				}
-				return b.sendProgress(ctx, chatID, id, text, message.MessageID)
-			})
+			_ = b.presentEvent(ctx, progressKey, chatID, event.ResponseID, event, message.MessageID)
 			return
 		}
 		// Terminal events are a fallback cleanup boundary for handlers that do
 		// not yet emit the explicit activity-off event. Stop before delivery.
 		setActivity(false)
 		terminalDelivered = true
-		previewID := ""
-		if !event.Local {
-			previewID = b.progress.Stop(progressKey)
-		}
-		text := event.Text
-		if event.Kind == core.EventFinal && event.FinalText != nil {
-			text = *event.FinalText
-		}
-		if event.Kind == core.EventError {
-			text = channel.ErrorResponse(text)
-		}
-		if text != "" {
-			_, _ = b.sendWithIDs(ctx, chatID, text, replyID, false, previewID)
-			replyID = 0
-		}
-		for _, attachment := range event.Attachments {
-			if err := b.sendAttachment(ctx, chatID, attachment, replyID); err != nil {
-				_ = b.send(ctx, chatID, channel.ErrorResponse("Spynel attachment delivery error: "+err.Error()), message.MessageID)
-			}
-			replyID = 0
+		if err := b.presentEvent(ctx, progressKey, chatID, event.ResponseID, event, message.MessageID); err != nil {
+			_ = b.sendIndependent(ctx, message, channel.ErrorResponse("Spynel response delivery error: "+err.Error()))
 		}
 	}
 	if ctx.Err() != nil || b.requireRuntimeAuthorization() != nil || !b.allowed(message.From) {
@@ -608,11 +589,8 @@ func (b *Bot) handle(ctx context.Context, handler channel.Handler, message *tele
 			return
 		}
 		terminalDelivered = true
-		if !core.IsCommand(b.Name(), rawText) {
-			b.progress.Stop(progressKey)
-		}
 		setActivity(false)
-		_ = b.send(ctx, chatID, channel.ErrorResponse(err.Error()), message.MessageID)
+		_ = b.presentEvent(ctx, progressKey, chatID, "", core.Event{Kind: core.EventError, RequestID: acceptedRequest, Text: err.Error(), Done: true, Local: true}, message.MessageID)
 		return
 	}
 	activityMu.Lock()
@@ -683,7 +661,7 @@ func (b *Bot) welcome(ctx context.Context, message *telegramMessage) {
 			welcome = "Welcome, {name}!"
 		}
 		name := firstNonempty(member.FirstName, b.sender(member))
-		_ = b.send(ctx, strconv.FormatInt(message.Chat.ID, 10), strings.ReplaceAll(welcome, "{name}", name), message.MessageID)
+		_ = b.sendIndependent(ctx, message, strings.ReplaceAll(welcome, "{name}", name))
 	}
 }
 
@@ -824,8 +802,15 @@ func (b *Bot) updates(ctx context.Context, offset int64) ([]telegramUpdate, erro
 	return envelope.Result, nil
 }
 
-func (b *Bot) send(ctx context.Context, chatID, text string, replyTo int64) error {
-	_, err := b.sendWithIDs(ctx, chatID, text, replyTo, false)
+func (b *Bot) sendIndependent(ctx context.Context, message *telegramMessage, text string) error {
+	if ctx.Err() != nil || b.requireRuntimeAuthorization() != nil || !b.allowed(message.From) {
+		return errTelegramRuntimeAuthorization
+	}
+	conversation := b.conversationID(message)
+	r, unlock := b.lockResponse(ctx, conversation, false)
+	defer unlock()
+	b.freezePreview(conversation, r)
+	_, err := b.sendWithIDs(ctx, strconv.FormatInt(message.Chat.ID, 10), text, message.MessageID, false)
 	return err
 }
 

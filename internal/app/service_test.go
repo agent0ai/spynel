@@ -73,6 +73,10 @@ type propertyServiceHarness struct {
 	modelsErr error
 }
 
+type emptyCatalogHarness struct{ *serviceHarness }
+
+func (*emptyCatalogHarness) Models(context.Context) ([]harness.Model, error) { return nil, nil }
+
 func (r *propertyServiceHarness) Models(context.Context) ([]harness.Model, error) {
 	if r.modelsErr != nil {
 		return nil, r.modelsErr
@@ -1855,6 +1859,12 @@ func TestTelegramStartRepliesWithoutRegisteringACommand(t *testing.T) {
 		if err := service.Handle(context.Background(), message, func(event core.Event) { events = append(events, event) }); err != nil {
 			t.Fatal(err)
 		}
+		if test.channel == "telegram" {
+			if len(events) == 0 || events[0].Kind != core.EventAccepted || events[0].RequestID == "" {
+				t.Fatal("missing accepted input boundary")
+			}
+			events = events[1:]
+		}
 		if len(events) != 1 || events[0].Kind != core.EventFinal || !events[0].Done || !events[0].Local || events[0].Text != test.want {
 			t.Fatalf("%s %q response = %#v", test.channel, test.text, events)
 		}
@@ -2919,8 +2929,42 @@ func TestHarnessAndModelCommandsUseSharedSettings(t *testing.T) {
 	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "TG-7", Text: "/harness"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(response.Text, "claude-code") || !strings.Contains(response.Text, "codex") || !strings.Contains(response.Text, "/harness <name>") {
+	if !strings.Contains(response.Text, "Current harness: `codex`") || !strings.Contains(response.Text, "claude-code") || !strings.Contains(response.Text, "/harness <name>") {
 		t.Fatalf("remote /harness response = %#v", response)
+	}
+}
+
+func TestModelCommandShowsCurrentSelectionWithoutDiscovery(t *testing.T) {
+	for _, test := range []struct {
+		name, model, want, detail string
+		target                    harness.Harness
+	}{
+		{"catalog", "sonnet", "sonnet", "`opus`", newServiceHarness()},
+		{"custom", "custom-model", "custom-model", "`opus`", newServiceHarness()},
+		{"default", "", "harness default", "`opus`", newServiceHarness()},
+		{"unavailable", "custom-model", "custom-model", "Cannot load models", &propertyServiceHarness{serviceHarness: newServiceHarness(), modelsErr: errors.New("unavailable")}},
+		{"empty", "custom-model", "custom-model", "no available models", &emptyCatalogHarness{newServiceHarness()}},
+		{"no provider", "custom-model", "custom-model", "does not provide a model catalog", nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := workspace.Init(root, false); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := config.Load(config.PathForRoot(root))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Harness.Model = test.model
+			service := New(cfg, test.target)
+			var response core.Event
+			if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "TG-7", Text: "/model"}, func(event core.Event) { response = event }); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(response.Text, "Current model: `"+test.want+"`") || !strings.Contains(response.Text, test.detail) {
+				t.Fatalf("/model response = %q", response.Text)
+			}
+		})
 	}
 }
 
@@ -4152,7 +4196,7 @@ func TestClearCommandRemovesDurableConversationHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Kind != core.EventFinal || !response.Clear || response.Text == "" {
+	if response.Kind != core.EventFinal || !response.Clear || response.Text == "" || response.RequestID == "" {
 		t.Fatalf("unexpected clear response %#v", response)
 	}
 	entries, _, err := service.History.Entries("tui", "local")

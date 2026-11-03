@@ -89,6 +89,55 @@ func TestConcurrentMessageIdentityDispatchesOnce(t *testing.T) {
 	}
 }
 
+func TestTelegramAdmissionBoundariesKeepExecutionAndSourceCorrelation(t *testing.T) {
+	s, _, _ := newRecoveryTestService(t)
+	target := newHeldServiceHarness()
+	s.Harness = target
+	s.Orchestrator.Harness = target
+	var boundaries []string
+	var results []core.Event
+	emit := func(event core.Event) {
+		if event.Kind == core.EventAccepted {
+			boundaries = append(boundaries, event.RequestID)
+		} else if event.Kind == core.EventFinal {
+			results = append(results, event)
+		}
+	}
+	for _, source := range []string{"telegram:7:10", "telegram:7:11", "telegram:7:12"} {
+		message := core.Message{Channel: "telegram", Conversation: "TG-7", SourceMessageID: source, Text: "keep earlier work and respond"}
+		if err := s.Handle(t.Context(), message, emit); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Handle(t.Context(), message, emit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key := "chat:telegram:TG-7"
+	if strings.Join(boundaries, ",") != "telegram:7:10,telegram:7:11,telegram:7:12" || len(target.prompts[key]) != 3 || s.Runtime.Status().Jobs != 1 {
+		t.Fatal("duplicate boundary, extra model call, or abandoned execution", boundaries)
+	}
+	target.finish(key)
+	if len(results) != 1 || results[0].RequestID != "telegram:7:12" || results[0].ResponseID == "" || results[0].Text != "finished" {
+		t.Fatal("final lost current source or response identity", results)
+	}
+	entries, _, err := s.History.Entries("telegram", "TG-7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	answers := 0
+	for _, entry := range entries {
+		if entry.Role == "assistant" {
+			answers++
+			if entry.Content != "finished" || len(entry.Covers) != 3 {
+				t.Fatal("canonical answer or earlier source coverage lost", entry)
+			}
+		}
+	}
+	if answers != 1 || s.Runtime.Status().Jobs != 0 {
+		t.Fatal("execution was not settled exactly once")
+	}
+}
+
 func TestLocalMessageValidationAndOperationalLogPrivacy(t *testing.T) {
 	for _, name := range []string{"../escape", "a/b", "a b", "name_", strings.Repeat("a", 121)} {
 		if ValidateConversationName(name) == nil {

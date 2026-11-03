@@ -25,6 +25,7 @@ type ProgressStreams struct {
 type progressStream struct {
 	mu         sync.Mutex
 	text, id   string
+	sentText   string
 	dirty      bool
 	deltaBytes int
 	cancel     context.CancelFunc
@@ -134,6 +135,7 @@ func (p *ProgressStreams) run(ctx context.Context, key string, stream *progressS
 		if err == nil && nextID != "" {
 			stream.mu.Lock()
 			stream.id = nextID
+			stream.sentText = text
 			stream.mu.Unlock()
 		}
 	}
@@ -152,16 +154,22 @@ func UnstreamedFinal(text string, final *string, deltaBytes int) string {
 // Stop fences queued/in-flight progress before the terminal's independent send.
 // A failed or cancelled preview never prevents the ordinary final delivery.
 func (p *ProgressStreams) Stop(key string) string {
+	id, _ := p.StopWithText(key)
+	return id
+}
+
+// StopWithText also returns the last text confirmed in the native preview.
+func (p *ProgressStreams) StopWithText(key string) (string, string) {
 	p.mu.Lock()
 	stream := p.streams[key]
 	delete(p.streams, key)
 	p.mu.Unlock()
 	if stream == nil {
-		return ""
+		return "", ""
 	}
 	stream.cancel()
 	<-stream.done
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
-	return stream.id
+	return stream.id, stream.sentText
 }

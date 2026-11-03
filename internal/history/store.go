@@ -29,6 +29,8 @@ type Entry struct {
 	At                time.Time `json:"at"`
 	Role              string    `json:"role"`
 	Sender            string    `json:"sender,omitempty"`
+	Provenance        string    `json:"provenance,omitempty"`
+	NativeMessageID   string    `json:"native_message_id,omitempty"`
 	ForwardedFrom     string    `json:"forwarded_from,omitempty"`
 	ReplyTo           string    `json:"reply_to,omitempty"`
 	Content           string    `json:"content"`
@@ -498,6 +500,9 @@ func FormatEntry(entry Entry) string {
 		return reply + " " + entry.Content
 	}
 	label := entry.Role
+	if entry.Provenance == "framework" {
+		label += " [framework]"
+	}
 	if entry.Sender != "" {
 		sender := entry.Sender
 		if entry.ForwardedFrom != "" {
