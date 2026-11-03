@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/resources/banner.webp" alt="Spynel — Simplicity. Leverage. Quality." width="100%">
+  <a href="https://youtu.be/-dq5PkLdAZ0" title="Spynel - manage ALL of your AI work with one chat."><img src=".github/resources/banner.webp" alt="Watch: Spynel - manage ALL of your AI work with one chat." width="100%"></a>
 </p>
 
 <p align="center">
