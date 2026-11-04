@@ -6,7 +6,7 @@
 
 ## Local Contracts
 
-- Own the canonical slash-command catalog and parsing shared by application dispatch and remote intake classification, including Telegram mentions and existing aliases. Recognition is a scheduling hint only; transport authorization and application effects retain their existing owners.
+- Own the canonical slash-command catalog and parsing shared by application dispatch and remote intake classification, including Telegram mentions and existing aliases such as `/models` for `/model`. Recognition is a scheduling hint only; transport authorization and application effects retain their existing owners.
 
 - Keep types provider- and transport-neutral; implementation dependencies belong in consuming packages.
 - Preserve bounded and optional serialization semantics, including reply references and attachment directives, without embedding secrets.

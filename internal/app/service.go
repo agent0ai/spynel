@@ -1271,7 +1271,7 @@ func (s *Service) handleCommand(ctx context.Context, message core.Message, emit 
 		return s.configurationCommand(message, "whatsapp", remainder, emit)
 	case "harness":
 		return s.harnessCommand(message, remainder, emit)
-	case "model":
+	case "model", "models":
 		return s.modelCommand(ctx, message, remainder, emit)
 	case "effort":
 		return s.modelPropertyCommand(ctx, message, "effort", remainder, emit)

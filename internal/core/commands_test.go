@@ -25,6 +25,8 @@ func TestRemoteCommandRecognition(t *testing.T) {
 		{"telegram", "/@spy", "", "", false},
 		{"telegram", "/todo request", "todo", "request", true},
 		{"whatsapp", "/logs", "logs", "", true},
+		{"telegram", "/MODELS@spy custom-model", "models", "custom-model", true},
+		{"whatsapp", "/models", "models", "", true},
 	} {
 		name, args := ParseCommand(test.channel, test.text)
 		if name != test.name || args != test.args || IsCommand(test.channel, test.text) != test.known {

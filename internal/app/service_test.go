@@ -2957,12 +2957,14 @@ func TestModelCommandShowsCurrentSelectionWithoutDiscovery(t *testing.T) {
 			}
 			cfg.Harness.Model = test.model
 			service := New(cfg, test.target)
-			var response core.Event
-			if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "TG-7", Text: "/model"}, func(event core.Event) { response = event }); err != nil {
-				t.Fatal(err)
-			}
-			if !strings.Contains(response.Text, "Current model: `"+test.want+"`") || !strings.Contains(response.Text, test.detail) {
-				t.Fatalf("/model response = %q", response.Text)
+			for _, command := range []string{"/model", "/models", "/models@spy"} {
+				var response core.Event
+				if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "TG-7", Text: command}, func(event core.Event) { response = event }); err != nil {
+					t.Fatal(err)
+				}
+				if !response.Local || !strings.Contains(response.Text, "Current model: `"+test.want+"`") || !strings.Contains(response.Text, test.detail) {
+					t.Fatalf("%s response = %#v", command, response)
+				}
 			}
 		})
 	}
@@ -2996,7 +2998,7 @@ func TestModelCommandPersistsDuringActiveHarnessTurnForNextDispatch(t *testing.T
 		t.Fatal(err)
 	}
 	var response core.Event
-	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "TG-7", Text: "/model gpt-5.6-sol"}, func(event core.Event) { response = event }); err != nil {
+	if err := service.Handle(context.Background(), core.Message{Channel: "telegram", Conversation: "TG-7", Text: "/models gpt-5.6-sol"}, func(event core.Event) { response = event }); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(response.Text, "Saved `harness.model` = `gpt-5.6-sol`") || !strings.Contains(response.Text, "subsequent harness turns") {

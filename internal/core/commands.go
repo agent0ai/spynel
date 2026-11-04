@@ -26,7 +26,7 @@ func IsCommand(channel, text string) bool {
 	switch name {
 	case "":
 		return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(text), "/")) == ""
-	case "commands", "logs", "todo", "extensions", "exit":
+	case "commands", "logs", "models", "todo", "extensions", "exit":
 		return true
 	case "start":
 		return channel == "telegram"

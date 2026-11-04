@@ -355,3 +355,35 @@ func TestNotificationContextDoesNotOwnConcurrentStream(t *testing.T) {
 		}
 	})
 }
+
+func TestRapidBoundariesPreserveTerminalErrorsAndCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		event core.Event
+		want  string
+	}{
+		{"error", core.Event{Kind: core.EventError, Text: "provider failed", Done: true}, "Error provider failed"},
+		{"cancelled", core.Event{Kind: core.EventFinal, Text: "Cancelled", Done: true}, "Cancelled"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newPresentationFixture(t)
+				f.event(t, "TG-7", "telegram:7:10", "", core.Event{Kind: core.EventAccepted})
+				f.event(t, "TG-7", "telegram:7:10", "", core.Event{Kind: core.EventDelta, Text: "earlier"})
+				presentationTick()
+				f.event(t, "TG-7", "telegram:7:11", "", core.Event{Kind: core.EventAccepted})
+				f.event(t, "TG-7", "telegram:7:12", "", core.Event{Kind: core.EventAccepted})
+				f.event(t, "TG-7", "telegram:7:10", "", core.Event{Kind: core.EventDelta, Text: "later"})
+				presentationTick()
+				f.event(t, "TG-7", "telegram:7:10", "terminal", test.event)
+				calls := f.snapshot()
+				if len(calls) != 3 || calls[0].text != "earlier" || calls[1].method != "sendMessage" || calls[1].reply != 12 || calls[1].id == calls[0].id || calls[2].method != "editMessageText" || calls[2].id != calls[1].id || calls[2].text != test.want {
+					t.Fatalf("terminal crossed a boundary or added a notice: %#v", calls)
+				}
+				if len(f.bot.responses) != 0 {
+					t.Fatal("terminal retained presentation state")
+				}
+			})
+		})
+	}
+}
