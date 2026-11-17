@@ -68,7 +68,7 @@ func TestWorkerSettingsPersistenceConflictRetryAndRestore(t *testing.T) {
 	previous, runtime := workerSettingsConfig(t)
 	before, _ := previous.Encode()
 	next := previous
-	if _, err := SetSettings(&next, map[string]string{"harness.model": "new", "orchestrator.interval_seconds": "19"}); err != nil {
+	if _, err := SetSettings(&next, map[string]string{"harness.model": "new", "orchestrator.interval_seconds": "19", "orchestrator.notification_timeout_seconds": "600"}); err != nil {
 		t.Fatal(err)
 	}
 	encoded, _ := next.Encode()
@@ -85,7 +85,7 @@ func TestWorkerSettingsPersistenceConflictRetryAndRestore(t *testing.T) {
 	if _, err := store.Reload(before); err == nil || store.Snapshot().Harness.Model != previous.Harness.Model {
 		t.Fatal("stale expected configuration was published")
 	}
-	if saved, err := store.Reload(encoded); err != nil || saved.Harness.Model != "new" {
+	if saved, err := store.Reload(encoded); err != nil || saved.Harness.Model != "new" || saved.Orchestrator.NotificationTimeoutSeconds != 600 {
 		t.Fatal("committed settings could not be published", err)
 	}
 	retry, err := PrepareWorkerSettings(previous.Root, target, target, change)

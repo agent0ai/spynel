@@ -27,6 +27,9 @@ func (m *Manager) notificationTimeout() time.Duration {
 	if m.notificationAgentTimeout > 0 {
 		return m.notificationAgentTimeout
 	}
+	if seconds := m.runtimeSnapshot().Orchestrator.NotificationTimeoutSeconds; seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
 	return 2 * time.Minute
 }
 

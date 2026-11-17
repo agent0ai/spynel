@@ -72,6 +72,7 @@ orchestrator:
   semantic_heartbeat_minutes: 15
   # off, decide (agent sends or records a skip once), or always (agent sends unless safely impossible).
   task_notifications: decide
+  notification_timeout_seconds: 120
   max_parallel: 4
 
 extensions:

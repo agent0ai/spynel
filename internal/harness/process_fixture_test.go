@@ -315,7 +315,7 @@ func runHarnessFixture(mode string) int {
 	switch mode {
 	case "codex-lifecycle", "codex-interrupt", "codex-worker", "codex-followup-refusal", "codex-models", "codex-init-missing-method", "codex-resume-missing-method", "codex-resume-error", "codex-resume-no-rollout", "codex-stream-overflow", "codex-thread-changed-field", "codex-terminal-changed-status":
 		return runCodexFixture(mode)
-	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero":
+	case "claude-stream", "claude-steer", "claude-text", "claude-interrupt", "claude-help-missing-flag", "claude-init-changed-event", "claude-terminal-error", "claude-result-nonzero", "claude-pre-init-error", "claude-pre-init-hang", "claude-stderr-error", "claude-hook-init":
 		return runClaudeFixture(mode)
 	case "pi-lifecycle", "pi-steer", "pi-interrupt", "pi-state-missing-session", "pi-model-capabilities", "pi-off-default":
 		return runPiFixture(mode)
@@ -660,7 +660,11 @@ func runCodexFixture(mode string) int {
 					write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": threadID, "turnId": turnID, "delta": "hello "}})
 					time.Sleep(40 * time.Millisecond)
 					write(map[string]any{"method": "item/agentMessage/delta", "params": map[string]any{"threadId": threadID, "turnId": turnID, "delta": "world"}})
-					write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": threadID, "turn": map[string]any{"id": turnID, "status": "completed"}}})
+					status := os.Getenv("SPYNEL_TEST_CODEX_TERMINAL_STATUS")
+					if status == "" {
+						status = "completed"
+					}
+					write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": threadID, "turn": map[string]any{"id": turnID, "status": status}}})
 				}()
 			}
 		case "turn/steer":
@@ -698,6 +702,22 @@ func runCodexFixture(mode string) int {
 			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{}})
 			write(map[string]any{"method": "turn/completed", "params": map[string]any{"threadId": "thr_stop", "turn": map[string]any{"id": "turn_stop", "status": "interrupted"}}})
+		case "thread/unsubscribe":
+			if os.Getenv("SPYNEL_TEST_CODEX_RELEASE_ERROR") != "" {
+				write(map[string]any{"id": message.ID, "error": map[string]any{"code": -32000, "message": "synthetic cleanup failure"}})
+				continue
+			}
+			go func(id int) {
+				if release := os.Getenv("SPYNEL_TEST_CODEX_DELAY_RELEASE"); release != "" {
+					for {
+						if _, err := os.Stat(release); err == nil {
+							break
+						}
+						time.Sleep(time.Millisecond)
+					}
+				}
+				write(map[string]any{"id": id, "result": map[string]any{"status": "unsubscribed"}})
+			}(message.ID)
 		case "model/list":
 			if mode == "codex-stream-overflow" {
 				write(map[string]any{"method": "item/completed", "params": map[string]any{"threadId": "fixture-thread", "turnId": "fixture-turn", "item": map[string]any{"type": "commandExecution", "aggregatedOutput": strings.Repeat("x", 17*1024*1024)}}})
@@ -735,6 +755,18 @@ func runClaudeFixture(mode string) int {
 	}
 	appendFixtureLog(map[string]any{"kind": "input", "text": scanner.Text()})
 	session := "claude-session"
+	if mode == "claude-stderr-error" {
+		_, _ = fmt.Fprintln(os.Stderr, "synthetic stale session: No conversation found; api_key=synthetic-secret Authorization: Bearer synthetic-bearer")
+		return 1
+	}
+	if mode == "claude-pre-init-error" || mode == "claude-pre-init-hang" {
+		write(map[string]any{"type": "result", "subtype": "error_during_execution", "is_error": true, "result": "synthetic stale session", "session_id": "unvalidated"})
+		_, _ = fmt.Fprintln(os.Stderr, "No conversation found; api_key=synthetic-secret Authorization: Bearer synthetic-bearer")
+		if mode == "claude-pre-init-hang" {
+			time.Sleep(time.Minute)
+		}
+		return 1
+	}
 	if mode == "claude-steer" {
 		session = "steered-session"
 	} else if mode == "claude-interrupt" {
@@ -743,6 +775,10 @@ func runClaudeFixture(mode string) int {
 	if mode == "claude-init-changed-event" {
 		write(map[string]any{"type": "system", "subtype": "startup", "session_id": session})
 	} else {
+		if mode == "claude-hook-init" {
+			write(map[string]any{"type": "system", "subtype": "hook_started", "session_id": session})
+			write(map[string]any{"type": "system", "subtype": "hook_response", "session_id": session})
+		}
 		write(map[string]any{"type": "system", "subtype": "init", "session_id": session})
 	}
 	write(map[string]any{"type": "stream_event", "session_id": session, "event": map[string]any{"type": "message_start"}})

@@ -22,6 +22,8 @@ other oversized messages, which still require investigation using that error.
 Transport failure also closes stdin so a native child behind the npm launcher
 receives EOF instead of retaining an unreadable connection and thread ownership.
 
+On 2026-11-17, installed Codex 0.169.0 generated non-experimental schemas for `thread/unsubscribe` and its `unsubscribed`, `notLoaded`, and `notSubscribed` results. Spynel releases completed idle threads off the protocol reader with a bounded per-key call, keeps the resumable ID and resumes before its next turn. Synthetic process tests cover cleanup failures, follow-up races, reset and teardown. They do not establish live MCP child shutdown timing, memory savings or reported OOM causality. Claude pre-init error results now retain the native cause and bounded, redacted stderr without accepting an uninitialized session.
+
 Any future authenticated or native-provider run must follow the separately
 reviewed [provider-canary threat model and authorization plan](provider-canary-threat-model.md).
 That plan is a gate, not evidence that a canary has run.

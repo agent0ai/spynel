@@ -452,7 +452,7 @@ func TestReviewQueueWaitsForImplementationLeaseReconciliation(t *testing.T) {
 	fake := newFakeRecipient()
 	manager := New(cfg, fake, extensions.Runner{Directory: filepath.Join(root, "missing")})
 	implementation := Lease{
-		ID: leaseID(route.Name+":"+phaseTaskImplementation, documentID(document)), ClaimID: "implementation",
+		ID: leaseID(route.Name+":"+phaseTaskImplementation, documentID(document)), ClaimID: "implementation", WorkID: documentID(document),
 		DocumentType: "task", OwnerID: manager.ownerID, Route: route.Name, File: working,
 		SessionKey: "implementation-session", ThreadID: "implementation-thread",
 		State: "awaiting_transition", Phase: phaseTaskImplementation, StartedAt: time.Now().UTC(), HeartbeatAt: time.Now().UTC(),

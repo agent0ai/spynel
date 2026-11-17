@@ -116,7 +116,7 @@ func TestJournaledClaimIsFinishedAfterRestart(t *testing.T) {
 	now := time.Now().UTC()
 	claimKey := leaseID("tasks:"+phaseTaskImplementation, id)
 	lease := Lease{
-		ID: claimKey, ClaimID: claimKey, DocumentType: "task", Route: "tasks", File: target, SourceFile: task,
+		ID: claimKey, ClaimID: claimKey, WorkID: id, DocumentType: "task", Route: "tasks", File: target, SourceFile: task,
 		SessionKey: phaseSessionKey("tasks", id, phaseTaskImplementation, 1), State: "claiming", Phase: phaseTaskImplementation,
 		ClaimAttempt: 1, StartedAt: now, HeartbeatAt: now,
 	}
@@ -167,7 +167,7 @@ func TestJournaledReviewClaimFinishesMetadataAfterRenameOnlyCrash(t *testing.T) 
 	started := time.Now().UTC().Add(-time.Minute)
 	claimKey := leaseID("tasks:"+phaseTaskReview, id)
 	lease := Lease{
-		ID: claimKey, ClaimID: claimKey, DocumentType: "task", Route: "tasks", File: reviewing, SourceFile: review,
+		ID: claimKey, ClaimID: claimKey, WorkID: id, DocumentType: "task", Route: "tasks", File: reviewing, SourceFile: review,
 		SessionKey: phaseSessionKey("tasks", id, phaseTaskReview, 1), State: "claiming", Phase: phaseTaskReview,
 		ClaimAttempt: 1, StartedAt: started, HeartbeatAt: started,
 	}
@@ -852,7 +852,7 @@ func TestGoalDoneRequiresReviewProof(t *testing.T) {
 	if err := WriteDocument(path, document); err != nil {
 		t.Fatal(err)
 	}
-	lease := Lease{ID: "goal-review", Route: "goals", File: path, Phase: phaseGoalReview, SessionKey: "review-session", State: "processing", StartedAt: now, HeartbeatAt: now}
+	lease := Lease{ID: "goal-review", WorkID: "goal-proof", Route: "goals", File: path, Phase: phaseGoalReview, SessionKey: "review-session", State: "processing", StartedAt: now, HeartbeatAt: now}
 	if err := manager.saveLease(lease); err != nil {
 		t.Fatal(err)
 	}

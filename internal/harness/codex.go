@@ -46,18 +46,19 @@ type Codex struct {
 	writeMu sync.Mutex
 	// ponytail: one app-server stream serializes callbacks; use per-thread
 	// dispatch only if slow callbacks measurably limit throughput.
-	eventMu  sync.Mutex
-	keyMu    sync.Mutex
-	keyLocks map[string]*sync.Mutex
-	mu       sync.Mutex
-	nextID   int
-	pending  map[int]codexPendingCall
-	session  map[string]string
-	loaded   map[string]bool
-	active   map[string]*turnState
-	deferred map[string][]wireMessage
-	closed   bool
-	failure  error
+	eventMu      sync.Mutex
+	keyMu        sync.Mutex
+	keyLocks     map[string]*operationGate
+	mu           sync.Mutex
+	nextID       int
+	pending      map[int]codexPendingCall
+	session      map[string]string
+	loaded       map[string]bool
+	active       map[string]*turnState
+	deferred     map[string][]wireMessage
+	closed       bool
+	failure      error
+	idleReleases sync.WaitGroup
 }
 
 func (*Codex) FollowUpMode() FollowUpMode { return FollowUpSteer }
@@ -183,7 +184,7 @@ func NewCodex(cfg CodexConfig) (*Codex, error) {
 	c := &Codex{
 		config: cfg, nextID: 1, pending: map[int]codexPendingCall{}, session: map[string]string{},
 		loaded: map[string]bool{}, active: map[string]*turnState{}, deferred: map[string][]wireMessage{},
-		keyLocks: map[string]*sync.Mutex{},
+		keyLocks: map[string]*operationGate{},
 	}
 	if err := c.loadSessions(); err != nil {
 		return nil, err
@@ -338,7 +339,9 @@ func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selec
 		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	lock := c.lockForKey(key)
-	lock.Lock()
+	if err := lock.LockContext(ctx); err != nil {
+		return "", false, &SendNotAdmittedError{Err: err}
+	}
 	defer lock.Unlock()
 	threadID, err := c.ensureThread(ctx, key, selection.Model, emit)
 	if err != nil {
@@ -428,7 +431,9 @@ func (c *Codex) steer(ctx context.Context, key, prompt string, emit core.Emit, r
 		return "", &SendNotAdmittedError{Err: errors.New("harness prompt is empty")}
 	}
 	lock := c.lockForKey(key)
-	lock.Lock()
+	if err := lock.LockContext(ctx); err != nil {
+		return "", &SendNotAdmittedError{Err: err}
+	}
 	defer lock.Unlock()
 	c.mu.Lock()
 	threadID := c.session[key]
@@ -603,7 +608,9 @@ func (c *Codex) IsActive(key string) bool {
 
 func (c *Codex) Interrupt(ctx context.Context, key string) (bool, error) {
 	lock := c.lockForKey(key)
-	lock.Lock()
+	if err := lock.LockContext(ctx); err != nil {
+		return false, err
+	}
 	defer lock.Unlock()
 	c.mu.Lock()
 	threadID := c.session[key]
@@ -627,23 +634,71 @@ func (c *Codex) ResetSession(key string) error {
 	lock.Lock()
 	defer lock.Unlock()
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if threadID := c.session[key]; threadID != "" && c.active[threadID] != nil {
+	threadID := c.session[key]
+	if threadID != "" && c.active[threadID] != nil {
+		c.mu.Unlock()
 		return errors.New("cannot reset a session while its turn is active")
 	}
 	delete(c.session, key)
-	return c.saveSessionsLocked()
+	err := c.saveSessionsLocked()
+	if err != nil && threadID != "" {
+		c.session[key] = threadID
+	}
+	c.mu.Unlock()
+	c.releaseIdleThread(key, threadID)
+	return err
 }
 
-func (c *Codex) lockForKey(key string) *sync.Mutex {
+func (c *Codex) lockForKey(key string) *operationGate {
 	c.keyMu.Lock()
 	defer c.keyMu.Unlock()
 	lock := c.keyLocks[key]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = &operationGate{}
 		c.keyLocks[key] = lock
 	}
 	return lock
+}
+
+// Release off the reader loop: its RPC reply needs that loop to keep running.
+func (c *Codex) releaseIdleThread(key, threadID string) {
+	c.mu.Lock()
+	if key == "" || threadID == "" || c.closed || c.ctx == nil || !c.loaded[threadID] {
+		c.mu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
+	c.idleReleases.Add(1)
+	c.mu.Unlock()
+	go func() {
+		defer c.idleReleases.Done()
+		defer cancel()
+		lock := c.lockForKey(key)
+		if err := lock.LockContext(ctx); err != nil {
+			return
+		}
+		defer lock.Unlock()
+		c.mu.Lock()
+		if c.closed || !c.loaded[threadID] || c.active[threadID] != nil {
+			c.mu.Unlock()
+			return
+		}
+		// A lost reply may still unload the thread. Always resume before reuse.
+		delete(c.loaded, threadID)
+		c.mu.Unlock()
+		result, err := c.call(ctx, "thread/unsubscribe", map[string]any{"threadId": threadID})
+		if err == nil {
+			var response struct {
+				Status string `json:"status"`
+			}
+			if json.Unmarshal(result, &response) != nil || (response.Status != "unsubscribed" && response.Status != "notLoaded" && response.Status != "notSubscribed") {
+				err = errors.New("incompatible thread/unsubscribe result")
+			}
+		}
+		if err != nil && ctx.Err() != context.Canceled && c.config.Stderr != nil {
+			_, _ = fmt.Fprintf(c.config.Stderr, "Codex idle thread release failed: %v\n", err)
+		}
+	}()
 }
 
 func (c *Codex) handleNotification(message wireMessage) {
@@ -776,12 +831,16 @@ func (c *Codex) handleNotificationLocked(message wireMessage) {
 		delete(c.active, state.threadID)
 		c.mu.Unlock()
 		state.emitEvent(core.Event{Kind: kind, Text: text, FinalText: &finalText, ThreadID: state.threadID, TurnID: state.turnID, Done: true, Execution: execution})
+		c.releaseIdleThread(state.key, state.threadID)
 	default:
 		// Keep internal tool and lifecycle method names out of user-facing status.
 	}
 }
 
 func (c *Codex) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	id, response, err := c.beginCall(method, params)
 	if err != nil {
 		return nil, err
@@ -993,7 +1052,9 @@ func (c *Codex) Close() error {
 	if c.closed {
 		done := c.processDone
 		c.mu.Unlock()
-		return waitProviderProcess(done)
+		err := waitProviderProcess(done)
+		c.idleReleases.Wait()
+		return err
 	}
 	c.closed = true
 	stdin := c.stdin
@@ -1007,7 +1068,9 @@ func (c *Codex) Close() error {
 	if cancel != nil {
 		cancel()
 	}
-	return waitProviderProcess(done)
+	err := waitProviderProcess(done)
+	c.idleReleases.Wait()
+	return err
 }
 
 func (c *Codex) loadSessions() error {

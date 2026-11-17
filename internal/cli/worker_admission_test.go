@@ -113,6 +113,8 @@ func runWorkerAdmissionProvider() int {
 				continue
 			}
 			result["thread"] = map[string]string{"id": "synthetic-thread"}
+		case "thread/unsubscribe":
+			result["status"] = "unsubscribed"
 		case "turn/start":
 			if os.Getenv("SPYNEL_TEST_WORKER_UNCERTAIN_START") == "1" {
 				if _, err := file.WriteString("start-effect\n"); err != nil || file.Sync() != nil {

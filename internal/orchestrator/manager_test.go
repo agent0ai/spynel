@@ -447,7 +447,7 @@ func TestImplementationDoneMoveIsReconciledIntoIndependentReview(t *testing.T) {
 	var moved sync.Once
 	fake.beforeEmit = func() {
 		moved.Do(func() {
-			if err := os.Rename(working, done); err != nil {
+			if err := moveDocument(working, done, "done", time.Now().UTC()); err != nil {
 				t.Errorf("move completed task: %v", err)
 			}
 			if err := manager.recoverStale(context.Background()); err != nil {
@@ -809,12 +809,12 @@ func TestReviewTransitionAcceptRejectAndSelfReviewGuard(t *testing.T) {
 				implementer = thread
 			}
 			manager := New(cfg, newFakeRecipient(), extensions.Runner{Directory: filepath.Join(root, "missing")})
-			lease := Lease{ID: "lease", Route: "tasks", File: path, SessionKey: "review-session", Phase: phaseTaskReview, ClaimAttempt: 1, ThreadID: thread, ImplementerThread: implementer, StartedAt: time.Now(), HeartbeatAt: time.Now()}
+			lease := Lease{ID: "lease", WorkID: "review-id", Route: "tasks", File: path, SessionKey: "review-session", Phase: phaseTaskReview, ClaimAttempt: 1, ThreadID: thread, ImplementerThread: implementer, StartedAt: time.Now(), HeartbeatAt: time.Now()}
 			if err := manager.saveLease(lease); err != nil {
 				t.Fatal(err)
 			}
 			target := filepath.Join(filepath.Dir(cfg.Resolve(route.Source)), test.target, filepath.Base(path))
-			if err := os.Rename(path, target); err != nil {
+			if err := moveDocument(path, target, test.target, time.Now().UTC()); err != nil {
 				t.Fatal(err)
 			}
 			if err := manager.reconcileTransitions(context.Background()); err != nil {

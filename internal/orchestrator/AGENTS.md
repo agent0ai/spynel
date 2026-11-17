@@ -52,6 +52,10 @@
 
 - Exact-event notification cancellation uses the ordinary outbox/send mutex and existing cancelled terminal state, preserves attempts/errors and delivered/expired records, and never retracts external effects. Authenticated workspace operators can retire a recorded event by its exact original route and ID even after route revocation; it sends nothing and grants no delivery authority. Communication, notification and heartbeat prompts require confirmed cancellation of resolved-question deliveries before ordinary task resumption, leaving unrelated decisions pending. No runtime answer parser, reminder state or task transition belongs to this primitive.
 
+- Reconciliation selects exactly one regular, readable same-basename document matching the lease’s immutable WorkID and its status folder. Diagnose malformed/mismatched candidates, preserve ambiguous or missing claims, and continue unrelated reconciliation/recovery/dispatch. Interrupted claims validate identity before repair; unreadable claims stay retained. Local transition errors do not abort ordinary queue scanning.
+- One-shot idle waiting performs transition-only settlement, retires the completed phase’s lease/job once and joins admitted notifications with caller cancellation. It never claims review, goal planning or another queued phase; ordinary scans retain their dispatch behavior.
+- Notification deadlines read the current `orchestrator.notification_timeout_seconds` at dispatch (default 120, 30–1800 whole seconds). Both local and retained-worker jobs capture that bound once; saves never alter an admitted deadline or authorize retries/replay.
+
 ## Child DOX Index
 
 No child DOX files.

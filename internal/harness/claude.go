@@ -17,9 +17,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/agent0ai/spynel/internal/core"
 	"github.com/agent0ai/spynel/internal/fsx"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // Claude is a lightweight adapter around Claude Code print mode. It uses
@@ -131,6 +133,7 @@ type claudeEvent struct {
 	SessionID string          `json:"session_id"`
 	IsError   bool            `json:"is_error"`
 	Result    string          `json:"result"`
+	Errors    []string        `json:"errors"`
 	Error     json.RawMessage `json:"error"`
 	Event     struct {
 		Type  string `json:"type"`
@@ -638,6 +641,18 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 			turn.emitEvent(core.Event{Kind: core.EventStatus, Text: "Claude Code turn started", ThreadID: event.SessionID,
 				Execution: &core.ExecutionStatus{State: "running"}})
 		}
+		if turn.sessionID == "" && event.Type == "result" && event.IsError {
+			text := strings.TrimSpace(strings.Join(append([]string{event.Result}, event.Errors...), "\n"))
+			if text == "" {
+				text = "Claude Code startup failed: " + event.Subtype
+			}
+			terminal = core.Event{Kind: core.EventError, Text: text, Done: true}
+			completed = true
+			turn.closeInput()
+			cleanup := time.AfterFunc(2*time.Second, turn.cancel)
+			defer cleanup.Stop()
+			break
+		}
 		if turn.sessionID == "" && event.Type != "system" {
 			terminal = core.Event{Kind: core.EventError, Text: fmt.Sprintf("Claude Code executable %q returned an incompatible stream: expected system/init with required session_id before output; update Claude Code or select another harness", turn.executable), Done: true}
 			completed = true
@@ -696,6 +711,13 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 	c.processWait.Done()
 	turn.cancel()
 	if completed {
+		if turn.sessionID == "" {
+			if detail := strings.TrimSpace(turn.stderr.String()); detail != "" {
+				terminal.Text += "\n" + detail
+			}
+			terminal.Text = claudeStartupDiagnostic(terminal.Text)
+			terminal.Execution = &core.ExecutionStatus{State: "error", Detail: terminal.Text}
+		}
 		if waitErr != nil && c.config.Stderr != nil {
 			_, _ = fmt.Fprintf(c.config.Stderr, "Claude Code returned a result but its process failed: %v\n", waitErr)
 		}
@@ -717,8 +739,36 @@ func (c *Claude) runTurn(turn *claudeTurn, reader io.Reader) {
 	} else if err != nil {
 		message += ": " + err.Error()
 	}
+	if turn.sessionID == "" {
+		message = claudeStartupDiagnostic(message)
+	}
 	c.finishClaudeTurn(turn, core.Event{Kind: core.EventError, Text: message, ThreadID: turn.sessionID, Done: true,
 		Execution: &core.ExecutionStatus{State: "error", Detail: message}})
+}
+
+var claudeStartupSecrets = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)((?:authorization|auth)\s*["']?\s*[:=]\s*)[^\r\n]+`),
+	regexp.MustCompile(`(?i)([a-z0-9_.-]*(?:token|password|passwd|passphrase|secret|credential|api[_-]?key|access[_-]?key)[a-z0-9_.-]*\s*["']?\s*[:=]\s*)(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\r\n,;]+)`),
+	regexp.MustCompile(`(?i)(bearer\s+)[a-zA-Z0-9._~+/=-]+`),
+	regexp.MustCompile(`(?i)(\b[a-z][a-z0-9+.-]*://)[^/?#\s'"<>]+@`),
+	regexp.MustCompile(`(?i)(session[\s_-]*id\s*[:=]\s*)[^\s,;]+`),
+	regexp.MustCompile(`\b(?:sk-|ghp_|github_pat_)[a-zA-Z0-9_-]+`),
+}
+
+func claudeStartupDiagnostic(text string) string {
+	text = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return -1
+		}
+		return r
+	}, ansi.Strip(text))
+	for _, pattern := range claudeStartupSecrets {
+		text = pattern.ReplaceAllString(text, "${1}[REDACTED]")
+	}
+	if runes := []rune(text); len(runes) > 4096 {
+		text = string(runes[:2000]) + "\n[diagnostic middle omitted]\n" + string(runes[len(runes)-2000:])
+	}
+	return text
 }
 
 func (c *Claude) emitClaudeDelta(turn *claudeTurn, text string) {
