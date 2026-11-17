@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -628,6 +629,10 @@ func runCodexFixture(mode string) int {
 			}
 			write(map[string]any{"id": message.ID, "result": map[string]any{"thread": map[string]any{"id": threadID}}})
 		case "turn/start":
+			if code, err := strconv.Atoi(os.Getenv("SPYNEL_TEST_CODEX_START_ERROR")); err == nil {
+				write(map[string]any{"id": message.ID, "error": map[string]any{"code": code, "message": "synthetic start failure"}})
+				continue
+			}
 			threadID, turnID := "thr_test", "turn_test"
 			if mode == "codex-interrupt" || mode == "codex-worker" || mode == "codex-followup-refusal" {
 				threadID, turnID = "thr_stop", "turn_stop"

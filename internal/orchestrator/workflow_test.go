@@ -464,6 +464,7 @@ func TestGoalRoundSettlesIntoFreshGoalReviewAndContinuesToPlanning(t *testing.T)
 		"round": 1, "verdict": "continue", "criteria_satisfied": false,
 		"reviewed_at": time.Now().UTC().Format(time.RFC3339),
 	}
+	goalDocument.FrontMatter["status"] = "planning"
 	if err := WriteDocument(reviewingGoal, goalDocument); err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +482,7 @@ func TestGoalRoundSettlesIntoFreshGoalReviewAndContinuesToPlanning(t *testing.T)
 			planningLease = lease
 		}
 	}
-	if planningLease.ID == "" || planningLease.SessionKey == reviewLease.SessionKey {
+	if planningLease.ID == "" || planningLease.SessionKey == reviewLease.SessionKey || manager.leaseExists(reviewLease.ID) {
 		t.Fatalf("continuation did not receive a fresh planning lease: review=%#v planning=%#v", reviewLease, planningLease)
 	}
 }

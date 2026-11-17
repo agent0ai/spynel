@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -160,6 +161,79 @@ func TestCodexQueuedReleasePreservesNewActiveTurn(t *testing.T) {
 	c.idleReleases.Wait()
 	if !c.loaded["thread"] || !c.IsActive("chat") {
 		t.Fatal("old cleanup released the new turn")
+	}
+}
+
+func TestCodexRejectedStartReleasesOnlyProvenIdleThread(t *testing.T) {
+	for _, code := range []int{-32600, -32601, -32602, -32000} {
+		t.Run(strconv.Itoa(code), func(t *testing.T) {
+			command, root, logPath := portableHarnessFixture(t, "codex-lifecycle")
+			t.Setenv("SPYNEL_TEST_CODEX_START_ERROR", strconv.Itoa(code))
+			c, err := NewCodex(CodexConfig{Command: command, Cwd: root, SessionsFile: filepath.Join(root, "sessions.json")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			if err := c.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			refused := code != -32000
+			for turn := 0; turn < 2; turn++ {
+				id, _, err := c.Send(ctx, "chat", "synthetic", nil)
+				if err == nil || !strings.Contains(err.Error(), "synthetic start failure") || id != "thr_test" {
+					t.Fatal("start error lost", id, err)
+				}
+				c.idleReleases.Wait()
+				c.mu.Lock()
+				loaded := c.loaded[id]
+				c.mu.Unlock()
+				if loaded == refused || c.IsActive("chat") || c.ThreadID("chat") != id {
+					t.Fatal("incorrect cleanup or resumability after start error")
+				}
+			}
+			methods := map[string]int{}
+			for _, r := range readFixtureRecords(t, logPath) {
+				methods[r.Method]++
+			}
+			if refused && (methods["thread/unsubscribe"] != 2 || methods["thread/resume"] != 1) ||
+				!refused && (methods["thread/unsubscribe"] != 0 || methods["thread/resume"] != 0) {
+				t.Fatal("unsafe release or missing resume", methods)
+			}
+		})
+	}
+}
+
+func TestCodexSessionSaveFailureReleasesUnstartedThread(t *testing.T) {
+	command, root, logPath := portableHarnessFixture(t, "codex-lifecycle")
+	blocker := filepath.Join(root, "regular-file")
+	if err := os.WriteFile(blocker, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewCodex(CodexConfig{Command: command, Cwd: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.config.SessionsFile = filepath.Join(blocker, "sessions.json")
+	_, _, err = c.Send(ctx, "chat", "synthetic", nil)
+	var notAdmitted *SendNotAdmittedError
+	if !errors.As(err, &notAdmitted) {
+		t.Fatal("session save did not fail before turn delivery", err)
+	}
+	c.idleReleases.Wait()
+	methods := map[string]int{}
+	for _, r := range readFixtureRecords(t, logPath) {
+		methods[r.Method]++
+	}
+	if methods["turn/start"] != 0 || methods["thread/unsubscribe"] != 1 || c.ThreadID("chat") != "" {
+		t.Fatal("unpersisted idle thread leaked or turn was delivered", methods)
 	}
 }
 

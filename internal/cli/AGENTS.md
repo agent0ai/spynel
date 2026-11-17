@@ -76,7 +76,7 @@
 
 - The managed Telegram builder supplies the application-owned history store for ordinary streamed-response delivery receipts, in addition to live verbosity and authorization. This adds no startup, provider or notification-worker dispatch.
 
-- One-shot `run-once` delegates final transition-only lease/job settlement and admitted-notification waiting to Manager.WaitForIdle; it must not dispatch a successor phase to finish bookkeeping. Native synthetic worker tests cover canonical notification-deadline saves, unchanged admitted deadlines and the next notification dispatch without external sends.
+- One-shot `run-once` delegates final transition-only lease/job settlement and admitted-notification waiting to Manager.WaitForIdle; it must not dispatch a successor phase to finish bookkeeping. Native synthetic worker tests cover canonical notification-deadline saves, unchanged admitted deadlines and the next notification dispatch without external sends, plus invalid retained workflow documents across controller replacement, unrelated scanning and repair without another original reservation.
 
 ## Child DOX Index
 

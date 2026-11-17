@@ -30,7 +30,7 @@ func reliabilityManager(t *testing.T) (*Manager, string) {
 }
 
 func TestTransitionCandidatesAreIsolated(t *testing.T) {
-	for _, scenario := range []string{"malformed-and-valid", "wrong-id", "wrong-status", "ambiguous", "missing"} {
+	for _, scenario := range []string{"malformed-and-valid", "wrong-id", "wrong-status", "ambiguous", "ambiguous-claimed", "missing"} {
 		t.Run(scenario, func(t *testing.T) {
 			m, _ := reliabilityManager(t)
 			file, err := Create(m.Config, "tasks", "transition", "")
@@ -52,6 +52,10 @@ func TestTransitionCandidatesAreIsolated(t *testing.T) {
 			}
 			candidate := m.Config.StatePath("tasks", "review", filepath.Base(file))
 			doc.FrontMatter["status"] = "review"
+			if scenario == "ambiguous-claimed" {
+				candidate = m.Config.StatePath("tasks", "reviewing", filepath.Base(file))
+				doc.FrontMatter["status"] = "reviewing"
+			}
 			if scenario == "wrong-id" {
 				doc.FrontMatter["id"] = "unrelated"
 			}
@@ -71,14 +75,14 @@ func TestTransitionCandidatesAreIsolated(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if scenario == "ambiguous" {
+			if strings.HasPrefix(scenario, "ambiguous") {
 				doc.FrontMatter["status"] = "waiting"
 				if err := WriteDocument(m.Config.StatePath("tasks", "waiting", filepath.Base(file)), doc); err != nil {
 					t.Fatal(err)
 				}
 			}
-			var logs []string
-			m.Log = func(line string) { logs = append(logs, line) }
+			var logs atomic.Int32
+			m.Log = func(string) { logs.Add(1) }
 			if err := m.reconcileTransitions(t.Context()); err != nil {
 				t.Fatalf("isolated candidate stopped reconciliation: %v", err)
 			}
@@ -86,7 +90,7 @@ func TestTransitionCandidatesAreIsolated(t *testing.T) {
 			if m.leaseExists(lease.ID) == valid {
 				t.Fatal("valid transition was not retired, or unsafe lease was discarded")
 			}
-			if len(logs) == 0 {
+			if logs.Load() == 0 {
 				t.Fatal("unsafe candidate was not diagnosed")
 			}
 			if _, err := Create(m.Config, "tasks", "unrelated work", ""); err != nil {
@@ -105,6 +109,9 @@ func TestTransitionCandidatesAreIsolated(t *testing.T) {
 			}
 			if !found {
 				t.Fatal("unrelated work did not dispatch")
+			}
+			if !valid && (!m.leaseExists(lease.ID) || fake.calls != 2) {
+				t.Fatal("complete scan dispatched an unresolved claim or discarded its lease")
 			}
 			if scenario != "missing" && !valid {
 				if _, err := os.Stat(candidate); err != nil {

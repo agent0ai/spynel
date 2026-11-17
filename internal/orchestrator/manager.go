@@ -80,6 +80,7 @@ type Manager struct {
 
 	mu                          sync.Mutex
 	scanMu                      sync.Mutex
+	workerWorkflows             map[string]bool // Retained snapshot for this scan; guarded by scanMu.
 	inflight                    map[string]bool
 	runtimeJobs                 map[string]int
 	controlCancelled            map[string]int
@@ -481,6 +482,13 @@ func (m *Manager) scanWorkflows(ctx context.Context, generation *uint64) (bool, 
 	scan := func() error {
 		m.scanMu.Lock()
 		defer m.scanMu.Unlock()
+		m.workerWorkflows = make(map[string]bool, len(retained))
+		defer func() { m.workerWorkflows = nil }()
+		for _, execution := range retained {
+			if execution.Workflow != nil {
+				m.workerWorkflows[execution.Workflow.LeaseID] = true
+			}
+		}
 		if generation != nil {
 			m.scanTimerMu.Lock()
 			current := m.scanTimerGeneration
@@ -686,7 +694,11 @@ func (m *Manager) startExistingClaim(ctx context.Context, route workflowRoute, p
 		id = leaseID(route.Name+":"+phase, path)
 	}
 	key := leaseID(route.Name+":"+phase, id)
-	if m.leaseExists(key) || m.hasLeaseForFile(path) || m.isInflight(key) {
+	_, documentLeased, err := m.leaseForDocument(route.Name, filepath.Base(path), "", "")
+	if err != nil {
+		return err
+	}
+	if m.leaseExists(key) || documentLeased || m.isInflight(key) {
 		return nil
 	}
 	field := phaseAttemptField(phase)
@@ -982,7 +994,7 @@ func (m *Manager) reconcileFinishedTransitions(ctx context.Context, dispatchNext
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if m.Worker != nil && m.isInflight(lease.ID) {
+		if m.Worker != nil && (m.isInflight(lease.ID) || m.workerWorkflows[lease.ID]) {
 			continue
 		}
 		if lease.State == "claiming" {
@@ -1294,7 +1306,7 @@ func (m *Manager) resumeInterruptedClaims(ctx context.Context) error {
 		return err
 	}
 	for _, lease := range leases {
-		if lease.State != "claiming" || m.isInflight(lease.ID) || m.Harness.IsActive(lease.SessionKey) {
+		if lease.State != "claiming" || m.workerWorkflows[lease.ID] || m.isInflight(lease.ID) || m.Harness.IsActive(lease.SessionKey) {
 			continue
 		}
 		if _, err := os.Stat(lease.File); os.IsNotExist(err) && lease.SourceFile != "" {
@@ -1677,6 +1689,9 @@ func (m *Manager) recoverStale(ctx context.Context) error {
 	}
 	now := time.Now()
 	for _, lease := range leases {
+		if m.workerWorkflows[lease.ID] {
+			continue
+		}
 		if lease.CancellationRequested {
 			if lease.State != "cancelled" {
 				lease.State = "cancelled"

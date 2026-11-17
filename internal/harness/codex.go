@@ -345,6 +345,7 @@ func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selec
 	defer lock.Unlock()
 	threadID, err := c.ensureThread(ctx, key, selection.Model, emit)
 	if err != nil {
+		c.releaseIdleThread(key, threadID)
 		return "", false, &SendNotAdmittedError{Err: err}
 	}
 	c.mu.Lock()
@@ -378,6 +379,11 @@ func (c *Codex) SendWithInference(ctx context.Context, key, prompt string, selec
 	}
 	result, err := c.call(ctx, "turn/start", params)
 	if err != nil {
+		var refusal *rpcCallError
+		// JSON-RPC request validation failures prove that no turn started.
+		if errors.As(err, &refusal) && (refusal.Code == -32600 || refusal.Code == -32601 || refusal.Code == -32602) {
+			c.releaseIdleThread(key, threadID)
+		}
 		return threadID, false, fmt.Errorf("start Codex turn with required method turn/start: %w", err)
 	}
 	var response struct {
@@ -557,7 +563,6 @@ func (c *Codex) ensureThread(ctx context.Context, key, model string, emit core.E
 		} else {
 			c.session[key] = threadID
 		}
-		delete(c.loaded, response.Thread.ID)
 	}
 	c.mu.Unlock()
 	if err == nil && missingRollout && emit != nil {

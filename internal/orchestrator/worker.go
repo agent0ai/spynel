@@ -164,12 +164,15 @@ func (m *Manager) attachWorkerWorkflows(ctx context.Context, executions []harnes
 		if !ok {
 			return errors.New("retained worker workflow route unavailable")
 		}
-		if document, err := ReadDocument(lease.File); err == nil {
+		document, err := ReadDocument(lease.File)
+		if err == nil {
 			if documentID(document) != work.WorkID || numberValue(document.FrontMatter[phaseAttemptField(work.Phase)]) != work.ClaimAttempt {
-				return errors.New("retained worker workflow document changed")
+				err = errors.New("retained worker workflow document changed")
 			}
-		} else if !os.IsNotExist(err) {
-			return err
+		}
+		if err != nil && !os.IsNotExist(err) {
+			m.log("retain invalid worker workflow document " + work.LeaseID + ": " + err.Error())
+			continue
 		}
 		lease.WorkID, lease.OwnerID, lease.HeartbeatAt = work.WorkID, m.ownerID, time.Now().UTC()
 		if !execution.Done {

@@ -33,6 +33,95 @@ func TestWorkerWorkflowManagerRestoresJobWithoutDispatch(t *testing.T) {
 	}
 }
 
+func TestWorkerWorkflowInvalidDocumentDoesNotBlockUnrelatedScan(t *testing.T) {
+	for _, scenario := range []string{"malformed", "identity", "attempt"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newWorkerAgentFixture(t)
+			ctx, detach := context.WithCancel(t.Context())
+			defer detach()
+			first, err := orchestrator.Create(f.cfg, "tasks", "retained invalid claim", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.service.Orchestrator.ScanOnce(ctx); err != nil {
+				t.Fatal(err)
+			}
+			waitWorkerAgent(t, func() bool {
+				xs := f.inspect(t)
+				return len(xs) == 1 && xs[0].ThreadID != ""
+			})
+			execution := f.inspect(t)[0]
+			detach()
+			f.stop(t)
+			if err := f.owner.Release(f.term); err != nil {
+				t.Fatal(err)
+			}
+			f.open(t)
+			m := f.service.Orchestrator
+			path := f.cfg.StatePath("tasks", "working", filepath.Base(first))
+			original, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "malformed" {
+				if err := os.WriteFile(path, []byte("---\nstatus:"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				doc, err := orchestrator.ReadDocument(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if scenario == "identity" {
+					doc.FrontMatter["id"] = "different"
+				} else {
+					doc.FrontMatter["attempt"] = execution.Workflow.ClaimAttempt + 1
+				}
+				if err := orchestrator.WriteDocument(path, doc); err != nil {
+					t.Fatal(err)
+				}
+			}
+			leasePath := f.cfg.StatePath("runtime", "leases", execution.Workflow.LeaseID+".json")
+			leaseBefore, err := os.ReadFile(leasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := orchestrator.Create(f.cfg, "tasks", "unrelated queued work", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			fresh, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer func() { cancel(); m.Wait() }()
+			if err := m.ScanOnce(fresh); err != nil {
+				t.Fatal("invalid retained document blocked scan", err)
+			}
+			waitWorkerAgent(t, func() bool { return len(f.inspect(t)) == 2 })
+			if _, err := os.Stat(second); !os.IsNotExist(err) {
+				t.Fatal("unrelated task stayed queued", err)
+			}
+			leaseAfter, err := os.ReadFile(leasePath)
+			if err != nil || string(leaseAfter) != string(leaseBefore) {
+				t.Fatal("invalid retained claim was adopted or recovered", err)
+			}
+			if err := os.WriteFile(path, original, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.ScanOnce(fresh); err != nil {
+				t.Fatal("repaired retained claim did not reattach", err)
+			}
+			waitWorkerAgent(t, func() bool {
+				lease, ok := m.LeaseForSession(execution.Key)
+				return ok && lease.OwnerID != execution.Workflow.OwnerID
+			})
+			for _, current := range f.inspect(t) {
+				if current.Sequence == execution.Sequence && (current.Key != execution.Key || current.Reservation == nil || *current.Reservation != *execution.Reservation) {
+					t.Fatal("repair changed the original admission or provider counters")
+				}
+			}
+		})
+	}
+}
+
 func workerWorkflowManagerFixture(t *testing.T, movedEarly bool) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
